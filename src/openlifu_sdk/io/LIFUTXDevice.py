@@ -5,11 +5,12 @@ import logging
 import re
 import struct
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Annotated, Dict, List, Literal
+from typing import TYPE_CHECKING, Annotated, Dict, List, Literal, Optional
 
 import numpy as np
 
 from openlifu_sdk.io.LIFUUart import LIFUUart
+from openlifu_sdk.io.LIFUUserConfig import LifuUserConfig
 from openlifu_sdk.util.annotations import OpenLIFUFieldData
 from openlifu_sdk.util.units import getunitconversion
 
@@ -106,6 +107,7 @@ HW_ID_DATA_LENGTH = 12
 TEMPERATURE_DATA_LENGTH = 4
 
 from openlifu_sdk.io.LIFUConfig import (
+    OW_CMD,
     OW_CMD_ASYNC,
     OW_CMD_DFU,
     OW_CMD_ECHO,
@@ -115,6 +117,7 @@ from openlifu_sdk.io.LIFUConfig import (
     OW_CMD_PING,
     OW_CMD_RESET,
     OW_CMD_TOGGLE_LED,
+    OW_CMD_USR_CFG,
     OW_CMD_VERSION,
     OW_CONTROLLER,
     OW_CTRL_GET_SWTRIG,
@@ -388,6 +391,145 @@ class TxDevice:
         except Exception as e:
             logger.error("Unexpected error during process: %s", e)
             raise  # Re-raise the exception for the caller to handle
+
+    def read_config(self) -> Optional[LifuUserConfig]:
+        """
+        Read the user configuration from device flash.
+        
+        The configuration is stored as JSON with metadata (magic, version, sequence, CRC).
+        
+        Returns:
+            LifuUserConfig: Parsed configuration object, or None on error
+            
+        Raises:
+            ValueError: If the UART is not connected
+            Exception: If an error occurs during communication
+        """
+        try:
+            if self.uart.demo_mode:
+                logger.info("Demo mode: returning empty config")
+                return LifuUserConfig()
+
+            if not self.uart.is_connected():
+                raise ValueError("Console Device not connected")
+
+            # Send read command (reserved=0 for READ)
+            logger.info("Reading user config from device...")
+            r = self.uart.send_packet(
+                id=None,
+                packetType=OW_CMD,
+                command=OW_CMD_USR_CFG,
+                reserved=0  # 0 = READ
+            )
+            self.uart.clear_buffer()
+
+            if r.packet_type == OW_ERROR:
+                logger.error("Error reading config from device")
+                return None
+
+            # Parse wire format response
+            try:
+                config = LifuUserConfig.from_wire_bytes(r.data)
+                logger.info(f"Read config: seq={config.header.seq}, json_len={config.header.json_len}")
+                return config
+            except Exception as e:
+                logger.error(f"Failed to parse config response: {e}")
+                return None
+
+        except ValueError as v:
+            logger.error("ValueError: %s", v)
+            raise
+
+        except Exception as e:
+            logger.error("Unexpected error reading config: %s", e)
+            raise
+
+    def write_config(self, config: LifuUserConfig) -> Optional[LifuUserConfig]:
+        """
+        Write user configuration to device flash.
+        
+        Can pass either:
+        - Full wire format (header + JSON)
+        - Raw JSON bytes (device will parse as JSON)
+        
+        Args:
+            config: LifuUserConfig object to write
+            
+        Returns:
+            LifuUserConfig: Updated configuration from device (with new seq/crc), or None on error
+            
+        Raises:
+            ValueError: If the UART is not connected
+            Exception: If an error occurs during communication
+        """
+        try:
+            if self.uart.demo_mode:
+                logger.info("Demo mode: simulating config write")
+                return config
+
+            if not self.uart.is_connected():
+                raise ValueError("Console Device not connected")
+
+            # Convert config to wire format bytes
+            wire_data = config.to_wire_bytes()
+            
+            logger.info(f"Writing config to device: {len(wire_data)} bytes")
+            
+            # Send write command (reserved=1 for WRITE)
+            r = self.uart.send_packet(
+                id=None,
+                packetType=OW_CMD,
+                command=OW_CMD_USR_CFG,
+                reserved=1,  # 1 = WRITE
+                data=wire_data
+            )
+            self.uart.clear_buffer()
+
+            if r.packet_type == OW_ERROR:
+                logger.error("Error writing config to device")
+                return None
+
+            # Response contains updated header (with new seq/crc)
+            try:
+                updated_config = LifuUserConfig.from_wire_bytes(r.data)
+                logger.info(f"Config written successfully: new seq={updated_config.header.seq}")
+                return updated_config
+            except Exception as e:
+                logger.error(f"Failed to parse write response: {e}")
+                return None
+
+        except ValueError as v:
+            logger.error("ValueError: %s", v)
+            raise
+
+        except Exception as e:
+            logger.error("Unexpected error writing config: %s", e)
+            raise
+
+    def write_config_json(self, json_str: str) -> Optional[LifuUserConfig]:
+        """
+        Write user configuration from a JSON string.
+        
+        This is a convenience method that creates a LifuUserConfig from JSON
+        and writes it to the device.
+        
+        Args:
+            json_str: JSON string to write
+            
+        Returns:
+            LifuUserConfig: Updated configuration from device, or None on error
+            
+        Raises:
+            ValueError: If JSON is invalid or UART is not connected
+            Exception: If an error occurs during communication
+        """
+        try:
+            config = LifuUserConfig()
+            config.set_json_str(json_str)
+            return self.write_config(config)
+        except json.JSONDecodeError as e:
+            logger.error(f"Invalid JSON: {e}")
+            raise ValueError(f"Invalid JSON: {e}")
 
     def get_temperature(self, module:int=1) -> float:
         """
