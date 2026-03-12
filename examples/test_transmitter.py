@@ -33,7 +33,7 @@ else:
     raise Exception("No TX7332 devices found.")
 
 print("Set TX7332 Demo Waveform")
-if interface.txdevice.demo_tx7332():
+if interface.txdevice.demo_tx7332(0):
     print("TX7332 demo waveform set successfully.")
 else:
     print("Failed to set TX7332 demo waveform.")
