@@ -18,12 +18,18 @@ if tx_connected and hv_connected:
 else:
     print(f'LIFU Device NOT Fully Connected. TX: {tx_connected}, HV: {hv_connected}')
 
+hv_on = False
+
 print("Ping the device")
 interface.txdevice.ping()
 
 print("Get Temperature")
 temperature = interface.txdevice.get_temperature()
 print(f"Temperature: {temperature} °C")
+
+if hv_connected:
+    interface.hvcontroller.set_voltage(20.00)
+    hv_on = interface.hvcontroller.hv_enable(True)
 
 print("Enumerate TX7332 chips")
 num_tx_devices = interface.txdevice.enum_tx7332_devices()
@@ -34,6 +40,12 @@ else:
 
 print("Set TX7332 Demo Waveform")
 if interface.txdevice.demo_tx7332(0):
+    print("TX7332 demo waveform set successfully.")
+else:
+    print("Failed to set TX7332 demo waveform.")
+
+print("Set TX7332 Demo Waveform")
+if interface.txdevice.demo_tx7332(1):
     print("TX7332 demo waveform set successfully.")
 else:
     print("Failed to set TX7332 demo waveform.")
@@ -70,3 +82,9 @@ if interface.start_sonication():
         print("Failed to stop trigger.")
 else:
     print("Failed to get trigger setting.")
+
+if hv_on or hv_connected:
+    try:
+        interface.hvcontroller.hv_enable(False)
+    except Exception as e:
+        print(f"Exception caught {e}")
