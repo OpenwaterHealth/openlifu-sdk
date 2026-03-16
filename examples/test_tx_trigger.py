@@ -80,13 +80,17 @@ def main():
 
             break
 
+        # TriggerMode options:
+        #   TRIGGER_MODE_SINGLE     – fires one pulse train then stops
+        #   TRIGGER_MODE_SEQUENCE   – fires TriggerPulseTrainCount trains then stops
+        #   TRIGGER_MODE_CONTINUOUS – runs until stop_trigger() is called; TriggerPulseTrainCount is ignored
         json_trigger_data = {
             "TriggerFrequencyHz": params["freq"],
             "TriggerPulseCount": 5,
             "TriggerPulseWidthUsec": params["pulse_width"],
             "TriggerPulseTrainInterval": 600000,
             "TriggerPulseTrainCount": 3,
-            "TriggerMode": TRIGGER_MODE_CONTINUOUS, # Change to TRIGGER_MODE_CONTINUOUS or TRIGGER_MODE_SEQUENCE or TRIGGER_MODE_SINGLE as needed
+            "TriggerMode": TRIGGER_MODE_SINGLE, # Change to TRIGGER_MODE_CONTINUOUS or TRIGGER_MODE_SEQUENCE or TRIGGER_MODE_SINGLE as needed
             "ProfileIndex": 0,
             "ProfileIncrement": 0
         }
