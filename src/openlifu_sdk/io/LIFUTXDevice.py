@@ -130,6 +130,7 @@ from openlifu_sdk.io.LIFUConfig import (
     OW_TX7332_DEVICE_COUNT,
     OW_TX7332_ENUM,
     OW_TX7332_RREG,
+    OW_TX7332_RBLOCK,
     OW_TX7332_VWBLOCK,
     OW_TX7332_VWREG,
     OW_TX7332_WBLOCK,
@@ -168,9 +169,9 @@ class TxDevice:
         if self.uart and not self.uart.asyncMode:
             self.uart.check_usb_status()
             if self.uart.is_connected():
-                logger.info("TX Device connected.")
+                logger.debug("TX Device connected.")
             else:
-                logger.info("TX Device NOT Connected.")
+                logger.debug("TX Device NOT Connected.")
 
     def __parse_ti_cfg_file(self, file_path: str) -> list[tuple[str, int, int]]:
         """Parses the given configuration file and extracts all register groups, addresses, and values."""
@@ -222,7 +223,7 @@ class TxDevice:
                 logger.error("TX Device not connected")
                 return False
 
-            logger.info("Send Ping to Device.")
+            logger.debug("Send Ping to Device.")
 
             r = self.uart.send_packet(id=None, packetType=OW_CMD, command=OW_CMD_PING, addr=module)
             self.uart.clear_buffer()
@@ -273,7 +274,7 @@ class TxDevice:
                     ver = 'v0.0.0'
             else:
                 ver = 'v0.0.0'
-            logger.info(ver)
+            logger.debug(ver)
             return ver
         except ValueError as v:
             logger.error("ValueError: %s", v)
@@ -416,7 +417,7 @@ class TxDevice:
                 raise ValueError("Console Device not connected")
 
             # Send read command (reserved=0 for READ)
-            logger.info("Reading user config from device...")
+            logger.debug("Reading user config from device...")
             r = self.uart.send_packet(
                 id=None,
                 packetType=OW_CMD,
@@ -433,7 +434,7 @@ class TxDevice:
             # Parse wire format response
             try:
                 config = LifuUserConfig.from_wire_bytes(r.data)
-                logger.info(f"Read config: seq={config.header.seq}, json_len={config.header.json_len}")
+                logger.debug(f"Read config: seq={config.header.seq}, json_len={config.header.json_len}")
                 return config
             except Exception as e:
                 logger.error(f"Failed to parse config response: {e}")
@@ -476,7 +477,7 @@ class TxDevice:
             # Convert config to wire format bytes
             wire_data = config.to_wire_bytes()
             
-            logger.info(f"Writing config to device: {len(wire_data)} bytes")
+            logger.debug(f"Writing config to device: {len(wire_data)} bytes")
             
             # Send write command (reserved=1 for WRITE)
             r = self.uart.send_packet(
@@ -500,7 +501,7 @@ class TxDevice:
                 from openlifu_sdk.io.LIFUUserConfig import LifuUserConfigHeader
                 updated_header = LifuUserConfigHeader.from_bytes(r.data[:16])
                 updated_config = LifuUserConfig(header=updated_header, json_data=config.json_data)
-                logger.info(f"Config written successfully: new seq={updated_config.header.seq}")
+                logger.debug(f"Config written successfully: new seq={updated_config.header.seq}")
                 return updated_config
             except Exception as e:
                 logger.error(f"Failed to parse write response: {e}")
@@ -1020,7 +1021,7 @@ class TxDevice:
                 if r.packet_type != OW_ERROR and r.data_len == 1:
                     tx_module_count = r.data[0]
                 else:
-                    logger.info("Error retrieving TX module count.")
+                    logger.error("Error retrieving TX module count.")
             logger.info("TX Module Count: %d", tx_module_count)
             return tx_module_count
         except ValueError as v:
@@ -1062,7 +1063,7 @@ class TxDevice:
                 if r.packet_type != OW_ERROR and r.reserved > 0:
                     num_detected_devices = r.reserved
                 else:
-                    logger.info("Error enumerating TX devices.")
+                    logger.error("Error enumerating TX devices.")
                 if num_devices is not None and num_detected_devices != num_devices:
                     raise ValueError(f"Expected {num_devices} devices, but detected {num_detected_devices} devices")
             self.tx_registers = TxDeviceRegisters(num_transmitters=num_detected_devices, module_invert=self.module_invert)
@@ -1171,7 +1172,7 @@ class TxDevice:
                 logger.error("Error writing TX register value")
                 return False
 
-            logger.info(f"Successfully wrote value 0x{value:08X} to register 0x{address:04X}")
+            logger.debug(f"Successfully wrote value 0x{value:08X} to register 0x{address:04X}")
             return True
 
         except ValueError as v:
@@ -1242,7 +1243,7 @@ class TxDevice:
                 logger.error(f"Unexpected data length: {r.data_len}")
                 return 0
 
-            logger.info(f"Successfully read value 0x{value:08X} from register 0x{address:04X}")
+            logger.debug(f"Successfully read value 0x{value:08X} from register 0x{address:04X}")
             return value
         except ValueError as v:
             logger.error("ValueError: %s", v)
@@ -1332,6 +1333,68 @@ class TxDevice:
             raise  # Re-raise the exception for the caller to handleected error in write_block: {e}")
             return False
 
+    def read_block(self, identifier: int, start_address: int, count: int) -> Optional[List[int]]:
+        """
+        Read a block of consecutive register values from the TX device.
+
+        Args:
+            identifier (int): TX chip index.
+            start_address (int): The starting register address to read from.
+            count (int): Number of registers to read.
+
+        Returns:
+            List[int]: List of register values, or None on error.
+
+        Raises:
+            ValueError: If the device is not connected or parameters are invalid.
+            Exception: If an unexpected error occurs.
+        """
+        try:
+            if self.uart.demo_mode:
+                return [0] * count
+
+            if not self.uart.is_connected():
+                raise ValueError("TX Device not connected")
+
+            if identifier < 0:
+                raise ValueError("TX Chip address NOT SET")
+
+            if count <= 0 or count > 62:
+                raise ValueError(f"count must be 1-62, got {count}")
+
+            # Request payload: uint16_t start_addr, uint8_t count, uint8_t reserved
+            data = struct.pack('<HBB', start_address, count, 0)
+
+            r = self.uart.send_packet(
+                id=None,
+                packetType=OW_TX7332,
+                command=OW_TX7332_RBLOCK,
+                addr=identifier,
+                data=data
+            )
+            self.uart.clear_buffer()
+
+            if r.packet_type == OW_ERROR:
+                logger.error("Error reading TX register block")
+                return None
+
+            expected_len = count * 4
+            if r.data_len != expected_len:
+                logger.error(f"Unexpected data length: {r.data_len}, expected {expected_len}")
+                return None
+
+            values = list(struct.unpack(f'<{count}I', r.data))
+            logger.debug(f"read_block: {count} regs from 0x{start_address:04X} on tx {identifier}")
+            return values
+
+        except ValueError as v:
+            logger.error("ValueError: %s", v)
+            raise
+
+        except Exception as e:
+            logger.error("Unexpected error during process: %s", e)
+            raise
+
     def write_register_verify(self, address: int, value: int) -> bool:
         """
         Write a value to a register in the TX device with verification.
@@ -1383,7 +1446,7 @@ class TxDevice:
                 logger.error("Error verifying writing TX register value")
                 return False
 
-            logger.info(f"Successfully wrote value 0x{value:08X} to register 0x{address:04X}")
+            logger.debug(f"Successfully wrote value 0x{value:08X} to register 0x{address:04X}")
             return True
 
         except ValueError as v:
@@ -1429,7 +1492,7 @@ class TxDevice:
             # Configure chunking for large blocks
             max_regs_per_block = 62  # Maximum registers per block due to payload size
             num_chunks = (len(reg_values) + max_regs_per_block - 1) // max_regs_per_block
-            logger.info(f"Write Block: Total chunks = {num_chunks}")
+            logger.debug(f"Write Block: Total chunks = {num_chunks}")
 
             # Write each chunk
             for i in range(num_chunks):
@@ -1594,7 +1657,7 @@ class TxDevice:
 
             # Write each register to the TX device
             for group, addr, value in parsed_registers:
-                logger.info(f"Writing to {group:<20} | Address: 0x{addr:02X} | Value: 0x{value:08X}")
+                logger.debug(f"Writing to {group:<20} | Address: 0x{addr:02X} | Value: 0x{value:08X}")
                 if not self.write_register(identifier=txchip_id, address=addr, value=value):
                     logger.error(
                         f"Failed to write to TX CHIP ID: {txchip_id} | "
@@ -1602,7 +1665,7 @@ class TxDevice:
                     )
                     return False
 
-            logger.info("Successfully wrote all registers to the TX device.")
+            logger.debug("Successfully wrote all registers to the TX device.")
             return True
 
         except FileNotFoundError as e:
