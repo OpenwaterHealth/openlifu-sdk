@@ -6,7 +6,7 @@ import time
 from openlifu_sdk.io.LIFUInterface import LIFUInterface
 
 # set PYTHONPATH=%cd%\src;%PYTHONPATH%
-# python notebooks/test_tx_dfu.py
+# python examples\test_tx_dfu.py
 
 print("Starting LIFU Test Script...")
 interface = LIFUInterface()
