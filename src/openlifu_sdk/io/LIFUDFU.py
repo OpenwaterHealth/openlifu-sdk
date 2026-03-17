@@ -62,7 +62,12 @@ I2C_DFU_STATUS_BUSY     = 0x01
 I2C_DFU_STATUS_ERROR    = 0x02
 I2C_DFU_STATE_DNBUSY    = 0x01
 I2C_DFU_STATE_ERROR     = 0x04
-I2C_DFU_MAX_XFER_SIZE   = 2048
+# Maximum data bytes per write_block call.  The enclosing OW_I2C_PASSTHRU UART
+# packet carries (1 cmd + 4 addr + 2 len) = 7 bytes of I2C-DFU header, so the
+# total packet payload is I2C_DFU_MAX_XFER_SIZE + 7.  The master firmware hard-
+# rejects any UART packet with data_len > DATA_MAX_SIZE (2048), so this value
+# must be ≤ 2041.  Use 512 for a safe, standard I2C block size.
+I2C_DFU_MAX_XFER_SIZE   = 512
 I2C_DFU_VERSION_STR_MAX = 32
 
 # OW_I2C_PASSTHRU sub-commands (must match firmware if_commands.c handler)
