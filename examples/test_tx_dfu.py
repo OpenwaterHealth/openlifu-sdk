@@ -62,15 +62,17 @@ if user_input == 'y':
     if interface.txdevice.enter_dfu():
         print("Successful.")
 
-        print("Use stm32 cube programmer to update firmware, power cycle will put the console back into an operating state")
-        sys.exit(0)
-
 elif user_input == 'n':
     print("Reset device")
     if interface.txdevice.soft_reset():
         print("Successful.")
 
-time.sleep(6)
+time.sleep(5)
+
+if user_input == 'y':
+    print("Use stm32 cube programmer to update firmware, power cycle will put the console back into an operating state")
+    sys.exit(0)
+
 interface.txdevice.uart.reopen_after_reset()
 print("Ping the device again")
 if  interface.txdevice.ping():

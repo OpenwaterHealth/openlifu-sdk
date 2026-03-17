@@ -4,6 +4,7 @@ import json
 import logging
 import re
 import struct
+import time
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Annotated, Dict, List, Literal, Optional
 
@@ -112,6 +113,7 @@ from openlifu_sdk.io.LIFUConfig import (
     OW_CMD_DFU,
     OW_CMD_ECHO,
     OW_CMD_GET_AMBIENT,
+    OW_CMD_GET_MODULE_COUNT,
     OW_CMD_GET_TEMP,
     OW_CMD_HWID,
     OW_CMD_PING,
@@ -936,7 +938,6 @@ class TxDevice:
 
             r = self.uart.send_packet(id=None, packetType=OW_CONTROLLER, command=OW_CMD_DFU, addr=module)
             self.uart.clear_buffer()
-            # r.print_packet()
             if r is None:
                 # Device disconnected immediately after reset — expected for DFU entry
                 return True
@@ -1677,6 +1678,94 @@ class TxDevice:
         except Exception as e:
             logger.error(f"Unexpected error while writing TI config to TX Device: {e}")
             raise
+
+    # ------------------------------------------------------------------
+    # Firmware update (delegates to LIFUDFU.LIFUDFUManager)
+    # ------------------------------------------------------------------
+
+    def get_module_count(self) -> int:
+        """Return the number of connected LIFU transmitter modules (including master).
+
+        Sends ``OW_CMD_GET_MODULE_COUNT`` (0x10) to the firmware. Falls back to
+        deriving the count from the TX7332 chip count when the firmware does not
+        yet support the command.
+        """
+        try:
+            if self.uart.demo_mode:
+                return 1
+
+            if not self.uart.is_connected():
+                logger.error("TX Device not connected")
+                return 0
+
+            r = self.uart.send_packet(
+                id=None, packetType=OW_CMD,
+                command=OW_CMD_GET_MODULE_COUNT, addr=0
+            )
+            self.uart.clear_buffer()
+
+            if r.packet_type != OW_ERROR and r.data_len >= 1:
+                count = r.data[0]
+                logger.info("Module count from firmware: %d", count)
+                return count
+
+            # Fallback: TX7332 chip count / 2
+            logger.info(
+                "OW_CMD_GET_MODULE_COUNT not supported; falling back to TX7332 count"
+            )
+            module_count = self.get_tx_module_count()
+            return module_count
+
+        except Exception as e:
+            logger.error("Error getting module count: %s", e)
+            return 0
+
+    def update_firmware(self, module: int, package_file: str,
+                        vid: int = 0x0483, pid: int = 0xDF11,
+                        libusb_dll: str | None = None,
+                        i2c_addr: int = 0x72,
+                        dfu_wait_s: float = 5.0,
+                        progress_callback=None) -> bool:
+        """Update firmware on a single module.
+
+        Module 0 (USB master): host → USB DFU.
+        Module 1+ (I2C slaves): host → UART OW → master → I2C 0x72 (DFU bootloader).
+
+        Args:
+            module:            Module index (0 = USB master).
+            package_file:      Path to the signed firmware package file.
+            vid:               USB VID for module 0 DFU (default 0x0483).
+            pid:               USB PID for module 0 DFU (default 0xDF11).
+            libusb_dll:        Optional path to libusb-1.0.dll (Windows).
+            i2c_addr:          I2C address of the slave DFU bootloader (default 0x72).
+            dfu_wait_s:        Seconds to wait after DFU-enter for bootloader to boot.
+            progress_callback: Optional ``(written, total, label)`` callable.
+
+        Returns:
+            bool: True on success.
+
+        Raises:
+            ValueError:    If the UART is not connected.
+            RuntimeError:  If DFU entry cannot be verified or programming fails.
+        """
+        from openlifu_sdk.io.LIFUDFU import LIFUDFUManager  # lazy import
+
+        if not self.uart.is_connected():
+            raise ValueError("TX Device not connected")
+
+        mgr = LIFUDFUManager(uart=self.uart)
+        mgr.update_module(
+            module=module,
+            package_file=package_file,
+            enter_dfu_fn=self.enter_dfu,
+            vid=vid,
+            pid=pid,
+            libusb_dll=libusb_dll,
+            i2c_addr=i2c_addr,
+            dfu_wait_s=dfu_wait_s,
+            progress_callback=progress_callback,
+        )
+        return True
 
     @property
     def print(self) -> None:
