@@ -7,7 +7,7 @@ from openlifu_sdk.io.LIFUInterface import LIFUInterface
 
 # set PYTHONPATH=%cd%\src;%PYTHONPATH%
 # python examples\test_tx_dfu.py
-
+MODULE_ID = 2
 print("Starting LIFU Test Script...")
 interface = LIFUInterface()
 
@@ -50,7 +50,7 @@ if not interface.txdevice.ping():
     sys.exit(1)
 
 print("Get Version")
-version = interface.txdevice.get_version()
+version = interface.txdevice.get_version(module=MODULE_ID)
 print(f"Version: {version}")
 
 
@@ -59,12 +59,12 @@ user_input = input("Do you want to Enter DFU Mode? (y/n): ").strip().lower()
 
 if user_input == 'y':
     print("Enter DFU mode")
-    if interface.txdevice.enter_dfu():
+    if interface.txdevice.enter_dfu(module=MODULE_ID):
         print("Successful.")
 
 elif user_input == 'n':
     print("Reset device")
-    if interface.txdevice.soft_reset():
+    if interface.txdevice.soft_reset(module=MODULE_ID):
         print("Successful.")
 
 time.sleep(5)
@@ -73,9 +73,11 @@ if user_input == 'y':
     print("Use stm32 cube programmer to update firmware, power cycle will put the console back into an operating state")
     sys.exit(0)
 
-interface.txdevice.uart.reopen_after_reset()
+if MODULE_ID == 0:
+    interface.txdevice.uart.reopen_after_reset()
+
 print("Ping the device again")
-if  interface.txdevice.ping():
+if  interface.txdevice.ping(module=MODULE_ID):
     print("Test script complete.")
 else:
     print("Device did not respond after reset.")

@@ -60,6 +60,8 @@ I2C_DFU_CMD_GETVERSION  = 0x06
 I2C_DFU_STATUS_OK       = 0x00
 I2C_DFU_STATUS_BUSY     = 0x01
 I2C_DFU_STATUS_ERROR    = 0x02
+I2C_DFU_STATUS_BAD_ADDR = 0x03
+I2C_DFU_STATUS_FLASH_ERR= 0x04
 I2C_DFU_STATE_DNBUSY    = 0x01
 I2C_DFU_STATE_ERROR     = 0x04
 # Maximum data bytes per write_block call.  The enclosing OW_I2C_PASSTHRU UART
@@ -461,10 +463,11 @@ class STM32I2CDFUviaMaster:
         return {"status": raw[0], "state": raw[1]}
 
     def _wait_while_busy(self, timeout_s: float = 10.0) -> dict:
+        _ERROR_STATUSES = (I2C_DFU_STATUS_ERROR, I2C_DFU_STATUS_BAD_ADDR, I2C_DFU_STATUS_FLASH_ERR)
         deadline = time.monotonic() + timeout_s
         while time.monotonic() < deadline:
             st = self.get_status()
-            if st["state"] == I2C_DFU_STATE_ERROR or st["status"] == I2C_DFU_STATUS_ERROR:
+            if st["state"] == I2C_DFU_STATE_ERROR or st["status"] in _ERROR_STATUSES:
                 raise RuntimeError(
                     f"I2C DFU error: status=0x{st['status']:02X}, "
                     f"state=0x{st['state']:02X}"
@@ -474,6 +477,11 @@ class STM32I2CDFUviaMaster:
                 return st
             time.sleep(0.020)
         raise TimeoutError(f"I2C DFU timed out after {timeout_s:.0f} s")
+
+    def erase_page(self, address: int) -> None:
+        """Erase the flash page containing *address*."""
+        self._write(struct.pack("<BI", I2C_DFU_CMD_ERASE, address))
+        self._wait_while_busy(timeout_s=10.0)
 
     def mass_erase(self) -> None:
         """Erase the entire application flash region (sentinel addr = 0xFFFFFFFF)."""
@@ -590,6 +598,14 @@ class LIFUDFUManager:
         """Program a signed package to a slave module via I2C passthrough.
 
         The slave must already be in DFU bootloader mode at *i2c_addr*.
+
+        Sequence (mirrors dfu-i2c-test.py program-package):
+          1. Mass-erase the application flash region.
+          2. Erase the metadata page explicitly (it is outside the app region
+             and is NOT touched by mass-erase).
+          3. Write the firmware payload.
+          4. Write the metadata blob.
+          5. Send CMD_MANIFEST.
         """
         with open(package_file, "rb") as f:
             pkg_blob = f.read()
@@ -603,13 +619,15 @@ class LIFUDFUManager:
         dfu = STM32I2CDFUviaMaster(uart=self._uart, i2c_addr=i2c_addr)
         logger.info("I2C DFU: mass erasing application region...")
         dfu.mass_erase()
+        logger.info("I2C DFU: erasing metadata page @ 0x%08X...", pkg["meta_address"])
+        dfu.erase_page(pkg["meta_address"])
         dfu.write_memory(
             pkg["fw_address"], pkg["fw"],
             progress_callback=progress_callback
         )
+        logger.info("I2C DFU: writing metadata...")
         dfu.write_memory(
-            pkg["meta_address"], pkg["meta"],
-            progress_callback=progress_callback
+            pkg["meta_address"], pkg["meta"]
         )
         logger.info("I2C DFU: sending manifest...")
         dfu.manifest()

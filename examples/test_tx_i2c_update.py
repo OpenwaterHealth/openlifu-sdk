@@ -145,6 +145,16 @@ def main() -> None:
             sys.exit(0)
 
     # ------------------------------------------------------------------
+    # Show package layout before programming
+    # ------------------------------------------------------------------
+    from openlifu_sdk.io.LIFUDFU import STM32I2CDFUviaMaster, parse_signed_package
+    with open(args.package_file, "rb") as _f:
+        _pkg = parse_signed_package(_f.read())
+    print(f"  Package layout:")
+    print(f"    fw  : {len(_pkg['fw']):6d} B @ 0x{_pkg['fw_address']:08X}")
+    print(f"    meta: {len(_pkg['meta']):6d} B @ 0x{_pkg['meta_address']:08X}  (written by bootloader at manifest)")
+
+    # ------------------------------------------------------------------
     # Program
     # ------------------------------------------------------------------
     print(f"\nProgramming slave 0x{args.i2c_addr:02X}...")
@@ -165,7 +175,6 @@ def main() -> None:
 
     print("\nProgramming complete. Resetting slave...")
     try:
-        from openlifu_sdk.io.LIFUDFU import STM32I2CDFUviaMaster
         dfu = STM32I2CDFUviaMaster(uart=uart, i2c_addr=args.i2c_addr)
         dfu.reset()
     except Exception as e:
