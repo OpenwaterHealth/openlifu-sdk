@@ -367,7 +367,10 @@ class LIFUUart:
                 else:
                     time.sleep(0.05)  # Brief sleep to avoid a busy loop
             except serial.SerialException as e:
-                log.error("Serial _read_data error on %s: %s", self.descriptor, e)
+                if "ClearCommError" in str(e):
+                    log.warning("Device disconnected on %s", self.descriptor)
+                else:
+                    log.error("Serial _read_data error on %s: %s", self.descriptor, e)
                 self.running = False
 
     def _tx(self, data: bytes):
