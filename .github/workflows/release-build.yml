@@ -42,9 +42,11 @@ jobs:
           if [[ "$BASE_VERSION" == pre-* ]]; then
             BASE_VERSION="${BASE_VERSION#pre-}"
             BASE_VERSION="${BASE_VERSION#v}"
+            BASE_VERSION=$(echo "$BASE_VERSION" | grep -oE '^[0-9]+\.[0-9]+\.[0-9]+')
             echo "SETUPTOOLS_SCM_PRETEND_VERSION=${BASE_VERSION}rc0" >> $GITHUB_ENV
           else
             BASE_VERSION="${BASE_VERSION#v}"
+            BASE_VERSION=$(echo "$BASE_VERSION" | grep -oE '^[0-9]+\.[0-9]+\.[0-9]+')
             echo "SETUPTOOLS_SCM_PRETEND_VERSION=${BASE_VERSION}" >> $GITHUB_ENV
           fi
 
