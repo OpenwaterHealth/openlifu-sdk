@@ -7,7 +7,7 @@ from openlifu_sdk.io.LIFUInterface import LIFUInterface
 
 # set PYTHONPATH=%cd%\src;%PYTHONPATH%
 # python examples\test_tx_dfu.py
-MODULE_ID = 2
+MODULE_ID = 0
 print("Starting LIFU Test Script...")
 interface = LIFUInterface()
 

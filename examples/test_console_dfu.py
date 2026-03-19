@@ -6,7 +6,7 @@ from time import sleep
 from openlifu_sdk.io.LIFUInterface import LIFUInterface
 
 # set PYTHONPATH=%cd%\src;%PYTHONPATH%
-# python notebooks/test_console_dfu.py
+# python examples\test_console_dfu.py
 """
 Test script to automate:
 1. Connect to the device.

@@ -1,0 +1,149 @@
+name: Build package (release + manual)
+
+on:
+  push:
+    tags:
+      - "[0-9]*.[0-9]*.[0-9]*"
+      - "pre-[0-9]*.[0-9]*.[0-9]*"
+  workflow_dispatch:
+    inputs:
+      pretend_version:
+        description: "Optional: override version for manual test (e.g. 0.0.0-test1)"
+        required: false
+        type: string
+      tag_like_release:
+        description: "Create a temporary git tag in the job (instead of pretend version)"
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: write 
+  
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      id-token: write
+
+    steps:
+      - name: Checkout (need tags for setuptools-scm)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set version for tag builds
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          TAG_NAME="${GITHUB_REF#refs/tags/}"
+          BASE_VERSION="$TAG_NAME"
+
+          if [[ "$BASE_VERSION" == pre-* ]]; then
+            BASE_VERSION="${BASE_VERSION#pre-}"
+            BASE_VERSION="${BASE_VERSION#v}"
+            echo "SETUPTOOLS_SCM_PRETEND_VERSION=${BASE_VERSION}rc0" >> $GITHUB_ENV
+          else
+            BASE_VERSION="${BASE_VERSION#v}"
+            echo "SETUPTOOLS_SCM_PRETEND_VERSION=${BASE_VERSION}" >> $GITHUB_ENV
+          fi
+
+      # ----- Manual test helpers (only on workflow_dispatch) -----
+      - name: Set pretend version via env
+        if: github.event_name == 'workflow_dispatch' && inputs.pretend_version != ''
+        run: echo "SETUPTOOLS_SCM_PRETEND_VERSION=${{ inputs.pretend_version }}" >> $GITHUB_ENV
+
+      - name: Create a temporary tag (alternative to pretend version)
+        if: github.event_name == 'workflow_dispatch' && inputs.tag_like_release == true
+        run: |
+          # Use provided pretend_version or fallback
+          VERSION="${{ inputs.pretend_version }}"
+          if [ -z "$VERSION" ]; then VERSION="0.0.0rc1"; fi
+          git tag -a "v$VERSION" -m "temp test tag v$VERSION"
+          git describe --tags --always
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install build tooling
+        run: python -m pip install --upgrade build setuptools-scm
+
+      - name: Build sdist & wheel
+        run: python -m build
+
+      # ---------------------------
+      # Create GitHub Release (tags only)
+      # ---------------------------
+      - name: Detect release type
+        if: startsWith(github.ref, 'refs/tags/')
+        id: reltype
+        run: |
+          TAG_NAME="${GITHUB_REF#refs/tags/}"
+
+          if [[ "$TAG_NAME" == pre-* ]] || [[ "$TAG_NAME" == *"-rc"* ]] || [[ "$TAG_NAME" == *"-beta"* ]]; then
+            echo "prerelease=true" >> $GITHUB_OUTPUT
+          else
+            echo "prerelease=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Capture build metadata
+        if: startsWith(github.ref, 'refs/tags/')
+        id: buildmeta
+        run: |
+          echo "sha=$(git rev-parse --short HEAD)" >> $GITHUB_OUTPUT
+          echo "datetime=$(date -u '+%Y-%m-%d %H:%M:%S UTC')" >> $GITHUB_OUTPUT
+
+      - name: Generate release notes
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          : > notes.md
+
+          TAG_NAME="${GITHUB_REF#refs/tags/}"
+
+          if [[ "${{ steps.reltype.outputs.prerelease }}" == "true" ]]; then
+            echo "⚠️ **PRE-RELEASE – NOT FOR PRODUCTION**" >> notes.md
+            echo "" >> notes.md
+          fi
+
+          PREV_TAG=$(git tag --merged HEAD --sort=-creatordate \
+            | grep -E '^(pre-)?[0-9]+\.[0-9]+\.[0-9]+$' \
+            | grep -v "^${TAG_NAME}$" \
+            | head -n 1)
+
+          if [ -n "$PREV_TAG" ]; then
+            echo "Changes since ${PREV_TAG}:" >> notes.md
+            echo "" >> notes.md
+            git log "${PREV_TAG}..HEAD" --pretty=format:"- %s" >> notes.md
+          else
+            echo "Changes:" >> notes.md
+            echo "" >> notes.md
+            git log --pretty=format:"- %s" >> notes.md
+          fi
+
+          echo "" >> notes.md
+          echo "Sha: ${{ steps.buildmeta.outputs.sha }}" >> notes.md
+          echo "Built: ${{ steps.buildmeta.outputs.datetime }}" >> notes.md
+
+      - name: Create GitHub Release (tags only)
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: ncipollo/release-action@v1
+        with:
+          tag: ${{ github.ref_name }}
+          name: ${{ github.ref_name }}
+          bodyFile: notes.md
+          artifacts: dist/*
+          artifactErrorsFailBuild: true
+          prerelease: ${{ steps.reltype.outputs.prerelease }}
+          allowUpdates: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      # For manual runs, save artifacts to the workflow run instead
+      - name: Upload artifacts to run (manual tests)
+        if: github.event_name == 'workflow_dispatch'
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/*
