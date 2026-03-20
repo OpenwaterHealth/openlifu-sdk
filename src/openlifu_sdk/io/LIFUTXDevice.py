@@ -113,7 +113,7 @@ from openlifu_sdk.io.LIFUConfig import (
     OW_CMD_DFU,
     OW_CMD_ECHO,
     OW_CMD_GET_AMBIENT,
-    OW_CMD_GET_MODULE_COUNT,
+    OW_CTRL_GET_MODULE_COUNT,
     OW_CMD_GET_TEMP,
     OW_CMD_HWID,
     OW_CMD_PING,
@@ -1686,7 +1686,7 @@ class TxDevice:
     def get_module_count(self) -> int:
         """Return the number of connected LIFU transmitter modules (including master).
 
-        Sends ``OW_CMD_GET_MODULE_COUNT`` (0x10) to the firmware. Falls back to
+        Sends ``OW_CTRL_GET_MODULE_COUNT`` (0x10) to the firmware. Falls back to
         deriving the count from the TX7332 chip count when the firmware does not
         yet support the command.
         """
@@ -1700,7 +1700,7 @@ class TxDevice:
 
             r = self.uart.send_packet(
                 id=None, packetType=OW_CMD,
-                command=OW_CMD_GET_MODULE_COUNT, addr=0
+                command=OW_CTRL_GET_MODULE_COUNT, addr=0
             )
             self.uart.clear_buffer()
 
@@ -1711,7 +1711,7 @@ class TxDevice:
 
             # Fallback: TX7332 chip count / 2
             logger.info(
-                "OW_CMD_GET_MODULE_COUNT not supported; falling back to TX7332 count"
+                "OW_CTRL_GET_MODULE_COUNT not supported; falling back to TX7332 count"
             )
             module_count = self.get_tx_module_count()
             return module_count
