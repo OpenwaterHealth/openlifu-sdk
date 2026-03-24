@@ -86,7 +86,7 @@ def parse_json_value(value_str: str) -> any:
 def read_config_action(interface, output_file: str = None) -> bool:
     """Read configuration from device and display or save it."""
     print("Reading configuration from device...")
-    config = interface.hvcontroller.read_config()
+    config = interface.txdevice.read_config()
 
     if config is None:
         print("Error: Failed to read configuration")
@@ -116,7 +116,7 @@ def read_config_action(interface, output_file: str = None) -> bool:
 def get_value_action(interface, key: str) -> bool:
     """Get a specific value from the configuration."""
     print("Reading configuration from device...")
-    config = interface.hvcontroller.read_config()
+    config = interface.txdevice.read_config()
 
     if config is None:
         print("Error: Failed to read configuration")
@@ -136,7 +136,7 @@ def get_value_action(interface, key: str) -> bool:
 def set_values_action(interface, key_value_pairs: list) -> bool:
     """Set one or more values in the configuration."""
     print("Reading current configuration...")
-    config = interface.hvcontroller.read_config()
+    config = interface.txdevice.read_config()
 
     if config is None:
         print("Error: Failed to read configuration")
@@ -157,7 +157,7 @@ def set_values_action(interface, key_value_pairs: list) -> bool:
 
     # Write to device
     print("\nWriting configuration to device...")
-    updated_config = interface.hvcontroller.write_config(config)
+    updated_config = interface.txdevice.write_config(config)
 
     if updated_config is None:
         print("Error: Failed to write configuration")
@@ -173,7 +173,7 @@ def set_values_action(interface, key_value_pairs: list) -> bool:
 def remove_keys_action(interface, keys: list) -> bool:
     """Remove one or more keys from the configuration."""
     print("Reading current configuration...")
-    config = interface.hvcontroller.read_config()
+    config = interface.txdevice.read_config()
 
     if config is None:
         print("Error: Failed to read configuration")
@@ -200,7 +200,7 @@ def remove_keys_action(interface, keys: list) -> bool:
 
     # Write to device
     print("\nWriting configuration to device...")
-    updated_config = interface.hvcontroller.write_config(config)
+    updated_config = interface.txdevice.write_config(config)
 
     if updated_config is None:
         print("Error: Failed to write configuration")
@@ -234,7 +234,7 @@ def write_file_action(interface, json_file: str) -> bool:
         return False
 
     print("\nWriting configuration to device...")
-    config = interface.hvcontroller.read_config()
+    config = interface.txdevice.read_config()
 
     if config is None:
         print("Error: Failed to read current configuration")
@@ -246,7 +246,7 @@ def write_file_action(interface, json_file: str) -> bool:
     # Keep the same sequence number or increment it
     # The device will assign its own sequence on write
 
-    updated_config = interface.hvcontroller.write_config(config)
+    updated_config = interface.txdevice.write_config(config)
 
     if updated_config is None:
         print("Error: Failed to write configuration")
@@ -332,8 +332,8 @@ Examples:
         # Re-check connection
         tx_connected, hv_connected = interface.is_device_connected()
 
-    if hv_connected:
-        print("✅ LIFU Device Console connected.")
+    if tx_connected:
+        print("✅ LIFU Device TX connected.")
     else:
         print("❌ LIFU Device NOT fully connected.")
         print(f"  TX Connected: {tx_connected}")
