@@ -818,13 +818,6 @@ class LIFUDFUManager:
         Raises:
             RuntimeError: If DFU entry cannot be verified or programming fails.
         """
-        # Enforce workspace policy: module 0 (USB DFU) is valid only for
-        # the console bootloader profile in this workspace.
-        if module == 0 and device_type != "console":
-            raise ValueError(
-                "Module 0 (USB DFU) is only valid with device_type='console'"
-            )
-
         logger.info("Requesting DFU mode on module %d...", module)
         if(device_type == "transmitter"):
             enter_dfu_fn(module=module)

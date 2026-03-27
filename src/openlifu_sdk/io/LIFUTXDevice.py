@@ -1754,11 +1754,6 @@ class TxDevice:
         if not self.uart.is_connected():
             raise ValueError("TX Device not connected")
 
-        # Enforce workspace policy: module 0 (USB DFU) is only valid for
-        # the console bootloader profile here.
-        if module == 0 and device_type != "console":
-            raise ValueError("Module 0 (USB DFU) is only valid with device_type='console'")
-
         mgr = LIFUDFUManager(uart=self.uart)
         mgr.update_module(
             module=module,

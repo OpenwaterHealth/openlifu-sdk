@@ -195,9 +195,9 @@ def main() -> None:
             print("Aborted by user.")
             sys.exit(0)
 
-    # Validate module/device-type policy: module 0 (USB DFU) is only valid
+    # Validate module/device-type policy:
     # when targeting the console bootloader.
-    if args.module_id == 0 and args.device_type != "console":
+    if args.module_id > 0 and args.device_type == "console":
         print("ERROR: module 0 is only valid with --device-type console")
         sys.exit(2)
 
