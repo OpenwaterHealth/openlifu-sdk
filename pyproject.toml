@@ -66,3 +66,8 @@ include = [
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/openlifu_sdk"]
+
+[tool.hatch.build.targets.wheel.force-include]
+"firmware" = "openlifu_sdk/firmware"
+"libusb-1.0.29/VS2022/MS64/dll/libusb-1.0.dll" = "openlifu_sdk/libusb/win64/libusb-1.0.dll"
+"libusb-1.0.29/VS2022/MS32/dll/libusb-1.0.dll" = "openlifu_sdk/libusb/win32/libusb-1.0.dll"

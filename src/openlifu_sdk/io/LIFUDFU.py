@@ -12,7 +12,9 @@ from __future__ import annotations
 
 import logging
 import struct
+import sys
 import time
+from pathlib import Path
 from typing import TYPE_CHECKING, Callable
 from dataclasses import dataclass
 
@@ -41,6 +43,37 @@ try:
     import libusb_package as _libusb_package
 except ImportError:
     _libusb_package = None
+
+
+def _find_bundled_libusb_dll() -> str | None:
+    """Return the path to the bundled libusb-1.0.dll for Windows, or None.
+
+    Checks two locations in order:
+    1. Installed-wheel location: ``<openlifu_sdk>/libusb/win64/libusb-1.0.dll``
+       (populated by the ``force-include`` entry in pyproject.toml).
+    2. Repository / editable-install location: walks up from this file's
+       directory looking for ``libusb-1.0.29/VS2022/{MS64|MS32}/dll/libusb-1.0.dll``.
+    """
+    if sys.platform != "win32":
+        return None
+    arch_dir = "win64" if struct.calcsize("P") == 8 else "win32"
+
+    # 1. Installed wheel: <site-packages>/openlifu_sdk/libusb/<arch>/libusb-1.0.dll
+    pkg_root = Path(__file__).parent.parent  # .../openlifu_sdk/
+    candidate = pkg_root / "libusb" / arch_dir / "libusb-1.0.dll"
+    if candidate.is_file():
+        return str(candidate)
+
+    # 2. Development / editable install: search up the directory tree
+    ms_dir = "MS64" if arch_dir == "win64" else "MS32"
+    for parent in Path(__file__).parents:
+        dev_candidate = (
+            parent / "libusb-1.0.29" / "VS2022" / ms_dir / "dll" / "libusb-1.0.dll"
+        )
+        if dev_candidate.is_file():
+            return str(dev_candidate)
+
+    return None
 
 # ---------------------------------------------------------------------------
 # DFU protocol constants (shared by USB and I2C paths)
@@ -253,7 +286,14 @@ class STM32USBDFU:
                 find_library=_libusb_package.find_library
             )
         else:
-            self._backend = _usb_libusb1.get_backend()
+            bundled_dll = _find_bundled_libusb_dll()
+            if bundled_dll:
+                logger.debug("Using bundled libusb DLL: %s", bundled_dll)
+                self._backend = _usb_libusb1.get_backend(
+                    find_library=lambda _: bundled_dll
+                )
+            else:
+                self._backend = _usb_libusb1.get_backend()
         return self._backend
 
     def open(self) -> "STM32USBDFU":
