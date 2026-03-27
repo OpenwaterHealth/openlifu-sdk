@@ -49,8 +49,8 @@ def _find_bundled_libusb_dll() -> str | None:
     """Return the path to the bundled libusb-1.0.dll for Windows, or None.
 
     Checks two locations in order:
-    1. Installed-wheel location: ``<openlifu_sdk>/libusb/win64/libusb-1.0.dll``
-       (populated by the ``force-include`` entry in pyproject.toml).
+    1. Installed-package location: ``<openlifu_sdk>/libusb/win64/libusb-1.0.dll``
+       (included via setuptools ``package_data`` / ``MANIFEST.in`` entries).
     2. Repository / editable-install location: walks up from this file's
        directory looking for ``libusb-1.0.29/VS2022/{MS64|MS32}/dll/libusb-1.0.dll``.
     """
