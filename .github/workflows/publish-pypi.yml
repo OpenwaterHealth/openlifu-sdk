@@ -1,0 +1,78 @@
+name: Publish to PyPI
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag to publish'
+        required: true
+permissions:
+  contents: read   # needed to download release assets
+  id-token: write  # needed if using Trusted Publishing
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+
+    steps:
+      # 1️⃣ Check out the repository (needed for some tools)
+      - uses: actions/checkout@v4
+
+      # 2️⃣ Resolve the tag from either trigger type
+      - name: Resolve tag
+        id: tag
+        run: |
+          TAG="${{ github.event.release.tag_name || github.event.inputs.tag }}"
+          if [ -z "$TAG" ]; then
+            echo "::error::No tag provided. Supply a tag via release event or workflow_dispatch input."
+            exit 1
+          fi
+          echo "name=$TAG" >> $GITHUB_OUTPUT
+
+      # 3️⃣ Determine if this release is a pre-release
+      - name: Check if pre-release
+        id: prerelease
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          PRE=$(gh release view "${{ steps.tag.outputs.name }}" --json isPrerelease -q '.isPrerelease')
+          echo "pre=$PRE" >> $GITHUB_OUTPUT
+
+      # 4️⃣ Skip publishing if it's a pre-release
+      - name: Abort on pre-release
+        if: steps.prerelease.outputs.pre == 'true'
+        run: |
+          echo "Pre-release detected; skipping PyPI publish."
+          exit 0
+
+      # 5️⃣ Download artifacts from the GitHub release
+      - name: Download release assets
+        if: steps.prerelease.outputs.pre != 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          mkdir -p dist
+          gh release download "${{ steps.tag.outputs.name }}" --dir dist --pattern '*.tar.gz' --pattern '*.whl'
+
+      # 6️⃣ Set up Python
+      - name: Set up Python
+        if: steps.prerelease.outputs.pre != 'true'
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # 7️⃣ Install twine
+      - name: Install twine
+        if: steps.prerelease.outputs.pre != 'true'
+        run: pip install --upgrade twine
+
+      # 8️⃣ Publish to PyPI
+      - name: Publish to PyPI
+        if: steps.prerelease.outputs.pre != 'true'
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          user: __token__
+          password: ${{ secrets.PYPI_API_TOKEN }}
+          packages_dir: ./dist
