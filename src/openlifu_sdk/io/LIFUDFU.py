@@ -692,6 +692,10 @@ class LIFUDFUManager:
             len(pkg["fw"]), pkg["fw_address"],
             len(pkg["meta"]), pkg["meta_address"],
         )
+        if device_type not in ("transmitter", "console"):
+            raise ValueError(
+                f"Unknown device_type {device_type!r}; expected 'transmitter' or 'console'."
+            )
         profile = TRANSMITTER_PROFILE if device_type == "transmitter" else CONSOLE_PROFILE
         with STM32USBDFU(vid=vid, pid=pid, libusb_dll=libusb_dll,
                          device_profile=profile) as dfu:
