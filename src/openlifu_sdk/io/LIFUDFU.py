@@ -14,6 +14,7 @@ import logging
 import struct
 import time
 from typing import TYPE_CHECKING, Callable
+from dataclasses import dataclass
 
 from openlifu_sdk.io.LIFUConfig import OW_ERROR, OW_I2C_PASSTHRU
 
@@ -71,6 +72,35 @@ I2C_DFU_STATE_ERROR     = 0x04
 # must be ≤ 2041.  Use 512 for a safe, standard I2C block size.
 I2C_DFU_MAX_XFER_SIZE   = 512
 I2C_DFU_VERSION_STR_MAX = 32
+
+
+@dataclass
+class DeviceProfile:
+    name: str
+    transfer_size: int
+    version_read_len: int
+    program_alignment_bytes: int
+    app_default_address: int | None = None
+    reset_virt_addr: int | None = 0xFFFFFF08
+
+# Built-in profiles
+TRANSMITTER_PROFILE = DeviceProfile(
+    name="transmitter",
+    transfer_size=1024,
+    version_read_len=64,
+    program_alignment_bytes=8,
+    app_default_address=None,
+    reset_virt_addr=0xFFFFFF08,
+)
+
+CONSOLE_PROFILE = DeviceProfile(
+    name="console",
+    transfer_size=1024,
+    version_read_len=32,
+    program_alignment_bytes=4,
+    app_default_address=None,
+    reset_virt_addr=0xFFFFFF08,
+)
 
 # OW_I2C_PASSTHRU sub-commands (must match firmware if_commands.c handler)
 _PASSTHRU_WRITE       = 0x00   # write only
@@ -187,7 +217,8 @@ class STM32USBDFU:
 
     def __init__(self, vid: int = 0x0483, pid: int = 0xDF11,
                  transfer_size: int = 1024, timeout_ms: int = 4000,
-                 libusb_dll: str | None = None):
+                 libusb_dll: str | None = None,
+                 device_profile: "DeviceProfile" | None = None):
         if not _USB_DFU_AVAILABLE:
             raise RuntimeError(
                 "PyUSB not available. Install with: pip install pyusb"
@@ -200,6 +231,15 @@ class STM32USBDFU:
         self.dev = None
         self.intf = None
         self._backend = None
+        # device_profile may override transfer_size and provide read_len/alignment
+        if device_profile is not None:
+            self.transfer_size = int(device_profile.transfer_size)
+            self.version_read_len = int(device_profile.version_read_len)
+            self.program_alignment = int(device_profile.program_alignment_bytes)
+        else:
+            self.version_read_len = USB_DFU_VERSION_READ_LEN
+            # default alignment (safe): 8 (transmitter L4 uses 8-byte doubleword)
+            self.program_alignment = 8
 
     def _get_backend(self):
         if self._backend is not None:
@@ -340,7 +380,7 @@ class STM32USBDFU:
         """Read bootloader version string via DFU UPLOAD from the virtual address."""
         self._set_address(USB_DFU_VERSION_VIRT_ADDR)
         self.abort()
-        raw = self._ctrl_in(self.DFU_UPLOAD, 2, USB_DFU_VERSION_READ_LEN)
+        raw = self._ctrl_in(self.DFU_UPLOAD, 2, self.version_read_len)
         try:
             self._wait_while_busy()
         except Exception:
@@ -351,17 +391,49 @@ class STM32USBDFU:
     def write_memory(self, address: int, data: bytes,
                      page_erase: bool = True,
                      progress_callback: Callable | None = None) -> None:
-        """Write data to target flash, optionally erasing each 2 KB page first."""
+        """Write data to target flash, optionally erasing each 2 KB page first.
+
+        IMPORTANT: All page erases are performed before any data is written.
+        The STM32 DFU middleware (usbd_dfu.c) updates ``data_ptr`` when it
+        processes an ERASE command (block 0), which would corrupt the write
+        addresses of subsequent data blocks if erases and writes were
+        interleaved.  Separating the two phases — erase all required pages
+        first, then set the address pointer once and write sequentially —
+        matches the behaviour of dfu-test.py and avoids this issue.
+        """
         total = len(data)
         page_size = 2048
+        # enforce alignment expectations from device: address and chunk lengths
+        if (address % getattr(self, "program_alignment", 1)) != 0:
+            raise RuntimeError(
+                f"write_memory: start address 0x{address:08X} not aligned to "
+                f"{self.program_alignment} bytes"
+            )
+
+        # Phase 1: erase all required pages up-front (before setting the
+        # address pointer for writes).  The ERASE DfuSe command also updates
+        # data_ptr in the STM32 middleware, so erases must be completed before
+        # any data DNLOAD block is sent.
+        if page_erase and data:
+            first_page = address & ~(page_size - 1)
+            last_page = (address + total - 1) & ~(page_size - 1)
+            page = first_page
+            while page <= last_page:
+                self._erase_page(page)
+                page += page_size
+
+        # Phase 2: set address pointer once, then write all data blocks.
         self._recover_idle()
         self._set_address(address)
         block = 2
         written = 0
         for offset in range(0, total, self.transfer_size):
             chunk = data[offset:offset + self.transfer_size]
-            if page_erase and (offset % page_size == 0):
-                self._erase_page(address + offset)
+            # pad final chunk to program_alignment if required by bootloader
+            align = getattr(self, "program_alignment", 1)
+            if align > 1 and (len(chunk) % align) != 0:
+                pad_len = align - (len(chunk) % align)
+                chunk = chunk + (b"\xFF" * pad_len)
             self._dnload(block, chunk)
             block += 1
             written += len(chunk)
@@ -565,6 +637,7 @@ class LIFUDFUManager:
     def program_usb(self, package_file: str,
                     vid: int = 0x0483, pid: int = 0xDF11,
                     libusb_dll: str | None = None,
+                    device_type: str = "transmitter",
                     progress_callback: Callable | None = None) -> None:
         """Program a signed package to module 0 via USB DFU.
 
@@ -579,7 +652,9 @@ class LIFUDFUManager:
             len(pkg["fw"]), pkg["fw_address"],
             len(pkg["meta"]), pkg["meta_address"],
         )
-        with STM32USBDFU(vid=vid, pid=pid, libusb_dll=libusb_dll) as dfu:
+        profile = TRANSMITTER_PROFILE if device_type == "transmitter" else CONSOLE_PROFILE
+        with STM32USBDFU(vid=vid, pid=pid, libusb_dll=libusb_dll,
+                         device_profile=profile) as dfu:
             dfu.write_memory(
                 pkg["fw_address"], pkg["fw"],
                 page_erase=True, progress_callback=progress_callback
@@ -634,7 +709,8 @@ class LIFUDFUManager:
         logger.info("I2C DFU: programming complete.")
 
     def _wait_for_usb_dfu(self, vid: int, pid: int, libusb_dll: str | None,
-                           timeout_s: float = 30.0, poll_interval_s: float = 1.0) -> str:
+                           timeout_s: float = 30.0, poll_interval_s: float = 1.0,
+                           device_profile: "DeviceProfile" | None = None) -> str:
         """Poll for the USB DFU device until it enumerates or *timeout_s* elapses.
 
         Returns the bootloader version string once the device is found.
@@ -643,7 +719,8 @@ class LIFUDFUManager:
         # Pre-flight: verify the libusb backend can be loaded before entering
         # the poll loop.  If the DLL is missing or the path is wrong this fails
         # immediately with a clear message instead of silently timing out.
-        _probe = STM32USBDFU(vid=vid, pid=pid, libusb_dll=libusb_dll)
+        _probe = STM32USBDFU(vid=vid, pid=pid, libusb_dll=libusb_dll,
+                     device_profile=device_profile)
         backend = _probe._get_backend()
         if backend is None:
             raise RuntimeError(
@@ -678,7 +755,8 @@ class LIFUDFUManager:
                 "USB DFU device found after %.1f s (attempt %d)", elapsed, attempt
             )
             try:
-                with STM32USBDFU(vid=vid, pid=pid, libusb_dll=libusb_dll) as dfu:
+                with STM32USBDFU(vid=vid, pid=pid, libusb_dll=libusb_dll,
+                                 device_profile=device_profile) as dfu:
                     version = dfu.get_version()
                 return version
             except Exception as e:
@@ -707,6 +785,7 @@ class LIFUDFUManager:
                       i2c_addr: int = I2C_DFU_SLAVE_ADDR,
                       dfu_wait_s: float = 3.0,
                       dfu_enum_timeout_s: float = 30.0,
+                      device_type: str = "transmitter",
                       progress_callback: Callable | None = None) -> None:
         """High-level firmware update for a single module.
 
@@ -739,8 +818,18 @@ class LIFUDFUManager:
         Raises:
             RuntimeError: If DFU entry cannot be verified or programming fails.
         """
+        # Enforce workspace policy: module 0 (USB DFU) is valid only for
+        # the console bootloader profile in this workspace.
+        if module == 0 and device_type != "console":
+            raise ValueError(
+                "Module 0 (USB DFU) is only valid with device_type='console'"
+            )
+
         logger.info("Requesting DFU mode on module %d...", module)
-        enter_dfu_fn(module=module)
+        if(device_type == "transmitter"):
+            enter_dfu_fn(module=module)
+        else:
+            enter_dfu_fn()
 
         if dfu_wait_s > 0:
             logger.info("Initial DFU settling delay: %.1f s...", dfu_wait_s)
@@ -751,9 +840,10 @@ class LIFUDFUManager:
                 "Waiting for USB DFU device (timeout %ds)...", dfu_enum_timeout_s
             )
             try:
+                profile = TRANSMITTER_PROFILE if device_type == "transmitter" else CONSOLE_PROFILE
                 bl_version = self._wait_for_usb_dfu(
                     vid=vid, pid=pid, libusb_dll=libusb_dll,
-                    timeout_s=dfu_enum_timeout_s,
+                    timeout_s=dfu_enum_timeout_s, device_profile=profile,
                 )
             except RuntimeError as e:
                 raise RuntimeError(
@@ -763,6 +853,7 @@ class LIFUDFUManager:
             self.program_usb(
                 package_file, vid=vid, pid=pid,
                 libusb_dll=libusb_dll,
+                device_type=device_type,
                 progress_callback=progress_callback,
             )
         else:

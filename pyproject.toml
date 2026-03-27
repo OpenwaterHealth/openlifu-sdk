@@ -33,6 +33,7 @@ dependencies = [
   "pandas",
   "xarray",
   "pyserial",
+  "pyusb",
 ]
 
 [project.optional-dependencies]
