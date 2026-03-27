@@ -859,10 +859,18 @@ class LIFUDFUManager:
             RuntimeError: If DFU entry cannot be verified or programming fails.
         """
         logger.info("Requesting DFU mode on module %d...", module)
-        if(device_type == "transmitter"):
+        if device_type == "transmitter":
+            # Transmitter modules (including module 0 master) use the module-aware DFU entry
             enter_dfu_fn(module=module)
-        else:
+        elif device_type == "console":
+            # Console/host DFU is only valid for the USB master (module 0)
+            if module != 0:
+                raise ValueError(
+                    f"Console DFU is only supported for module 0; got module {module}"
+                )
             enter_dfu_fn()
+        else:
+            raise ValueError(f"Unsupported device_type {device_type!r} for DFU entry")
 
         if dfu_wait_s > 0:
             logger.info("Initial DFU settling delay: %.1f s...", dfu_wait_s)
