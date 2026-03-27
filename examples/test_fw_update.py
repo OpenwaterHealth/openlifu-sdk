@@ -80,6 +80,11 @@ def main() -> None:
         help="Seconds to wait after entering DFU mode (default: 5.0)"
     )
     p.add_argument(
+        "--device-type", choices=("transmitter", "console"),
+        default="transmitter",
+        help="Target bootloader device type (transmitter or console). Default: transmitter"
+    )
+    p.add_argument(
         "--yes", "-y", action="store_true",
         help="Skip the confirmation prompt"
     )
@@ -100,13 +105,23 @@ def main() -> None:
     print()
 
     # ------------------------------------------------------------------
-    # Connect to LIFU device
+    # Connect to LIFU device (select interface by device type)
     # ------------------------------------------------------------------
-    print("Connecting to LIFU transmitter device...")
     interface = LIFUInterface()
     tx_connected, hv_connected = interface.is_device_connected()
 
-    if not tx_connected and hv_connected:
+    # Determine which connection we require based on --device-type
+    if args.device_type == "console":
+        print("Connecting to LIFU console (HV controller)...")
+        required_connected = hv_connected
+        required_label = "HV controller"
+    else:
+        print("Connecting to LIFU transmitter device...")
+        required_connected = tx_connected
+        required_label = "TX device"
+
+    # If transmitter is expected but not present, attempt to enable 12V
+    if args.device_type == "transmitter" and not tx_connected and hv_connected:
         print("  TX device not connected — enabling 12 V rail...")
         interface.hvcontroller.turn_12v_on()
         time.sleep(2)
@@ -116,35 +131,53 @@ def main() -> None:
         print("  Re-initialising LIFU interface...")
         interface = LIFUInterface()
         tx_connected, hv_connected = interface.is_device_connected()
+        required_connected = tx_connected
 
-    if not tx_connected:
-        print("ERROR: TX device not connected. Cannot proceed.")
+    if not required_connected:
+        print(f"ERROR: {required_label} not connected. Cannot proceed.")
         sys.exit(1)
 
-    print("  TX device connected.")
-    txdev = interface.txdevice
+    print(f"  {required_label} connected.")
+
+    # Select the device controller object to use for general commands.
+    # For console-targeted operations use the HV controller; for
+    # transmitter-targeted operations use the TX device.
+    if args.device_type == "console":
+        txdev = interface.hvcontroller
+    else:
+        txdev = interface.txdevice
 
     # ------------------------------------------------------------------
-    # Verify target module is present
+    # Verify target module is present (only for transmitter modules)
+    # For console device type module must be 0 and we skip module_count.
     # ------------------------------------------------------------------
-    print(f"\nDetecting connected modules...")
-    module_count = txdev.get_module_count()
-    print(f"  Detected {module_count} module(s).")
+    if args.device_type == "console":
+        if args.module_id != 0:
+            print("ERROR: console device type only supports module 0")
+            sys.exit(2)
+        print("\nConsole target selected (module 0 assumed).")
+    else:
+        print(f"\nDetecting connected modules...")
+        module_count = txdev.get_module_count()
+        print(f"  Detected {module_count} module(s).")
 
-    if module_count <= args.module_id:
-        print(
-            f"\nERROR: Module {args.module_id} is not present "
-            f"(only {module_count} module(s) detected)."
-        )
-        sys.exit(1)
-    print(f"  Module {args.module_id} is present.")
+        if module_count <= args.module_id:
+            print(
+                f"\nERROR: Module {args.module_id} is not present "
+                f"(only {module_count} module(s) detected)."
+            )
+            sys.exit(1)
+        print(f"  Module {args.module_id} is present.")
 
     # ------------------------------------------------------------------
     # Show current firmware version
     # ------------------------------------------------------------------
     print(f"\nReading current firmware version for module {args.module_id}...")
     try:
-        current_version = txdev.get_version(module=args.module_id)
+        if args.device_type == "console":
+            current_version = txdev.get_version()
+        else:
+            current_version = txdev.get_version(module=args.module_id)
         print(f"  Current firmware version: {current_version}")
     except Exception as e:
         print(f"  WARNING: could not read current version ({e})")
@@ -162,21 +195,54 @@ def main() -> None:
             print("Aborted by user.")
             sys.exit(0)
 
+    # Validate module/device-type policy:
+    # when targeting the console bootloader.
+    if args.module_id > 0 and args.device_type == "console":
+        print("ERROR: module 0 is only valid with --device-type console")
+        sys.exit(2)
+
     # ------------------------------------------------------------------
     # Firmware update
     # ------------------------------------------------------------------
     print(f"\nStarting firmware update for module {args.module_id}...")
     try:
-        txdev.update_firmware(
-            module=args.module_id,
-            package_file=args.package_file,
-            vid=args.vid,
-            pid=args.pid,
-            libusb_dll=args.libusb_dll,
-            i2c_addr=args.i2c_addr,
-            dfu_wait_s=args.dfu_wait,
-            progress_callback=_progress,
-        )
+        if args.device_type == "console":
+            # For console (module 0 USB DFU) use LIFUDFUManager with the
+            # HV controller's enter_dfu function to trigger DFU on the
+            # console device.
+            from openlifu_sdk.io.LIFUDFU import LIFUDFUManager
+
+            # Use the console UART when operating on the console device
+            mgr = LIFUDFUManager(uart=interface.hvcontroller.uart)
+            try:
+                mgr.update_module(
+                module=args.module_id,
+                package_file=args.package_file,
+                enter_dfu_fn=interface.hvcontroller.enter_dfu,
+                vid=args.vid,
+                pid=args.pid,
+                libusb_dll=args.libusb_dll,
+                i2c_addr=args.i2c_addr,
+                dfu_wait_s=args.dfu_wait,
+                device_type=args.device_type,
+                progress_callback=_progress,
+            )
+            except Exception as e:
+                print(f"\nERROR: console DFU failed: {e}")
+                print("Hint: try increasing --dfu-wait or run test/dfu-test.py program-package --manifest")
+                raise
+        else:
+            txdev.update_firmware(
+                module=args.module_id,
+                package_file=args.package_file,
+                vid=args.vid,
+                pid=args.pid,
+                libusb_dll=args.libusb_dll,
+                i2c_addr=args.i2c_addr,
+                dfu_wait_s=args.dfu_wait,
+                device_type=args.device_type,
+                progress_callback=_progress,
+            )
     except RuntimeError as e:
         print(f"\nERROR: Firmware update failed — {e}")
         sys.exit(1)
@@ -203,8 +269,12 @@ def main() -> None:
         except Exception as e:
             print(f"  WARNING: post-update check failed ({e})")
     else:
-        print("Module 0 will reboot from the new firmware after DFU manifest.")
-        print("Power-cycle or wait for USB re-enumeration before reconnecting.")
+        if args.device_type == "console":
+            print("Module 0 will reboot from the new firmware after DFU manifest.")
+            print("Power-cycle or wait for USB re-enumeration before reconnecting.")
+        else:
+            print("Module 0 (master) will reboot from the new firmware after DFU manifest.")
+            print("Power-cycle or wait for USB re-enumeration before reconnecting.")
 
 
 if __name__ == "__main__":

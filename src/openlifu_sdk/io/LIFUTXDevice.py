@@ -1725,6 +1725,7 @@ class TxDevice:
                         libusb_dll: str | None = None,
                         i2c_addr: int = 0x72,
                         dfu_wait_s: float = 5.0,
+                        device_type: str = "transmitter",
                         progress_callback=None) -> bool:
         """Update firmware on a single module.
 
@@ -1763,6 +1764,7 @@ class TxDevice:
             libusb_dll=libusb_dll,
             i2c_addr=i2c_addr,
             dfu_wait_s=dfu_wait_s,
+            device_type=device_type,
             progress_callback=progress_callback,
         )
         return True

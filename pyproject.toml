@@ -1,38 +1,36 @@
 [build-system]
-requires = ["hatchling", "hatch-vcs"]
-build-backend = "hatchling.build"
+requires = ["setuptools>=77.0", "wheel", "setuptools-scm>=8"]
+build-backend = "setuptools.build_meta"
 
 
 [project]
 name = "openlifu-sdk"
+dynamic = ["version"]
 authors = [
-  { name = "Peter Hollender", email = "peterhollender@gmail.com" },
+  { name = "George Vigelette", email = "george@openwater.health" },
 ]
 description = "Openwater LIFU SDK — hardware I/O interface library"
-readme = "README.md"
-license.file = "LICENSE"
-requires-python = ">=3.10"
+readme = { file = "README.md", content-type = "text/markdown" }
+requires-python = ">=3.12"
+license = "MIT"
+license-files = ["LICENSE"]
 classifiers = [
-  "Development Status :: 3 - Alpha",
+  "Development Status :: 4 - Beta",
   "Intended Audience :: Science/Research",
   "Intended Audience :: Developers",
-  "License :: OSI Approved :: MIT License",
   "Operating System :: OS Independent",
   "Programming Language :: Python",
   "Programming Language :: Python :: 3",
-  "Programming Language :: Python :: 3 :: Only",
-  "Programming Language :: Python :: 3.10",
-  "Programming Language :: Python :: 3.11",
   "Programming Language :: Python :: 3.12",
   "Topic :: Scientific/Engineering",
   "Typing :: Typed",
 ]
-dynamic = ["version"]
 dependencies = [
   "numpy",
   "pandas",
   "xarray",
   "pyserial",
+  "pyusb",
 ]
 
 [project.optional-dependencies]
@@ -53,15 +51,20 @@ Homepage = "https://github.com/OpenwaterHealth/openlifu-sdk"
 "Bug Tracker" = "https://github.com/OpenwaterHealth/openlifu-sdk/issues"
 
 
-[tool.hatch.version]
-source = "vcs"
+[tool.setuptools.packages.find]
+where = ["src"]
 
-[tool.hatch.build.targets.sdist]
-include = [
-  "src/",
-  "LICENSE",
-  "README.md",
+[tool.setuptools.package-data]
+openlifu_sdk = [
+  "py.typed",
+  "firmware/*.bin",
+  "libusb/win64/*.dll",
+  "libusb/win32/*.dll",
 ]
 
-[tool.hatch.build.targets.wheel]
-packages = ["src/openlifu_sdk"]
+
+[tool.setuptools_scm]
+# Uses tags like v1.2.3 or 1.2.3  ->  1.2.3
+tag_regex = "^(?:pre-)?v?(?P<version>\\d+\\.\\d+\\.\\d+)$"
+version_scheme = "no-guess-dev"
+local_scheme = "no-local-version"
