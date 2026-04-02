@@ -4,7 +4,6 @@ import asyncio
 import importlib.metadata
 import logging
 from enum import Enum
-from typing import Dict, List, Optional
 
 import numpy as np
 import pandas as pd
@@ -15,30 +14,31 @@ from openlifu_sdk.io.LIFUTXDevice import TriggerModeOpts, TxDevice
 from openlifu_sdk.io.LIFUUart import LIFUUart
 
 REF_MAX_SEQUENCE_TIMES = {
-    "default": [2*60, 5*60, 10*60],    # users to use default values
-    "stress_test": [5*60, 9*60, 15*60] # QA to use stress test values
+    "default": [2 * 60, 5 * 60, 10 * 60],  # users to use default values
+    "stress_test": [5 * 60, 9 * 60, 15 * 60],  # QA to use stress test values
 }
 
 REF_MAX_DUTY_CYCLES = [0.05, 0.1, 0.2, 0.3, 0.4, 0.5]
 
 MAX_VOLTAGE_BY_DUTY_CYCLE_AND_SEQUENCE_TIME = {
     "evt2": [
-        [45, 45, 45], # 0.05
-        [40, 40, 40], # 0.1
-        [40, 40, 35], # 0.2
-        [40, 35, 30], # 0.3
-        [35, 30, 25], # 0.4
-        [30, 25, 20] # 0.5
+        [45, 45, 45],  # 0.05
+        [40, 40, 40],  # 0.1
+        [40, 40, 35],  # 0.2
+        [40, 35, 30],  # 0.3
+        [35, 30, 25],  # 0.4
+        [30, 25, 20],  # 0.5
     ],
     "evt0": [
-        [65, 65, 65], # 0.05
-        [65, 65, 50], # 0.1
-        [50, 40, 35], # 0.2
-        [45, 35, 30], # 0.3
-        [35, 30, 25], # 0.4
-        [30, 25, 20] # 0.5
+        [65, 65, 65],  # 0.05
+        [65, 65, 50],  # 0.1
+        [50, 40, 35],  # 0.2
+        [45, 35, 30],  # 0.3
+        [35, 30, 25],  # 0.4
+        [30, 25, 20],  # 0.5
     ],
 }
+
 
 class LIFUInterfaceStatus(Enum):
     STATUS_COMMS_ERROR = -1
@@ -52,28 +52,26 @@ class LIFUInterfaceStatus(Enum):
     STATUS_FINISHED = 7
     STATUS_ERROR = 8
 
+
 logger = logging.getLogger(__name__)
 
-class LIFUInterface:
-    signal_connect: LIFUSignal = LIFUSignal()
-    signal_disconnect: LIFUSignal = LIFUSignal()
-    signal_data_received: LIFUSignal = LIFUSignal()
-    hvcontroller: HVController = None
-    txdevice: TxDevice = None
 
-    def __init__(self,
-                 vid: int = 0x0483,
-                 tx_pid: int = 0x57AF,
-                 con_pid: int = 0x57A0,
-                 baudrate: int = 921600,
-                 timeout: int = 10,
-                 TX_test_mode: bool = False,
-                 HV_test_mode: bool = False,
-                 run_async: bool = False,
-                 ext_power_supply: bool = False,
-                 module_invert: bool | List[bool] = False,
-                 voltage_table_selection: Optional[str] = None,
-                 sequence_time_selection: Optional[str] = None) -> None:
+class LIFUInterface:
+    def __init__(
+        self,
+        vid: int = 0x0483,
+        tx_pid: int = 0x57AF,
+        con_pid: int = 0x57A0,
+        baudrate: int = 921600,
+        timeout: int = 10,
+        TX_test_mode: bool = False,
+        HV_test_mode: bool = False,
+        run_async: bool = False,
+        ext_power_supply: bool = False,
+        module_invert: bool | list[bool] = False,
+        voltage_table_selection: str | None = None,
+        sequence_time_selection: str | None = None,
+    ) -> None:
         """
         Initialize the LIFUInterface with given parameters and store them in the class.
 
@@ -83,9 +81,20 @@ class LIFUInterface:
             con_pid (int): Product ID for console device.
             baudrate (int): Communication baud rate.
             timeout (int): Read timeout in seconds.
-            test_mode (bool): Enable test mode.
+            TX_test_mode (bool): Enable TX test/demo mode.
+            HV_test_mode (bool): Enable HV test/demo mode.
             run_async (bool): Enable asynchronous operation.
+            ext_power_supply (bool): Use external power supply (skip HVController).
+            module_invert (bool | List[bool]): Invert signal on modules.
+            voltage_table_selection (str | None): EVT version override for voltage table.
+            sequence_time_selection (str | None): Sequence time set override.
         """
+        # Per-instance signals — must be created here, not at class level, to
+        # prevent all instances from sharing the same signal objects.
+        self.signal_connect: LIFUSignal = LIFUSignal()
+        self.signal_disconnect: LIFUSignal = LIFUSignal()
+        self.signal_data_received: LIFUSignal = LIFUSignal()
+
         # Store parameters in instance variables
         self.vid = vid
         self.tx_pid = tx_pid
@@ -94,8 +103,10 @@ class LIFUInterface:
         self.timeout = timeout
         self._test_mode = TX_test_mode
         self._async_mode = run_async
-        self._tx_uart = None
-        self._hv_uart = None
+        self._tx_uart: LIFUUart | None = None
+        self._hv_uart: LIFUUart | None = None
+        self.txdevice: TxDevice | None = None
+        self.hvcontroller: HVController | None = None
         self.status = LIFUInterfaceStatus.STATUS_SYS_OFF
 
         self.voltage_table = None
@@ -104,8 +115,22 @@ class LIFUInterface:
         self.sequence_time_selection = sequence_time_selection
 
         # Create a TXDevice instance as part of the interface
-        logger.debug("Initializing TX Module of LIFUInterface with VID: %s, PID: %s, baudrate: %s, timeout: %s", vid, tx_pid, baudrate, timeout)
-        self._tx_uart = LIFUUart(vid=vid, pid=tx_pid, baudrate=baudrate, timeout=timeout, desc="TX", demo_mode=TX_test_mode, async_mode=run_async)
+        logger.debug(
+            "Initializing TX Module of LIFUInterface with VID: %s, PID: %s, baudrate: %s, timeout: %s",
+            vid,
+            tx_pid,
+            baudrate,
+            timeout,
+        )
+        self._tx_uart = LIFUUart(
+            vid=vid,
+            pid=tx_pid,
+            baudrate=baudrate,
+            timeout=timeout,
+            desc="TX",
+            demo_mode=TX_test_mode,
+            async_mode=run_async,
+        )
         self.txdevice = TxDevice(uart=self._tx_uart, module_invert=module_invert)
 
         if ext_power_supply:
@@ -113,8 +138,22 @@ class LIFUInterface:
             self.hvcontroller = None
         else:
             # Create a LIFUHVController instance as part of the interface
-            logger.debug("Initializing Console of LIFUInterface with VID: %s, PID: %s, baudrate: %s, timeout: %s", vid, con_pid, baudrate, timeout)
-            self._hv_uart = LIFUUart(vid=vid, pid=con_pid, baudrate=baudrate, timeout=timeout, desc="HV", demo_mode=HV_test_mode, async_mode=run_async)
+            logger.debug(
+                "Initializing Console of LIFUInterface with VID: %s, PID: %s, baudrate: %s, timeout: %s",
+                vid,
+                con_pid,
+                baudrate,
+                timeout,
+            )
+            self._hv_uart = LIFUUart(
+                vid=vid,
+                pid=con_pid,
+                baudrate=baudrate,
+                timeout=timeout,
+                desc="HV",
+                demo_mode=HV_test_mode,
+                async_mode=run_async,
+            )
             self.hvcontroller = HVController(uart=self._hv_uart)
 
         # Connect signals to internal handlers
@@ -137,7 +176,9 @@ class LIFUInterface:
         else:
             evt_version = voltage_table.lower()
             if evt_version not in MAX_VOLTAGE_BY_DUTY_CYCLE_AND_SEQUENCE_TIME:
-                raise ValueError(f"Invalid voltage_table option '{voltage_table}'. Valid options are: {tuple(MAX_VOLTAGE_BY_DUTY_CYCLE_AND_SEQUENCE_TIME.keys())}")
+                raise ValueError(
+                    f"Invalid voltage_table option '{voltage_table}'. Valid options are: {tuple(MAX_VOLTAGE_BY_DUTY_CYCLE_AND_SEQUENCE_TIME.keys())}"
+                )
 
         return MAX_VOLTAGE_BY_DUTY_CYCLE_AND_SEQUENCE_TIME[evt_version]
 
@@ -148,7 +189,9 @@ class LIFUInterface:
         else:
             sequence_time = sequence_time.lower()
             if sequence_time not in REF_MAX_SEQUENCE_TIMES:
-                raise ValueError(f"Invalid sequence_time option '{sequence_time}'. Valid options are: {tuple(REF_MAX_SEQUENCE_TIMES.keys())}")
+                raise ValueError(
+                    f"Invalid sequence_time option '{sequence_time}'. Valid options are: {tuple(REF_MAX_SEQUENCE_TIMES.keys())}"
+                )
             return REF_MAX_SEQUENCE_TIMES[sequence_time]
 
     async def start_monitoring(self, interval: int = 1) -> None:
@@ -156,8 +199,7 @@ class LIFUInterface:
         try:
             if self._hv_uart is not None:
                 await asyncio.gather(
-                    self._tx_uart.monitor_usb_status(interval),
-                    self._hv_uart.monitor_usb_status(interval)
+                    self._tx_uart.monitor_usb_status(interval), self._hv_uart.monitor_usb_status(interval)
                 )
             else:
                 await self._tx_uart.monitor_usb_status(interval)
@@ -191,7 +233,7 @@ class LIFUInterface:
             hv_connected = self.hvcontroller.is_connected()
         return tx_connected, hv_connected
 
-    def get_max_voltage(self, solution: Dict) -> float:
+    def get_max_voltage(self, solution: dict) -> float:
         """
         Get the maximum voltage for a given solution.
 
@@ -201,7 +243,7 @@ class LIFUInterface:
         Returns:
             float: The maximum voltage for the solution.
         """
-        
+
         sequence_duty_cycle = self.get_sequence_duty_cycle(solution)
         sequence_duration = self.get_sequence_duration(solution)
 
@@ -225,18 +267,16 @@ class LIFUInterface:
         """
         data = {
             "Duty Cycle (%)": [f"<={100 * dc:0.1f}%" for dc in REF_MAX_DUTY_CYCLES],
-            }
+        }
         for i, duration in enumerate(self.sequence_time):
             col_name = f"<={duration // 60} min"
-            data[col_name] = [
-                self.voltage_table[j][i] for j in range(len(REF_MAX_DUTY_CYCLES))
-            ]
-        max_voltage =  pd.DataFrame(data).set_index("Duty Cycle (%)")
+            data[col_name] = [self.voltage_table[j][i] for j in range(len(REF_MAX_DUTY_CYCLES))]
+        max_voltage = pd.DataFrame(data).set_index("Duty Cycle (%)")
         max_voltage.Name = "Maximum Voltage (V)"
         max_voltage.Description = "This table shows the maximum voltage for different duty cycles and sequence times."
         return max_voltage
 
-    def check_solution(self, solution: Dict) -> None:
+    def check_solution(self, solution: dict) -> None:
         """
         Check if the solution is valid.
         Args:
@@ -244,26 +284,32 @@ class LIFUInterface:
         Raises:
             ValueError: If the solution is invalid.
         """
-        
+
         self.voltage_table = self._resolve_voltage_chart_evt_version(self.voltage_table_selection)
         self.sequence_time = self._resolve_max_sequence_time_set(self.sequence_time_selection)
         sequence_duty_cycle = self.get_sequence_duty_cycle(solution)
         duty_cycles_limits = np.array(REF_MAX_DUTY_CYCLES)
         if sequence_duty_cycle > duty_cycles_limits.max():
-            raise ValueError(f"Sequence duty cycle ({100*sequence_duty_cycle:0.1f} %) exceeds maximum allowed duty cycle ({100*duty_cycles_limits.max():0.1f} %).")
+            raise ValueError(
+                f"Sequence duty cycle ({100 * sequence_duty_cycle:0.1f} %) exceeds maximum allowed duty cycle ({100 * duty_cycles_limits.max():0.1f} %)."
+            )
         duty_cycle_index = np.where(duty_cycles_limits >= sequence_duty_cycle)[0][0]
 
         sequence_duration = self.get_sequence_duration(solution)
         duration_limits = np.array(self.sequence_time)
         if sequence_duration > duration_limits.max():
-            raise ValueError(f"Sequence duration ({sequence_duration:0.0f} s) exceeds maximum allowed duration ({duration_limits.max()} s).")
+            raise ValueError(
+                f"Sequence duration ({sequence_duration:0.0f} s) exceeds maximum allowed duration ({duration_limits.max()} s)."
+            )
         duration_index = np.where(duration_limits >= sequence_duration)[0][0]
 
         max_voltage = self.voltage_table[duty_cycle_index][duration_index]
-        if solution['voltage'] > max_voltage:
-            raise ValueError(f"Voltage ({solution['voltage']:0.1f}V) exceeds maximum allowed voltage ({max_voltage:0.1f}V) for duty cycle ({100*sequence_duty_cycle:0.1f} <= {100*duty_cycles_limits[duty_cycle_index]}%) and sequence time ({sequence_duration:0.0f} <= {duration_limits[duration_index]}s).")
+        if solution["voltage"] > max_voltage:
+            raise ValueError(
+                f"Voltage ({solution['voltage']:0.1f}V) exceeds maximum allowed voltage ({max_voltage:0.1f}V) for duty cycle ({100 * sequence_duty_cycle:0.1f} <= {100 * duty_cycles_limits[duty_cycle_index]}%) and sequence time ({sequence_duration:0.0f} <= {duration_limits[duration_index]}s)."
+            )
 
-    def get_sequence_duty_cycle(self, solution: Dict) -> float:
+    def get_sequence_duty_cycle(self, solution: dict) -> float:
         """
         Get the duty cycle of the sequence in the solution.
 
@@ -273,14 +319,15 @@ class LIFUInterface:
         Returns:
             float: The duty cycle of the sequence.
         """
-        
 
-        if solution['sequence']['pulse_train_interval'] == 0:
-            return solution['pulse']['duration'] / solution['sequence']['pulse_interval']
+        if solution["sequence"]["pulse_train_interval"] == 0:
+            return solution["pulse"]["duration"] / solution["sequence"]["pulse_interval"]
         else:
-            return (solution['pulse']['duration'] * solution['sequence']['pulse_count']) / solution['sequence']['pulse_train_interval']
+            return (solution["pulse"]["duration"] * solution["sequence"]["pulse_count"]) / solution["sequence"][
+                "pulse_train_interval"
+            ]
 
-    def get_sequence_duration(self, solution: Dict) -> float:
+    def get_sequence_duration(self, solution: dict) -> float:
         """
         Get the duration of the sequence in the solution.
 
@@ -290,23 +337,27 @@ class LIFUInterface:
         Returns:
             float: The duration of the sequence.
         """
-        
 
-        if solution['sequence']['pulse_train_interval'] == 0:
-            return solution['sequence']['pulse_interval'] * solution['sequence']['pulse_count'] * solution['sequence']['pulse_train_count']
+        if solution["sequence"]["pulse_train_interval"] == 0:
+            return (
+                solution["sequence"]["pulse_interval"]
+                * solution["sequence"]["pulse_count"]
+                * solution["sequence"]["pulse_train_count"]
+            )
         else:
-            return solution['sequence']['pulse_train_interval'] * solution['sequence']['pulse_train_count']
+            return solution["sequence"]["pulse_train_interval"] * solution["sequence"]["pulse_train_count"]
 
-    def set_module_invert(self, module_invert: bool | List[bool]) -> None:
+    def set_module_invert(self, module_invert: bool | list[bool]) -> None:
         if self.txdevice is not None:
             self.txdevice.set_module_invert(module_invert)
 
-    def set_solution(self,
-                     solution: Dict,
-                     profile_index:int=1,
-                     profile_increment:bool=True,
-                     trigger_mode: TriggerModeOpts = "sequence",
-                     ) -> None:
+    def set_solution(
+        self,
+        solution: dict,
+        profile_index: int = 1,
+        profile_increment: bool = True,
+        trigger_mode: TriggerModeOpts = "sequence",
+    ) -> None:
         """
         Load a solution to the device.
 
@@ -317,11 +368,14 @@ class LIFUInterface:
             trigger_mode (TriggerModeOpts): The trigger mode to use (defaults to "sequence")
             module_invert (List[bool]|bool): Invert the signal on all modules (singleton) or specific modules (list) (defaults to False)
         """
-        
 
         self.check_solution(solution)
 
-        if "transducer" in solution and solution["transducer"] is not None and "module_invert" in solution["transducer"]:
+        if (
+            "transducer" in solution
+            and solution["transducer"] is not None
+            and "module_invert" in solution["transducer"]
+        ):
             self.txdevice.set_module_invert(solution["transducer"]["module_invert"])
         else:
             self.txdevice.set_module_invert(False)
@@ -334,22 +388,22 @@ class LIFUInterface:
         else:
             solution_name = "Solution"
 
-        voltage = solution['voltage']
+        voltage = solution["voltage"]
         logger.info("Loading %s...", solution_name)
         # Convert solution data and send to the device
         self.txdevice.set_solution(
-                pulse = solution['pulse'],
-                delays = solution['delays'],
-                apodizations= solution['apodizations'],
-                sequence= solution['sequence'],
-                profile_index=profile_index,
-                profile_increment=profile_increment,
-                trigger_mode=trigger_mode
+            pulse=solution["pulse"],
+            delays=solution["delays"],
+            apodizations=solution["apodizations"],
+            sequence=solution["sequence"],
+            profile_index=profile_index,
+            profile_increment=profile_increment,
+            trigger_mode=trigger_mode,
         )
         self.set_status(LIFUInterfaceStatus.STATUS_READY)
 
         if self.hvcontroller is not None:
-            logger.info(f"Setting HV to {voltage} V...")
+            logger.info("Setting HV to %s V...", voltage)
             self.hvcontroller.set_voltage(voltage)
 
         logger.info("%s loaded successfully.", solution_name)

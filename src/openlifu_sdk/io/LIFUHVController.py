@@ -126,9 +126,7 @@ class HVController:
             if not self.uart.is_connected():
                 raise ValueError("Console Device not connected")
 
-            r = self.uart.send_packet(
-                id=None, packetType=OW_CMD, command=OW_CMD_VERSION
-            )
+            r = self.uart.send_packet(id=None, packetType=OW_CMD, command=OW_CMD_VERSION)
             self.uart.clear_buffer()
             # r.print_packet()
             if r.data_len == 3:
@@ -136,10 +134,10 @@ class HVController:
             elif r.data_len and r.data:
                 try:
                     # Decode only the valid length, strip trailing NULs and whitespace
-                    ver_str = r.data[:r.data_len].decode('utf-8', errors='ignore').rstrip('\x00').strip()
-                    ver = ver_str if ver_str else 'v0.0.0'
+                    ver_str = r.data[: r.data_len].decode("utf-8", errors="ignore").rstrip("\x00").strip()
+                    ver = ver_str if ver_str else "v0.0.0"
                 except Exception:
-                    ver = 'v0.0.0'
+                    ver = "v0.0.0"
             logger.info(ver)
             return ver
 
@@ -178,9 +176,7 @@ class HVController:
             if echo_data is not None and not isinstance(echo_data, bytes | bytearray):
                 raise TypeError("echo_data must be a byte array")
 
-            r = self.uart.send_packet(
-                id=None, packetType=OW_CMD, command=OW_CMD_ECHO, data=echo_data
-            )
+            r = self.uart.send_packet(id=None, packetType=OW_CMD, command=OW_CMD_ECHO, data=echo_data)
             self.uart.clear_buffer()
             # r.print_packet()
             if r.data_len > 0:
@@ -211,9 +207,7 @@ class HVController:
             if not self.uart.is_connected():
                 raise ValueError("Console Device not connected")
 
-            r = self.uart.send_packet(
-                id=None, packetType=OW_CMD, command=OW_CMD_TOGGLE_LED
-            )
+            r = self.uart.send_packet(id=None, packetType=OW_CMD, command=OW_CMD_TOGGLE_LED)
             self.uart.clear_buffer()
             # r.print_packet()
             if r.packet_type == OW_ERROR:
@@ -282,9 +276,7 @@ class HVController:
                 return 0
 
             # Send the GET_TEMP command
-            r = self.uart.send_packet(
-                id=None, packetType=OW_POWER, command=OW_POWER_GET_TEMP1
-            )
+            r = self.uart.send_packet(id=None, packetType=OW_POWER, command=OW_POWER_GET_TEMP1)
             self.uart.clear_buffer()
             # r.print_packet()
 
@@ -321,9 +313,7 @@ class HVController:
                 return 0
 
             # Send the GET_TEMP command
-            r = self.uart.send_packet(
-                id=None, packetType=OW_POWER, command=OW_POWER_GET_TEMP2
-            )
+            r = self.uart.send_packet(id=None, packetType=OW_POWER, command=OW_POWER_GET_TEMP2)
             self.uart.clear_buffer()
             # r.print_packet()
 
@@ -350,9 +340,7 @@ class HVController:
 
             logger.info("Turning off 12V.")
 
-            r = self.uart.send_packet(
-                id=None, packetType=OW_POWER, command=OW_POWER_12V_OFF
-            )
+            r = self.uart.send_packet(id=None, packetType=OW_POWER, command=OW_POWER_12V_OFF)
             self.uart.clear_buffer()
             # r.print_packet()
 
@@ -382,9 +370,7 @@ class HVController:
 
             logger.info("Turning on 12V.")
 
-            r = self.uart.send_packet(
-                id=None, packetType=OW_POWER, command=OW_POWER_12V_ON
-            )
+            r = self.uart.send_packet(id=None, packetType=OW_POWER, command=OW_POWER_12V_ON)
             self.uart.clear_buffer()
             # r.print_packet()
 
@@ -414,9 +400,7 @@ class HVController:
 
             logger.info("Get 12V voltage status.")
 
-            r = self.uart.send_packet(
-                id=None, packetType=OW_POWER, command=OW_POWER_GET_12VON
-            )
+            r = self.uart.send_packet(id=None, packetType=OW_POWER, command=OW_POWER_GET_12VON)
             self.uart.clear_buffer()
             # r.print_packet()
 
@@ -452,9 +436,7 @@ class HVController:
 
             logger.info("Turning on high voltage.")
 
-            r = self.uart.send_packet(
-                id=None, packetType=OW_POWER, command=OW_POWER_HV_ON, timeout=30
-            )
+            r = self.uart.send_packet(id=None, packetType=OW_POWER, command=OW_POWER_HV_ON, timeout=30)
             self.uart.clear_buffer()
             # r.print_packet()
 
@@ -487,9 +469,7 @@ class HVController:
 
             logger.info("Turning off high voltage.")
 
-            r = self.uart.send_packet(
-                id=None, packetType=OW_POWER, command=OW_POWER_HV_OFF
-            )
+            r = self.uart.send_packet(id=None, packetType=OW_POWER, command=OW_POWER_HV_OFF)
             self.uart.clear_buffer()
             # r.print_packet()
 
@@ -519,9 +499,7 @@ class HVController:
 
             logger.info("Get high voltage status.")
 
-            r = self.uart.send_packet(
-                id=None, packetType=OW_POWER, command=OW_POWER_GET_HVON
-            )
+            r = self.uart.send_packet(id=None, packetType=OW_POWER, command=OW_POWER_GET_HVON)
             self.uart.clear_buffer()
             # r.print_packet()
 
@@ -564,26 +542,22 @@ class HVController:
         if voltage is None:
             voltage = 0
         elif not (5.0 <= voltage <= 100.0):
-            raise ValueError(
-                "Voltage input must be within the valid range 5 to 100 Volts)."
-            )
+            raise ValueError("Voltage input must be within the valid range 5 to 100 Volts).")
 
         try:
-            #dac_input = int(((voltage) / 162) * 4095)
+            # dac_input = int(((voltage) / 162) * 4095)
             # logger.info("Setting DAC Value %d.", dac_input)
             # Pack the 12-bit DAC input into two bytes
-            #data = bytes(
+            # data = bytes(
             #    [
             #        (dac_input >> 8) & 0xFF,  # High byte (most significant bits)
             #        dac_input & 0xFF,  # Low byte (least significant bits)
             #    ]
-            #)
+            # )
 
-            data = struct.pack('>f', voltage)
+            data = struct.pack(">f", voltage)
 
-            r = self.uart.send_packet(
-                id=None, packetType=OW_POWER, command=OW_POWER_SET_HV, data=data
-            )
+            r = self.uart.send_packet(id=None, packetType=OW_POWER, command=OW_POWER_SET_HV, data=data)
             self.uart.clear_buffer()
             # r.print_packet()
 
@@ -656,9 +630,7 @@ class HVController:
                 ]
             )
 
-            r = self.uart.send_packet(
-                id=None, packetType=OW_POWER, command=OW_POWER_SET_DACS, data=data
-            )
+            r = self.uart.send_packet(id=None, packetType=OW_POWER, command=OW_POWER_SET_DACS, data=data)
             self.uart.clear_buffer()
             # r.print_packet()
 
@@ -695,9 +667,7 @@ class HVController:
 
             logger.info("Getting current output voltage.")
 
-            r = self.uart.send_packet(
-                id=None, packetType=OW_POWER, command=OW_POWER_GET_HV
-            )
+            r = self.uart.send_packet(id=None, packetType=OW_POWER, command=OW_POWER_GET_HV)
             self.uart.clear_buffer()
             # r.print_packet()
 
@@ -772,7 +742,7 @@ class HVController:
                 logger.error("Error setting Fan Speed")
                 return -1
 
-            logger.info(f"Set fan speed to {fan_speed}")
+            logger.info("Set fan speed to %s", fan_speed)
             return fan_speed
 
         except ValueError as v:
@@ -808,9 +778,7 @@ class HVController:
 
             logger.info("Getting current output voltage.")
 
-            r = self.uart.send_packet(
-                id=None, addr=fan_id, packetType=OW_POWER, command=OW_POWER_GET_FAN
-            )
+            r = self.uart.send_packet(id=None, addr=fan_id, packetType=OW_POWER, command=OW_POWER_GET_FAN)
 
             self.uart.clear_buffer()
             # r.print_packet()
@@ -821,7 +789,7 @@ class HVController:
 
             elif r.data_len == 1:
                 fan_value = r.data[0]
-                logger.info(f"Output fan speed is {fan_value}")
+                logger.info("Output fan speed is %s", fan_value)
                 return fan_value
             else:
                 logger.error("Error getting output voltage from device")
@@ -852,9 +820,7 @@ class HVController:
             raise ValueError("High voltage controller not connected")
 
         if rgb_state not in [0, 1, 2, 3]:
-            raise ValueError(
-                "Invalid RGB state. Must be 0 (OFF), 1 (RED), 2 (BLUE), or 3 (GREEN)"
-            )
+            raise ValueError("Invalid RGB state. Must be 0 (OFF), 1 (RED), 2 (BLUE), or 3 (GREEN)")
 
         try:
             if self.uart.demo_mode:
@@ -876,7 +842,7 @@ class HVController:
                 logger.error("Error setting RGB LED state")
                 return -1
 
-            logger.info(f"Set RGB LED state to {rgb_state}")
+            logger.info("Set RGB LED state to %s", rgb_state)
             return rgb_state
 
         except ValueError as v:
@@ -906,9 +872,7 @@ class HVController:
 
             logger.info("Getting current RGB LED state.")
 
-            r = self.uart.send_packet(
-                id=None, packetType=OW_POWER, command=OW_POWER_GET_RGB
-            )
+            r = self.uart.send_packet(id=None, packetType=OW_POWER, command=OW_POWER_GET_RGB)
 
             self.uart.clear_buffer()
 
@@ -917,7 +881,7 @@ class HVController:
                 return -1
 
             rgb_state = r.reserved
-            logger.info(f"Current RGB LED state is {rgb_state}")
+            logger.info("Current RGB LED state is %s", rgb_state)
             return rgb_state
 
         except ValueError as v:
@@ -948,7 +912,13 @@ class HVController:
             if self.uart.demo_mode:
                 # Return demo data for 8 channels
                 return [
-                    {"channel": i, "raw_adc": 2048, "reserved": 0, "voltage": 12.5 + i, "converted_voltage": 25.0 + i * 2}
+                    {
+                        "channel": i,
+                        "raw_adc": 2048,
+                        "reserved": 0,
+                        "voltage": 12.5 + i,
+                        "converted_voltage": 25.0 + i * 2,
+                    }
                     for i in range(8)
                 ]
 
@@ -957,9 +927,7 @@ class HVController:
                 return []
 
             # Send the voltage monitor command
-            r = self.uart.send_packet(
-                id=None, packetType=OW_POWER, command=OW_POWER_VMON
-            )
+            r = self.uart.send_packet(id=None, packetType=OW_POWER, command=OW_POWER_VMON)
             self.uart.clear_buffer()
             # r.print_packet()
 
@@ -975,18 +943,22 @@ class HVController:
 
                 # Unpack data for 8 channels
                 for channel_num in range(8):
-                    channels.append({
-                        "channel": channel_num,
-                        "raw_adc": raw_values[channel_num],
-                        "voltage": round(voltages[channel_num], 3),
-                        "converted_voltage": round(converted_voltages[channel_num], 3)
-                    })
+                    channels.append(
+                        {
+                            "channel": channel_num,
+                            "raw_adc": raw_values[channel_num],
+                            "voltage": round(voltages[channel_num], 3),
+                            "converted_voltage": round(converted_voltages[channel_num], 3),
+                        }
+                    )
 
                     offset += 10  # Move to next channel (2 + 4 + 4 = 10 bytes)
 
                 return channels
             else:
-                raise ValueError(f"Invalid data length received for voltage monitor: expected 96 bytes, got {r.data_len}")
+                raise ValueError(
+                    f"Invalid data length received for voltage monitor: expected 96 bytes, got {r.data_len}"
+                )
 
         except ValueError as v:
             logger.error("ValueError: %s", v)
@@ -1008,7 +980,7 @@ class HVController:
         if not self.uart.is_connected():
             raise ValueError("High voltage controller not connected")
 
-        if dac_id not in [0, 1, 2 ,3]:
+        if dac_id not in [0, 1, 2, 3]:
             raise ValueError("Invalid DAC ID. Must be 0, 1, 2, or 3")
 
         if dac_value not in range(4096):
@@ -1039,7 +1011,7 @@ class HVController:
                 logger.error("Error setting DAC value")
                 return -1
 
-            logger.info(f"Set DAC value to {dac_value}")
+            logger.info("Set DAC value to %s", dac_value)
             return dac_value
 
         except ValueError as v:
@@ -1069,7 +1041,7 @@ class HVController:
             if self.uart.demo_mode:
                 return True
 
-            logger.info(f"{'Enabling' if enable else 'Disabling'} high voltage output.")
+            logger.info("%s high voltage output.", "Enabling" if enable else "Disabling")
 
             r = self.uart.send_packet(
                 id=None,
@@ -1086,7 +1058,7 @@ class HVController:
                 logger.error("Error setting HV enable state")
                 return False
 
-            logger.info(f"High voltage output {'enabled' if enable else 'disabled'} successfully.")
+            logger.info("High voltage output %s successfully.", "enabled" if enable else "disabled")
             return True
 
         except ValueError as v:

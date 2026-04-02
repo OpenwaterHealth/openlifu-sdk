@@ -43,6 +43,9 @@ dev = [
   "pytest>=6",
   "pytest-cov>=3",
   "pytest-mock",
+  "pre-commit",
+  "ruff",
+  "mypy",
 ]
 
 
@@ -68,3 +71,66 @@ openlifu_sdk = [
 tag_regex = "^(?:pre-)?v?(?P<version>\\d+\\.\\d+\\.\\d+)$"
 version_scheme = "no-guess-dev"
 local_scheme = "no-local-version"
+
+
+# ---------------------------------------------------------------------------
+# Ruff – linting and formatting
+# ---------------------------------------------------------------------------
+[tool.ruff]
+target-version = "py312"
+line-length = 120
+
+[tool.ruff.lint]
+select = [
+  "E",    # pycodestyle errors
+  "W",    # pycodestyle warnings
+  "F",    # pyflakes
+  "I",    # isort
+  "UP",   # pyupgrade
+  "B",    # flake8-bugbear
+  "G",    # flake8-logging-format (catches f-string logging)
+  "LOG",  # flake8-logging
+  "C4",   # flake8-comprehensions
+  "PIE",  # flake8-pie
+  "RUF",  # ruff-specific
+]
+ignore = [
+  "E501",   # line too long – handled by formatter
+  "B008",   # do not perform function calls in default arguments
+  "UP007",  # use X | Y for unions – fine but deferred
+]
+
+[tool.ruff.lint.isort]
+known-first-party = ["openlifu_sdk"]
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+
+
+# ---------------------------------------------------------------------------
+# Mypy – static type checking
+# ---------------------------------------------------------------------------
+[tool.mypy]
+python_version = "3.12"
+warn_return_any = false
+warn_unused_configs = true
+ignore_missing_imports = true
+# Start non-strict; tighten incrementally
+strict = false
+
+
+# ---------------------------------------------------------------------------
+# Pytest
+# ---------------------------------------------------------------------------
+[tool.pytest.ini_options]
+testpaths = ["unit-test"]
+addopts = "-v"
+
+[tool.coverage.run]
+source = ["src"]
+omit = ["*/firmware/*", "*/libusb/*"]
+
+[tool.coverage.report]
+show_missing = true
+skip_covered = false

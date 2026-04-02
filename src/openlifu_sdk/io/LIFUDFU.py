@@ -14,9 +14,10 @@ import logging
 import struct
 import sys
 import time
-from pathlib import Path
-from typing import TYPE_CHECKING, Callable
+from collections.abc import Callable
 from dataclasses import dataclass
+from pathlib import Path
+from typing import TYPE_CHECKING
 
 from openlifu_sdk.io.LIFUConfig import OW_ERROR, OW_I2C_PASSTHRU
 
@@ -29,9 +30,10 @@ logger = logging.getLogger(__name__)
 # Optional USB DFU dependencies (module 0 only)
 # ---------------------------------------------------------------------------
 try:
+    import usb.backend.libusb1 as _usb_libusb1
     import usb.core as _usb_core
     import usb.util as _usb_util
-    import usb.backend.libusb1 as _usb_libusb1
+
     _USB_DFU_AVAILABLE = True
 except ImportError:
     _usb_core = None
@@ -67,13 +69,12 @@ def _find_bundled_libusb_dll() -> str | None:
     # 2. Development / editable install: search up the directory tree
     ms_dir = "MS64" if arch_dir == "win64" else "MS32"
     for parent in Path(__file__).parents:
-        dev_candidate = (
-            parent / "libusb-1.0.29" / "VS2022" / ms_dir / "dll" / "libusb-1.0.dll"
-        )
+        dev_candidate = parent / "libusb-1.0.29" / "VS2022" / ms_dir / "dll" / "libusb-1.0.dll"
         if dev_candidate.is_file():
             return str(dev_candidate)
 
     return None
+
 
 # ---------------------------------------------------------------------------
 # DFU protocol constants (shared by USB and I2C paths)
@@ -81,29 +82,29 @@ def _find_bundled_libusb_dll() -> str | None:
 
 # USB DFU virtual addresses (must match usbd_dfu_if.c)
 USB_DFU_VERSION_VIRT_ADDR = 0xFFFFFF00
-USB_DFU_VERSION_READ_LEN  = 64
+USB_DFU_VERSION_READ_LEN = 64
 
 # I2C DFU command bytes (must match i2c_dfu_if.h)
-I2C_DFU_SLAVE_ADDR      = 0x72
-I2C_DFU_CMD_DNLOAD      = 0x01
-I2C_DFU_CMD_ERASE       = 0x02
-I2C_DFU_CMD_GETSTATUS   = 0x03
-I2C_DFU_CMD_MANIFEST    = 0x04
-I2C_DFU_CMD_RESET       = 0x05
-I2C_DFU_CMD_GETVERSION  = 0x06
-I2C_DFU_STATUS_OK       = 0x00
-I2C_DFU_STATUS_BUSY     = 0x01
-I2C_DFU_STATUS_ERROR    = 0x02
+I2C_DFU_SLAVE_ADDR = 0x72
+I2C_DFU_CMD_DNLOAD = 0x01
+I2C_DFU_CMD_ERASE = 0x02
+I2C_DFU_CMD_GETSTATUS = 0x03
+I2C_DFU_CMD_MANIFEST = 0x04
+I2C_DFU_CMD_RESET = 0x05
+I2C_DFU_CMD_GETVERSION = 0x06
+I2C_DFU_STATUS_OK = 0x00
+I2C_DFU_STATUS_BUSY = 0x01
+I2C_DFU_STATUS_ERROR = 0x02
 I2C_DFU_STATUS_BAD_ADDR = 0x03
-I2C_DFU_STATUS_FLASH_ERR= 0x04
-I2C_DFU_STATE_DNBUSY    = 0x01
-I2C_DFU_STATE_ERROR     = 0x04
+I2C_DFU_STATUS_FLASH_ERR = 0x04
+I2C_DFU_STATE_DNBUSY = 0x01
+I2C_DFU_STATE_ERROR = 0x04
 # Maximum data bytes per write_block call.  The enclosing OW_I2C_PASSTHRU UART
 # packet carries (1 cmd + 4 addr + 2 len) = 7 bytes of I2C-DFU header, so the
 # total packet payload is I2C_DFU_MAX_XFER_SIZE + 7.  The master firmware hard-
 # rejects any UART packet with data_len > DATA_MAX_SIZE (2048), so this value
 # must be ≤ 2041.  Use 512 for a safe, standard I2C block size.
-I2C_DFU_MAX_XFER_SIZE   = 512
+I2C_DFU_MAX_XFER_SIZE = 512
 I2C_DFU_VERSION_STR_MAX = 32
 
 
@@ -115,6 +116,7 @@ class DeviceProfile:
     program_alignment_bytes: int
     app_default_address: int | None = None
     reset_virt_addr: int | None = 0xFFFFFF08
+
 
 # Built-in profiles
 TRANSMITTER_PROFILE = DeviceProfile(
@@ -136,19 +138,20 @@ CONSOLE_PROFILE = DeviceProfile(
 )
 
 # OW_I2C_PASSTHRU sub-commands (must match firmware if_commands.c handler)
-_PASSTHRU_WRITE       = 0x00   # write only
-_PASSTHRU_WRITE_READ  = 0x01   # write then delay 5 ms then read
+_PASSTHRU_WRITE = 0x00  # write only
+_PASSTHRU_WRITE_READ = 0x01  # write then delay 5 ms then read
 
 # Signed package format (must match dfu-test.py)
-_PKG_MAGIC        = 0x314B4750   # 'PGK1'
-_PKG_VERSION      = 1
-_PKG_HDR_NOCRC    = "<IHHIIIII"
-_PKG_HDR_FULL     = "<IHHIIIIII"
+_PKG_MAGIC = 0x314B4750  # 'PGK1'
+_PKG_VERSION = 1
+_PKG_HDR_NOCRC = "<IHHIIIII"
+_PKG_HDR_FULL = "<IHHIIIIII"
 
 
 # ---------------------------------------------------------------------------
 # Package helpers
 # ---------------------------------------------------------------------------
+
 
 def stm32_crc32(data: bytes, init: int = 0xFFFFFFFF) -> int:
     """Compute CRC32 compatible with the STM32 CRC peripheral (poly=0x04C11DB7)."""
@@ -176,10 +179,9 @@ def parse_signed_package(pkg: bytes) -> dict:
     if len(pkg) < hdr_size:
         raise ValueError("signed package too small")
 
-    (magic, version, declared_hdr_size,
-     fw_address, fw_len,
-     meta_address, meta_len,
-     payload_crc, header_crc) = struct.unpack(_PKG_HDR_FULL, pkg[:hdr_size])
+    (magic, version, declared_hdr_size, fw_address, fw_len, meta_address, meta_len, payload_crc, header_crc) = (
+        struct.unpack(_PKG_HDR_FULL, pkg[:hdr_size])
+    )
 
     if magic != _PKG_MAGIC:
         raise ValueError(f"signed package magic mismatch: 0x{magic:08X}")
@@ -188,36 +190,31 @@ def parse_signed_package(pkg: bytes) -> dict:
     if declared_hdr_size != hdr_size:
         raise ValueError("signed package header size mismatch")
 
-    calc_hdr_crc = stm32_crc32(pkg[:hdr_size - 4])
+    calc_hdr_crc = stm32_crc32(pkg[: hdr_size - 4])
     if header_crc != calc_hdr_crc:
-        raise ValueError(
-            f"header CRC mismatch: pkg=0x{header_crc:08X}, calc=0x{calc_hdr_crc:08X}"
-        )
+        raise ValueError(f"header CRC mismatch: pkg=0x{header_crc:08X}, calc=0x{calc_hdr_crc:08X}")
 
     payload_len = fw_len + meta_len
     payload = pkg[hdr_size:]
     if len(payload) != payload_len:
-        raise ValueError(
-            f"payload size mismatch: expected {payload_len}, got {len(payload)}"
-        )
+        raise ValueError(f"payload size mismatch: expected {payload_len}, got {len(payload)}")
 
     calc_payload_crc = stm32_crc32(payload)
     if payload_crc != calc_payload_crc:
-        raise ValueError(
-            f"payload CRC mismatch: pkg=0x{payload_crc:08X}, calc=0x{calc_payload_crc:08X}"
-        )
+        raise ValueError(f"payload CRC mismatch: pkg=0x{payload_crc:08X}, calc=0x{calc_payload_crc:08X}")
 
     return {
-        "fw_address":   fw_address,
+        "fw_address": fw_address,
         "meta_address": meta_address,
-        "fw":           payload[:fw_len],
-        "meta":         payload[fw_len:],
+        "fw": payload[:fw_len],
+        "meta": payload[fw_len:],
     }
 
 
 # ---------------------------------------------------------------------------
 # USB DFU client  (module 0)
 # ---------------------------------------------------------------------------
+
 
 class STM32USBDFU:
     """Minimal STM32 DfuSe USB client using PyUSB.
@@ -229,33 +226,36 @@ class STM32USBDFU:
     """
 
     # DFU class requests
-    DFU_DNLOAD    = 1
-    DFU_UPLOAD    = 2
+    DFU_DNLOAD = 1
+    DFU_UPLOAD = 2
     DFU_GETSTATUS = 3
     DFU_CLRSTATUS = 4
-    DFU_ABORT     = 6
+    DFU_ABORT = 6
 
     # DfuSe DNLOAD block 0 sub-commands
     CMD_SET_ADDRESS_POINTER = 0x21
-    CMD_ERASE               = 0x41
+    CMD_ERASE = 0x41
 
     # DFU state values
-    STATE_DFU_DNLOAD_SYNC         = 3
-    STATE_DFU_DNLOAD_BUSY         = 4
-    STATE_DFU_DNLOAD_IDLE         = 5
-    STATE_DFU_MANIFEST_SYNC       = 6
-    STATE_DFU_MANIFEST            = 7
+    STATE_DFU_DNLOAD_SYNC = 3
+    STATE_DFU_DNLOAD_BUSY = 4
+    STATE_DFU_DNLOAD_IDLE = 5
+    STATE_DFU_MANIFEST_SYNC = 6
+    STATE_DFU_MANIFEST = 7
     STATE_DFU_MANIFEST_WAIT_RESET = 8
-    STATE_DFU_ERROR               = 10
+    STATE_DFU_ERROR = 10
 
-    def __init__(self, vid: int = 0x0483, pid: int = 0xDF11,
-                 transfer_size: int = 1024, timeout_ms: int = 4000,
-                 libusb_dll: str | None = None,
-                 device_profile: "DeviceProfile" | None = None):
+    def __init__(
+        self,
+        vid: int = 0x0483,
+        pid: int = 0xDF11,
+        transfer_size: int = 1024,
+        timeout_ms: int = 4000,
+        libusb_dll: str | None = None,
+        device_profile: DeviceProfile | None = None,
+    ):
         if not _USB_DFU_AVAILABLE:
-            raise RuntimeError(
-                "PyUSB not available. Install with: pip install pyusb"
-            )
+            raise RuntimeError("PyUSB not available. Install with: pip install pyusb")
         self.vid = vid
         self.pid = pid
         self.transfer_size = transfer_size
@@ -278,38 +278,26 @@ class STM32USBDFU:
         if self._backend is not None:
             return self._backend
         if self.libusb_dll:
-            self._backend = _usb_libusb1.get_backend(
-                find_library=lambda _: self.libusb_dll
-            )
+            self._backend = _usb_libusb1.get_backend(find_library=lambda _: self.libusb_dll)
         elif _libusb_package is not None:
-            self._backend = _usb_libusb1.get_backend(
-                find_library=_libusb_package.find_library
-            )
+            self._backend = _usb_libusb1.get_backend(find_library=_libusb_package.find_library)
         else:
             bundled_dll = _find_bundled_libusb_dll()
             if bundled_dll:
                 logger.debug("Using bundled libusb DLL: %s", bundled_dll)
-                self._backend = _usb_libusb1.get_backend(
-                    find_library=lambda _: bundled_dll
-                )
+                self._backend = _usb_libusb1.get_backend(find_library=lambda _: bundled_dll)
             else:
                 self._backend = _usb_libusb1.get_backend()
         return self._backend
 
-    def open(self) -> "STM32USBDFU":
-        self.dev = _usb_core.find(
-            idVendor=self.vid, idProduct=self.pid, backend=self._get_backend()
-        )
+    def open(self) -> STM32USBDFU:
+        self.dev = _usb_core.find(idVendor=self.vid, idProduct=self.pid, backend=self._get_backend())
         if self.dev is None:
-            raise RuntimeError(
-                f"USB DFU device not found: VID=0x{self.vid:04X}, PID=0x{self.pid:04X}"
-            )
+            raise RuntimeError(f"USB DFU device not found: VID=0x{self.vid:04X}, PID=0x{self.pid:04X}")
         self.dev.set_configuration()
         cfg = self.dev.get_active_configuration()
         for intf in cfg:
-            if (intf.bInterfaceClass == 0xFE
-                    and intf.bInterfaceSubClass == 0x01
-                    and intf.bInterfaceProtocol == 0x02):
+            if intf.bInterfaceClass == 0xFE and intf.bInterfaceSubClass == 0x01 and intf.bInterfaceProtocol == 0x02:
                 self.intf = intf
                 break
         if self.intf is None:
@@ -333,7 +321,7 @@ class STM32USBDFU:
         self.dev = None
         self.intf = None
 
-    def __enter__(self) -> "STM32USBDFU":
+    def __enter__(self) -> STM32USBDFU:
         return self.open()
 
     def __exit__(self, *args) -> None:
@@ -342,16 +330,12 @@ class STM32USBDFU:
     # --- low-level USB control transfers ---
 
     def _ctrl_out(self, req: int, value: int, data: bytes = b"") -> int:
-        return self.dev.ctrl_transfer(
-            0x21, req, value, self.intf.bInterfaceNumber,
-            data, timeout=self.timeout_ms
-        )
+        return self.dev.ctrl_transfer(0x21, req, value, self.intf.bInterfaceNumber, data, timeout=self.timeout_ms)
 
     def _ctrl_in(self, req: int, value: int, length: int) -> bytes:
-        return bytes(self.dev.ctrl_transfer(
-            0xA1, req, value, self.intf.bInterfaceNumber,
-            length, timeout=self.timeout_ms
-        ))
+        return bytes(
+            self.dev.ctrl_transfer(0xA1, req, value, self.intf.bInterfaceNumber, length, timeout=self.timeout_ms)
+        )
 
     def get_status(self) -> dict:
         raw = self._ctrl_in(self.DFU_GETSTATUS, 0, 6)
@@ -400,9 +384,7 @@ class STM32USBDFU:
     def _dnload(self, block_num: int, payload: bytes) -> dict:
         self._recover_idle()
         try:
-            self._ctrl_out(
-                self.DFU_DNLOAD, block_num, bytes(payload) if payload else b""
-            )
+            self._ctrl_out(self.DFU_DNLOAD, block_num, bytes(payload) if payload else b"")
         except Exception as e:
             if "timeout" not in str(e).lower():
                 raise
@@ -428,9 +410,9 @@ class STM32USBDFU:
         self.abort()
         return raw.rstrip(b"\x00").decode("ascii", errors="replace")
 
-    def write_memory(self, address: int, data: bytes,
-                     page_erase: bool = True,
-                     progress_callback: Callable | None = None) -> None:
+    def write_memory(
+        self, address: int, data: bytes, page_erase: bool = True, progress_callback: Callable | None = None
+    ) -> None:
         """Write data to target flash, optionally erasing each 2 KB page first.
 
         IMPORTANT: All page erases are performed before any data is written.
@@ -446,8 +428,7 @@ class STM32USBDFU:
         # enforce alignment expectations from device: address and chunk lengths
         if (address % getattr(self, "program_alignment", 1)) != 0:
             raise RuntimeError(
-                f"write_memory: start address 0x{address:08X} not aligned to "
-                f"{self.program_alignment} bytes"
+                f"write_memory: start address 0x{address:08X} not aligned to {self.program_alignment} bytes"
             )
 
         # Phase 1: erase all required pages up-front (before setting the
@@ -468,12 +449,12 @@ class STM32USBDFU:
         block = 2
         written = 0
         for offset in range(0, total, self.transfer_size):
-            chunk = data[offset:offset + self.transfer_size]
+            chunk = data[offset : offset + self.transfer_size]
             # pad final chunk to program_alignment if required by bootloader
             align = getattr(self, "program_alignment", 1)
             if align > 1 and (len(chunk) % align) != 0:
                 pad_len = align - (len(chunk) % align)
-                chunk = chunk + (b"\xFF" * pad_len)
+                chunk = chunk + (b"\xff" * pad_len)
             self._dnload(block, chunk)
             block += 1
             written += len(chunk)
@@ -495,6 +476,7 @@ class STM32USBDFU:
 # I2C DFU client via OW master passthrough  (modules 1+)
 # ---------------------------------------------------------------------------
 
+
 class STM32I2CDFUviaMaster:
     """I2C DFU client that routes all I2C transactions through the USB-master
     module via the ``OW_I2C_PASSTHRU`` UART packet type.
@@ -513,9 +495,7 @@ class STM32I2CDFUviaMaster:
         data       = raw bytes to write
     """
 
-    def __init__(self, uart: "LIFUUart",
-                 i2c_addr: int = I2C_DFU_SLAVE_ADDR,
-                 write_read_delay_s: float = 0.005):
+    def __init__(self, uart: LIFUUart, i2c_addr: int = I2C_DFU_SLAVE_ADDR, write_read_delay_s: float = 0.005):
         self._uart = uart
         self._addr = i2c_addr
         self._wr_delay = write_read_delay_s
@@ -535,12 +515,10 @@ class STM32I2CDFUviaMaster:
         self._uart.clear_buffer()
         if r is None or r.packet_type == OW_ERROR:
             raise RuntimeError(
-                f"I2C passthrough write failed (addr=0x{self._addr:02X}, "
-                f"payload={payload[:8].hex()}...)"
+                f"I2C passthrough write failed (addr=0x{self._addr:02X}, payload={payload[:8].hex()}...)"
             )
 
-    def _exchange(self, payload: bytes, read_len: int,
-                  pre_read_delay_s: float | None = None) -> bytes:
+    def _exchange(self, payload: bytes, read_len: int, pre_read_delay_s: float | None = None) -> bytes:
         """Write *payload* to the I2C slave, wait, then read *read_len* bytes back.
 
         The firmware inserts a fixed 5 ms gap between write and read.
@@ -560,12 +538,8 @@ class STM32I2CDFUviaMaster:
         )
         self._uart.clear_buffer()
         if r is None or r.packet_type == OW_ERROR:
-            raise RuntimeError(
-                f"I2C passthrough exchange failed (addr=0x{self._addr:02X}, "
-                f"want_rx={read_len})"
-            )
-        return bytes(r.data[:read_len]) if (r.data and len(r.data) >= read_len) \
-               else bytes(read_len)
+            raise RuntimeError(f"I2C passthrough exchange failed (addr=0x{self._addr:02X}, want_rx={read_len})")
+        return bytes(r.data[:read_len]) if (r.data and len(r.data) >= read_len) else bytes(read_len)
 
     # --- DFU protocol commands ---
 
@@ -580,12 +554,8 @@ class STM32I2CDFUviaMaster:
         while time.monotonic() < deadline:
             st = self.get_status()
             if st["state"] == I2C_DFU_STATE_ERROR or st["status"] in _ERROR_STATUSES:
-                raise RuntimeError(
-                    f"I2C DFU error: status=0x{st['status']:02X}, "
-                    f"state=0x{st['state']:02X}"
-                )
-            if (st["status"] != I2C_DFU_STATUS_BUSY
-                    and st["state"] != I2C_DFU_STATE_DNBUSY):
+                raise RuntimeError(f"I2C DFU error: status=0x{st['status']:02X}, state=0x{st['state']:02X}")
+            if st["status"] != I2C_DFU_STATUS_BUSY and st["state"] != I2C_DFU_STATE_DNBUSY:
                 return st
             time.sleep(0.020)
         raise TimeoutError(f"I2C DFU timed out after {timeout_s:.0f} s")
@@ -608,13 +578,12 @@ class STM32I2CDFUviaMaster:
         self._write(payload)
         self._wait_while_busy(timeout_s=10.0)
 
-    def write_memory(self, address: int, data: bytes,
-                     progress_callback: Callable | None = None) -> None:
+    def write_memory(self, address: int, data: bytes, progress_callback: Callable | None = None) -> None:
         """Write arbitrary-length data in ``I2C_DFU_MAX_XFER_SIZE``-byte chunks."""
         total = len(data)
         written = 0
         for offset in range(0, total, I2C_DFU_MAX_XFER_SIZE):
-            chunk = data[offset:offset + I2C_DFU_MAX_XFER_SIZE]
+            chunk = data[offset : offset + I2C_DFU_MAX_XFER_SIZE]
             self.write_block(address + offset, chunk)
             written += len(chunk)
             if progress_callback:
@@ -634,15 +603,14 @@ class STM32I2CDFUviaMaster:
         read_len = 2 + I2C_DFU_VERSION_STR_MAX
         raw = self._exchange(bytes([I2C_DFU_CMD_GETVERSION]), read_len)
         if raw[0] not in (I2C_DFU_STATUS_OK, I2C_DFU_STATUS_BUSY):
-            raise RuntimeError(
-                f"I2C DFU GETVERSION failed: status=0x{raw[0]:02X}"
-            )
+            raise RuntimeError(f"I2C DFU GETVERSION failed: status=0x{raw[0]:02X}")
         return raw[2:].split(b"\x00")[0].decode("ascii", errors="replace")
 
 
 # ---------------------------------------------------------------------------
 # High-level firmware update manager
 # ---------------------------------------------------------------------------
+
 
 class LIFUDFUManager:
     """Orchestrates firmware updates for a single LIFU transmitter module.
@@ -658,13 +626,12 @@ class LIFUDFUManager:
         )
     """
 
-    def __init__(self, uart: "LIFUUart"):
+    def __init__(self, uart: LIFUUart):
         self._uart = uart
 
     # --- per-transport helpers ---
 
-    def get_bootloader_version_usb(self, vid: int = 0x0483, pid: int = 0xDF11,
-                                   libusb_dll: str | None = None) -> str:
+    def get_bootloader_version_usb(self, vid: int = 0x0483, pid: int = 0xDF11, libusb_dll: str | None = None) -> str:
         """Read bootloader version string from module 0 via USB DFU."""
         with STM32USBDFU(vid=vid, pid=pid, libusb_dll=libusb_dll) as dfu:
             return dfu.get_version()
@@ -674,11 +641,15 @@ class LIFUDFUManager:
         dfu = STM32I2CDFUviaMaster(uart=self._uart, i2c_addr=i2c_addr)
         return dfu.get_version()
 
-    def program_usb(self, package_file: str,
-                    vid: int = 0x0483, pid: int = 0xDF11,
-                    libusb_dll: str | None = None,
-                    device_type: str = "transmitter",
-                    progress_callback: Callable | None = None) -> None:
+    def program_usb(
+        self,
+        package_file: str,
+        vid: int = 0x0483,
+        pid: int = 0xDF11,
+        libusb_dll: str | None = None,
+        device_type: str = "transmitter",
+        progress_callback: Callable | None = None,
+    ) -> None:
         """Program a signed package to module 0 via USB DFU.
 
         The module must already be in DFU bootloader mode.
@@ -689,31 +660,24 @@ class LIFUDFUManager:
 
         logger.info(
             "USB DFU: fw %d B @ 0x%08X, meta %d B @ 0x%08X",
-            len(pkg["fw"]), pkg["fw_address"],
-            len(pkg["meta"]), pkg["meta_address"],
+            len(pkg["fw"]),
+            pkg["fw_address"],
+            len(pkg["meta"]),
+            pkg["meta_address"],
         )
         if device_type not in ("transmitter", "console"):
-            raise ValueError(
-                f"Unknown device_type {device_type!r}; expected 'transmitter' or 'console'."
-            )
+            raise ValueError(f"Unknown device_type {device_type!r}; expected 'transmitter' or 'console'.")
         profile = TRANSMITTER_PROFILE if device_type == "transmitter" else CONSOLE_PROFILE
-        with STM32USBDFU(vid=vid, pid=pid, libusb_dll=libusb_dll,
-                         device_profile=profile) as dfu:
-            dfu.write_memory(
-                pkg["fw_address"], pkg["fw"],
-                page_erase=True, progress_callback=progress_callback
-            )
-            dfu.write_memory(
-                pkg["meta_address"], pkg["meta"],
-                page_erase=True, progress_callback=progress_callback
-            )
+        with STM32USBDFU(vid=vid, pid=pid, libusb_dll=libusb_dll, device_profile=profile) as dfu:
+            dfu.write_memory(pkg["fw_address"], pkg["fw"], page_erase=True, progress_callback=progress_callback)
+            dfu.write_memory(pkg["meta_address"], pkg["meta"], page_erase=True, progress_callback=progress_callback)
             logger.info("USB DFU: sending manifest...")
             dfu.manifest()
         logger.info("USB DFU: programming complete.")
 
-    def program_i2c(self, package_file: str,
-                    i2c_addr: int = I2C_DFU_SLAVE_ADDR,
-                    progress_callback: Callable | None = None) -> None:
+    def program_i2c(
+        self, package_file: str, i2c_addr: int = I2C_DFU_SLAVE_ADDR, progress_callback: Callable | None = None
+    ) -> None:
         """Program a signed package to a slave module via I2C passthrough.
 
         The slave must already be in DFU bootloader mode at *i2c_addr*.
@@ -732,29 +696,32 @@ class LIFUDFUManager:
 
         logger.info(
             "I2C DFU: fw %d B @ 0x%08X, meta %d B @ 0x%08X",
-            len(pkg["fw"]), pkg["fw_address"],
-            len(pkg["meta"]), pkg["meta_address"],
+            len(pkg["fw"]),
+            pkg["fw_address"],
+            len(pkg["meta"]),
+            pkg["meta_address"],
         )
         dfu = STM32I2CDFUviaMaster(uart=self._uart, i2c_addr=i2c_addr)
         logger.info("I2C DFU: mass erasing application region...")
         dfu.mass_erase()
         logger.info("I2C DFU: erasing metadata page @ 0x%08X...", pkg["meta_address"])
         dfu.erase_page(pkg["meta_address"])
-        dfu.write_memory(
-            pkg["fw_address"], pkg["fw"],
-            progress_callback=progress_callback
-        )
+        dfu.write_memory(pkg["fw_address"], pkg["fw"], progress_callback=progress_callback)
         logger.info("I2C DFU: writing metadata...")
-        dfu.write_memory(
-            pkg["meta_address"], pkg["meta"]
-        )
+        dfu.write_memory(pkg["meta_address"], pkg["meta"])
         logger.info("I2C DFU: sending manifest...")
         dfu.manifest()
         logger.info("I2C DFU: programming complete.")
 
-    def _wait_for_usb_dfu(self, vid: int, pid: int, libusb_dll: str | None,
-                           timeout_s: float = 30.0, poll_interval_s: float = 1.0,
-                           device_profile: "DeviceProfile" | None = None) -> str:
+    def _wait_for_usb_dfu(
+        self,
+        vid: int,
+        pid: int,
+        libusb_dll: str | None,
+        timeout_s: float = 30.0,
+        poll_interval_s: float = 1.0,
+        device_profile: DeviceProfile | None = None,
+    ) -> str:
         """Poll for the USB DFU device until it enumerates or *timeout_s* elapses.
 
         Returns the bootloader version string once the device is found.
@@ -763,13 +730,11 @@ class LIFUDFUManager:
         # Pre-flight: verify the libusb backend can be loaded before entering
         # the poll loop.  If the DLL is missing or the path is wrong this fails
         # immediately with a clear message instead of silently timing out.
-        _probe = STM32USBDFU(vid=vid, pid=pid, libusb_dll=libusb_dll,
-                     device_profile=device_profile)
+        _probe = STM32USBDFU(vid=vid, pid=pid, libusb_dll=libusb_dll, device_profile=device_profile)
         backend = _probe._get_backend()
         if backend is None:
             raise RuntimeError(
-                "libusb backend not available — install libusb or pass --libusb-dll "
-                "pointing to a valid libusb-1.0.dll."
+                "libusb backend not available — install libusb or pass --libusb-dll pointing to a valid libusb-1.0.dll."
             )
 
         deadline = time.monotonic() + timeout_s
@@ -786,51 +751,45 @@ class LIFUDFUManager:
 
             if dev is None:
                 remaining = deadline - time.monotonic()
-                logger.debug(
-                    "USB DFU not found yet (attempt %d, %.0f s remaining)...",
-                    attempt, max(remaining, 0)
-                )
+                logger.debug("USB DFU not found yet (attempt %d, %.0f s remaining)...", attempt, max(remaining, 0))
                 time.sleep(poll_interval_s)
                 continue
 
             # Phase 2: device is present — open it and read the version string.
             elapsed = timeout_s - (deadline - time.monotonic())
-            logger.info(
-                "USB DFU device found after %.1f s (attempt %d)", elapsed, attempt
-            )
+            logger.info("USB DFU device found after %.1f s (attempt %d)", elapsed, attempt)
             try:
-                with STM32USBDFU(vid=vid, pid=pid, libusb_dll=libusb_dll,
-                                 device_profile=device_profile) as dfu:
+                with STM32USBDFU(vid=vid, pid=pid, libusb_dll=libusb_dll, device_profile=device_profile) as dfu:
                     version = dfu.get_version()
                 return version
             except Exception as e:
-                # Device enumerated but version read failed (e.g. DFU state    
+                # Device enumerated but version read failed (e.g. DFU state
                 # machine not ready yet or bootloader doesn't support virtual
                 # version address).  Log visibly and return a placeholder so
                 # the update can still proceed.
                 logger.warning(
-                    "USB DFU device found but version read failed: %s — "
-                    "proceeding with version='unknown'", e
+                    "USB DFU device found but version read failed: %s — proceeding with version='unknown'", e
                 )
                 return "unknown"
 
         raise RuntimeError(
-            f"USB DFU device (VID=0x{vid:04X}, PID=0x{pid:04X}) did not "
-            f"enumerate within {timeout_s:.0f} s"
+            f"USB DFU device (VID=0x{vid:04X}, PID=0x{pid:04X}) did not enumerate within {timeout_s:.0f} s"
         )
 
-    def update_module(self,
-                      module: int,
-                      package_file: str,
-                      enter_dfu_fn: Callable,
-                      vid: int = 0x0483,
-                      pid: int = 0xDF11,
-                      libusb_dll: str | None = None,
-                      i2c_addr: int = I2C_DFU_SLAVE_ADDR,
-                      dfu_wait_s: float = 3.0,
-                      dfu_enum_timeout_s: float = 30.0,
-                      device_type: str = "transmitter",
-                      progress_callback: Callable | None = None) -> None:
+    def update_module(
+        self,
+        module: int,
+        package_file: str,
+        enter_dfu_fn: Callable,
+        vid: int = 0x0483,
+        pid: int = 0xDF11,
+        libusb_dll: str | None = None,
+        i2c_addr: int = I2C_DFU_SLAVE_ADDR,
+        dfu_wait_s: float = 3.0,
+        dfu_enum_timeout_s: float = 30.0,
+        device_type: str = "transmitter",
+        progress_callback: Callable | None = None,
+    ) -> None:
         """High-level firmware update for a single module.
 
         Steps:
@@ -869,9 +828,7 @@ class LIFUDFUManager:
         elif device_type == "console":
             # Console/host DFU is only valid for the USB master (module 0)
             if module != 0:
-                raise ValueError(
-                    f"Console DFU is only supported for module 0; got module {module}"
-                )
+                raise ValueError(f"Console DFU is only supported for module 0; got module {module}")
             enter_dfu_fn()
         else:
             raise ValueError(f"Unsupported device_type {device_type!r} for DFU entry")
@@ -881,22 +838,23 @@ class LIFUDFUManager:
             time.sleep(dfu_wait_s)
 
         if module == 0:
-            logger.info(
-                "Waiting for USB DFU device (timeout %ds)...", dfu_enum_timeout_s
-            )
+            logger.info("Waiting for USB DFU device (timeout %ds)...", dfu_enum_timeout_s)
             try:
                 profile = TRANSMITTER_PROFILE if device_type == "transmitter" else CONSOLE_PROFILE
                 bl_version = self._wait_for_usb_dfu(
-                    vid=vid, pid=pid, libusb_dll=libusb_dll,
-                    timeout_s=dfu_enum_timeout_s, device_profile=profile,
+                    vid=vid,
+                    pid=pid,
+                    libusb_dll=libusb_dll,
+                    timeout_s=dfu_enum_timeout_s,
+                    device_profile=profile,
                 )
             except RuntimeError as e:
-                raise RuntimeError(
-                    f"Module 0 did not enter USB DFU mode: {e}"
-                ) from e
+                raise RuntimeError(f"Module 0 did not enter USB DFU mode: {e}") from e
             logger.info("USB DFU bootloader version: %s", bl_version)
             self.program_usb(
-                package_file, vid=vid, pid=pid,
+                package_file,
+                vid=vid,
+                pid=pid,
                 libusb_dll=libusb_dll,
                 device_type=device_type,
                 progress_callback=progress_callback,
@@ -904,22 +862,19 @@ class LIFUDFUManager:
         else:
             logger.info(
                 "Verifying I2C DFU entry (module %d, addr=0x%02X via master)...",
-                module, i2c_addr,
+                module,
+                i2c_addr,
             )
             try:
                 bl_version = self.get_bootloader_version_i2c(i2c_addr=i2c_addr)
             except Exception as e:
-                raise RuntimeError(
-                    f"Module {module} did not enter I2C DFU mode at "
-                    f"0x{i2c_addr:02X}: {e}"
-                ) from e
+                raise RuntimeError(f"Module {module} did not enter I2C DFU mode at 0x{i2c_addr:02X}: {e}") from e
             if not bl_version:
-                raise RuntimeError(
-                    f"Module {module} I2C DFU bootloader returned an empty version string"
-                )
+                raise RuntimeError(f"Module {module} I2C DFU bootloader returned an empty version string")
             logger.info("I2C DFU bootloader version: %s", bl_version)
             self.program_i2c(
-                package_file, i2c_addr=i2c_addr,
+                package_file,
+                i2c_addr=i2c_addr,
                 progress_callback=progress_callback,
             )
 
