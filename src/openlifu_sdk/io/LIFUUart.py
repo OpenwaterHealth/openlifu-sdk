@@ -18,16 +18,7 @@ OW_START_BYTE = 0xAA
 OW_END_BYTE = 0xDD
 ID_COUNTER = 0  # Initializing the ID counter
 
-# Set up logging
-log = logging.getLogger("UART")
-log.setLevel(logging.ERROR)
-log.propagate = False
-
-handler = logging.StreamHandler()
-handler.setLevel(logging.ERROR)
-formatter = logging.Formatter("%(asctime)s - %(levelname)s - %(message)s") # Format output with timestamp
-handler.setFormatter(formatter)
-log.addHandler(handler)
+log = logging.getLogger(__name__)
 
 # CRC16-ccitt lookup table
 crc16_tab = [

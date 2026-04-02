@@ -146,15 +146,7 @@ if TYPE_CHECKING:
     pass
 
 
-logger = logging.getLogger("TXDevice")
-logger.setLevel(logging.INFO)
-logger.propagate = False
-
-if not logger.handlers:
-    handler = logging.StreamHandler()
-    formatter = logging.Formatter("%(asctime)s - %(levelname)s - %(message)s")
-    handler.setFormatter(formatter)
-    logger.addHandler(handler)
+logger = logging.getLogger(__name__)
 
 class TxDevice:
     def __init__(self, uart: LIFUUart, module_invert: bool | list[bool] = False):
@@ -436,10 +428,10 @@ class TxDevice:
             # Parse wire format response
             try:
                 config = LifuUserConfig.from_wire_bytes(r.data)
-                logger.debug(f"Read config: seq={config.header.seq}, json_len={config.header.json_len}")
+                logger.debug("Read config: seq=%s, json_len=%s", config.header.seq, config.header.json_len)
                 return config
             except Exception as e:
-                logger.error(f"Failed to parse config response: {e}")
+                logger.error("Failed to parse config response: %s", e)
                 return None
 
         except ValueError as v:
@@ -479,7 +471,7 @@ class TxDevice:
             # Convert config to wire format bytes
             wire_data = config.to_wire_bytes()
             
-            logger.debug(f"Writing config to device: {len(wire_data)} bytes")
+            logger.debug("Writing config to device: %s bytes", len(wire_data))
             
             # Send write command (reserved=1 for WRITE)
             r = self.uart.send_packet(
@@ -503,10 +495,10 @@ class TxDevice:
                 from openlifu_sdk.io.LIFUUserConfig import LifuUserConfigHeader
                 updated_header = LifuUserConfigHeader.from_bytes(r.data[:16])
                 updated_config = LifuUserConfig(header=updated_header, json_data=config.json_data)
-                logger.debug(f"Config written successfully: new seq={updated_config.header.seq}")
+                logger.debug("Config written successfully: new seq=%s", updated_config.header.seq)
                 return updated_config
             except Exception as e:
-                logger.error(f"Failed to parse write response: {e}")
+                logger.error("Failed to parse write response: %s", e)
                 return None
 
         except ValueError as v:
@@ -539,7 +531,7 @@ class TxDevice:
             config.set_json_str(json_str)
             return self.write_config(module=module, config=config)
         except json.JSONDecodeError as e:
-            logger.error(f"Invalid JSON: {e}")
+            logger.error("Invalid JSON: %s", e)
             raise ValueError(f"Invalid JSON: {e}")
 
     def get_temperature(self, module:int=1) -> float:
@@ -662,13 +654,12 @@ class TxDevice:
         if pulse_train_interval > 0 and (pulse_train_interval < pulse_interval * pulse_count):
             raise ValueError("Pulse train interval cannot be less than pulse interval * pulse count")
 
-        logger.info(f"Setting trigger with parameters: "
-                        f"pulse_interval={pulse_interval}, "
-                        f"pulse_count={pulse_count}, "
-                        f"pulse_width={pulse_width}, "
-                        f"pulse_train_interval={pulse_train_interval}, "
-                        f"pulse_train_count={pulse_train_count}, "
-                        f"trigger_mode={trigger_mode}")
+        logger.info(
+            "Setting trigger with parameters: pulse_interval=%s, pulse_count=%s, "
+            "pulse_width=%s, pulse_train_interval=%s, pulse_train_count=%s, trigger_mode=%s",
+            pulse_interval, pulse_count, pulse_width,
+            pulse_train_interval, pulse_train_count, trigger_mode,
+        )
 
         trigger_json = {
             "TriggerFrequencyHz": 1/pulse_interval,
@@ -711,7 +702,7 @@ class TxDevice:
             try:
                 json_string = json.dumps(data)
             except json.JSONDecodeError as e:
-                logger.error(f"Data must be valid JSON: {e}")
+                logger.error("Data must be valid JSON: %s", e)
                 return None
 
             payload = json_string.encode('utf-8')
@@ -725,7 +716,7 @@ class TxDevice:
                     response_json = json.loads(r.data.decode('utf-8'))
                     return response_json
                 except json.JSONDecodeError as e:
-                    logger.error(f"Error decoding JSON: {e}")
+                    logger.error("Error decoding JSON: %s", e)
                     return None
             else:
                 return None
@@ -761,7 +752,7 @@ class TxDevice:
             try:
                 data_object = json.loads(r.data.decode('utf-8'))
             except json.JSONDecodeError as e:
-                logger.error(f"Error decoding JSON: {e}")
+                logger.error("Error decoding JSON: %s", e)
             return data_object
         except ValueError as v:
             logger.error("ValueError: %s", v)
@@ -1153,7 +1144,7 @@ class TxDevice:
             try:
                 data = struct.pack('<HI', address, value)
             except struct.error as e:
-                logger.error(f"Error packing address and value: {e}")
+                logger.error("Error packing address and value: %s", e)
                 raise ValueError("Invalid address or value format") from e
 
             # Send the write command to the device
@@ -1173,7 +1164,7 @@ class TxDevice:
                 logger.error("Error writing TX register value")
                 return False
 
-            logger.debug(f"Successfully wrote value 0x{value:08X} to register 0x{address:04X}")
+            logger.debug("Successfully wrote value 0x%08X to register 0x%04X", value, address)
             return True
 
         except ValueError as v:
@@ -1213,7 +1204,7 @@ class TxDevice:
             try:
                 data = struct.pack('<H', address)
             except struct.error as e:
-                logger.error(f"Error packing address {address}: {e}")
+                logger.error("Error packing address %s: %s", address, e)
                 raise ValueError("Invalid address format") from e
 
             # Send the read command to the device
@@ -1238,13 +1229,13 @@ class TxDevice:
                 try:
                     value = struct.unpack('<I', r.data)[0]
                 except struct.error as e:
-                    logger.error(f"Error unpacking register value: {e}")
+                    logger.error("Error unpacking register value: %s", e)
                     return 0
             else:
-                logger.error(f"Unexpected data length: {r.data_len}")
+                logger.error("Unexpected data length: %s", r.data_len)
                 return 0
 
-            logger.debug(f"Successfully read value 0x{value:08X} from register 0x{address:04X}")
+            logger.debug("Successfully read value 0x%08X from register 0x%04X", value, address)
             return value
         except ValueError as v:
             logger.error("ValueError: %s", v)
@@ -1289,7 +1280,7 @@ class TxDevice:
             # Configure chunking for large blocks
             max_regs_per_block = 62  # Maximum registers per block due to payload size
             num_chunks = (len(reg_values) + max_regs_per_block - 1) // max_regs_per_block
-            logger.debug(f"Write Block: Total chunks = {num_chunks}")
+            logger.debug("Write Block: Total chunks = %s", num_chunks)
 
             # Write each chunk
             for i in range(num_chunks):
@@ -1302,7 +1293,7 @@ class TxDevice:
                     data_format = '<HBB' + 'I' * len(chunk)  # Start address (H), chunk length (B), reserved (B), values (I...)
                     data = struct.pack(data_format, start_address + chunk_start, len(chunk), 0, *chunk)
                 except struct.error as e:
-                    logger.error(f"Error packing data for chunk {i}: {e}")
+                    logger.error("Error packing data for chunk %s: %s", i, e)
                     return False
 
                 # Send the packet
@@ -1319,7 +1310,7 @@ class TxDevice:
                 # r.print_packet()
                 # Check for errors in the response
                 if r.packet_type == OW_ERROR:
-                    logger.error(f"Error writing TX block at chunk {i}")
+                    logger.error("Error writing TX block at chunk %s", i)
                     return False
 
             logger.debug("Block write successful")
@@ -1381,11 +1372,11 @@ class TxDevice:
 
             expected_len = count * 4
             if r.data_len != expected_len:
-                logger.error(f"Unexpected data length: {r.data_len}, expected {expected_len}")
+                logger.error("Unexpected data length: %s, expected %s", r.data_len, expected_len)
                 return None
 
             values = list(struct.unpack(f'<{count}I', r.data))
-            logger.debug(f"read_block: {count} regs from 0x{start_address:04X} on tx {identifier}")
+            logger.debug("read_block: %s regs from 0x%04X on tx %s", count, start_address, identifier)
             return values
 
         except ValueError as v:
@@ -1427,7 +1418,7 @@ class TxDevice:
             try:
                 data = struct.pack('<HI', address, value)
             except struct.error as e:
-                logger.error(f"Error packing address and value: {e}")
+                logger.error("Error packing address and value: %s", e)
                 raise ValueError("Invalid address or value format") from e
 
             # Send the write command to the device
@@ -1447,7 +1438,7 @@ class TxDevice:
                 logger.error("Error verifying writing TX register value")
                 return False
 
-            logger.debug(f"Successfully wrote value 0x{value:08X} to register 0x{address:04X}")
+            logger.debug("Successfully wrote value 0x%08X to register 0x%04X", value, address)
             return True
 
         except ValueError as v:
@@ -1493,7 +1484,7 @@ class TxDevice:
             # Configure chunking for large blocks
             max_regs_per_block = 62  # Maximum registers per block due to payload size
             num_chunks = (len(reg_values) + max_regs_per_block - 1) // max_regs_per_block
-            logger.debug(f"Write Block: Total chunks = {num_chunks}")
+            logger.debug("Write Block: Total chunks = %s", num_chunks)
 
             # Write each chunk
             for i in range(num_chunks):
@@ -1506,7 +1497,7 @@ class TxDevice:
                     data_format = '<HBB' + 'I' * len(chunk)  # Start address (H), chunk length (B), reserved (B), values (I...)
                     data = struct.pack(data_format, start_address + chunk_start, len(chunk), 0, *chunk)
                 except struct.error as e:
-                    logger.error(f"Error packing data for chunk {i}: {e}")
+                    logger.error("Error packing data for chunk %s: %s", i, e)
                     return False
 
                 # Send the packet
@@ -1523,7 +1514,7 @@ class TxDevice:
 
                 # Check for errors in the response
                 if r.packet_type == OW_ERROR:
-                    logger.error(f"Error verifying writing TX block at chunk {i}")
+                    logger.error("Error verifying writing TX block at chunk %s", i)
                     return False
 
             logger.debug("Block write successful")
@@ -1626,7 +1617,7 @@ class TxDevice:
             for txi, txregs in enumerate(registers):
                 for addr, reg_values in txregs.items():
                     if not self.write_block(identifier=txi, start_address=addr, reg_values=reg_values):
-                        logger.error(f"Error applying TX CHIP ID: {txi} registers")
+                        logger.error("Error applying TX CHIP ID: %s registers", txi)
                         return False
             return True
 
@@ -1658,7 +1649,7 @@ class TxDevice:
 
             # Write each register to the TX device
             for group, addr, value in parsed_registers:
-                logger.debug(f"Writing to {group:<20} | Address: 0x{addr:02X} | Value: 0x{value:08X}")
+                logger.debug("Writing to %-20s | Address: 0x%02X | Value: 0x%08X", group, addr, value)
                 if not self.write_register(identifier=txchip_id, address=addr, value=value):
                     logger.error(
                         f"Failed to write to TX CHIP ID: {txchip_id} | "
@@ -1670,13 +1661,13 @@ class TxDevice:
             return True
 
         except FileNotFoundError as e:
-            logger.error(f"TI configuration file not found: {file_path}. Error: {e}")
+            logger.error("TI configuration file not found: %s. Error: %s", file_path, e)
             raise
         except ValueError as e:
-            logger.error(f"Invalid input or device state: {e}")
+            logger.error("Invalid input or device state: %s", e)
             raise
         except Exception as e:
-            logger.error(f"Unexpected error while writing TI config to TX Device: {e}")
+            logger.error("Unexpected error while writing TI config to TX Device: %s", e)
             raise
 
     # ------------------------------------------------------------------

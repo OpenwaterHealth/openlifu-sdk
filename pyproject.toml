@@ -43,6 +43,9 @@ dev = [
   "pytest>=6",
   "pytest-cov>=3",
   "pytest-mock",
+  "pre-commit",
+  "ruff",
+  "mypy",
 ]
 
 

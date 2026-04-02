@@ -772,7 +772,7 @@ class HVController:
                 logger.error("Error setting Fan Speed")
                 return -1
 
-            logger.info(f"Set fan speed to {fan_speed}")
+            logger.info("Set fan speed to %s", fan_speed)
             return fan_speed
 
         except ValueError as v:
@@ -821,7 +821,7 @@ class HVController:
 
             elif r.data_len == 1:
                 fan_value = r.data[0]
-                logger.info(f"Output fan speed is {fan_value}")
+                logger.info("Output fan speed is %s", fan_value)
                 return fan_value
             else:
                 logger.error("Error getting output voltage from device")
@@ -876,7 +876,7 @@ class HVController:
                 logger.error("Error setting RGB LED state")
                 return -1
 
-            logger.info(f"Set RGB LED state to {rgb_state}")
+            logger.info("Set RGB LED state to %s", rgb_state)
             return rgb_state
 
         except ValueError as v:
@@ -917,7 +917,7 @@ class HVController:
                 return -1
 
             rgb_state = r.reserved
-            logger.info(f"Current RGB LED state is {rgb_state}")
+            logger.info("Current RGB LED state is %s", rgb_state)
             return rgb_state
 
         except ValueError as v:
@@ -1039,7 +1039,7 @@ class HVController:
                 logger.error("Error setting DAC value")
                 return -1
 
-            logger.info(f"Set DAC value to {dac_value}")
+            logger.info("Set DAC value to %s", dac_value)
             return dac_value
 
         except ValueError as v:
@@ -1069,7 +1069,7 @@ class HVController:
             if self.uart.demo_mode:
                 return True
 
-            logger.info(f"{'Enabling' if enable else 'Disabling'} high voltage output.")
+            logger.info("%s high voltage output.", "Enabling" if enable else "Disabling")
 
             r = self.uart.send_packet(
                 id=None,
@@ -1086,7 +1086,7 @@ class HVController:
                 logger.error("Error setting HV enable state")
                 return False
 
-            logger.info(f"High voltage output {'enabled' if enable else 'disabled'} successfully.")
+            logger.info("High voltage output %s successfully.", "enabled" if enable else "disabled")
             return True
 
         except ValueError as v:

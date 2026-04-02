@@ -55,12 +55,6 @@ class LIFUInterfaceStatus(Enum):
 logger = logging.getLogger(__name__)
 
 class LIFUInterface:
-    signal_connect: LIFUSignal = LIFUSignal()
-    signal_disconnect: LIFUSignal = LIFUSignal()
-    signal_data_received: LIFUSignal = LIFUSignal()
-    hvcontroller: HVController = None
-    txdevice: TxDevice = None
-
     def __init__(self,
                  vid: int = 0x0483,
                  tx_pid: int = 0x57AF,
@@ -83,9 +77,20 @@ class LIFUInterface:
             con_pid (int): Product ID for console device.
             baudrate (int): Communication baud rate.
             timeout (int): Read timeout in seconds.
-            test_mode (bool): Enable test mode.
+            TX_test_mode (bool): Enable TX test/demo mode.
+            HV_test_mode (bool): Enable HV test/demo mode.
             run_async (bool): Enable asynchronous operation.
+            ext_power_supply (bool): Use external power supply (skip HVController).
+            module_invert (bool | List[bool]): Invert signal on modules.
+            voltage_table_selection (str | None): EVT version override for voltage table.
+            sequence_time_selection (str | None): Sequence time set override.
         """
+        # Per-instance signals — must be created here, not at class level, to
+        # prevent all instances from sharing the same signal objects.
+        self.signal_connect: LIFUSignal = LIFUSignal()
+        self.signal_disconnect: LIFUSignal = LIFUSignal()
+        self.signal_data_received: LIFUSignal = LIFUSignal()
+
         # Store parameters in instance variables
         self.vid = vid
         self.tx_pid = tx_pid
@@ -94,8 +99,10 @@ class LIFUInterface:
         self.timeout = timeout
         self._test_mode = TX_test_mode
         self._async_mode = run_async
-        self._tx_uart = None
-        self._hv_uart = None
+        self._tx_uart: Optional[LIFUUart] = None
+        self._hv_uart: Optional[LIFUUart] = None
+        self.txdevice: Optional[TxDevice] = None
+        self.hvcontroller: Optional[HVController] = None
         self.status = LIFUInterfaceStatus.STATUS_SYS_OFF
 
         self.voltage_table = None
