@@ -32,8 +32,10 @@ from openlifu_sdk.io.LIFUConfig import (
     OW_POWER_SET_HV,
     OW_POWER_SET_RGB,
     OW_POWER_VMON,
+    HW_ID_DATA_LENGTH
 )
 from openlifu_sdk.io.LIFUUart import LIFUUart
+from openlifu_sdk.util.hwid import format_hwid
 
 logger = logging.getLogger(__name__)
 
@@ -241,7 +243,7 @@ class HVController:
         """
         try:
             if self.uart.demo_mode:
-                return bytes.fromhex("deadbeefcafebabe5566778811223344")
+                return format_hwid("deadbeefcafebabe5566778811223344")
 
             if not self.uart.is_connected():
                 raise ValueError("Console Device not connected")
@@ -249,8 +251,8 @@ class HVController:
             r = self.uart.send_packet(id=None, packetType=OW_CMD, command=OW_CMD_HWID)
             self.uart.clear_buffer()
             # r.print_packet()
-            if r.data_len == 16:
-                return r.data.hex()
+            if r.data_len >= HW_ID_DATA_LENGTH: # HWID is returned as 16 bytes, but only uses first 12
+                return format_hwid(r.data[:HW_ID_DATA_LENGTH].hex())
             else:
                 return None
 
