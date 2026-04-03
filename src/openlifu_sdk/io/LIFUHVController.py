@@ -243,7 +243,7 @@ class HVController:
         """
         try:
             if self.uart.demo_mode:
-                return format_hwid("deadbeefcafebabe5566778811223344")
+                return format_hwid("deadbeefcafebabe55667788")
 
             if not self.uart.is_connected():
                 raise ValueError("Console Device not connected")
