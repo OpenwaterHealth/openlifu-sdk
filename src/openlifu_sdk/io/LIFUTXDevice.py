@@ -14,6 +14,7 @@ from openlifu_sdk.io.LIFUUart import LIFUUart
 from openlifu_sdk.io.LIFUUserConfig import LifuUserConfig
 from openlifu_sdk.util.annotations import OpenLIFUFieldData
 from openlifu_sdk.util.units import getunitconversion
+from openlifu_sdk.util.hwid import format_hwid
 
 DEFAULT_NUM_TRANSMITTERS = 2
 TRANSMITTERS_PER_MODULE = 2
@@ -104,7 +105,6 @@ ELASTIC_MODE_PULSE_LENGTH_ADJUST = 125e-6
 ProfileOpts = Literal['active', 'configured', 'all']
 TriggerModeOpts = Literal['sequence', 'continuous','single']
 DEFAULT_PULSE_WIDTH_US = 20
-HW_ID_DATA_LENGTH = 12
 TEMPERATURE_DATA_LENGTH = 4
 
 from openlifu_sdk.io.LIFUConfig import (
@@ -140,6 +140,7 @@ from openlifu_sdk.io.LIFUConfig import (
     TRIGGER_MODE_CONTINUOUS,
     TRIGGER_MODE_SEQUENCE,
     TRIGGER_MODE_SINGLE,
+    HW_ID_DATA_LENGTH
 )
 
 if TYPE_CHECKING:
@@ -376,7 +377,7 @@ class TxDevice:
         """
         try:
             if self.uart.demo_mode:
-                return bytes.fromhex("deadbeefcafebabe1122334455667788")
+                return format_hwid("deadbeefcafebabe11223344")
 
             if not self.uart.is_connected():
                 logger.error("TX Device not connected")
@@ -385,8 +386,8 @@ class TxDevice:
             r = self.uart.send_packet(id=None, packetType=OW_CMD, command=OW_CMD_HWID, addr=module)
             self.uart.clear_buffer()
             # r.print_packet()
-            if r.data_len == HW_ID_DATA_LENGTH:
-                return r.data.hex()
+            if r.data_len >= HW_ID_DATA_LENGTH:
+                return format_hwid(r.data[:HW_ID_DATA_LENGTH].hex())
             else:
                 return None
         except ValueError as v:
