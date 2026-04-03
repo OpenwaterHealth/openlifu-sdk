@@ -542,7 +542,7 @@ class TxDevice:
             logger.error(f"Invalid JSON: {e}")
             raise ValueError(f"Invalid JSON: {e}")
 
-    def get_temperature(self, module:int=1) -> float:
+    def get_temperature(self, module:int=0) -> float:
         """
         Retrieve the temperature reading from the TX device.
 
