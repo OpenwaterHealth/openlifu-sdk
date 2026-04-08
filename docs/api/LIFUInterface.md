@@ -25,4 +25,9 @@ Context manager support: `with LIFUInterface() as iface:` ensures `close()` is c
 Notes:
 
 - Safety parameters (allowed duty cycles and voltage charts) are defined in `LIFUInterface.py` and can be influenced by `voltage_table_selection` and `sequence_time_selection` constructor args.
-- For device-level operations inspect `openlifu_sdk.io.LIFUTXDevice` and `openlifu_sdk.io.LIFUHVController`.
+
+See also:
+
+- `LIFUTXDevice` (TX programming, profiles, triggers): [LIFUTXDevice API](LIFUTXDevice.md)
+- `LIFUHVController` (console/HV control, power, telemetry): [LIFUHVController API](LIFUHVController.md)
+- `LIFUDFU` (firmware update helpers): [LIFUDFU API](LIFUDFU.md)
