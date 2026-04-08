@@ -36,3 +36,8 @@ tx_connected, hv_connected = interface.is_device_connected()
 ## Examples
 
 See the `examples/` directory for usage scripts.
+
+Documentation
+-------------
+
+Detailed SDK documentation is available in the `docs/` folder. Start with [docs/README.md](docs/README.md) for installation, usage examples, and an API reference.
