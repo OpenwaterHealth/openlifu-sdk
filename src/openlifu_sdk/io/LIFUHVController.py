@@ -476,47 +476,47 @@ class HVController:
             logger.error("Unexpected error during process: %s", e)
             raise  # Re-raise the exception for the caller to handle
 
-    def wait_for_settle(self, range_volts:float = 2, settle_time: float = 0.5, timeout: float = 15.0, polling_interval: float = 0.1):
+    def wait_for_settle(self, range_volts: float = 2, settle_time: float = 0.5, timeout: float = 15.0, polling_interval: float = 0.1):
         """
         Wait for the high voltage to settle to within a target range after turning on.
 
         Args:
-            settle_time (int): The time in seconds to wait for the voltage to settle.
-            timeout (int): The maximum time in seconds to wait before giving up.
+            range_volts (float): The acceptable voltage range in volts.
+            settle_time (float): The time in seconds to wait for the voltage to settle.
+            timeout (float): The maximum time in seconds to wait before giving up.
+            polling_interval (float): The interval in seconds between voltage checks.
 
         Returns:
             bool: True if the voltage settled successfully, False if it timed out or an error occurred.
         """
         import time
+
         start_time = time.time()
         within_target_start_time = None
         within_range = False
+        target_voltage = self.supply_voltage if self.is_hv_on else 0.0
         while time.time() - start_time < timeout:
             loop_time = time.time()
             voltage = self.get_voltage()
             if voltage is None:
                 raise ValueError("Failed to read voltage during settle wait.")
-            logger.info(f"Current voltage: {voltage:.2f} V")
-            if abs(voltage - self.supply_voltage) <= range_volts:
+            logger.info(f"Current voltage: {voltage:.2f} V, Target: {target_voltage:.2f} V")
+            if abs(voltage - target_voltage) <= range_volts:
                 if not within_range:
-                    logger.info(f"Voltage ({voltage:.2f} V) is within target range of {self.supply_voltage} ± {range_volts} V. Starting settle timer.")
+                    logger.info(f"Voltage ({voltage:.2f} V) is within target range of {target_voltage:.2f} ± {range_volts:.2f} V. Starting settle timer.")
                     within_target_start_time = time.time()
                     within_range = True
                 elif time.time() - within_target_start_time >= settle_time:
                     logger.info(f"Voltage ({voltage:.2f} V) has settled successfully.")
-                    return
+                    return True
             else:
                 if within_range:
-                    logger.warning(f"Voltage ({voltage:.2f} V) went out of target range of {self.supply_voltage} ± {range_volts} V. Resetting settle timer.")
+                    logger.warning(f"Voltage ({voltage:.2f} V) went out of target range of {target_voltage:.2f} ± {range_volts:.2f} V. Resetting settle timer.")
                 within_range = False
                 within_target_start_time = None
-            time.sleep(polling_interval - (max(time.time() - loop_time, 0)))  # Adjust sleep to maintain consistent polling interval
-        raise TimeoutError("Timed out waiting for voltage to settle.")    
-
-
-        
-        
-
+            time.sleep(max(0, polling_interval - (time.time() - loop_time)))  # Adjust sleep to maintain consistent polling interval
+        logger.error("Timed out waiting for voltage to settle.")
+        return False    
 
     def turn_hv_off(self):
         """
