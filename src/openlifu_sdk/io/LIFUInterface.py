@@ -367,6 +367,7 @@ class LIFUInterface:
             if self.hvcontroller is not None:
                 logger.info("Turn ON HV")
                 bHvOn = self.hvcontroller.turn_hv_on()
+                self.hvcontroller.wait_for_settle()
             else:
                 logger.info("Using external power supply, HV will not be turned ON.")
                 bHvOn = True
@@ -433,6 +434,7 @@ class LIFUInterface:
             if self.hvcontroller is not None:
                 logger.info("Turn OFF HV")
                 bHvOff = self.hvcontroller.turn_hv_off()
+                self.hvcontroller.wait_for_settle()
             else:
                 logger.info("Using external power supply, HV will not be turned OFF.")
                 bHvOff = True

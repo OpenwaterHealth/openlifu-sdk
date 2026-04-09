@@ -476,6 +476,48 @@ class HVController:
             logger.error("Unexpected error during process: %s", e)
             raise  # Re-raise the exception for the caller to handle
 
+    def wait_for_settle(self, range_volts:float = 2, settle_time: float = 0.5, timeout: float = 15.0, polling_interval: float = 0.1):
+        """
+        Wait for the high voltage to settle to within a target range after turning on.
+
+        Args:
+            settle_time (int): The time in seconds to wait for the voltage to settle.
+            timeout (int): The maximum time in seconds to wait before giving up.
+
+        Returns:
+            bool: True if the voltage settled successfully, False if it timed out or an error occurred.
+        """
+        import time
+        start_time = time.time()
+        within_target_start_time = None
+        within_range = False
+        while time.time() - start_time < timeout:
+            loop_time = time.time()
+            voltage = self.get_voltage()
+            if voltage is None:
+                raise ValueError("Failed to read voltage during settle wait.")
+            logger.info(f"Current voltage: {voltage:.2f} V")
+            if abs(voltage - self.supply_voltage) <= range_volts:
+                if not within_range:
+                    logger.info(f"Voltage ({voltage:.2f} V) is within target range of {self.supply_voltage} ± {range_volts} V. Starting settle timer.")
+                    within_target_start_time = time.time()
+                    within_range = True
+                elif time.time() - within_target_start_time >= settle_time:
+                    logger.info(f"Voltage ({voltage:.2f} V) has settled successfully.")
+                    return
+            else:
+                if within_range:
+                    logger.warning(f"Voltage ({voltage:.2f} V) went out of target range of {self.supply_voltage} ± {range_volts} V. Resetting settle timer.")
+                within_range = False
+                within_target_start_time = None
+            time.sleep(polling_interval - (max(time.time() - loop_time, 0)))  # Adjust sleep to maintain consistent polling interval
+        raise TimeoutError("Timed out waiting for voltage to settle.")    
+
+
+        
+        
+
+
     def turn_hv_off(self):
         """
         Turn off the high voltage.
