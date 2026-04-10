@@ -38,7 +38,11 @@ from openlifu_sdk.io.LIFUUart import LIFUUart
 from openlifu_sdk.util.hwid import format_hwid
 
 logger = logging.getLogger(__name__)
-
+ch = logging.StreamHandler()
+formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+ch.setFormatter(formatter)
+logger.addHandler(ch)
+logger.propagate = True
 
 class HVController:
     def __init__(self, uart: LIFUUart = None):
@@ -350,7 +354,7 @@ class HVController:
             if not self.uart.is_connected():
                 raise ValueError("Console not connected")
 
-            logger.info("Turning off 12V.")
+            logger.debug("Turning off 12V.")
 
             r = self.uart.send_packet(
                 id=None, packetType=OW_POWER, command=OW_POWER_12V_OFF
@@ -414,7 +418,7 @@ class HVController:
             if not self.uart.is_connected():
                 raise ValueError("Console not connected")
 
-            logger.info("Get 12V voltage status.")
+            logger.debug("Get 12V voltage status.")
 
             r = self.uart.send_packet(
                 id=None, packetType=OW_POWER, command=OW_POWER_GET_12VON
@@ -452,7 +456,7 @@ class HVController:
             if not self.uart.is_connected():
                 raise ValueError("Console not connected")
 
-            logger.info("Turning on high voltage.")
+            logger.debug("Turning on high voltage.")
 
             r = self.uart.send_packet(
                 id=None, packetType=OW_POWER, command=OW_POWER_HV_ON, timeout=30
@@ -476,6 +480,55 @@ class HVController:
             logger.error("Unexpected error during process: %s", e)
             raise  # Re-raise the exception for the caller to handle
 
+    def wait_for_settle(self, range_volts: float = 2, settle_time: float = 0.5, timeout: float = 15.0, polling_interval: float = 0.1):
+        """
+        Wait for the high voltage to settle to within a target range after turning on.
+
+        Args:
+            range_volts (float): The acceptable voltage range in volts.
+            settle_time (float): The time in seconds to wait for the voltage to settle.
+            timeout (float): The maximum time in seconds to wait before giving up.
+            polling_interval (float): The interval in seconds between voltage checks.
+
+        Returns:
+            bool: True if the voltage settled successfully, False if it timed out or an error occurred.
+        """
+        import time
+
+        start_time = time.time()
+        within_target_start_time = None
+        within_range = False
+        if self.is_hv_on:
+            target_voltage = self.supply_voltage
+        else:
+            target_voltage = 0
+        while time.time() - start_time < timeout:
+            loop_time = time.time()
+            current_voltage = self.get_voltage()
+            if current_voltage is None:
+                raise ValueError("Failed to read voltage during settle wait.")
+            logger.debug(f"Current voltage: {current_voltage:.2f} V")
+            if abs(current_voltage - target_voltage) <= range_volts:
+                if not within_range:
+                    logger.debug(f"Voltage ({current_voltage:.2f} V) is within target range of {target_voltage} ± {range_volts} V. Starting {settle_time:0.2f} S settle timer.")
+                    within_target_start_time = time.time()
+                    within_range = True
+                elif time.time() - within_target_start_time >= settle_time:
+                    logger.info(f"Voltage ({current_voltage:.2f} V) has settled successfully.")
+                    return
+            else:
+                if within_range:
+                    logger.warning(f"Voltage ({current_voltage:.2f} V) went out of target range of {target_voltage} ± {range_volts} V. Resetting {settle_time:0.2f} S settle timer.")
+                within_range = False
+                within_target_start_time = None
+            time.sleep(polling_interval - (max(time.time() - loop_time, 0)))  # Adjust sleep to maintain consistent polling interval
+        raise TimeoutError(f"Voltage ({current_voltage:.2f} V) failed to stabilize for {settle_time:0.2f}S within {target_voltage} ± {range_volts} V within {timeout} S.")    
+
+
+        
+        
+
+
     def turn_hv_off(self):
         """
         Turn off the high voltage.
@@ -487,7 +540,7 @@ class HVController:
             if not self.uart.is_connected():
                 raise ValueError("Console not connected")
 
-            logger.info("Turning off high voltage.")
+            logger.debug("Turning off high voltage.")
 
             r = self.uart.send_packet(
                 id=None, packetType=OW_POWER, command=OW_POWER_HV_OFF
@@ -519,7 +572,7 @@ class HVController:
             if not self.uart.is_connected():
                 raise ValueError("Console not connected")
 
-            logger.info("Get high voltage status.")
+            logger.debug("Get high voltage status.")
 
             r = self.uart.send_packet(
                 id=None, packetType=OW_POWER, command=OW_POWER_GET_HVON
@@ -695,7 +748,7 @@ class HVController:
             if self.uart.demo_mode:
                 return 18.4
 
-            logger.info("Getting current output voltage.")
+            logger.debug("Getting current output voltage.")
 
             r = self.uart.send_packet(
                 id=None, packetType=OW_POWER, command=OW_POWER_GET_HV
@@ -751,7 +804,7 @@ class HVController:
             if self.uart.demo_mode:
                 return 40
 
-            logger.info("Getting current output voltage.")
+            logger.debug(f"Setting fan {fan_id} speed to {fan_speed}")
 
             data = bytes(
                 [
@@ -774,7 +827,7 @@ class HVController:
                 logger.error("Error setting Fan Speed")
                 return -1
 
-            logger.info(f"Set fan speed to {fan_speed}")
+            logger.info(f"Set fan {fan_id} speed to {fan_speed}")
             return fan_speed
 
         except ValueError as v:
@@ -808,7 +861,7 @@ class HVController:
             if self.uart.demo_mode:
                 return 40.0
 
-            logger.info("Getting current output voltage.")
+            logger.debug("Getting fan {fan_id} speed")
 
             r = self.uart.send_packet(
                 id=None, addr=fan_id, packetType=OW_POWER, command=OW_POWER_GET_FAN
@@ -823,7 +876,7 @@ class HVController:
 
             elif r.data_len == 1:
                 fan_value = r.data[0]
-                logger.info(f"Output fan speed is {fan_value}")
+                logger.info(f"Output fan {fan_id} speed is {fan_value}")
                 return fan_value
             else:
                 logger.error("Error getting output voltage from device")
@@ -862,7 +915,7 @@ class HVController:
             if self.uart.demo_mode:
                 return rgb_state
 
-            logger.info("Setting RGB LED state.")
+            logger.debug("Setting RGB LED state.")
 
             # Send the RGB state as the reserved byte in the packet
             r = self.uart.send_packet(

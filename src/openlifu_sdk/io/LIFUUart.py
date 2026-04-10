@@ -493,8 +493,28 @@ class LIFUUart:
                     # Optionally, check that the response has the expected type and command.
                     if response.packet_type == OW_RESP and response.command == command:
                         return response
+                    elif response.packet_type == OW_RESP:
+                        # Correct response type but command byte doesn't echo the sent command.
+                        # Some firmware versions return a status code (e.g. 0xFF) in the command
+                        # field of OW_RESP packets rather than echoing the original command.
+                        # The payload is still valid; log at WARNING level and return the response.
+                        log.error(
+                            "Response command mismatch (firmware status in cmd field): "
+                            "id=%s cmd=%s expected_cmd=%s – data may still be valid",
+                            getattr(response, "id", None),
+                            getattr(response, "command", None),
+                            command
+                        )
+                        return response
                     else:
-                        log.error("Received unexpected response: %s", response)
+                        log.error(
+                            "Received unexpected response: id=%s type=%s cmd=%s expected_type=%s expected_cmd=%s",
+                            getattr(response, "id", None),
+                            getattr(response, "packet_type", None),
+                            getattr(response, "command", None),
+                            OW_RESP,
+                            command
+                        )
                         return response
                 except queue.Empty:
                     log.error("Timeout waiting for response to packet ID %d", id)
@@ -507,8 +527,8 @@ class LIFUUart:
         except ValueError as ve:
             log.error("Validation error in send_packet: %s", ve)
             raise
-        except Exception as e:
-            log.error("Unexpected error in send_packet: %s", e)
+        except Exception as e:            
+            log.error("Unexpected response: %s", e)
             raise
 
     def clear_buffer(self):

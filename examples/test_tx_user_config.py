@@ -83,10 +83,10 @@ def parse_json_value(value_str: str) -> any:
         return parse_value(value_str)
 
 
-def read_config_action(interface, output_file: str = None) -> bool:
+def read_config_action(interface, output_file: str = None, module: int = 0) -> bool:
     """Read configuration from device and display or save it."""
     print("Reading configuration from device...")
-    config = interface.txdevice.read_config()
+    config = interface.txdevice.read_config(module=module)
 
     if config is None:
         print("Error: Failed to read configuration")
@@ -113,10 +113,10 @@ def read_config_action(interface, output_file: str = None) -> bool:
     return True
 
 
-def get_value_action(interface, key: str) -> bool:
+def get_value_action(interface, key: str, module: int = 0) -> bool:
     """Get a specific value from the configuration."""
     print("Reading configuration from device...")
-    config = interface.txdevice.read_config()
+    config = interface.txdevice.read_config(module=module)
 
     if config is None:
         print("Error: Failed to read configuration")
@@ -133,10 +133,10 @@ def get_value_action(interface, key: str) -> bool:
     return True
 
 
-def set_values_action(interface, key_value_pairs: list) -> bool:
+def set_values_action(interface, key_value_pairs: list, module: int = 0) -> bool:
     """Set one or more values in the configuration."""
     print("Reading current configuration...")
-    config = interface.txdevice.read_config()
+    config = interface.txdevice.read_config(module=module)
 
     if config is None:
         print("Error: Failed to read configuration")
@@ -157,7 +157,7 @@ def set_values_action(interface, key_value_pairs: list) -> bool:
 
     # Write to device
     print("\nWriting configuration to device...")
-    updated_config = interface.txdevice.write_config(config)
+    updated_config = interface.txdevice.write_config(config, module=module)
 
     if updated_config is None:
         print("Error: Failed to write configuration")
@@ -170,10 +170,10 @@ def set_values_action(interface, key_value_pairs: list) -> bool:
     return True
 
 
-def remove_keys_action(interface, keys: list) -> bool:
+def remove_keys_action(interface, keys: list, module: int = 0) -> bool:
     """Remove one or more keys from the configuration."""
     print("Reading current configuration...")
-    config = interface.txdevice.read_config()
+    config = interface.txdevice.read_config(module=module)
 
     if config is None:
         print("Error: Failed to read configuration")
@@ -200,7 +200,7 @@ def remove_keys_action(interface, keys: list) -> bool:
 
     # Write to device
     print("\nWriting configuration to device...")
-    updated_config = interface.txdevice.write_config(config)
+    updated_config = interface.txdevice.write_config(config, module=module)
 
     if updated_config is None:
         print("Error: Failed to write configuration")
@@ -213,7 +213,7 @@ def remove_keys_action(interface, keys: list) -> bool:
     return True
 
 
-def write_file_action(interface, json_file: str) -> bool:
+def write_file_action(interface, json_file: str, module: int = 0) -> bool:
     """Write configuration from a JSON file to the device."""
     try:
         with open(json_file, 'r') as f:
@@ -234,7 +234,7 @@ def write_file_action(interface, json_file: str) -> bool:
         return False
 
     print("\nWriting configuration to device...")
-    config = interface.txdevice.read_config()
+    config = interface.txdevice.read_config(module=module)
 
     if config is None:
         print("Error: Failed to read current configuration")
@@ -246,7 +246,7 @@ def write_file_action(interface, json_file: str) -> bool:
     # Keep the same sequence number or increment it
     # The device will assign its own sequence on write
 
-    updated_config = interface.txdevice.write_config(config)
+    updated_config = interface.txdevice.write_config(config, module=module)
 
     if updated_config is None:
         print("Error: Failed to write configuration")
@@ -298,6 +298,9 @@ Examples:
     parser.add_argument('--output', metavar='FILE',
                         help='Save read configuration to a JSON file')
 
+    parser.add_argument('--module', '-m', type=int, default=0,
+                        help='Module index to operate on (0 = USB master, 1+ = slaves)')
+
     args = parser.parse_args()
 
     # Check if at least one action is specified
@@ -344,21 +347,21 @@ Examples:
     success = True
 
     if args.read:
-        success = read_config_action(interface, args.output) and success
+        success = read_config_action(interface, args.output, module=args.module) and success
 
     if args.get:
-        success = get_value_action(interface, args.get) and success
+        success = get_value_action(interface, args.get, module=args.module) and success
 
     if args.set:
-        success = set_values_action(interface, args.set) and success
+        success = set_values_action(interface, args.set, module=args.module) and success
 
     if args.remove:
         # Flatten nested lists from action='append'
         all_keys = [key for sublist in args.remove for key in sublist]
-        success = remove_keys_action(interface, all_keys) and success
+        success = remove_keys_action(interface, all_keys, module=args.module) and success
 
     if args.write_file:
-        success = write_file_action(interface, args.write_file) and success
+        success = write_file_action(interface, args.write_file, module=args.module) and success
 
     return 0 if success else 1
 
