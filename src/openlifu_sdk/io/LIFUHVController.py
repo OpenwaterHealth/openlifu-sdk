@@ -480,18 +480,21 @@ class HVController:
             logger.error("Unexpected error during process: %s", e)
             raise  # Re-raise the exception for the caller to handle
 
-    def wait_for_settle(self, range_volts:float = 2, settle_time: float = 0.5, timeout: float = 15.0, polling_interval: float = 0.1):
+    def wait_for_settle(self, range_volts: float = 2, settle_time: float = 0.5, timeout: float = 15.0, polling_interval: float = 0.1):
         """
         Wait for the high voltage to settle to within a target range after turning on.
 
         Args:
-            settle_time (int): The time in seconds to wait for the voltage to settle.
-            timeout (int): The maximum time in seconds to wait before giving up.
+            range_volts (float): The acceptable voltage range in volts.
+            settle_time (float): The time in seconds to wait for the voltage to settle.
+            timeout (float): The maximum time in seconds to wait before giving up.
+            polling_interval (float): The interval in seconds between voltage checks.
 
         Returns:
             bool: True if the voltage settled successfully, False if it timed out or an error occurred.
         """
         import time
+
         start_time = time.time()
         within_target_start_time = None
         within_range = False

@@ -390,6 +390,9 @@ class LIFUInterface:
                 return True
             else:
                 logger.error("Failed to start sonication.")
+                if self.hvcontroller is not None:
+                    logger.info("Turning off HV due to failure.")
+                    self.hvcontroller.turn_hv_off()
                 return False
 
         except ValueError as v:
