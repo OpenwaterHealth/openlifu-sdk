@@ -146,10 +146,12 @@ from openlifu_sdk.io.LIFUConfig import (
 if TYPE_CHECKING:
     pass
 
-
-logger = logging.getLogger("TXDevice")
-logger.setLevel(logging.INFO)
-logger.propagate = False
+logger = logging.getLogger(__name__)
+ch = logging.StreamHandler()
+formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+ch.setFormatter(formatter)
+logger.addHandler(ch)
+logger.propagate = True
 
 if not logger.handlers:
     handler = logging.StreamHandler()
@@ -1024,7 +1026,7 @@ class TxDevice:
                     tx_module_count = r.data[0]
                 else:
                     logger.error("Error retrieving TX module count.")
-            logger.info("TX Module Count: %d", tx_module_count)
+            logger.debug("TX Module Count: %d", tx_module_count)
             return tx_module_count
         except ValueError as v:
             logger.error("ValueError: %s", v)
@@ -1707,7 +1709,7 @@ class TxDevice:
 
             if r.packet_type != OW_ERROR and r.data_len >= 1:
                 count = r.data[0]
-                logger.info("Module count from firmware: %d", count)
+                logger.debug("Module count from firmware: %d", count)
                 return count
 
             # Fallback: TX7332 chip count / 2
