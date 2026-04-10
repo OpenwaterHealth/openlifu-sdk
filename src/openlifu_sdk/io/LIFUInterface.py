@@ -53,6 +53,12 @@ class LIFUInterfaceStatus(Enum):
     STATUS_ERROR = 8
 
 logger = logging.getLogger(__name__)
+ch = logging.StreamHandler()
+formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+ch.setFormatter(formatter)
+logger.addHandler(ch)
+logger.propagate = True
+
 
 class LIFUInterface:
     signal_connect: LIFUSignal = LIFUSignal()
@@ -335,7 +341,7 @@ class LIFUInterface:
             solution_name = "Solution"
 
         voltage = solution['voltage']
-        logger.info("Loading %s...", solution_name)
+        logger.debug("Loading %s...", solution_name)
         # Convert solution data and send to the device
         self.txdevice.set_solution(
                 pulse = solution['pulse'],
@@ -349,7 +355,6 @@ class LIFUInterface:
         self.set_status(LIFUInterfaceStatus.STATUS_READY)
 
         if self.hvcontroller is not None:
-            logger.info(f"Setting HV to {voltage} V...")
             self.hvcontroller.set_voltage(voltage)
 
         logger.info("%s loaded successfully.", solution_name)
@@ -365,16 +370,17 @@ class LIFUInterface:
                 return True
 
             if self.hvcontroller is not None:
-                logger.info("Turn ON HV")
+                logger.debug("Turn ON HV")
                 bHvOn = self.hvcontroller.turn_hv_on()
+                self.hvcontroller.wait_for_settle()
             else:
-                logger.info("Using external power supply, HV will not be turned ON.")
+                logger.debug("Using external power supply, HV will not be turned ON.")
                 bHvOn = True
 
             if self._async_mode:
                 self.txdevice.async_mode(True)
 
-            logger.info("Start Sonication")
+            logger.debug("Starting Trigger")
             # Send the solution data to the device
             bTriggerOn = self.txdevice.start_trigger()
 
@@ -384,6 +390,9 @@ class LIFUInterface:
                 return True
             else:
                 logger.error("Failed to start sonication.")
+                if self.hvcontroller is not None:
+                    logger.info("Turning off HV due to failure.")
+                    self.hvcontroller.turn_hv_off()
                 return False
 
         except ValueError as v:
@@ -401,7 +410,7 @@ class LIFUInterface:
         Args:
             status (LIFUInterfaceStatus): The status to set.
         """
-        logger.info("Setting device status to %s", status.name)
+        logger.debug("Setting device status to %s", status.name)
         self.status = status
 
     def get_status(self) -> LIFUInterfaceStatus:
@@ -426,15 +435,16 @@ class LIFUInterface:
             if self._test_mode:
                 return True
 
-            logger.info("Stop Sonication")
+            logger.debug("Stopping trigger")
             # Send the solution data to the device
             bTriggerOff = self.txdevice.stop_trigger()
 
             if self.hvcontroller is not None:
-                logger.info("Turn OFF HV")
+                logger.debug("Turn OFF HV")
                 bHvOff = self.hvcontroller.turn_hv_off()
+                self.hvcontroller.wait_for_settle(timeout=10)
             else:
-                logger.info("Using external power supply, HV will not be turned OFF.")
+                logger.debug("Using external power supply, HV will not be turned OFF.")
                 bHvOff = True
 
             if self._async_mode:
