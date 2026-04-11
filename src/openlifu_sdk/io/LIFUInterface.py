@@ -16,10 +16,13 @@ from openlifu_sdk.io.LIFUUart import LIFUUart
 
 REF_MAX_SEQUENCE_TIMES = {
     "default": [2*60, 5*60, 10*60],    # users to use default values
-    "stress_test": [5*60, 9*60, 15*60] # QA to use stress test values
+    "stress_test": [60*60, 60*60, 60*60] # QA to use stress test values
 }
 
-REF_MAX_DUTY_CYCLES = [0.05, 0.1, 0.2, 0.3, 0.4, 0.5]
+REF_MAX_DUTY_CYCLES = {
+    "default": [0.05, 0.1, 0.2, 0.3, 0.4, 0.5],
+    "stress_test": [0.5, 0.5, 0.5, 0.5, 0.5, 0.5]
+}
 
 MAX_VOLTAGE_BY_DUTY_CYCLE_AND_SEQUENCE_TIME = {
     "evt2": [
@@ -79,7 +82,8 @@ class LIFUInterface:
                  ext_power_supply: bool = False,
                  module_invert: bool | List[bool] = False,
                  voltage_table_selection: Optional[str] = None,
-                 sequence_time_selection: Optional[str] = None) -> None:
+                 sequence_time_selection: Optional[str] = None,
+                 duty_cycle_selection: Optional[str] = None) -> None:
         """
         Initialize the LIFUInterface with given parameters and store them in the class.
 
@@ -106,8 +110,10 @@ class LIFUInterface:
 
         self.voltage_table = None
         self.sequence_time = None
+        self.duty_cycles = None
         self.voltage_table_selection = voltage_table_selection
         self.sequence_time_selection = sequence_time_selection
+        self.duty_cycle_selection = duty_cycle_selection
 
         # Create a TXDevice instance as part of the interface
         logger.debug("Initializing TX Module of LIFUInterface with VID: %s, PID: %s, baudrate: %s, timeout: %s", vid, tx_pid, baudrate, timeout)
@@ -156,6 +162,16 @@ class LIFUInterface:
             if sequence_time not in REF_MAX_SEQUENCE_TIMES:
                 raise ValueError(f"Invalid sequence_time option '{sequence_time}'. Valid options are: {tuple(REF_MAX_SEQUENCE_TIMES.keys())}")
             return REF_MAX_SEQUENCE_TIMES[sequence_time]
+
+    # Restrict duty cycle options for users vs QA
+    def _resolve_duty_cycle_set(self, duty_cycle: str) -> list[float]:
+        if duty_cycle is None:
+            return REF_MAX_DUTY_CYCLES["default"]
+        else:
+            duty_cycle = duty_cycle.lower()
+            if duty_cycle not in REF_MAX_DUTY_CYCLES:
+                raise ValueError(f"Invalid duty_cycle option '{duty_cycle}'. Valid options are: {tuple(REF_MAX_DUTY_CYCLES.keys())}")
+            return REF_MAX_DUTY_CYCLES[duty_cycle]
 
     async def start_monitoring(self, interval: int = 1) -> None:
         """Start monitoring for USB device connections."""
@@ -212,7 +228,7 @@ class LIFUInterface:
         sequence_duration = self.get_sequence_duration(solution)
 
         # Find the index of the duty cycle in the reference list
-        duty_cycles_limits = np.array(REF_MAX_DUTY_CYCLES)
+        duty_cycles_limits = np.array(self.duty_cycles)
         duty_cycle_index = np.where(duty_cycles_limits >= sequence_duty_cycle)[0][0]
 
         # Find the index of the duration in the reference list
@@ -230,12 +246,12 @@ class LIFUInterface:
             pd.DataFrame: A DataFrame containing the maximum voltages.
         """
         data = {
-            "Duty Cycle (%)": [f"<={100 * dc:0.1f}%" for dc in REF_MAX_DUTY_CYCLES],
+            "Duty Cycle (%)": [f"<={100 * dc:0.1f}%" for dc in self.duty_cycles],
             }
         for i, duration in enumerate(self.sequence_time):
             col_name = f"<={duration // 60} min"
             data[col_name] = [
-                self.voltage_table[j][i] for j in range(len(REF_MAX_DUTY_CYCLES))
+                self.voltage_table[j][i] for j in range(len(self.duty_cycles))
             ]
         max_voltage =  pd.DataFrame(data).set_index("Duty Cycle (%)")
         max_voltage.Name = "Maximum Voltage (V)"
@@ -253,8 +269,9 @@ class LIFUInterface:
         
         self.voltage_table = self._resolve_voltage_chart_evt_version(self.voltage_table_selection)
         self.sequence_time = self._resolve_max_sequence_time_set(self.sequence_time_selection)
+        self.duty_cycles = self._resolve_duty_cycle_set(self.duty_cycle_selection)
         sequence_duty_cycle = self.get_sequence_duty_cycle(solution)
-        duty_cycles_limits = np.array(REF_MAX_DUTY_CYCLES)
+        duty_cycles_limits = np.array(self.duty_cycles)
         if sequence_duty_cycle > duty_cycles_limits.max():
             raise ValueError(f"Sequence duty cycle ({100*sequence_duty_cycle:0.1f} %) exceeds maximum allowed duty cycle ({100*duty_cycles_limits.max():0.1f} %).")
         duty_cycle_index = np.where(duty_cycles_limits >= sequence_duty_cycle)[0][0]
