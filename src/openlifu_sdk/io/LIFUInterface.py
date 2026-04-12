@@ -461,7 +461,7 @@ class LIFUInterface:
             if self.hvcontroller is not None:
                 logger.debug("Turn OFF HV")
                 bHvOff = self.hvcontroller.turn_hv_off()
-                self.hvcontroller.wait_for_settle(timeout=10)
+                # self.hvcontroller.wait_for_settle(timeout=10) #commenting out until better solution is implemented due to long discharge time
             else:
                 logger.debug("Using external power supply, HV will not be turned OFF.")
                 bHvOff = True
