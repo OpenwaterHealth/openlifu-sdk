@@ -329,6 +329,7 @@ class LIFUInterface:
                      profile_index:int=1,
                      profile_increment:bool=True,
                      trigger_mode: TriggerModeOpts = "sequence",
+                     _allow_unsafe_solution: bool = False
                      ) -> None:
         """
         Load a solution to the device.
@@ -339,10 +340,11 @@ class LIFUInterface:
             profile_increment (bool): Increment the profile index
             trigger_mode (TriggerModeOpts): The trigger mode to use (defaults to "sequence")
             module_invert (List[bool]|bool): Invert the signal on all modules (singleton) or specific modules (list) (defaults to False)
+            _allow_unsafe_solution (bool): Allow loading a solution that may be unsafe (defaults to False)
         """
         
-
-        self.check_solution(solution)
+        if not _allow_unsafe_solution:
+            self.check_solution(solution)
 
         if "transducer" in solution and solution["transducer"] is not None and "module_invert" in solution["transducer"]:
             self.txdevice.set_module_invert(solution["transducer"]["module_invert"])
