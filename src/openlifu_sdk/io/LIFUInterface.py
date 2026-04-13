@@ -378,9 +378,12 @@ class LIFUInterface:
 
         logger.info("%s loaded successfully.", solution_name)
 
-    def start_sonication(self) -> bool:
+    def start_sonication(self, async_mode: bool | None = None) -> bool:
         """
         Start sonication.
+
+        Args:
+            async_mode (bool | None): Whether to start sonication in asynchronous mode (defaults to None, which means it will use the current async mode setting of the interface).
 
         Sets the device to a running state and sends a start command if necessary.
         """
@@ -396,8 +399,10 @@ class LIFUInterface:
                 logger.debug("Using external power supply, HV will not be turned ON.")
                 bHvOn = True
 
-            if self._async_mode:
-                self.txdevice.async_mode(True)
+            if async_mode is not None:
+                self.txdevice.async_mode(async_mode)
+            else:
+                self.txdevice.async_mode(self._async_mode)
 
             logger.debug("Starting Trigger")
             # Send the solution data to the device
@@ -466,8 +471,7 @@ class LIFUInterface:
                 logger.debug("Using external power supply, HV will not be turned OFF.")
                 bHvOff = True
 
-            if self._async_mode:
-                self.txdevice.async_mode(False)
+            self.txdevice.async_mode(False)
 
             if bTriggerOff and bHvOff:
                 logger.info("Sonication stopped successfully.")
