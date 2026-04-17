@@ -29,9 +29,11 @@ def main() -> int:
     print(f"TX7332 device count: {tx7332_count}")
 
     for i in range(count):
+        hw_id = tx.get_hardware_id(module=i)
+        fw_ver = tx.get_version(module=i)
         temp = tx.get_temperature(module=i)
         ambient = tx.get_ambient(module=i)
-        print(f"  Module {i}: temp={temp} °C, ambient={ambient} °C")
+        print(f"  Module {i}: hw_id={hw_id}, fw_ver={fw_ver}, temp={temp} °C, ambient={ambient} °C")
 
     tx.close()
     return 0
