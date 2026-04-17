@@ -8,7 +8,6 @@ from ow_comms.config import DEFAULT_TIMEOUT, OW_VID
 from .LIFUTransmitter import LIFUTransmitter, TriggerMode
 from .LIFUConsole import LIFUConsole
 from .LIFUConfig import OW_TRANSMITTER_PID, OW_CONSOLE_PID
-from ..services.SolutionService import SolutionService
 from ..services.SonicationService import SonicationService
 
 log = logging.getLogger("LIFUInterface")
@@ -21,11 +20,6 @@ class LIFUInterface:
                  con_vid: int = OW_VID, con_pid: int = OW_CONSOLE_PID):
         self.transmitter = LIFUTransmitter(tx_vid, tx_pid, baudrate=baudrate, timeout=timeout)
         self.console = LIFUConsole(con_vid, con_pid, baudrate=baudrate, timeout=timeout)
-
-        self.solution_service = SolutionService(
-            transmitter=self.transmitter,
-            console=self.console,
-        )
 
         self.sonication_service = SonicationService(
             transmitter=self.transmitter,

@@ -11,7 +11,7 @@ authors = [
 ]
 description = "Openwater LIFU SDK — hardware I/O interface library"
 readme = { file = "README.md", content-type = "text/markdown" }
-requires-python = ">=3.12"
+requires-python = ">=3.10"
 license = "MIT"
 license-files = ["LICENSE"]
 classifiers = [
@@ -21,11 +21,14 @@ classifiers = [
   "Operating System :: OS Independent",
   "Programming Language :: Python",
   "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
   "Programming Language :: Python :: 3.12",
   "Topic :: Scientific/Engineering",
   "Typing :: Typed",
 ]
 dependencies = [
+  "ow-comms-sdk",
   "numpy",
   "pandas",
   "xarray",
@@ -35,22 +38,12 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-test = [
-  "pytest>=6",
-  "pytest-cov>=3",
-  "pytest-mock",
-]
-dev = [
-  "pytest>=6",
-  "pytest-cov>=3",
-  "pytest-mock",
-]
-
+test = ["pytest>=6", "pytest-cov>=3", "pytest-mock"]
+dev = ["openlifu-sdk[test]"]
 
 [project.urls]
 Homepage = "https://github.com/OpenwaterHealth/openlifu-sdk"
 "Bug Tracker" = "https://github.com/OpenwaterHealth/openlifu-sdk/issues"
-
 
 [tool.setuptools.packages.find]
 where = ["src"]
@@ -62,7 +55,6 @@ openlifu_sdk = [
   "libusb/win64/*.dll",
   "libusb/win32/*.dll",
 ]
-
 
 [tool.setuptools_scm]
 # Uses tags like v1.2.3 or 1.2.3  ->  1.2.3
