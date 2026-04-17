@@ -338,7 +338,7 @@ class ConsoleGUI(QMainWindow):
     # ------------------------------------------------------------------
 
     def _on_connected(self, desc: str, port: str):
-        if desc != "Console":
+        if desc != "LIFUConsole":
             return
         self._console_connected = True
         self._status_indicator.set_connected(True)
@@ -349,7 +349,7 @@ class ConsoleGUI(QMainWindow):
         self._cmd_version()
 
     def _on_disconnected(self, desc: str):
-        if desc != "Console":
+        if desc != "LIFUConsole":
             return
         self._console_connected = False
         self._status_indicator.set_connected(False)
@@ -362,7 +362,7 @@ class ConsoleGUI(QMainWindow):
         self._append_log("Disconnected")
 
     def _on_data(self, desc: str, pkt):
-        if desc != "Console":
+        if desc != "LIFUConsole":
             return
         self._append_log(
             f"RX id={pkt.id} type=0x{pkt.packet_type:02X} "
@@ -370,7 +370,7 @@ class ConsoleGUI(QMainWindow):
         )
 
     def _on_error(self, desc: str, pkt_id: int, msg: str):
-        if desc != "Console":
+        if desc != "LIFUConsole":
             return
         self._append_log(f"ERROR id={pkt_id} {msg}")
 
