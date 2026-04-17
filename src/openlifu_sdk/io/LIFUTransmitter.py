@@ -79,7 +79,7 @@ class LIFUTransmitter(OWComponent):
         if data is None:
             raise ValueError("Trigger data cannot be None")
         payload = json.dumps(data).encode("utf-8")
-        r = self.send(packet_type=OW_CONTROLLER, command=OW_CTRL_SET_SWTRIG, data=payload)
+        r = self.send(packet_type=OW_CONTROLLER, command=OW_CTRL_SET_SWTRIG, addr=0, data=payload)
         r.print_packet()
         if r is None or r.packet_type == OW_ERROR or r.data_len == 0:
             log.error("set_trigger failed")
@@ -97,7 +97,7 @@ class LIFUTransmitter(OWComponent):
             Parsed JSON response dict, or None on error.
         """
         self._require_connected()
-        r = self.send(packet_type=OW_CONTROLLER, command=OW_CTRL_GET_SWTRIG)
+        r = self.send(packet_type=OW_CONTROLLER, command=OW_CTRL_GET_SWTRIG, addr=0)
         r.print_packet()
         if r is None or r.packet_type == OW_ERROR or r.data_len == 0:
             log.error("get_trigger failed")
@@ -115,7 +115,7 @@ class LIFUTransmitter(OWComponent):
             True if started successfully, False otherwise.
         """
         self._require_connected()
-        r = self.send(packet_type=OW_CONTROLLER, command=OW_CTRL_START_SWTRIG)
+        r = self.send(packet_type=OW_CONTROLLER, command=OW_CTRL_START_SWTRIG, addr=0)
         r.print_packet()
         if r is None or r.packet_type == OW_ERROR:
             log.error("start_trigger failed")
@@ -129,7 +129,7 @@ class LIFUTransmitter(OWComponent):
             True if stopped successfully, False otherwise.
         """
         self._require_connected()
-        r = self.send(packet_type=OW_CONTROLLER, command=OW_CTRL_STOP_SWTRIG)
+        r = self.send(packet_type=OW_CONTROLLER, command=OW_CTRL_STOP_SWTRIG, addr=0)
         r.print_packet()
         if r is None or r.packet_type == OW_ERROR:
             log.error("stop_trigger failed")
@@ -150,7 +150,7 @@ class LIFUTransmitter(OWComponent):
             Number of modules, or 0 on error.
         """
         self._require_connected()
-        r = self.send(packet_type=OW_CONTROLLER, command=OW_CTRL_GET_MODULE_COUNT)
+        r = self.send(packet_type=OW_CONTROLLER, command=OW_CTRL_GET_MODULE_COUNT, addr=0)
         if r is None or r.packet_type == OW_ERROR or r.data_len < 1:
             log.error("get_module_count failed")
             return 0
@@ -170,7 +170,7 @@ class LIFUTransmitter(OWComponent):
             Number of TX7332 devices detected, or 0 on error.
         """
         self._require_connected()
-        r = self.send(packet_type=OW_TX7332, command=OW_TX7332_ENUM)
+        r = self.send(packet_type=OW_TX7332, command=OW_TX7332_ENUM, addr=0)
         r.print_packet()
         if r is None or r.packet_type == OW_ERROR or r.reserved < 1:
             log.error("enum_tx7332_devices failed")

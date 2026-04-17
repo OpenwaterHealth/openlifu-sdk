@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+from typing import Dict, Literal
 
 from ow_comms.config import (
     DEFAULT_TIMEOUT, OW_VID, OW_TRANSMITTER_PID, OW_CONSOLE_PID,
@@ -10,6 +11,7 @@ from .LIFUConsole import LIFUConsole
 
 log = logging.getLogger("LIFUInterface")
 
+TriggerModeOpts = Literal['sequence', 'continuous','single']
 
 class LIFUInterface:
     """Top-level facade that holds a :class:`LIFUTransmitter` and a :class:`LIFUConsole`."""
@@ -39,3 +41,68 @@ class LIFUInterface:
         """Leave async mode for both components."""
         self.transmitter.stop()
         self.console.stop()
+
+    def check_solution(self, solution: Dict) -> None:
+        """
+        Check if the solution is valid.
+        Args:
+            solution (Dict): The solution to check.
+        Raises:
+            ValueError: If the solution is invalid.
+        """
+        pass
+
+    def set_solution(self,
+                     solution: Dict,
+                     profile_index:int=1,
+                     profile_increment:bool=True,
+                     trigger_mode: TriggerModeOpts = "sequence",
+                     _allow_unsafe_solution: bool = False
+                     ) -> None:
+        """
+        Load a solution to the device.
+
+        Args:
+            solution (Solution): The solution to load.
+            profile_index (int): The profile index to load the solution to (defaults to 0)
+            profile_increment (bool): Increment the profile index
+            trigger_mode (TriggerModeOpts): The trigger mode to use (defaults to "sequence")
+            module_invert (List[bool]|bool): Invert the signal on all modules (singleton) or specific modules (list) (defaults to False)
+            _allow_unsafe_solution (bool): Allow loading a solution that may be unsafe (defaults to False)
+        """
+        pass
+
+    def start_sonication(self, async_mode: bool | None = None) -> bool:
+        """
+        Start sonication.
+
+        Args:
+            async_mode (bool | None): Whether to start sonication in asynchronous mode (defaults to None, which means it will use the current async mode setting of the interface).
+
+        Sets the device to a running state and sends a start command if necessary.
+        """
+        pass
+
+
+    def stop_sonication(self) -> bool:
+        """
+        Stop sonication.
+
+        Stops the current sonication process.
+        """
+        pass
+
+    def close(self):
+        self.stop()
+
+        """Close all connections."""
+        if self.transmitter:
+            self.transmitter.close()
+        if self.console:
+            self.console.close()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        self.close()
