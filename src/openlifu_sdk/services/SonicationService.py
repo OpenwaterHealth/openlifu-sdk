@@ -1,11 +1,51 @@
 from __future__ import annotations
 
+import logging
+from typing import TYPE_CHECKING, Dict, Optional
 
-from typing import Dict
+import numpy as np
+import pandas as pd
 
 from ..io.LIFUConsole import LIFUConsole
 from ..io.LIFUTransmitter import LIFUTransmitter, TriggerMode
 
+from ..models.tx_registers import (
+    DEFAULT_PATTERN_DUTY_CYCLE,
+    NUM_CHANNELS,
+    Tx7332DelayProfile,
+    Tx7332PulseProfile,
+)
+
+logger = logging.getLogger(__name__)
+
+REF_MAX_SEQUENCE_TIMES = {
+    "default": [2*60, 5*60, 10*60],    # users to use default values
+    "stress_test": [60*60, 60*60, 60*60] # QA to use stress test values
+}
+
+REF_MAX_DUTY_CYCLES = {
+    "default": [0.05, 0.1, 0.2, 0.3, 0.4, 0.5],
+    "stress_test": [0.5, 0.5, 0.5, 0.5, 0.5, 0.5]
+}
+
+MAX_VOLTAGE_BY_DUTY_CYCLE_AND_SEQUENCE_TIME = {
+    "evt2": [
+        [45, 45, 45], # 0.05
+        [40, 40, 40], # 0.1
+        [40, 40, 35], # 0.2
+        [40, 35, 30], # 0.3
+        [35, 30, 25], # 0.4
+        [30, 25, 20] # 0.5
+    ],
+    "evt0": [
+        [65, 65, 65], # 0.05
+        [65, 65, 50], # 0.1
+        [50, 40, 35], # 0.2
+        [45, 35, 30], # 0.3
+        [35, 30, 25], # 0.4
+        [30, 25, 20] # 0.5
+    ],
+}
 
 class SonicationService:
     """Validates, translates, and programs a solution onto the TX device
