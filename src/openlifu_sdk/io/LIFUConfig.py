@@ -1,6 +1,8 @@
 
 # Import packet-type registration from the shared SDK so LIFU-specific
 # commands resolve to the correct packet type without polluting the base SDK.
+from enum import Enum
+
 from ow_comms.component import register_command_packet_types
 
 # ---------------------------------------------------------------------------
@@ -90,3 +92,15 @@ POWER_COMMANDS = {
 register_command_packet_types(TX7332_COMMANDS, OW_TX7332)
 register_command_packet_types(CONTROLLER_COMMANDS, OW_CONTROLLER)
 register_command_packet_types(POWER_COMMANDS, OW_POWER)
+
+class LIFUInterfaceStatus(Enum):
+    STATUS_COMMS_ERROR = -1
+    STATUS_SYS_OFF = 0
+    STATUS_SYS_POWERUP = 1
+    STATUS_SYS_ON = 2
+    STATUS_PROGRAMMING = 3
+    STATUS_READY = 4
+    STATUS_NOT_READY = 5
+    STATUS_RUNNING = 6
+    STATUS_FINISHED = 7
+    STATUS_ERROR = 8

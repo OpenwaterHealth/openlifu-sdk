@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 """TX7332 register management for the LIFU transmitter.
 
 Provides dataclasses and helpers for computing TX7332 delay/pulse profiles

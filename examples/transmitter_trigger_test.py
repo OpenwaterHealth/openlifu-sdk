@@ -209,6 +209,7 @@ def _set_and_verify(tx, args) -> tuple[int, int]:
         print(f"  {k}: {v}")
 
     get_resp = tx.get_trigger()
+    print(get_resp)
     if get_resp is None:
         print("\nERROR: get_trigger returned None")
         return 0, 1

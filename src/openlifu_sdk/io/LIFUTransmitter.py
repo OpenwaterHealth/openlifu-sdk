@@ -158,10 +158,20 @@ class LIFUTransmitter(OWComponent):
         """
         self._require_connected()
         r = self.send(packet_type=OW_CONTROLLER, command=OW_CTRL_GET_MODULE_COUNT, addr=0)
-        if r is None or r.packet_type == OW_ERROR or r.data_len < 1:
-            log.error("get_module_count failed")
+        
+        # Check for transport failure or hardware error reporting
+        if r is None or r.packet_type == OW_ERROR:
+            log.error("get_module_count: Communication error or hardware NACK")
             return 0
-        return r.data[0]
+        
+        # Check for malformed payload
+        if not r.data or len(r.data) < 1:
+            log.error(f"get_module_count: Unexpected payload length ({r.data_len})")
+            return 0
+
+        count = r.data[0]
+        log.debug(f"Detected {count} module(s)")
+        return count
 
     # ------------------------------------------------------------------
     # TX7332 – enumeration
@@ -178,12 +188,20 @@ class LIFUTransmitter(OWComponent):
         """
         self._require_connected()
         r = self.send(packet_type=OW_TX7332, command=OW_TX7332_ENUM, addr=0)
-        r.print_packet()
-        if r is None or r.packet_type == OW_ERROR or r.reserved < 1:
-            log.error("enum_tx7332_devices failed")
+
+        # 1. Null check first to prevent AttributeError
+        if r is None:
+            log.error("enum_tx7332_devices failed: No response from controller")
             return 0
+            
+        r.print_packet()
+
+        if r.packet_type == OW_ERROR or r.reserved < 1:
+            log.error("enum_tx7332_devices failed: Hardware reported error or zero devices")
+            return 0
+
         num_detected_devices = r.reserved
-        log.info("TX7332 devices detected: %d", num_detected_devices)
+        log.debug("TX7332 devices detected: %d", num_detected_devices)
         return num_detected_devices
 
     # ------------------------------------------------------------------
