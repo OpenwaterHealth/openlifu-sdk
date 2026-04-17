@@ -18,7 +18,7 @@ import time
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
-from openlifu_sdk.io import LIFUInterface
+from openlifu_sdk import LIFUInterface
 
 ECHO_SIZES = list(range(16, 241, 16))  # 16, 32, 48, ... 240
 

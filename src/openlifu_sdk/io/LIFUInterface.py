@@ -3,15 +3,15 @@ from __future__ import annotations
 import logging
 from typing import Dict, Literal
 
-from ow_comms.config import (
-    DEFAULT_TIMEOUT, OW_VID, OW_TRANSMITTER_PID, OW_CONSOLE_PID,
-)
-from .LIFUTransmitter import LIFUTransmitter
+from ow_comms.config import DEFAULT_TIMEOUT, OW_VID
+
+from .LIFUTransmitter import LIFUTransmitter, TriggerMode
 from .LIFUConsole import LIFUConsole
+from .LIFUConfig import OW_TRANSMITTER_PID, OW_CONSOLE_PID
+from ..services.SolutionService import SolutionService
+from ..services.SonicationService import SonicationService
 
 log = logging.getLogger("LIFUInterface")
-
-TriggerModeOpts = Literal['sequence', 'continuous','single']
 
 class LIFUInterface:
     """Top-level facade that holds a :class:`LIFUTransmitter` and a :class:`LIFUConsole`."""
@@ -21,6 +21,16 @@ class LIFUInterface:
                  con_vid: int = OW_VID, con_pid: int = OW_CONSOLE_PID):
         self.transmitter = LIFUTransmitter(tx_vid, tx_pid, baudrate=baudrate, timeout=timeout)
         self.console = LIFUConsole(con_vid, con_pid, baudrate=baudrate, timeout=timeout)
+
+        self.solution_service = SolutionService(
+            transmitter=self.transmitter,
+            console=self.console,
+        )
+
+        self.sonication_service = SonicationService(
+            transmitter=self.transmitter,
+            console=self.console,
+        )
 
     # -- Convenience batch operations ---------------------------------
 
@@ -56,7 +66,7 @@ class LIFUInterface:
                      solution: Dict,
                      profile_index:int=1,
                      profile_increment:bool=True,
-                     trigger_mode: TriggerModeOpts = "sequence",
+                     trigger_mode: TriggerMode = TriggerMode.SEQUENCE,
                      _allow_unsafe_solution: bool = False
                      ) -> None:
         """
@@ -66,7 +76,7 @@ class LIFUInterface:
             solution (Solution): The solution to load.
             profile_index (int): The profile index to load the solution to (defaults to 0)
             profile_increment (bool): Increment the profile index
-            trigger_mode (TriggerModeOpts): The trigger mode to use (defaults to "sequence")
+            trigger_mode (TriggerMode): The trigger mode to use (defaults to "sequence")
             module_invert (List[bool]|bool): Invert the signal on all modules (singleton) or specific modules (list) (defaults to False)
             _allow_unsafe_solution (bool): Allow loading a solution that may be unsafe (defaults to False)
         """

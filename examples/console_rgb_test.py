@@ -15,7 +15,7 @@ import time
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
-from openlifu_sdk.io import LIFUInterface
+from openlifu_sdk import LIFUInterface
 
 STATE_NAMES = {0: "OFF", 1: "RED", 2: "BLUE", 3: "GREEN"}
 NAME_TO_STATE = {"off": 0, "red": 1, "blue": 2, "green": 3}

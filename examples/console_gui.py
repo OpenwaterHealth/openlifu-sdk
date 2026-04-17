@@ -8,7 +8,7 @@ import os
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
-from openlifu_sdk.io import LIFUInterface
+from openlifu_sdk import LIFUInterface
 from PyQt6.QtCore import QObject, pyqtSignal, QTimer
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QTextEdit, QPushButton, QLabel,

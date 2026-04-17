@@ -20,7 +20,7 @@ import os
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
-from openlifu_sdk.io import LIFUInterface
+from openlifu_sdk import LIFUInterface
 
 # Tolerance for floating-point comparisons
 REL_TOL = 1e-3

@@ -16,7 +16,7 @@ import time
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
-from openlifu_sdk.io import LIFUInterface
+from openlifu_sdk import LIFUInterface
 
 # Safe delay-data register range
 DELAY_DATA_START = 0x0020

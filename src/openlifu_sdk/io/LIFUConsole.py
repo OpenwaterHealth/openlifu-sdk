@@ -4,8 +4,14 @@ import logging
 import struct
 
 from ow_comms.config import (
-    GLOBAL_COMMANDS, CONTROLLER_COMMANDS, OW_POWER, POWER_COMMANDS, DEFAULT_TIMEOUT,
-    OW_VID, OW_CONSOLE_PID, OW_ERROR,
+    GLOBAL_COMMANDS, DEFAULT_TIMEOUT, OW_VID, OW_ERROR,
+)
+
+from ow_comms.component import OWComponent
+
+from .LIFUConfig import ( 
+    OW_CONSOLE_PID, OW_CONSOLE_PID,
+    CONTROLLER_COMMANDS, OW_POWER, POWER_COMMANDS,
     OW_POWER_GET_TEMP1, OW_POWER_GET_TEMP2,
     OW_POWER_12V_ON, OW_POWER_12V_OFF, OW_POWER_GET_12VON,
     OW_POWER_HV_ON, OW_POWER_HV_OFF, OW_POWER_GET_HVON,
@@ -14,7 +20,6 @@ from ow_comms.config import (
     OW_POWER_SET_RGB, OW_POWER_GET_RGB,
     OW_POWER_STATUS, OW_POWER_VMON,
 )
-from ow_comms.component import OWComponent
 
 log = logging.getLogger("LIFUConsole")
 
