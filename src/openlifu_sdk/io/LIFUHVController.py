@@ -1,17 +1,14 @@
 from __future__ import annotations
 
+from asyncio import timeout
 import logging
 import struct
 
 from openlifu_sdk.io.LIFUConfig import (
-    OW_CMD,
-    OW_CMD_DFU,
-    OW_CMD_ECHO,
-    OW_CMD_HWID,
-    OW_CMD_PING,
-    OW_CMD_RESET,
-    OW_CMD_TOGGLE_LED,
-    OW_CMD_VERSION,
+    CONTROLLER_COMMANDS,
+    DEFAULT_TIMEOUT,
+    GLOBAL_COMMANDS,
+    OW_CONSOLE_PID,
     OW_ERROR,
     OW_POWER,
     OW_POWER_12V_OFF,
@@ -32,9 +29,11 @@ from openlifu_sdk.io.LIFUConfig import (
     OW_POWER_SET_HV,
     OW_POWER_SET_RGB,
     OW_POWER_VMON,
-    HW_ID_DATA_LENGTH
+    OW_VID,
+    POWER_COMMANDS,
 )
-from openlifu_sdk.io.LIFUUart import LIFUUart
+from openlifu_sdk.io.component import OWComponent, register_command_packet_types, register_command_packet_types
+from openlifu_sdk.io.uart import OWUart
 from openlifu_sdk.util.hwid import format_hwid
 
 logger = logging.getLogger(__name__)
@@ -44,22 +43,24 @@ ch.setFormatter(formatter)
 logger.addHandler(ch)
 logger.propagate = True
 
-class HVController:
-    def __init__(self, uart: LIFUUart = None):
+class HVController(OWComponent):
+    def __init__(self,  vid: int = OW_VID, pid: int = OW_CONSOLE_PID,
+                 baudrate: int = 921600, timeout: float = DEFAULT_TIMEOUT, test_mode: bool = False):
         """
         Initialize the HVController.
 
         Args:
-            uart (LIFUUart): The LIFUUart instance for communication.
+            uart (OWUart): The OWUart instance for communication.
         """
-        self.uart = uart
+        super().__init__(
+            vid, pid,
+            supported_commands=GLOBAL_COMMANDS | CONTROLLER_COMMANDS | POWER_COMMANDS,
+            baudrate=baudrate, timeout=timeout, desc="HV",
+        )
+        
+        register_command_packet_types(POWER_COMMANDS, OW_POWER)
 
-        if self.uart and not self.uart.asyncMode:
-            self.uart.check_usb_status()
-            if self.uart.is_connected():
-                logger.info("HV Console connected.")
-            else:
-                logger.info("HV Console NOT Connected.")
+        self._test_mode = test_mode
 
         # Initialize the high voltage state (should get this from device)
         self.output_voltage = 0.0
@@ -68,209 +69,9 @@ class HVController:
 
         self.supply_voltage = None
 
-    def is_connected(self):
-        if self.uart:
-            return self.uart.is_connected()
-
-    def close(self):
-        """
-        Close Uart
-        """
-        if self.uart and self.uart.is_connected():
-            self.uart.disconnect()
-
-    def ping(self) -> bool:
-        """
-        Send a ping command to the Console device to verify connectivity.
-
-        Raises:
-            ValueError: If the UART is not connected.
-            Exception: If an error occurs during the ping process.
-        """
-        try:
-            if self.uart.demo_mode:
-                return True
-
-            if not self.uart.is_connected():
-                raise ValueError("Console Device not connected")
-
-            logger.info("Send Ping to Device.")
-            r = self.uart.send_packet(id=None, packetType=OW_CMD, command=OW_CMD_PING)
-            self.uart.clear_buffer()
-            logger.info("Received Ping from Device.")
-            # r.print_packet()
-
-            if r.packet_type == OW_ERROR:
-                logger.error("Error sending ping")
-                return False
-            else:
-                return True
-
-        except ValueError as v:
-            logger.error("ValueError: %s", v)
-            raise  # Re-raise the exception for the caller to handle
-
-        except Exception as e:
-            logger.error("Unexpected error during process: %s", e)
-            raise  # Re-raise the exception for the caller to handle
-
-    def get_version(self) -> str:
-        """
-        Retrieve the firmware version of the Console device.
-
-        Returns:
-            str: Firmware version in the format 'vX.Y.Z'.
-
-        Raises:
-            ValueError: If the UART is not connected.
-            Exception: If an error occurs while fetching the version.
-        """
-        try:
-            if self.uart.demo_mode:
-                return "v0.1.1"
-
-            if not self.uart.is_connected():
-                raise ValueError("Console Device not connected")
-
-            r = self.uart.send_packet(
-                id=None, packetType=OW_CMD, command=OW_CMD_VERSION
-            )
-            self.uart.clear_buffer()
-            # r.print_packet()
-            if r.data_len == 3:
-                ver = f"v{r.data[0]}.{r.data[1]}.{r.data[2]}"
-            elif r.data_len and r.data:
-                try:
-                    # Decode only the valid length, strip trailing NULs and whitespace
-                    ver_str = r.data[:r.data_len].decode('utf-8', errors='ignore').rstrip('\x00').strip()
-                    ver = ver_str if ver_str else 'v0.0.0'
-                except Exception:
-                    ver = 'v0.0.0'
-            logger.info(ver)
-            return ver
-
-        except ValueError as v:
-            logger.error("ValueError: %s", v)
-            raise  # Re-raise the exception for the caller to handle
-
-        except Exception as e:
-            logger.error("Unexpected error during process: %s", e)
-            raise  # Re-raise the exception for the caller to handle
-
-    def echo(self, echo_data=None) -> tuple[bytes, int]:
-        """
-        Send an echo command to the device with data and receive the same data in response.
-
-        Args:
-            echo_data (bytes): The data to send (must be a byte array).
-
-        Returns:
-            tuple[bytes, int]: The echoed data and its length.
-
-        Raises:
-            ValueError: If the UART is not connected.
-            TypeError: If the `echo_data` is not a byte array.
-            Exception: If an error occurs during the echo process.
-        """
-        try:
-            if self.uart.demo_mode:
-                data = b"Hello LIFU!"
-                return data, len(data)
-
-            if not self.uart.is_connected():
-                raise ValueError("Console Device  not connected")
-
-            # Check if echo_data is a byte array
-            if echo_data is not None and not isinstance(echo_data, bytes | bytearray):
-                raise TypeError("echo_data must be a byte array")
-
-            r = self.uart.send_packet(
-                id=None, packetType=OW_CMD, command=OW_CMD_ECHO, data=echo_data
-            )
-            self.uart.clear_buffer()
-            # r.print_packet()
-            if r.data_len > 0:
-                return r.data, r.data_len
-            else:
-                return None, None
-
-        except ValueError as v:
-            logger.error("ValueError: %s", v)
-            raise  # Re-raise the exception for the caller to handle
-
-        except Exception as e:
-            logger.error("Unexpected error during process: %s", e)
-            raise  # Re-raise the exception for the caller to handle
-
-    def toggle_led(self) -> bool:
-        """
-        Toggle the LED on the Console device.
-
-        Raises:
-            ValueError: If the UART is not connected.
-            Exception: If an error occurs while toggling the LED.
-        """
-        try:
-            if self.uart.demo_mode:
-                return True
-
-            if not self.uart.is_connected():
-                raise ValueError("Console Device not connected")
-
-            r = self.uart.send_packet(
-                id=None, packetType=OW_CMD, command=OW_CMD_TOGGLE_LED
-            )
-            self.uart.clear_buffer()
-            # r.print_packet()
-            if r.packet_type == OW_ERROR:
-                return False
-
-            return True
-        except ValueError as v:
-            logger.error("ValueError: %s", v)
-            raise  # Re-raise the exception for the caller to handle
-
-        except Exception as e:
-            logger.error("Unexpected error during process: %s", e)
-            raise  # Re-raise the exception for the caller to handle
-
-    def get_hardware_id(self) -> str:
-        """
-        Retrieve the hardware ID of the Console device.
-
-        Returns:
-            str: Hardware ID in hexadecimal format.
-
-        Raises:
-            ValueError: If the UART is not connected.
-            Exception: If an error occurs while retrieving the hardware ID.
-        """
-        try:
-            if self.uart.demo_mode:
-                return format_hwid("deadbeefcafebabe55667788")
-
-            if not self.uart.is_connected():
-                raise ValueError("Console Device not connected")
-
-            r = self.uart.send_packet(id=None, packetType=OW_CMD, command=OW_CMD_HWID)
-            self.uart.clear_buffer()
-            # r.print_packet()
-            if r.data_len >= HW_ID_DATA_LENGTH: # HWID is returned as 16 bytes, but only uses first 12
-                return format_hwid(r.data[:HW_ID_DATA_LENGTH].hex())
-            else:
-                return None
-
-        except ValueError as v:
-            logger.error("ValueError: %s", v)
-            raise  # Re-raise the exception for the caller to handle
-
-        except Exception as e:
-            logger.error("Unexpected error during process: %s", e)
-            raise  # Re-raise the exception for the caller to handle
-
     def get_temperature1(self) -> float:
         """
-        Retrieve the temperature reading from the TX device.
+        Retrieve the temperature reading from the HV controller.
 
         Returns:
             float: Temperature value in Celsius.
@@ -279,206 +80,74 @@ class HVController:
             ValueError: If the UART is not connected.
             Exception: If an error occurs or the received data length is invalid.
         """
-        try:
-            if self.uart.demo_mode:
-                return 32.4
-
-            if not self.uart.is_connected():
-                logger.error("TX Device not connected")
-                return 0
-
-            # Send the GET_TEMP command
-            r = self.uart.send_packet(
-                id=None, packetType=OW_POWER, command=OW_POWER_GET_TEMP1
-            )
-            self.uart.clear_buffer()
-            # r.print_packet()
-
-            # Check if the data length matches a float (4 bytes)
-            if r.data_len == 4:
-                # Unpack the float value from the received data (assuming little-endian)
-                temperature = struct.unpack("<f", r.data)[0]
-                # Truncate the temperature to 2 decimal places
-                truncated_temperature = round(temperature, 2)
-                return truncated_temperature
-            else:
-                raise ValueError("Invalid data length received for temperature")
-        except ValueError as v:
-            logger.error("ValueError: %s", v)
-            raise  # Re-raise the exception for the caller to handle
+        self._require_connected()
+        r = self.send(packet_type=OW_POWER, command=OW_POWER_GET_TEMP1)
+        r.print_packet()
+        if r is None:
+            raise RuntimeError("LIFUConsole: temperature1 request timed out")
+        if r.data_len == 4:
+            return round(struct.unpack("<f", r.data)[0], 2)
+        raise ValueError("Invalid data length for temperature1")
 
     def get_temperature2(self) -> float:
         """
-        Retrieve the temperature reading from the TX device.
+        Retrieve the temperature reading from the HV controller.
 
         Returns:
             float: Temperature value in Celsius.
 
         Raises:
-            ValueError: If the UART is not connected.
-            Exception: If an error occurs or the received data length is invalid.
+            ValueError: If the UART is not connected or invalid data is received.
         """
-        try:
-            if self.uart.demo_mode:
-                return 32.4
-
-            if not self.uart.is_connected():
-                logger.error("TX Device not connected")
-                return 0
-
-            # Send the GET_TEMP command
-            r = self.uart.send_packet(
-                id=None, packetType=OW_POWER, command=OW_POWER_GET_TEMP2
-            )
-            self.uart.clear_buffer()
-            # r.print_packet()
-
-            # Check if the data length matches a float (4 bytes)
-            if r.data_len == 4:
-                # Unpack the float value from the received data (assuming little-endian)
-                temperature = struct.unpack("<f", r.data)[0]
-                # Truncate the temperature to 2 decimal places
-                truncated_temperature = round(temperature, 2)
-                return truncated_temperature
-            else:
-                raise ValueError("Invalid data length received for temperature")
-        except ValueError as v:
-            logger.error("ValueError: %s", v)
-            raise  # Re-raise the exception for the caller to handle
+        self._require_connected()
+        r = self.send(packet_type=OW_POWER, command=OW_POWER_GET_TEMP2)
+        r.print_packet()
+        if r is None:
+            raise RuntimeError("HVController: temperature2 request timed out")
+        if r.data_len == 4:
+            return round(struct.unpack("<f", r.data)[0], 2)
+        raise ValueError("Invalid data length for temperature2")
 
     def turn_12v_off(self):
-        try:
-            if self.uart.demo_mode:
-                return True
-
-            if not self.uart.is_connected():
-                raise ValueError("Console not connected")
-
-            logger.debug("Turning off 12V.")
-
-            r = self.uart.send_packet(
-                id=None, packetType=OW_POWER, command=OW_POWER_12V_OFF
-            )
-            self.uart.clear_buffer()
-            # r.print_packet()
-
-            if r.packet_type == OW_ERROR:
-                logger.error("Error turning off 12V")
-                return False
-            else:
-                self.is_12v_on = False
-                logger.info("12V turned off successfully.")
-                return True
-
-        except ValueError as v:
-            logger.error("ValueError: %s", v)
-            raise  # Re-raise the exception for the caller to handle
-
-        except Exception as e:
-            logger.error("Unexpected error during process: %s", e)
-            raise  # Re-raise the exception for the caller to handle
+        self._require_connected()
+        r = self.send(packet_type=OW_POWER, command=OW_POWER_12V_OFF)
+        r.print_packet()
+        if r is None or r.packet_type == OW_ERROR:
+            logger.error("Error turning off 12V")
+            return False
+        logger.info("12V turned off")
+        return True
 
     def turn_12v_on(self):
-        try:
-            if self.uart.demo_mode:
-                return True
-
-            if not self.uart.is_connected():
-                raise ValueError("Console not connected")
-
-            logger.info("Turning on 12V.")
-
-            r = self.uart.send_packet(
-                id=None, packetType=OW_POWER, command=OW_POWER_12V_ON
-            )
-            self.uart.clear_buffer()
-            # r.print_packet()
-
-            if r.packet_type == OW_ERROR:
-                logger.error("Error turning on 12V")
-                return False
-            else:
-                self.is_12v_on = True
-                logger.info("12V turned on successfully.")
-                return True
-
-        except ValueError as v:
-            logger.error("ValueError: %s", v)
-            raise  # Re-raise the exception for the caller to handle
-
-        except Exception as e:
-            logger.error("Unexpected error during process: %s", e)
-            raise  # Re-raise the exception for the caller to handle
+        self._require_connected()
+        r = self.send(packet_type=OW_POWER, command=OW_POWER_12V_ON)
+        r.print_packet()
+        if r is None or r.packet_type == OW_ERROR:
+            logger.error("Error turning on 12V")
+            return False
+        logger.info("12V turned on")
+        return True
 
     def get_12v_status(self):
-        try:
-            if self.uart.demo_mode:
-                return True
+        self._require_connected()
+        r = self.send(packet_type=OW_POWER, command=OW_POWER_GET_12VON)
+        r.print_packet()
+        if r is None or r.packet_type == OW_ERROR:
+            raise RuntimeError("HVController: 12V status request failed")
+        return r.reserved == 1
 
-            if not self.uart.is_connected():
-                raise ValueError("Console not connected")
-
-            logger.debug("Get 12V voltage status.")
-
-            r = self.uart.send_packet(
-                id=None, packetType=OW_POWER, command=OW_POWER_GET_12VON
-            )
-            self.uart.clear_buffer()
-            # r.print_packet()
-
-            if r.packet_type == OW_ERROR:
-                logger.error("Error retrieving 12V status")
-                return False
-            else:
-                if r.reserved == 1:
-                    self.is_12v_on = True
-                else:
-                    self.is_12v_on = False
-
-                return self.is_12v_on
-
-        except ValueError as v:
-            logger.error("ValueError: %s", v)
-            raise  # Re-raise the exception for the caller to handle
-
-        except Exception as e:
-            logger.error("Unexpected error during process: %s", e)
-            raise  # Re-raise the exception for the caller to handle
-
-    def turn_hv_on(self):
+    def turn_hv_on(self, timeout: float | None = 30.0) -> bool:
         """
         Turn on the high voltage.
         """
-        try:
-            if self.uart.demo_mode:
-                return True
-
-            if not self.uart.is_connected():
-                raise ValueError("Console not connected")
-
-            logger.debug("Turning on high voltage.")
-
-            r = self.uart.send_packet(
-                id=None, packetType=OW_POWER, command=OW_POWER_HV_ON, timeout=30
-            )
-            self.uart.clear_buffer()
-            # r.print_packet()
-
-            if r.packet_type == OW_ERROR:
-                logger.error("Error turning on HV Supply")
-                return False
-            else:
-                self.is_hv_on = True
-                logger.info("HV Supply turned on successfully.")
-                return True
-
-        except ValueError as v:
-            logger.error("ValueError: %s", v)
-            raise  # Re-raise the exception for the caller to handle
-
-        except Exception as e:
-            logger.error("Unexpected error during process: %s", e)
-            raise  # Re-raise the exception for the caller to handle
+        self._require_connected()
+        r = self.send(packet_type=OW_POWER, command=OW_POWER_HV_ON, timeout=timeout)
+        r.print_packet()
+        if r is None or r.packet_type == OW_ERROR:
+            logger.error("Error turning on HV")
+            return False
+        logger.info("HV turned on")
+        return True
 
     def wait_for_settle(self, range_volts: float = 2, settle_time: float = 0.5, timeout: float = 15.0, polling_interval: float = 0.1):
         """
@@ -525,79 +194,26 @@ class HVController:
         raise TimeoutError(f"Voltage ({current_voltage:.2f} V) failed to stabilize for {settle_time:0.2f}S within {target_voltage} ± {range_volts} V within {timeout} S.")    
 
 
-        
-        
-
-
-    def turn_hv_off(self):
+    def turn_hv_off(self, timeout: float | None = 5.0) -> bool:
         """
         Turn off the high voltage.
         """
-        try:
-            if self.uart.demo_mode:
-                return True
+        self._require_connected()
+        r = self.send(packet_type=OW_POWER, command=OW_POWER_HV_OFF, timeout=timeout)
+        r.print_packet()
+        if r is None or r.packet_type == OW_ERROR:
+            logger.error("Error turning off HV")
+            return False
+        logger.info("HV turned off")
+        return True
 
-            if not self.uart.is_connected():
-                raise ValueError("Console not connected")
-
-            logger.debug("Turning off high voltage.")
-
-            r = self.uart.send_packet(
-                id=None, packetType=OW_POWER, command=OW_POWER_HV_OFF
-            )
-            self.uart.clear_buffer()
-            # r.print_packet()
-
-            if r.packet_type == OW_ERROR:
-                logger.error("Error turning off HV Supply")
-                return False
-            else:
-                self.is_hv_on = False
-                logger.info("HV Supply turned off successfully.")
-                return True
-
-        except ValueError as v:
-            logger.error("ValueError: %s", v)
-            raise  # Re-raise the exception for the caller to handle
-
-        except Exception as e:
-            logger.error("Unexpected error during process: %s", e)
-            raise  # Re-raise the exception for the caller to handle
-
-    def get_hv_status(self):
-        try:
-            if self.uart.demo_mode:
-                return True
-
-            if not self.uart.is_connected():
-                raise ValueError("Console not connected")
-
-            logger.debug("Get high voltage status.")
-
-            r = self.uart.send_packet(
-                id=None, packetType=OW_POWER, command=OW_POWER_GET_HVON
-            )
-            self.uart.clear_buffer()
-            # r.print_packet()
-
-            if r.packet_type == OW_ERROR:
-                logger.error("Error retrievinging HV Status")
-                return False
-            else:
-                if r.reserved == 1:
-                    self.is_hv_on = True
-                else:
-                    self.is_hv_on = False
-
-                return self.is_hv_on
-
-        except ValueError as v:
-            logger.error("ValueError: %s", v)
-            raise  # Re-raise the exception for the caller to handle
-
-        except Exception as e:
-            logger.error("Unexpected error during process: %s", e)
-            raise  # Re-raise the exception for the caller to handle
+    def get_hv_status(self) -> bool:
+        self._require_connected()
+        r = self.send(packet_type=OW_POWER, command=OW_POWER_GET_HVON)
+        r.print_packet()
+        if r is None or r.packet_type == OW_ERROR:
+            raise RuntimeError("HVController: HV status request failed")
+        return r.reserved == 1
 
     def set_voltage(self, voltage: float) -> bool:
         """
@@ -609,55 +225,17 @@ class HVController:
         Raises:
             ValueError: If the controller is not connected or voltage exceeds supply voltage.
         """
-        if self.uart.demo_mode:
-            return True
-
-        if not self.uart.is_connected():
-            raise ValueError("High voltage controller not connected")
-
-        # Validate and process the DAC input
-        if voltage is None:
-            voltage = 0
-        elif not (5.0 <= voltage <= 100.0):
-            raise ValueError(
-                "Voltage input must be within the valid range 5 to 100 Volts)."
-            )
-
-        try:
-            #dac_input = int(((voltage) / 162) * 4095)
-            # logger.info("Setting DAC Value %d.", dac_input)
-            # Pack the 12-bit DAC input into two bytes
-            #data = bytes(
-            #    [
-            #        (dac_input >> 8) & 0xFF,  # High byte (most significant bits)
-            #        dac_input & 0xFF,  # Low byte (least significant bits)
-            #    ]
-            #)
-
-            data = struct.pack('>f', voltage)
-
-            r = self.uart.send_packet(
-                id=None, packetType=OW_POWER, command=OW_POWER_SET_HV, data=data
-            )
-            self.uart.clear_buffer()
-            # r.print_packet()
-
-            if r.packet_type == OW_ERROR:
-                logger.error("Error setting HV")
-                return False
-            else:
-                self.supply_voltage = voltage
-                logger.info("Output voltage set to %.2fV successfully.", voltage)
-                return True
-
-        except ValueError as v:
-            logger.error("ValueError: %s", v)
-            raise  # Re-raise the exception for the caller to handle
-
-        except Exception as e:
-            logger.error("Unexpected error during process: %s", e)
-            raise  # Re-raise the exception for the caller to handle
-
+        self._require_connected()
+        if not 5.0 <= voltage <= 100.0:
+            raise ValueError("HV voltage must be between 5 and 100 V")
+        data = struct.pack('>f', voltage)
+        r = self.send(packet_type=OW_POWER, command=OW_POWER_SET_HV, data=data)
+        r.print_packet()
+        if r is None or r.packet_type == OW_ERROR:
+            logger.error("Error setting HV to %.2f", voltage)
+            return False
+        return True
+    
     def set_dacs(self, hvp: int, hvm: int, hrp: int, hrm: int) -> bool:
         """
         Set the output voltage.
@@ -668,11 +246,7 @@ class HVController:
         Raises:
             ValueError: If the controller is not connected or voltage exceeds supply voltage.
         """
-        if self.uart.demo_mode:
-            return True
-
-        if not self.uart.is_connected():
-            raise ValueError("High voltage controller not connected")
+        self._require_connected()
 
         # Validate and process the DAC input
         if hvp is None:
@@ -711,13 +285,9 @@ class HVController:
                 ]
             )
 
-            r = self.uart.send_packet(
-                id=None, packetType=OW_POWER, command=OW_POWER_SET_DACS, data=data
-            )
-            self.uart.clear_buffer()
-            # r.print_packet()
-
-            if r.packet_type == OW_ERROR:
+            r = self.send(packet_type=OW_POWER, command=OW_POWER_SET_DACS, data=data)
+            
+            if r is None or r.packet_type == OW_ERROR:
                 logger.error("Error setting DACS")
                 return False
             else:
@@ -741,41 +311,13 @@ class HVController:
         Raises:
             ValueError: If the controller is not connected.
         """
-        if not self.uart.is_connected():
-            raise ValueError("High voltage controller not connected")
-
-        try:
-            if self.uart.demo_mode:
-                return 18.4
-
-            logger.debug("Getting current output voltage.")
-
-            r = self.uart.send_packet(
-                id=None, packetType=OW_POWER, command=OW_POWER_GET_HV
-            )
-            self.uart.clear_buffer()
-            # r.print_packet()
-
-            if r.packet_type == OW_ERROR:
-                logger.error("Error Getting HV Voltage reading")
-                return 0.0
-            elif r.data_len == 4:
-                # Unpack the float value from the received data (assuming little-endian)
-                voltage = struct.unpack("<f", r.data)[0]
-                # Truncate the temperature to 2 decimal places
-                truncated_voltage = round(voltage, 2)
-                return truncated_voltage
-            else:
-                logger.error("Error getting output voltage from device")
-                return 0.0
-
-        except ValueError as v:
-            logger.error("ValueError: %s", v)
-            raise  # Re-raise the exception for the caller to handle
-
-        except Exception as e:
-            logger.error("Unexpected error during process: %s", e)
-            raise  # Re-raise the exception for the caller to handle
+        r = self.send(packet_type=OW_POWER, command=OW_POWER_GET_HV)
+        r.print_packet()
+        if r is None:
+            raise RuntimeError("HVController: get HV request timed out")
+        if r.data_len == 4:
+            return round(struct.unpack("<f", r.data)[0], 2)
+        raise ValueError("Invalid data length for HV reading")
 
     def set_fan_speed(self, fan_id: int = 0, fan_speed: int = 50) -> int:
         """
@@ -791,52 +333,19 @@ class HVController:
         Raises:
             ValueError: If the controller is not connected.
         """
-        if not self.uart.is_connected():
-            raise ValueError("High voltage controller not connected")
-
-        if fan_id not in [0, 1]:
+        self._require_connected()
+        if fan_id not in (0, 1):
             raise ValueError("Invalid fan ID. Must be 0 or 1")
-
-        if fan_speed not in range(101):
+        if not 0 <= fan_speed <= 100:
             raise ValueError("Invalid fan speed. Must be 0 to 100")
-
-        try:
-            if self.uart.demo_mode:
-                return 40
-
-            logger.debug(f"Setting fan {fan_id} speed to {fan_speed}")
-
-            data = bytes(
-                [
-                    fan_speed & 0xFF,  # Low byte (least significant bits)
-                ]
-            )
-
-            r = self.uart.send_packet(
-                id=None,
-                addr=fan_id,
-                packetType=OW_POWER,
-                command=OW_POWER_SET_FAN,
-                data=data,
-            )
-
-            self.uart.clear_buffer()
-            # r.print_packet()
-
-            if r.packet_type == OW_ERROR:
-                logger.error("Error setting Fan Speed")
-                return -1
-
-            logger.info(f"Set fan {fan_id} speed to {fan_speed}")
-            return fan_speed
-
-        except ValueError as v:
-            logger.error("ValueError: %s", v)
-            raise  # Re-raise the exception for the caller to handle
-
-        except Exception as e:
-            logger.error("Unexpected error during process: %s", e)
-            raise  # Re-raise the exception for the caller to handle
+        r = self.send(packet_type=OW_POWER, command=OW_POWER_SET_FAN, addr=fan_id,
+                      data=bytearray([fan_speed & 0xFF]))
+        r.print_packet()
+        if r is None or r.packet_type == OW_ERROR:
+            logger.error("Error setting fan %d speed", fan_id)
+            return -1
+        logger.info("Set fan %d speed to %d", fan_id, fan_speed)
+        return fan_speed
 
     def get_fan_speed(self, fan_id: int = 0) -> int:
         """
@@ -851,46 +360,19 @@ class HVController:
         Raises:
             ValueError: If the controller is not connected.
         """
-        if not self.uart.is_connected():
-            raise ValueError("High voltage controller not connected")
-
-        if fan_id not in [0, 1]:
+        self._require_connected()
+        if fan_id not in (0, 1):
             raise ValueError("Invalid fan ID. Must be 0 or 1")
+        r = self.send(packet_type=OW_POWER, command=OW_POWER_GET_FAN, addr=fan_id)
+        r.print_packet()
+        if r is None or r.packet_type == OW_ERROR:
+            logger.error("Error getting fan %d speed", fan_id)
+            return -1
+        if r.data_len >= 1:
+            return r.data[0]
+        raise ValueError("Invalid data length for fan reading")
 
-        try:
-            if self.uart.demo_mode:
-                return 40.0
-
-            logger.debug("Getting fan {fan_id} speed")
-
-            r = self.uart.send_packet(
-                id=None, addr=fan_id, packetType=OW_POWER, command=OW_POWER_GET_FAN
-            )
-
-            self.uart.clear_buffer()
-            # r.print_packet()
-
-            if r.packet_type == OW_ERROR:
-                logger.error("Error setting HV")
-                return 0.0
-
-            elif r.data_len == 1:
-                fan_value = r.data[0]
-                logger.info(f"Output fan {fan_id} speed is {fan_value}")
-                return fan_value
-            else:
-                logger.error("Error getting output voltage from device")
-                return -1
-
-        except ValueError as v:
-            logger.error("ValueError: %s", v)
-            raise  # Re-raise the exception for the caller to handle
-
-        except Exception as e:
-            logger.error("Unexpected error during process: %s", e)
-            raise  # Re-raise the exception for the caller to handle
-
-    def set_rgb_led(self, rgb_state: int) -> int:
+    def set_rgb_led(self, rgb_state: int) -> bool:
         """
         Set the RGB LED state.
 
@@ -903,44 +385,19 @@ class HVController:
         Raises:
             ValueError: If the controller is not connected or the RGB state is invalid.
         """
-        if not self.uart.is_connected():
-            raise ValueError("High voltage controller not connected")
+        self._require_connected()
 
         if rgb_state not in [0, 1, 2, 3]:
             raise ValueError(
                 "Invalid RGB state. Must be 0 (OFF), 1 (RED), 2 (BLUE), or 3 (GREEN)"
             )
 
-        try:
-            if self.uart.demo_mode:
-                return rgb_state
-
-            logger.debug("Setting RGB LED state.")
-
-            # Send the RGB state as the reserved byte in the packet
-            r = self.uart.send_packet(
-                id=None,
-                reserved=rgb_state & 0xFF,  # Send the RGB state as a single byte
-                packetType=OW_POWER,
-                command=OW_POWER_SET_RGB,
-            )
-
-            self.uart.clear_buffer()
-
-            if r.packet_type == OW_ERROR:
-                logger.error("Error setting RGB LED state")
-                return -1
-
-            logger.info(f"Set RGB LED state to {rgb_state}")
-            return rgb_state
-
-        except ValueError as v:
-            logger.error("ValueError: %s", v)
-            raise  # Re-raise the exception for the caller to handle
-
-        except Exception as e:
-            logger.error("Unexpected error during process: %s", e)
-            raise  # Re-raise the exception for the caller to handle
+        r = self.send(packet_type=OW_POWER, command=OW_POWER_SET_RGB, reserved=rgb_state)
+        r.print_packet()
+        if r is None or r.packet_type == OW_ERROR:
+            logger.error("Error setting RGB state")
+            return False
+        return True
 
     def get_rgb_led(self) -> int:
         """
@@ -952,36 +409,12 @@ class HVController:
         Raises:
             ValueError: If the controller is not connected.
         """
-        if not self.uart.is_connected():
-            raise ValueError("High voltage controller not connected")
-
-        try:
-            if self.uart.demo_mode:
-                return 1  # Default to RED in demo mode
-
-            logger.info("Getting current RGB LED state.")
-
-            r = self.uart.send_packet(
-                id=None, packetType=OW_POWER, command=OW_POWER_GET_RGB
-            )
-
-            self.uart.clear_buffer()
-
-            if r.packet_type == OW_ERROR:
-                logger.error("Error getting RGB LED state")
-                return -1
-
-            rgb_state = r.reserved
-            logger.info(f"Current RGB LED state is {rgb_state}")
-            return rgb_state
-
-        except ValueError as v:
-            logger.error("ValueError: %s", v)
-            raise  # Re-raise the exception for the caller to handle
-
-        except Exception as e:
-            logger.error("Unexpected error during process: %s", e)
-            raise  # Re-raise the exception for the caller to handle
+        self._require_connected()
+        r = self.send(packet_type=OW_POWER, command=OW_POWER_GET_RGB)
+        if r is None or r.packet_type == OW_ERROR:
+            logger.error("Error getting RGB LED state")
+            return -1
+        return r.reserved
 
     def get_vmon_values(self) -> list[dict]:
         """
@@ -999,53 +432,27 @@ class HVController:
             ValueError: If the UART is not connected.
             Exception: If an error occurs or the received data length is invalid.
         """
-        try:
-            if self.uart.demo_mode:
-                # Return demo data for 8 channels
-                return [
-                    {"channel": i, "raw_adc": 2048, "reserved": 0, "voltage": 12.5 + i, "converted_voltage": 25.0 + i * 2}
-                    for i in range(8)
-                ]
-
-            if not self.uart.is_connected():
-                logger.error("Console Device not connected")
-                return []
-
-            # Send the voltage monitor command
-            r = self.uart.send_packet(
-                id=None, packetType=OW_POWER, command=OW_POWER_VMON
+        self._require_connected()
+        r = self.send(packet_type=OW_POWER, command=OW_POWER_VMON)
+        r.print_packet()
+        if r is None:
+            raise RuntimeError("LIFUConsole: VMON request timed out")
+        if r.data_len != 80:
+            raise ValueError(
+                f"Invalid VMON data length: expected 80 bytes, got {r.data_len}"
             )
-            self.uart.clear_buffer()
-            # r.print_packet()
-
-            # Check if the data length matches 8 channels * 10 bytes per channel = 80 bytes
-            # Each channel: index (raw_adc) + uint16 (reserved) + float (voltage) + float (converted_voltage)
-            if r.data_len == 80:  # sizeof(ADC_ChannelData_t)
-                # Unpack: 8 uint16s, 8 floats, 8 floats (little-endian)
-                raw_values = struct.unpack_from("<8H", r.data, 0)
-                voltages = struct.unpack_from("<8f", r.data, 16)
-                converted_voltages = struct.unpack_from("<8f", r.data, 48)
-                channels = []
-                offset = 0
-
-                # Unpack data for 8 channels
-                for channel_num in range(8):
-                    channels.append({
-                        "channel": channel_num,
-                        "raw_adc": raw_values[channel_num],
-                        "voltage": round(voltages[channel_num], 3),
-                        "converted_voltage": round(converted_voltages[channel_num], 3)
-                    })
-
-                    offset += 10  # Move to next channel (2 + 4 + 4 = 10 bytes)
-
-                return channels
-            else:
-                raise ValueError(f"Invalid data length received for voltage monitor: expected 96 bytes, got {r.data_len}")
-
-        except ValueError as v:
-            logger.error("ValueError: %s", v)
-            raise  # Re-raise the exception for the caller to handle
+        raw_values = struct.unpack_from("<8H", r.data, 0)
+        voltages = struct.unpack_from("<8f", r.data, 16)
+        converted_voltages = struct.unpack_from("<8f", r.data, 48)
+        return [
+            {
+                "channel": i,
+                "raw_adc": raw_values[i],
+                "voltage": round(voltages[i], 3),
+                "converted_voltage": round(converted_voltages[i], 3),
+            }
+            for i in range(8)
+        ]
 
     def set_raw_dac(self, dac_id: int = 0, dac_value: int = 0) -> int:
         """
@@ -1060,8 +467,7 @@ class HVController:
         Raises:
             ValueError: If the controller is not connected.
         """
-        if not self.uart.is_connected():
-            raise ValueError("High voltage controller not connected")
+        self._require_connected()
 
         if dac_id not in [0, 1, 2 ,3]:
             raise ValueError("Invalid DAC ID. Must be 0, 1, 2, or 3")
@@ -1069,41 +475,26 @@ class HVController:
         if dac_value not in range(4096):
             raise ValueError("Invalid DAC value. Must be 0 to 4095")
 
-        try:
-            if self.uart.demo_mode:
-                return dac_value
-            logger.info("Setting Raw DAC value.")
-            data = bytes(
-                [
-                    (dac_value >> 8) & 0xFF,  # High byte (most significant bits)
-                    dac_value & 0xFF,  # Low byte (least significant bits)
-                ]
-            )
-            r = self.uart.send_packet(
-                id=None,
-                addr=dac_id,
-                packetType=OW_POWER,
-                command=OW_POWER_RAW_DAC,
-                data=data,
-            )
+        logger.info("Setting Raw DAC value.")
+        data = bytes(
+            [
+                (dac_value >> 8) & 0xFF,  # High byte (most significant bits)
+                dac_value & 0xFF,  # Low byte (least significant bits)
+            ]
+        )
 
-            self.uart.clear_buffer()
-            # r.print_packet()
+        r = self.send(
+            addr=dac_id,
+            packet_type=OW_POWER,
+            command=OW_POWER_RAW_DAC,
+            data=data,
+        )
+        r.print_packet()
+        if r is None or r.packet_type == OW_ERROR:
+            raise RuntimeError("LIFUHVController: RAW DAC request timed out")
 
-            if r.packet_type == OW_ERROR:
-                logger.error("Error setting DAC value")
-                return -1
-
-            logger.info(f"Set DAC value to {dac_value}")
-            return dac_value
-
-        except ValueError as v:
-            logger.error("ValueError: %s", v)
-            raise  # Re-raise the exception for the caller to handle
-
-        except Exception as e:
-            logger.error("Unexpected error during process: %s", e)
-            raise  # Re-raise the exception for the caller to handle
+        logger.info(f"Set DAC value to {dac_value}")
+        return dac_value
 
     def hv_enable(self, enable: bool = False) -> bool:
         """
@@ -1115,108 +506,22 @@ class HVController:
             bool: True if the operation was successful, False otherwise.
         Raises:
             ValueError: If the controller is not connected.
-        if not self.uart.is_connected():
         """
-        if not self.uart.is_connected():
-            raise ValueError("High voltage controller not connected")
+        self._require_connected()
+        logger.info(f"{'Enabling' if enable else 'Disabling'} high voltage output.")
 
-        try:
-            if self.uart.demo_mode:
-                return True
+        r = self.send(
+            addr=1 if enable else 0,
+            packet_type=OW_POWER,
+            command=OW_POWER_HV_ENABLE,
+            data=None,
+        )
 
-            logger.info(f"{'Enabling' if enable else 'Disabling'} high voltage output.")
+        r.print_packet()
 
-            r = self.uart.send_packet(
-                id=None,
-                addr=1 if enable else 0,
-                packetType=OW_POWER,
-                command=OW_POWER_HV_ENABLE,
-                data=None,
-            )
+        if r is None or r.packet_type == OW_ERROR:
+            raise RuntimeError("LIFUHVController: HV enable request timed out")
+        
+        logger.info(f"High voltage output {'enabled' if enable else 'disabled'} successfully.")
+        return True
 
-            self.uart.clear_buffer()
-            # r.print_packet()
-
-            if r.packet_type == OW_ERROR:
-                logger.error("Error setting HV enable state")
-                return False
-
-            logger.info(f"High voltage output {'enabled' if enable else 'disabled'} successfully.")
-            return True
-
-        except ValueError as v:
-            logger.error("ValueError: %s", v)
-            raise  # Re-raise the exception for the caller to handle
-
-        except Exception as e:
-            logger.error("Unexpected error during process: %s", e)
-            raise  # Re-raise the exception for the caller to handle
-
-    def soft_reset(self) -> bool:
-        """
-        Perform a soft reset on the Console device.
-
-        Returns:
-            bool: True if the reset was successful, False otherwise.
-
-        Raises:
-            ValueError: If the UART is not connected.
-            Exception: If an error occurs while resetting the device.
-        """
-        try:
-            if self.uart.demo_mode:
-                return True
-
-            if not self.uart.is_connected():
-                raise ValueError("Console Device  not connected")
-
-            r = self.uart.send_packet(id=None, packetType=OW_CMD, command=OW_CMD_RESET)
-            self.uart.clear_buffer()
-            # r.print_packet()
-            if r.packet_type == OW_ERROR:
-                logger.error("Error resetting device")
-                return False
-            else:
-                return True
-
-        except ValueError as v:
-            logger.error("ValueError: %s", v)
-            raise  # Re-raise the exception for the caller to handle
-
-        except Exception as e:
-            logger.error("Unexpected error during process: %s", e)
-            raise  # Re-raise the exception for the caller to handle
-
-    def enter_dfu(self) -> bool:
-        """
-        Perform a soft reset to enter DFU mode on TX device.
-
-        Returns:
-            bool: True if the reset was successful, False otherwise.
-
-        Raises:
-            ValueError: If the UART is not connected.
-            Exception: If an error occurs while resetting the device.
-        """
-        try:
-            if self.uart.demo_mode:
-                return True
-
-            if not self.uart.is_connected():
-                raise ValueError("TX Device not connected")
-
-            r = self.uart.send_packet(id=None, packetType=OW_CMD, command=OW_CMD_DFU)
-            self.uart.clear_buffer()
-            # r.print_packet()
-            if r.packet_type == OW_ERROR:
-                logger.error("Error setting DFU mode for device")
-                return False
-            else:
-                return True
-        except ValueError as v:
-            logger.error("ValueError: %s", v)
-            raise  # Re-raise the exception for the caller to handle
-
-        except Exception as e:
-            logger.error("Unexpected error during process: %s", e)
-            raise  # Re-raise the exception for the caller to handle

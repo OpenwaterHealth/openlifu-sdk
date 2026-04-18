@@ -9,10 +9,9 @@ from typing import Dict, List, Optional
 import numpy as np
 import pandas as pd
 
+from openlifu_sdk.io.LIFUConfig import DEFAULT_TIMEOUT, OW_CONSOLE_PID, OW_TRANSMITTER_PID, OW_VID
 from openlifu_sdk.io.LIFUHVController import HVController
-from openlifu_sdk.io.LIFUSignal import LIFUSignal
 from openlifu_sdk.io.LIFUTXDevice import TriggerModeOpts, TxDevice
-from openlifu_sdk.io.LIFUUart import LIFUUart
 
 REF_MAX_SEQUENCE_TIMES = {
     "default": [2*60, 5*60, 10*60],    # users to use default values
@@ -62,20 +61,16 @@ ch.setFormatter(formatter)
 logger.addHandler(ch)
 logger.propagate = True
 
-
 class LIFUInterface:
-    signal_connect: LIFUSignal = LIFUSignal()
-    signal_disconnect: LIFUSignal = LIFUSignal()
-    signal_data_received: LIFUSignal = LIFUSignal()
     hvcontroller: HVController = None
     txdevice: TxDevice = None
 
     def __init__(self,
-                 vid: int = 0x0483,
-                 tx_pid: int = 0x57AF,
-                 con_pid: int = 0x57A0,
+                 vid: int = OW_VID,
+                 tx_pid: int = OW_TRANSMITTER_PID,
+                 con_pid: int = OW_CONSOLE_PID,
                  baudrate: int = 921600,
-                 timeout: int = 10,
+                 timeout: float = DEFAULT_TIMEOUT,
                  TX_test_mode: bool = False,
                  HV_test_mode: bool = False,
                  run_async: bool = False,
@@ -93,19 +88,13 @@ class LIFUInterface:
             con_pid (int): Product ID for console device.
             baudrate (int): Communication baud rate.
             timeout (int): Read timeout in seconds.
-            test_mode (bool): Enable test mode.
+            TX_test_mode (bool): Enable TX test mode.
             run_async (bool): Enable asynchronous operation.
         """
         # Store parameters in instance variables
-        self.vid = vid
-        self.tx_pid = tx_pid
-        self.con_pid = con_pid
-        self.baudrate = baudrate
-        self.timeout = timeout
-        self._test_mode = TX_test_mode
         self._async_mode = run_async
-        self._tx_uart = None
-        self._hv_uart = None
+        self.txdevice = None
+        self.hvcontroller = None
         self.status = LIFUInterfaceStatus.STATUS_SYS_OFF
 
         self.voltage_table = None
@@ -116,27 +105,20 @@ class LIFUInterface:
         self.duty_cycle_selection = duty_cycle_selection
 
         # Create a TXDevice instance as part of the interface
-        logger.debug("Initializing TX Module of LIFUInterface with VID: %s, PID: %s, baudrate: %s, timeout: %s", vid, tx_pid, baudrate, timeout)
-        self._tx_uart = LIFUUart(vid=vid, pid=tx_pid, baudrate=baudrate, timeout=timeout, desc="TX", demo_mode=TX_test_mode, async_mode=run_async)
-        self.txdevice = TxDevice(uart=self._tx_uart, module_invert=module_invert)
-
+        self.txdevice = TxDevice(vid=vid, pid=tx_pid, baudrate=baudrate, timeout=timeout, test_mode=TX_test_mode, module_invert=module_invert)
+        
         if ext_power_supply:
             logger.debug("External power supply selected, skipping HVController initialization.")
             self.hvcontroller = None
         else:
             # Create a LIFUHVController instance as part of the interface
-            logger.debug("Initializing Console of LIFUInterface with VID: %s, PID: %s, baudrate: %s, timeout: %s", vid, con_pid, baudrate, timeout)
-            self._hv_uart = LIFUUart(vid=vid, pid=con_pid, baudrate=baudrate, timeout=timeout, desc="HV", demo_mode=HV_test_mode, async_mode=run_async)
-            self.hvcontroller = HVController(uart=self._hv_uart)
+            self.hvcontroller = HVController(vid=vid, pid=con_pid, baudrate=baudrate, timeout=timeout, test_mode=HV_test_mode)
 
-        # Connect signals to internal handlers
-        if self._async_mode:
-            self._tx_uart.signal_connect.connect(self.signal_connect.emit)
-            self._tx_uart.signal_disconnect.connect(self.signal_disconnect.emit)
-            self._tx_uart.signal_data_received.connect(self.signal_data_received.emit)
-            self._hv_uart.signal_connect.connect(self.signal_connect.emit)
-            self._hv_uart.signal_disconnect.connect(self.signal_disconnect.emit)
-            self._hv_uart.signal_data_received.connect(self.signal_data_received.emit)
+        if not self._async_mode:
+            if self.txdevice is not None:
+                self.txdevice.connect()
+            if self.hvcontroller is not None:
+                self.hvcontroller.connect()
 
     # Temporary fix for hardware variations between EVT0 and EVT2
     def _resolve_voltage_chart_evt_version(self, voltage_table: str) -> list[list[int]]:

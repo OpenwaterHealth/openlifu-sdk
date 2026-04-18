@@ -10,8 +10,8 @@ from typing import TYPE_CHECKING, Annotated, Dict, List, Literal, Optional
 
 import numpy as np
 
-from openlifu_sdk.io.LIFUUart import LIFUUart
 from openlifu_sdk.io.LIFUUserConfig import LifuUserConfig
+from openlifu_sdk.io.component import OWComponent, register_command_packet_types
 from openlifu_sdk.util.annotations import OpenLIFUFieldData
 from openlifu_sdk.util.units import getunitconversion
 from openlifu_sdk.util.hwid import format_hwid
@@ -108,6 +108,9 @@ DEFAULT_PULSE_WIDTH_US = 20
 TEMPERATURE_DATA_LENGTH = 4
 
 from openlifu_sdk.io.LIFUConfig import (
+    CONTROLLER_COMMANDS,
+    DEFAULT_TIMEOUT,
+    GLOBAL_COMMANDS,
     OW_CMD,
     OW_CMD_ASYNC,
     OW_CMD_DFU,
@@ -127,6 +130,7 @@ from openlifu_sdk.io.LIFUConfig import (
     OW_CTRL_START_SWTRIG,
     OW_CTRL_STOP_SWTRIG,
     OW_ERROR,
+    OW_TRANSMITTER_PID,
     OW_TX7332,
     OW_TX7332_DEMO,
     OW_TX7332_DEVICE_COUNT,
@@ -137,10 +141,12 @@ from openlifu_sdk.io.LIFUConfig import (
     OW_TX7332_VWREG,
     OW_TX7332_WBLOCK,
     OW_TX7332_WREG,
+    OW_VID,
     TRIGGER_MODE_CONTINUOUS,
     TRIGGER_MODE_SEQUENCE,
     TRIGGER_MODE_SINGLE,
-    HW_ID_DATA_LENGTH
+    HW_ID_DATA_LENGTH,
+    TX7332_COMMANDS
 )
 
 if TYPE_CHECKING:
@@ -159,24 +165,33 @@ if not logger.handlers:
     handler.setFormatter(formatter)
     logger.addHandler(handler)
 
-class TxDevice:
-    def __init__(self, uart: LIFUUart, module_invert: bool | list[bool] = False):
+class TxDevice(OWComponent):
+    def __init__(self, vid: int = OW_VID, pid: int = OW_TRANSMITTER_PID,
+                 baudrate: int = 921600, timeout: float = DEFAULT_TIMEOUT, test_mode: bool = False, module_invert: bool | list[bool] = False):
         """
         Initialize the TxDevice.
 
         Args:
-            uart (LIFUUart): The LIFUUart instance for communication.
+            vid (int): USB Vendor ID of the device.
+            pid (int): USB Product ID of the device.
+            baudrate (int): Baud rate for UART communication.
+            timeout (float): Timeout for UART operations in seconds.
+            test_mode (bool): If True, simulates device responses without actual hardware communication.
+            module_invert (bool | list[bool]): If True or list of bools, inverts the module addressing scheme.
         """
+        super().__init__(
+            vid, pid,
+            supported_commands=GLOBAL_COMMANDS | TX7332_COMMANDS | CONTROLLER_COMMANDS,
+            baudrate=baudrate, timeout=timeout, desc="TX",
+        )
+        
+        register_command_packet_types(TX7332_COMMANDS, OW_TX7332)
+        register_command_packet_types(CONTROLLER_COMMANDS, OW_CONTROLLER)
+
         self._tx_instances = []
         self.tx_registers = None
-        self.uart = uart
+        self._test_mode = test_mode
         self.module_invert = module_invert
-        if self.uart and not self.uart.asyncMode:
-            self.uart.check_usb_status()
-            if self.uart.is_connected():
-                logger.debug("TX Device connected.")
-            else:
-                logger.debug("TX Device NOT Connected.")
 
     def __parse_ti_cfg_file(self, file_path: str) -> list[tuple[str, int, int]]:
         """Parses the given configuration file and extracts all register groups, addresses, and values."""
@@ -194,358 +209,7 @@ class TxDevice:
 
         return parsed_data
 
-    def is_connected(self) -> bool:
-        """
-        Check if the TX device is connected.
-
-        Returns:
-            bool: True if the device is connected, False otherwise.
-        """
-        if self.uart:
-            return self.uart.is_connected()
-        return False
-
-    def close(self):
-        """
-        Close Uart
-        """
-        if self.uart and self.uart.is_connected():
-            self.uart.disconnect()
-
-    def ping(self, module:int=0) -> bool:
-        """
-        Send a ping command to the TX device to verify connectivity.
-
-        Raises:
-            ValueError: If the UART is not connected.
-            Exception: If an error occurs during the ping process.
-        """
-        try:
-            if self.uart.demo_mode:
-                return True
-
-            if not self.uart.is_connected():
-                logger.error("TX Device not connected")
-                return False
-
-            logger.debug("Send Ping to Device.")
-
-            r = self.uart.send_packet(id=None, packetType=OW_CMD, command=OW_CMD_PING, addr=module)
-            self.uart.clear_buffer()
-
-            if r.packet_type == OW_ERROR:
-                logger.error("Error sending ping")
-                return False
-            else:
-                return True
-        except ValueError as v:
-            logger.error("ValueError: %s", v)
-            raise  # Re-raise the exception for the caller to handle
-
-        except Exception as e:
-            logger.error("Unexpected error during process: %s", e)
-            raise  # Re-raise the exception for the caller to handle
-
-    def get_version(self, module:int=0) -> str:
-        """
-        Retrieve the firmware version of the TX device.
-
-        Returns:
-            str: Firmware version in the format 'vX.Y.Z'.
-
-        Raises:
-            ValueError: If the UART is not connected.
-            Exception: If an error occurs while fetching the version.
-        """
-        try:
-            if self.uart.demo_mode:
-                return 'v0.1.1'
-
-            if not self.uart.is_connected():
-                logger.error("TX Device not connected")
-                return 'v0.0.0'
-
-            r = self.uart.send_packet(id=None, packetType=OW_CMD, command=OW_CMD_VERSION, addr=module)
-            self.uart.clear_buffer()
-            r.print_packet()
-            if r.data_len == 3:
-                ver = f'v{r.data[0]}.{r.data[1]}.{r.data[2]}'
-            elif r.data_len and r.data:
-                try:
-                    # Decode only the valid length, strip trailing NULs and whitespace
-                    ver_str = r.data[:r.data_len].decode('utf-8', errors='ignore').rstrip('\x00').strip()
-                    ver = ver_str if ver_str else 'v0.0.0'
-                except Exception:
-                    ver = 'v0.0.0'
-            else:
-                ver = 'v0.0.0'
-            logger.debug(ver)
-            return ver
-        except ValueError as v:
-            logger.error("ValueError: %s", v)
-            raise  # Re-raise the exception for the caller to handle
-
-        except Exception as e:
-            logger.error("Unexpected error during process: %s", e)
-            raise  # Re-raise the exception for the caller to handle
-
-    def echo(self, module:int=0, echo_data = None) -> tuple[bytes, int]:
-        """
-        Send an echo command to the device with data and receive the same data in response.
-
-        Args:
-            echo_data (bytes): The data to send (must be a byte array).
-
-        Returns:
-            tuple[bytes, int]: The echoed data and its length.
-
-        Raises:
-            ValueError: If the UART is not connected.
-            TypeError: If the `echo_data` is not a byte array.
-            Exception: If an error occurs during the echo process.
-        """
-        try:
-            if self.uart.demo_mode:
-                data = b"Hello LIFU!"
-                return data, len(data)
-
-            if not self.uart.is_connected():
-                logger.error("TX Device not connected")
-                return None, None
-
-            # Check if echo_data is a byte array
-            if echo_data is not None and not isinstance(echo_data, bytes | bytearray):
-                raise TypeError("echo_data must be a byte array")
-
-            r = self.uart.send_packet(id=None, packetType=OW_CMD, command=OW_CMD_ECHO, addr=module, data=echo_data)
-            self.uart.clear_buffer()
-            # r.print_packet()
-            if r.data_len > 0:
-                return r.data, r.data_len
-            else:
-                return None, None
-
-        except ValueError as v:
-            logger.error("ValueError: %s", v)
-            raise  # Re-raise the exception for the caller to handle
-
-        except TypeError as t:
-            logger.error("TypeError: %s", t)
-            raise  # Re-raise the exception for the caller to handle
-
-        except Exception as e:
-            logger.error("Unexpected error during echo process: %s", e)
-            raise  # Re-raise the exception for the caller to handle
-
-    def toggle_led(self, module:int=0) -> bool:
-        """
-        Toggle the LED on the TX device.
-
-        Raises:
-            ValueError: If the UART is not connected.
-            Exception: If an error occurs while toggling the LED.
-        """
-        try:
-            if self.uart.demo_mode:
-                return True
-
-            if not self.uart.is_connected():
-                logger.error("TX Device not connected")
-                return False
-
-            r = self.uart.send_packet(id=None, packetType=OW_CMD, command=OW_CMD_TOGGLE_LED, addr=module)
-            self.uart.clear_buffer()
-            # r.print_packet()
-            return True
-
-        except ValueError as v:
-            logger.error("ValueError: %s", v)
-            raise  # Re-raise the exception for the caller to handle
-
-        except Exception as e:
-            logger.error("Unexpected error during process: %s", e)
-            raise  # Re-raise the exception for the caller to handle
-
-    def get_hardware_id(self, module:int=0) -> str:
-        """
-        Retrieve the hardware ID of the TX device.
-
-        Returns:
-            str: Hardware ID in hexadecimal format.
-
-        Raises:
-            ValueError: If the UART is not connected.
-            Exception: If an error occurs while retrieving the hardware ID.
-        """
-        try:
-            if self.uart.demo_mode:
-                return format_hwid("deadbeefcafebabe11223344")
-
-            if not self.uart.is_connected():
-                logger.error("TX Device not connected")
-                return None
-
-            r = self.uart.send_packet(id=None, packetType=OW_CMD, command=OW_CMD_HWID, addr=module)
-            self.uart.clear_buffer()
-            # r.print_packet()
-            if r.data_len >= HW_ID_DATA_LENGTH:
-                return format_hwid(r.data[:HW_ID_DATA_LENGTH].hex())
-            else:
-                return None
-        except ValueError as v:
-            logger.error("ValueError: %s", v)
-            raise  # Re-raise the exception for the caller to handle
-
-        except Exception as e:
-            logger.error("Unexpected error during process: %s", e)
-            raise  # Re-raise the exception for the caller to handle
-
-    def read_config(self, module:int=0) -> Optional[LifuUserConfig]:
-        """
-        Read the user configuration from device flash.
-        
-        The configuration is stored as JSON with metadata (magic, version, sequence, CRC).
-        
-        Returns:
-            LifuUserConfig: Parsed configuration object, or None on error
-            
-        Raises:
-            ValueError: If the UART is not connected
-            Exception: If an error occurs during communication
-        """
-        try:
-            if self.uart.demo_mode:
-                logger.info("Demo mode: returning empty config")
-                return LifuUserConfig()
-
-            if not self.uart.is_connected():
-                raise ValueError("Console Device not connected")
-
-            # Send read command (reserved=0 for READ)
-            logger.debug("Reading user config from device...")
-            r = self.uart.send_packet(
-                id=None,
-                packetType=OW_CMD,
-                addr=module,
-                command=OW_CMD_USR_CFG,
-                reserved=0  # 0 = READ
-            )
-            self.uart.clear_buffer()
-
-            if r.packet_type == OW_ERROR:
-                logger.error("Error reading config from device")
-                return None
-
-            # Parse wire format response
-            try:
-                config = LifuUserConfig.from_wire_bytes(r.data)
-                logger.debug(f"Read config: seq={config.header.seq}, json_len={config.header.json_len}")
-                return config
-            except Exception as e:
-                logger.error(f"Failed to parse config response: {e}")
-                return None
-
-        except ValueError as v:
-            logger.error("ValueError: %s", v)
-            raise
-
-        except Exception as e:
-            logger.error("Unexpected error reading config: %s", e)
-            raise
-
-    def write_config(self, config: LifuUserConfig, module:int=0) -> Optional[LifuUserConfig]:
-        """
-        Write user configuration to device flash.
-        
-        Can pass either:
-        - Full wire format (header + JSON)
-        - Raw JSON bytes (device will parse as JSON)
-        
-        Args:
-            config: LifuUserConfig object to write
-            
-        Returns:
-            LifuUserConfig: Updated configuration from device (with new seq/crc), or None on error
-            
-        Raises:
-            ValueError: If the UART is not connected
-            Exception: If an error occurs during communication
-        """
-        try:
-            if self.uart.demo_mode:
-                logger.info("Demo mode: simulating config write")
-                return config
-
-            if not self.uart.is_connected():
-                raise ValueError("Console Device not connected")
-
-            # Convert config to wire format bytes
-            wire_data = config.to_wire_bytes()
-            
-            logger.debug(f"Writing config to device: {len(wire_data)} bytes")
-            
-            # Send write command (reserved=1 for WRITE)
-            r = self.uart.send_packet(
-                id=None,
-                packetType=OW_CMD,
-                command=OW_CMD_USR_CFG,
-                addr=module,
-                reserved=1,  # 1 = WRITE
-                data=wire_data
-            )
-            self.uart.clear_buffer()
-
-            if r.packet_type == OW_ERROR:
-                logger.error("Error writing config to device")
-                return None
-
-            # Response contains only the updated 16-byte header (with new seq/crc).
-            # Reconstruct the full config by combining the updated header with the
-            # JSON data we just wrote (which is not echoed back by the firmware).
-            try:
-                from openlifu_sdk.io.LIFUUserConfig import LifuUserConfigHeader
-                updated_header = LifuUserConfigHeader.from_bytes(r.data[:16])
-                updated_config = LifuUserConfig(header=updated_header, json_data=config.json_data)
-                logger.debug(f"Config written successfully: new seq={updated_config.header.seq}")
-                return updated_config
-            except Exception as e:
-                logger.error(f"Failed to parse write response: {e}")
-                return None
-
-        except ValueError as v:
-            logger.error("ValueError: %s", v)
-            raise
-
-        except Exception as e:
-            logger.error("Unexpected error writing config: %s", e)
-            raise
-
-    def write_config_json(self, json_str: str, module:int=0) -> Optional[LifuUserConfig]:
-        """
-        Write user configuration from a JSON string.
-        
-        This is a convenience method that creates a LifuUserConfig from JSON
-        and writes it to the device.
-        
-        Args:
-            json_str: JSON string to write
-            
-        Returns:
-            LifuUserConfig: Updated configuration from device, or None on error
-            
-        Raises:
-            ValueError: If JSON is invalid or UART is not connected
-            Exception: If an error occurs during communication
-        """
-        try:
-            config = LifuUserConfig()
-            config.set_json_str(json_str)
-            return self.write_config(module=module, config=config)
-        except json.JSONDecodeError as e:
-            logger.error(f"Invalid JSON: {e}")
-            raise ValueError(f"Invalid JSON: {e}")
-
-    def get_temperature(self, module:int=0) -> float:
+    def get_temperature(self, module:int=0) -> float | None:
         """
         Retrieve the temperature reading from the TX device.
 
@@ -556,37 +220,17 @@ class TxDevice:
             ValueError: If the UART is not connected.
             Exception: If an error occurs or the received data length is invalid.
         """
-        try:
-            if self.uart.demo_mode:
-                return 32.4
+        self._require_connected()
+        r = self.send(packet_type=OW_CONTROLLER, command=OW_CMD_GET_TEMP, addr=module)
+        r.print_packet()
+        if r is None or r.data_len < TEMPERATURE_DATA_LENGTH:
+            return None
+        
+        temperature = struct.unpack('<f', r.data)[0]
+        truncated_temperature = round(temperature, 2)
+        return truncated_temperature
 
-            if not self.uart.is_connected():
-                logger.error("TX Device not connected")
-                return 0
-
-            # Send the GET_TEMP command
-            r = self.uart.send_packet(id=None, packetType=OW_CONTROLLER, command=OW_CMD_GET_TEMP, addr=module)
-            self.uart.clear_buffer()
-            # r.print_packet()
-
-            # Check if the data length matches a float (4 bytes)
-            if r.data_len == TEMPERATURE_DATA_LENGTH:
-                # Unpack the float value from the received data (assuming little-endian)
-                temperature = struct.unpack('<f', r.data)[0]
-                # Truncate the temperature to 2 decimal places
-                truncated_temperature = round(temperature, 2)
-                return truncated_temperature
-            else:
-                raise ValueError("Invalid data length received for temperature")
-        except ValueError as v:
-            logger.error("ValueError: %s", v)
-            raise  # Re-raise the exception for the caller to handle
-
-        except Exception as e:
-            logger.error("Unexpected error during process: %s", e)
-            raise  # Re-raise the exception for the caller to handle
-
-    def get_ambient_temperature(self, module:int=0) -> float:
+    def get_ambient_temperature(self, module:int=0) -> float | None:
         """
         Retrieve the ambient temperature reading from the TX device.
 
@@ -597,37 +241,15 @@ class TxDevice:
             ValueError: If the UART is not connected.
             Exception: If an error occurs or the received data length is invalid.
         """
-        try:
-            if self.uart.demo_mode:
-                return 28.9
-
-            if not self.uart.is_connected():
-                logger.error("TX Device not connected")
-                return 0
-
-            # Send the GET_TEMP command
-            r = self.uart.send_packet(id=None, packetType=OW_CONTROLLER, command=OW_CMD_GET_AMBIENT, addr=module)
-            self.uart.clear_buffer()
-            # r.print_packet()
-
-            # Check if the data length matches a float (4 bytes)
-            if r.data_len == TEMPERATURE_DATA_LENGTH:
-                # Unpack the float value from the received data (assuming little-endian)
-                temperature = struct.unpack('<f', r.data)[0]
-                # Truncate the temperature to 2 decimal places
-                truncated_temperature = round(temperature, 2)
-                return truncated_temperature
-            else:
-                logger.error("Invalid data length received for ambient temperature")
-                return 0
-        except ValueError as v:
-            logger.error("ValueError: %s", v)
-            raise  # Re-raise the exception for the caller to handle
-
-        except Exception as e:
-            logger.error("Unexpected error during process: %s", e)
-            raise  # Re-raise the exception for the caller to handle
-            return 0
+        self._require_connected()
+        r = self.send(packet_type=OW_CONTROLLER, command=OW_CMD_GET_AMBIENT, addr=module)
+        r.print_packet()
+        if r is None or r.data_len < TEMPERATURE_DATA_LENGTH:
+            return None
+        
+        temperature = struct.unpack('<f', r.data)[0]
+        truncated_temperature = round(temperature, 2)
+        return truncated_temperature
 
     def set_trigger(self,
                     pulse_interval: float,
@@ -699,48 +321,22 @@ class TxDevice:
             ValueError: If `data` is None or the UART is not connected.
             Exception: If an error occurs while setting the trigger.
         """
+        self._require_connected()
+        if data is None:
+            raise ValueError("Trigger data cannot be None")
+        payload = json.dumps(data).encode("utf-8")
+        r = self.send(packet_type=OW_CONTROLLER, command=OW_CTRL_SET_SWTRIG, addr=0, data=payload)
+        r.print_packet()
+        if r is None or r.packet_type == OW_ERROR or r.data_len == 0:
+            logger.error("set_trigger failed")
+            return None
         try:
-            if self.uart.demo_mode:
-                return None
+            return json.loads(r.data[:r.data_len].decode("utf-8"))
+        except (json.JSONDecodeError, UnicodeDecodeError) as e:
+            logger.error("set_trigger JSON decode error: %s", e)
+            return None
 
-            # Ensure data is not None and is a valid dictionary
-            if data is None:
-                logger.error("Data cannot be None.")
-                return None
-
-            if not self.uart.is_connected():
-                raise ValueError("TX Device not connected")
-
-            try:
-                json_string = json.dumps(data)
-            except json.JSONDecodeError as e:
-                logger.error(f"Data must be valid JSON: {e}")
-                return None
-
-            payload = json_string.encode('utf-8')
-
-            r = self.uart.send_packet(id=None, packetType=OW_CONTROLLER, command=OW_CTRL_SET_SWTRIG, addr=0, data=payload)
-            self.uart.clear_buffer()
-
-            if r.packet_type != OW_ERROR and r.data_len > 0:
-                # Parse response as JSON, if possible
-                try:
-                    response_json = json.loads(r.data.decode('utf-8'))
-                    return response_json
-                except json.JSONDecodeError as e:
-                    logger.error(f"Error decoding JSON: {e}")
-                    return None
-            else:
-                return None
-        except ValueError as v:
-            logger.error("ValueError: %s", v)
-            raise  # Re-raise the exception for the caller to handle
-
-        except Exception as e:
-            logger.error("Unexpected error during process: %s", e)
-            raise  # Re-raise the exception for the caller to handle
-
-    def get_trigger_json(self) -> dict:
+    def get_trigger_json(self) -> dict | None:
         """
         Start the trigger on the TX device.
 
@@ -751,28 +347,17 @@ class TxDevice:
             ValueError: If the UART is not connected.
             Exception: If an error occurs while starting the trigger.
         """
+        self._require_connected()
+        r = self.send(packet_type=OW_CONTROLLER, command=OW_CTRL_GET_SWTRIG, addr=0)
+        r.print_packet()
+        if r is None or r.packet_type == OW_ERROR or r.data_len == 0:
+            logger.error("get_trigger failed")
+            return None
         try:
-            if self.uart.demo_mode:
-                return None
-
-            if not self.uart.is_connected():
-                raise ValueError("TX Device not connected")
-
-            r = self.uart.send_packet(id=None, packetType=OW_CONTROLLER, command=OW_CTRL_GET_SWTRIG, addr=0, data=None)
-            self.uart.clear_buffer()
-            data_object = None
-            try:
-                data_object = json.loads(r.data.decode('utf-8'))
-            except json.JSONDecodeError as e:
-                logger.error(f"Error decoding JSON: {e}")
-            return data_object
-        except ValueError as v:
-            logger.error("ValueError: %s", v)
-            raise  # Re-raise the exception for the caller to handle
-
-        except Exception as e:
-            logger.error("Unexpected error during process: %s", e)
-            raise  # Re-raise the exception for the caller to handle
+            return json.loads(r.data[:r.data_len].decode("utf-8"))
+        except (json.JSONDecodeError, UnicodeDecodeError) as e:
+            logger.error("get_trigger JSON decode error: %s", e)
+            return None
 
     def get_trigger(self):
         """
@@ -818,28 +403,14 @@ class TxDevice:
             ValueError: If the UART is not connected.
             Exception: If an error occurs while starting the trigger.
         """
-        try:
-            if self.uart.demo_mode:
-                return True
-
-            if not self.uart.is_connected():
-                raise ValueError("TX Device not connected")
-
-            r = self.uart.send_packet(id=None, packetType=OW_CONTROLLER, command=OW_CTRL_START_SWTRIG, addr=0, data=None)
-            self.uart.clear_buffer()
-            # r.print_packet()
-            if r.packet_type == OW_ERROR:
-                logger.error("Error starting trigger")
-                return False
-            else:
-                return True
-        except ValueError as v:
-            logger.error("ValueError: %s", v)
-            raise  # Re-raise the exception for the caller to handle
-
-        except Exception as e:
-            logger.error("Unexpected error during process: %s", e)
-            raise  # Re-raise the exception for the caller to handle
+        self._require_connected()
+        r = self.send(packet_type=OW_CONTROLLER, command=OW_CTRL_START_SWTRIG, addr=0)
+        r.print_packet()
+        if r is None or r.packet_type == OW_ERROR:
+            logger.error("Error starting trigger")
+            return False
+        else:
+            return True
 
     def stop_trigger(self) -> bool:
         """
@@ -855,108 +426,14 @@ class TxDevice:
             ValueError: If the UART is not connected.
             Exception: If an error occurs during the operation.
         """
-        try:
-            if self.uart.demo_mode:
-                return True
-
-            # Check if the device is connected
-            if not self.uart.is_connected():
-                raise ValueError("TX Device not connected")
-
-            # Send the STOP_SWTRIG command to the device
-            r = self.uart.send_packet(
-                id=None,
-                packetType=OW_CONTROLLER,
-                command=OW_CTRL_STOP_SWTRIG,
-                addr=0,
-                data=None
-            )
-
-            # Clear the UART buffer to prepare for further communication
-            self.uart.clear_buffer()
-
-            # Log the received packet for debugging purposes
-            # r.print_packet()
-
-            # Check the packet type to determine success
-            if r.packet_type == OW_ERROR:
-                logger.error("Error stopping trigger")
-                return False
-            else:
-                return True
-        except ValueError as v:
-            logger.error("ValueError: %s", v)
-            raise  # Re-raise the exception for the caller to handle
-
-        except Exception as e:
-            logger.error("Unexpected error during process: %s", e)
-            raise  # Re-raise the exception for the caller to handle
-
-    def soft_reset(self, module:int=0) -> bool:
-        """
-        Perform a soft reset on the TX device.
-
-        Returns:
-            bool: True if the reset was successful, False otherwise.
-
-        Raises:
-            ValueError: If the UART is not connected.
-            Exception: If an error occurs while resetting the device.
-        """
-        try:
-            if self.uart.demo_mode:
-                return True
-
-            if not self.uart.is_connected():
-                raise ValueError("TX Device not connected")
-
-            self.uart.send_packet(id=None, packetType=OW_CONTROLLER, command=OW_CMD_RESET, addr=module)
-            self.uart.clear_buffer()
-            return True
-        except ValueError as v:
-            logger.error("ValueError: %s", v)
-            raise  # Re-raise the exception for the caller to handle
-
-        except Exception as e:
-            logger.error("Unexpected error during process: %s", e)
-            raise  # Re-raise the exception for the caller to handle
-
-    def enter_dfu(self, module:int=0) -> bool:
-        """
-        Perform a soft reset to enter DFU mode on TX device.
-
-        Returns:
-            bool: True if the reset was successful, False otherwise.
-
-        Raises:
-            ValueError: If the UART is not connected.
-            Exception: If an error occurs while resetting the device.
-        """
-        try:
-            if self.uart.demo_mode:
-                return True
-
-            if not self.uart.is_connected():
-                raise ValueError("TX Device not connected")
-
-            r = self.uart.send_packet(id=None, packetType=OW_CONTROLLER, command=OW_CMD_DFU, addr=module)
-            self.uart.clear_buffer()
-            if r is None:
-                # Device disconnected immediately after reset — expected for DFU entry
-                return True
-            if r.packet_type == OW_ERROR:
-                logger.error("Error setting DFU mode for device")
-                return False
-            else:
-                return True
-        except ValueError as v:
-            logger.error("ValueError: %s", v)
-            raise  # Re-raise the exception for the caller to handle
-
-        except Exception as e:
-            logger.error("Unexpected error during process: %s", e)
-            raise  # Re-raise the exception for the caller to handle
-
+        self._require_connected()
+        r = self.send(packet_type=OW_CONTROLLER, command=OW_CTRL_STOP_SWTRIG, addr=0)
+        r.print_packet()
+        if r is None or r.packet_type == OW_ERROR:
+            logger.error("stop_trigger failed")
+            return False
+        return True
+    
     def async_mode(self, enable: bool | None = None) -> bool:
         """
         Enable or disable asynchronous mode for the TX device.
@@ -971,33 +448,22 @@ class TxDevice:
             ValueError: If the UART is not connected.
             Exception: If an error occurs while setting async mode.
         """
-        try:
-            if self.uart.demo_mode:
-                return True
+        self._require_connected()
 
-            if not self.uart.is_connected():
-                raise ValueError("TX Device not connected")
-
-            if enable is not None:
-                if enable:
-                    payload = struct.pack('<B', 1)
-                else:
-                    payload = struct.pack('<B', 0)
+        if enable is not None:
+            if enable:
+                payload = struct.pack('<B', 1)
             else:
-                payload = None
+                payload = struct.pack('<B', 0)
+        else:
+            payload = None
 
-            r = self.uart.send_packet(id=None, packetType=OW_CONTROLLER, command=OW_CMD_ASYNC, addr=0, data=payload)
-            self.uart.clear_buffer()
-            # r.print_packet()
-            if r.packet_type == OW_ERROR:
-                raise RuntimeError("Error running async mode command for device")
-            else:
-                return r.reserved == 1  # reserved field indicates async mode status
-
-        except ValueError as v:
-            logger.error("ValueError: %s", v)
-            raise
-
+        r = self.send(packet_type=OW_CONTROLLER, command=OW_CMD_ASYNC, addr=0, data=payload)
+        r.print_packet()
+        if r is None or r.packet_type == OW_ERROR:
+            raise RuntimeError("Error running async mode command for device")
+        
+        return r.reserved == 1  # reserved field indicates async mode status
 
     def get_tx_module_count(self) -> int:
         """
@@ -1012,29 +478,19 @@ class TxDevice:
             Exception: If an error occurs during enumeration.
         """
         tx_module_count = 0
-        try:
-            if self.uart.demo_mode:
-                tx_module_count = 1
-            else:
-                if not self.uart.is_connected():
-                    raise ValueError("TX Device not connected")
-
-                r = self.uart.send_packet(id=None, packetType=OW_TX7332, command=OW_TX7332_DEVICE_COUNT, addr=0)
-                self.uart.clear_buffer()
-                # r.print_packet()
-                if r.packet_type != OW_ERROR and r.data_len == 1:
-                    tx_module_count = r.data[0]
-                else:
-                    logger.error("Error retrieving TX module count.")
-            logger.debug("TX Module Count: %d", tx_module_count)
-            return tx_module_count
-        except ValueError as v:
-            logger.error("ValueError: %s", v)
-            raise  # Re-raise the exception for the caller to handle
-
-        except Exception as e:
-            logger.error("Unexpected error during process: %s", e)
-            raise  # Re-raise the exception for the caller to handle
+        self._require_connected()
+        r = self.send(packet_type=OW_CONTROLLER, command=OW_CTRL_GET_MODULE_COUNT, addr=0)
+        r.print_packet()
+        if r is None or r.packet_type == OW_ERROR:
+            raise RuntimeError("Error retrieving TX module count.")
+                
+        # 
+        if r.data_len == 1:
+            tx_module_count = r.data[0]
+        else:
+            logger.error("Error retrieving TX module count.")
+        logger.debug("TX Module Count: %d", tx_module_count)
+        return tx_module_count
 
     def enum_tx7332_devices(self,
                             num_devices: int | None = None) -> int:
@@ -1054,32 +510,24 @@ class TxDevice:
             ValueError: If the UART is not connected.
             Exception: If an error occurs during enumeration.
         """
-        try:
-            if self.uart.demo_mode:
-                num_detected_devices = num_devices
-            else:
-                if not self.uart.is_connected():
-                    raise ValueError("TX Device not connected")
+        self._require_connected()
+        r = self.send(packet_type=OW_TX7332, command=OW_TX7332_ENUM, addr=0)
+        r.print_packet()
+        if r is None or r.packet_type == OW_ERROR:
+            raise RuntimeError("Error enumerating TX7332 devices.")
 
-                r = self.uart.send_packet(id=None, packetType=OW_TX7332, command=OW_TX7332_ENUM)
-                self.uart.clear_buffer()
-                # r.print_packet()
-                if r.packet_type != OW_ERROR and r.reserved > 0:
-                    num_detected_devices = r.reserved
-                else:
-                    logger.error("Error enumerating TX devices.")
-                if num_devices is not None and num_detected_devices != num_devices:
-                    raise ValueError(f"Expected {num_devices} devices, but detected {num_detected_devices} devices")
-            self.tx_registers = TxDeviceRegisters(num_transmitters=num_detected_devices, module_invert=self.module_invert)
-            logger.info("TX Device Count: %d", num_detected_devices)
-            return num_detected_devices
-        except ValueError as v:
-            logger.error("ValueError: %s", v)
-            raise  # Re-raise the exception for the caller to handle
+        if r.reserved > 0:
+            num_detected_devices = r.reserved
+        else:
+            logger.error("Error enumerating TX7332 devices.")
+            num_detected_devices = 0
+        
+        if num_devices is not None and num_detected_devices != num_devices:
+            raise ValueError(f"Expected {num_devices} devices, but detected {num_detected_devices} devices")
 
-        except Exception as e:
-            logger.error("Unexpected error during process: %s", e)
-            raise  # Re-raise the exception for the caller to handle
+        self.tx_registers = TxDeviceRegisters(num_transmitters=num_detected_devices, module_invert=self.module_invert)
+        logger.info("TX Device Count: %d", num_detected_devices)
+        return num_detected_devices
 
     def set_module_invert(self, module_invert: bool | List[bool]) -> None:
         """
@@ -1102,443 +550,120 @@ class TxDevice:
         Raises:
             ValueError: If the UART is not connected.
         """
-        try:
-            if self.uart.demo_mode:
-                return True
+        self._require_connected()
+        r = self.send(packet_type=OW_TX7332, command=OW_TX7332_DEMO, addr=identifier)
+        r.print_packet()
+        if r is None or r.packet_type == OW_ERROR:
+            raise RuntimeError("Error writing demo TX7332 registers.")
 
-            if not self.uart.is_connected():
-                raise ValueError("TX Device not connected")
-
-            r = self.uart.send_packet(id=None, addr=identifier, packetType=OW_TX7332, command=OW_TX7332_DEMO)
-            self.uart.clear_buffer()
-            # r.print_packet()
-            if r.packet_type == OW_ERROR:
-                logger.error("Error demoing TX devices")
-                return False
-
-            return True
-        except ValueError as v:
-            logger.error("ValueError: %s", v)
-            raise  # Re-raise the exception for the caller to handle
-
-        except Exception as e:
-            logger.error("Unexpected error during process: %s", e)
-            raise  # Re-raise the exception for the caller to handle
-
+        return True
+        
     def write_register(self, identifier:int, address: int, value: int) -> bool:
-        """
-        Write a value to a register in the TX device.
+        """Write a single TX7332 register.
 
         Args:
-            address (int): The register address to write to.
-            value (int): The value to write to the register.
+            identifier: TX7332 chip index.
+            address: Register address.
+            value: 32-bit value to write.
 
         Returns:
-            bool: True if the write operation was successful, False otherwise.
-
-        Raises:
-            ValueError: If the device is not connected, or the identifier is invalid.
-            Exception: If an unexpected error occurs during the operation.
+            True on success, False on error.
         """
-        try:
-            if self.uart.demo_mode:
-                return True
-
-            # Check if the UART is connected
-            if not self.uart.is_connected():
-                raise ValueError("TX Device not connected")
-
-            # Validate the identifier
-            if identifier < 0:
-                raise ValueError("TX Chip address NOT SET")
-
-            # Pack the address and value into the required format
-            try:
-                data = struct.pack('<HI', address, value)
-            except struct.error as e:
-                logger.error(f"Error packing address and value: {e}")
-                raise ValueError("Invalid address or value format") from e
-
-            # Send the write command to the device
-            r = self.uart.send_packet(
-                id=None,
-                packetType=OW_TX7332,
-                command=OW_TX7332_WREG,
-                addr=identifier,
-                data=data
-            )
-
-            # Clear UART buffer after sending the packet
-            self.uart.clear_buffer()
-
-            # Check the response for errors
-            if r.packet_type == OW_ERROR:
-                logger.error("Error writing TX register value")
-                return False
-
-            logger.debug(f"Successfully wrote value 0x{value:08X} to register 0x{address:04X}")
-            return True
-
-        except ValueError as v:
-            logger.error("ValueError: %s", v)
-            raise  # Re-raise the exception for the caller to handle
-
-        except Exception as e:
-            logger.error("Unexpected error during process: %s", e)
-            raise  # Re-raise the exception for the caller to handle
+        self._require_connected()
+        if identifier < 0:
+            raise ValueError("TX chip identifier must be >= 0")
+        data = struct.pack("<HI", address, value)
+        r = self.send(packet_type=OW_TX7332, command=OW_TX7332_WREG, addr=identifier, data=data)
+        if r is None or r.packet_type == OW_ERROR:
+            logger.error("write_register failed (chip=%d addr=0x%04X)", identifier, address)
+            return False
+        logger.debug("Wrote 0x%08X to chip %d reg 0x%04X", value, identifier, address)
+        return True
 
     def read_register(self, identifier:int, address: int) -> int:
-        """
-        Read a register value from the TX device.
+        """Read a single TX7332 register.
 
         Args:
-            address (int): The register address to read.
+            identifier: TX7332 chip index.
+            address: Register address.
 
         Returns:
-            int: The value of the register if successful, or 0 on failure.
-
-        Raises:
-            ValueError: If the identifier is not set or is out of range.
-            Exception: If an unexpected error occurs during the operation.
+            32-bit register value, or None on error.
         """
-        try:
-            if self.uart.demo_mode:
-                return 45
-
-            if not self.uart.is_connected():
-                raise ValueError("TX Device not connected")
-
-            # Validate the identifier
-            if identifier < 0:
-                raise ValueError("TX Chip address NOT SET")
-
-            # Pack the address into the required format
-            try:
-                data = struct.pack('<H', address)
-            except struct.error as e:
-                logger.error(f"Error packing address {address}: {e}")
-                raise ValueError("Invalid address format") from e
-
-            # Send the read command to the device
-            r = self.uart.send_packet(
-                id=None,
-                packetType=OW_TX7332,
-                command=OW_TX7332_RREG,
-                addr=identifier,
-                data=data
-            )
-
-            # Clear UART buffer after sending the packet
-            self.uart.clear_buffer()
-            # r.print_packet()
-            # Check for errors in the response
-            if r.packet_type == OW_ERROR:
-                logger.error("Error reading TX register value")
-                return 0
-
-            # Verify data length and unpack the register value
-            if r.data_len == 4:
-                try:
-                    value = struct.unpack('<I', r.data)[0]
-                except struct.error as e:
-                    logger.error(f"Error unpacking register value: {e}")
-                    return 0
-            else:
-                logger.error(f"Unexpected data length: {r.data_len}")
-                return 0
-
-            logger.debug(f"Successfully read value 0x{value:08X} from register 0x{address:04X}")
-            return value
-        except ValueError as v:
-            logger.error("ValueError: %s", v)
-            raise  # Re-raise the exception for the caller to handle
-
-        except Exception as e:
-            logger.error("Unexpected error during process: %s", e)
-            raise  # Re-raise the exception for the caller to handle
+        self._require_connected()
+        if identifier < 0:
+            raise ValueError("TX chip identifier must be >= 0")
+        data = struct.pack("<H", address)
+        r = self.send(packet_type=OW_TX7332, command=OW_TX7332_RREG, addr=identifier, data=data)
+        if r is None or r.packet_type == OW_ERROR:
+            logger.error("read_register failed (chip=%d addr=0x%04X)", identifier, address)
+            return None
+        if r.data_len < 4:
+            logger.error("read_register: unexpected data_len=%d", r.data_len)
+            return None
+        value = struct.unpack("<I", r.data[:4])[0]
+        logger.debug("Read 0x%08X from chip %d reg 0x%04X", value, identifier, address)
+        return value
 
     def write_block(self, identifier: int, start_address: int, reg_values: List[int]) -> bool:
-        """
-        Write a block of register values to the TX device.
+        """Write a contiguous block of TX7332 registers.
+
+        Large blocks are automatically split into chunks of up to 62 registers.
 
         Args:
-            start_address (int): The starting register address to write to.
-            reg_values (List[int]): List of register values to write.
+            identifier: TX7332 chip index.
+            start_address: Starting register address.
+            reg_values: List of 32-bit register values.
 
         Returns:
-            bool: True if the block write operation was successful, False otherwise.
-
-        Raises:
-            ValueError: If the device is not connected, the identifier is invalid, or parameters are out of range.
+            True on success, False on error.
         """
-        try:
-            if self.uart.demo_mode:
-                return True
+        self._require_connected()
+        if identifier < 0:
+            raise ValueError("TX chip identifier must be >= 0")
+        if not reg_values:
+            raise ValueError("reg_values must be a non-empty list")
 
-            # Ensure the UART connection is active
-            if not self.uart.is_connected():
-                raise ValueError("TX Device not connected")
-
-            # Validate the identifier
-            if identifier < 0:
-                raise ValueError("TX Chip address NOT SET")
-
-            # Validate the reg_values list
-            if not reg_values or not isinstance(reg_values, list):
-                raise ValueError("Invalid register values: Must be a non-empty list of integers")
-            if any(not isinstance(value, int) for value in reg_values):
-                raise ValueError("Invalid register values: All elements must be integers")
-
-            # Configure chunking for large blocks
-            max_regs_per_block = 62  # Maximum registers per block due to payload size
-            num_chunks = (len(reg_values) + max_regs_per_block - 1) // max_regs_per_block
-            logger.debug(f"Write Block: Total chunks = {num_chunks}")
-
-            # Write each chunk
-            for i in range(num_chunks):
-                chunk_start = i * max_regs_per_block
-                chunk_end = min((i + 1) * max_regs_per_block, len(reg_values))
-                chunk = reg_values[chunk_start:chunk_end]
-
-                # Pack the chunk into the required data format
-                try:
-                    data_format = '<HBB' + 'I' * len(chunk)  # Start address (H), chunk length (B), reserved (B), values (I...)
-                    data = struct.pack(data_format, start_address + chunk_start, len(chunk), 0, *chunk)
-                except struct.error as e:
-                    logger.error(f"Error packing data for chunk {i}: {e}")
-                    return False
-
-                # Send the packet
-                r = self.uart.send_packet(
-                    id=None,
-                    packetType=OW_TX7332,
-                    command=OW_TX7332_WBLOCK,
-                    addr=identifier,
-                    data=data
-                )
-
-                # Clear the UART buffer after sending
-                self.uart.clear_buffer()
-                # r.print_packet()
-                # Check for errors in the response
-                if r.packet_type == OW_ERROR:
-                    logger.error(f"Error writing TX block at chunk {i}")
-                    return False
-
-            logger.debug("Block write successful")
-            return True
-
-        except ValueError as v:
-            logger.error("ValueError: %s", v)
-            raise  # Re-raise the exception for the caller to handle
-
-        except Exception as e:
-            logger.error("Unexpected error during process: %s", e)
-            raise  # Re-raise the exception for the caller to handleected error in write_block: {e}")
-            return False
-
-    def read_block(self, identifier: int, start_address: int, count: int) -> Optional[List[int]]:
-        """
-        Read a block of consecutive register values from the TX device.
-
-        Args:
-            identifier (int): TX chip index.
-            start_address (int): The starting register address to read from.
-            count (int): Number of registers to read.
-
-        Returns:
-            List[int]: List of register values, or None on error.
-
-        Raises:
-            ValueError: If the device is not connected or parameters are invalid.
-            Exception: If an unexpected error occurs.
-        """
-        try:
-            if self.uart.demo_mode:
-                return [0] * count
-
-            if not self.uart.is_connected():
-                raise ValueError("TX Device not connected")
-
-            if identifier < 0:
-                raise ValueError("TX Chip address NOT SET")
-
-            if count <= 0 or count > 62:
-                raise ValueError(f"count must be 1-62, got {count}")
-
-            # Request payload: uint16_t start_addr, uint8_t count, uint8_t reserved
-            data = struct.pack('<HBB', start_address, count, 0)
-
-            r = self.uart.send_packet(
-                id=None,
-                packetType=OW_TX7332,
-                command=OW_TX7332_RBLOCK,
-                addr=identifier,
-                data=data
-            )
-            self.uart.clear_buffer()
-
-            if r.packet_type == OW_ERROR:
-                logger.error("Error reading TX register block")
-                return None
-
-            expected_len = count * 4
-            if r.data_len != expected_len:
-                logger.error(f"Unexpected data length: {r.data_len}, expected {expected_len}")
-                return None
-
-            values = list(struct.unpack(f'<{count}I', r.data))
-            logger.debug(f"read_block: {count} regs from 0x{start_address:04X} on tx {identifier}")
-            return values
-
-        except ValueError as v:
-            logger.error("ValueError: %s", v)
-            raise
-
-        except Exception as e:
-            logger.error("Unexpected error during process: %s", e)
-            raise
-
-    def write_register_verify(self, address: int, value: int) -> bool:
-        """
-        Write a value to a register in the TX device with verification.
-
-        Args:
-            address (int): The register address to write to.
-            value (int): The value to write to the register.
-
-        Returns:
-            bool: True if the write operation was successful, False otherwise.
-
-        Raises:
-            ValueError: If the device is not connected, or the identifier is invalid.
-            Exception: If an unexpected error occurs during the operation.
-        """
-        try:
-            if self.uart.demo_mode:
-                return True
-
-            # Check if the UART is connected
-            if not self.uart.is_connected():
-                raise ValueError("TX Device not connected")
-
-            # Validate the identifier
-            if self.identifier < 0:
-                raise ValueError("TX Chip address NOT SET")
-
-            # Pack the address and value into the required format
-            try:
-                data = struct.pack('<HI', address, value)
-            except struct.error as e:
-                logger.error(f"Error packing address and value: {e}")
-                raise ValueError("Invalid address or value format") from e
-
-            # Send the write command to the device
-            r = self.uart.send_packet(
-                id=None,
-                packetType=OW_TX7332,
-                command=OW_TX7332_VWREG,
-                addr=self.identifier,
-                data=data
-            )
-
-            # Clear UART buffer after sending the packet
-            self.uart.clear_buffer()
-
-            # Check the response for errors
-            if r.packet_type == OW_ERROR:
-                logger.error("Error verifying writing TX register value")
+        max_regs = 62
+        for chunk_start in range(0, len(reg_values), max_regs):
+            chunk = reg_values[chunk_start : chunk_start + max_regs]
+            fmt = "<HBB" + "I" * len(chunk)
+            data = struct.pack(fmt, start_address + chunk_start, len(chunk), 0, *chunk)
+            r = self.send(packet_type=OW_TX7332, command=OW_TX7332_WBLOCK, addr=identifier, data=data)
+            if r is None or r.packet_type == OW_ERROR:
+                logger.error("write_block failed (chip=%d chunk at 0x%04X)", identifier, start_address + chunk_start)
                 return False
+        logger.debug("write_block: %d regs from 0x%04X on chip %d", len(reg_values), start_address, identifier)
+        return True
 
-            logger.debug(f"Successfully wrote value 0x{value:08X} to register 0x{address:04X}")
-            return True
-
-        except ValueError as v:
-            logger.error("ValueError: %s", v)
-            raise  # Re-raise the exception for the caller to handle
-
-        except Exception as e:
-            logger.error("Unexpected error during process: %s", e)
-            raise  # Re-raise the exception for the caller to handle
-
-    def write_block_verify(self, start_address: int, reg_values: List[int]) -> bool:
-        """
-        Write a block of register values to the TX device with verification.
+    def read_block(self, identifier: int, start_address: int, count: int)-> list[int] | None:
+        """Read a contiguous block of TX7332 registers.
 
         Args:
-            start_address (int): The starting register address to write to.
-            reg_values (List[int]): List of register values to write.
+            identifier: TX7332 chip index.
+            start_address: Starting register address.
+            count: Number of registers to read (1-62).
 
         Returns:
-            bool: True if the block write operation was successful, False otherwise.
-
-        Raises:
-            ValueError: If the device is not connected, the identifier is invalid, or parameters are out of range.
+            List of 32-bit values, or None on error.
         """
-        try:
-            if self.uart.demo_mode:
-                return True
-
-            # Ensure the UART connection is active
-            if not self.uart.is_connected():
-                raise ValueError("TX Device not connected")
-
-            # Validate the identifier
-            if self.identifier < 0:
-                raise ValueError("TX Chip address NOT SET")
-
-            # Validate the reg_values list
-            if not reg_values or not isinstance(reg_values, list):
-                raise ValueError("Invalid register values: Must be a non-empty list of integers")
-            if any(not isinstance(value, int) for value in reg_values):
-                raise ValueError("Invalid register values: All elements must be integers")
-
-            # Configure chunking for large blocks
-            max_regs_per_block = 62  # Maximum registers per block due to payload size
-            num_chunks = (len(reg_values) + max_regs_per_block - 1) // max_regs_per_block
-            logger.debug(f"Write Block: Total chunks = {num_chunks}")
-
-            # Write each chunk
-            for i in range(num_chunks):
-                chunk_start = i * max_regs_per_block
-                chunk_end = min((i + 1) * max_regs_per_block, len(reg_values))
-                chunk = reg_values[chunk_start:chunk_end]
-
-                # Pack the chunk into the required data format
-                try:
-                    data_format = '<HBB' + 'I' * len(chunk)  # Start address (H), chunk length (B), reserved (B), values (I...)
-                    data = struct.pack(data_format, start_address + chunk_start, len(chunk), 0, *chunk)
-                except struct.error as e:
-                    logger.error(f"Error packing data for chunk {i}: {e}")
-                    return False
-
-                # Send the packet
-                r = self.uart.send_packet(
-                    id=None,
-                    packetType=OW_TX7332,
-                    command=OW_TX7332_VWBLOCK,
-                    addr=self.identifier,
-                    data=data
-                )
-
-                # Clear the UART buffer after sending
-                self.uart.clear_buffer()
-
-                # Check for errors in the response
-                if r.packet_type == OW_ERROR:
-                    logger.error(f"Error verifying writing TX block at chunk {i}")
-                    return False
-
-            logger.debug("Block write successful")
-            return True
-
-        except ValueError as v:
-            logger.error("ValueError: %s", v)
-            raise  # Re-raise the exception for the caller to handle
-
-        except Exception as e:
-            logger.error("Unexpected error during process: %s", e)
-            raise  # Re-raise the exception for the caller to handle
+        self._require_connected()
+        if identifier < 0:
+            raise ValueError("TX chip identifier must be >= 0")
+        if count <= 0 or count > 62:
+            raise ValueError(f"count must be 1-62, got {count}")
+        data = struct.pack("<HBB", start_address, count, 0)
+        r = self.send(packet_type=OW_TX7332, command=OW_TX7332_RBLOCK, addr=identifier, data=data)
+        if r is None or r.packet_type == OW_ERROR:
+            logger.error("read_block failed (chip=%d addr=0x%04X count=%d)", identifier, start_address, count)
+            return None
+        expected = count * 4
+        if r.data_len < expected:
+            logger.error("read_block: data_len=%d, expected=%d", r.data_len, expected)
+            return None
+        values = list(struct.unpack(f"<{count}I", r.data[:expected]))
+        logger.debug("read_block: %d regs from 0x%04X on chip %d", count, start_address, identifier)
+        return values
 
     def set_solution(self,
                      pulse: Dict,
@@ -1619,23 +744,13 @@ class TxDevice:
         Raises:
             ValueError: If the device is not connected.
         """
-        if self.uart.demo_mode:
-            return True
-
-        try:
-            if not self.uart.is_connected():
-                raise ValueError("TX Device not connected")
-            registers = self.tx_registers.get_registers(pack=True, pack_single=True)
-            for txi, txregs in enumerate(registers):
-                for addr, reg_values in txregs.items():
-                    if not self.write_block(identifier=txi, start_address=addr, reg_values=reg_values):
-                        logger.error(f"Error applying TX CHIP ID: {txi} registers")
-                        return False
-            return True
-
-        except Exception as e:
-            logger.error("Unexpected error during process: %s", e)
-            raise  # Re-raise the exception for the caller to handle
+        registers = self.tx_registers.get_registers(pack=True, pack_single=True)
+        for txi, txregs in enumerate(registers):
+            for addr, reg_values in txregs.items():
+                if not self.write_block(identifier=txi, start_address=addr, reg_values=reg_values):
+                    logger.error(f"Error applying TX CHIP ID: {txi} registers")
+                    return False
+        return True
 
     def write_ti_config_to_tx_device(self, file_path: str, txchip_id: int) -> bool:
         """
@@ -1649,10 +764,6 @@ class TxDevice:
             bool: True if all registers were written successfully, False otherwise.
         """
         try:
-            # Check if UART is connected
-            if not self.uart.is_connected():
-                raise ValueError("TX Device not connected")
-
             # Parse the TI configuration file
             parsed_registers = self.__parse_ti_cfg_file(file_path)
             if not parsed_registers:
@@ -1693,36 +804,23 @@ class TxDevice:
         deriving the count from the TX7332 chip count when the firmware does not
         yet support the command.
         """
-        try:
-            if self.uart.demo_mode:
-                return 1
-
-            if not self.uart.is_connected():
-                logger.error("TX Device not connected")
-                return 0
-
-            r = self.uart.send_packet(
-                id=None, packetType=OW_CMD,
-                command=OW_CTRL_GET_MODULE_COUNT, addr=0
-            )
-            self.uart.clear_buffer()
-
-            if r.packet_type != OW_ERROR and r.data_len >= 1:
-                count = r.data[0]
-                logger.debug("Module count from firmware: %d", count)
-                return count
-
-            # Fallback: TX7332 chip count / 2
-            logger.info(
-                "OW_CTRL_GET_MODULE_COUNT not supported; falling back to TX7332 count"
-            )
-            module_count = self.get_tx_module_count()
-            return module_count
-
-        except Exception as e:
-            logger.error("Error getting module count: %s", e)
+        self._require_connected()
+        r = self.send(packet_type=OW_CONTROLLER, command=OW_CTRL_GET_MODULE_COUNT, addr=0)
+        
+        # Check for transport failure or hardware error reporting
+        if r is None or r.packet_type == OW_ERROR:
+            logger.error("get_module_count: Communication error or hardware NACK")
+            return 0
+        
+        # Check for malformed payload
+        if not r.data or len(r.data) < 1:
+            logger.error(f"get_module_count: Unexpected payload length ({r.data_len})")
             return 0
 
+        count = r.data[0]
+        logger.debug(f"Detected {count} module(s)")
+        return count
+        
     def update_firmware(self, module: int, package_file: str,
                         vid: int = 0x0483, pid: int = 0xDF11,
                         libusb_dll: str | None = None,
@@ -1754,8 +852,7 @@ class TxDevice:
         """
         from openlifu_sdk.io.LIFUDFU import LIFUDFUManager  # lazy import
 
-        if not self.uart.is_connected():
-            raise ValueError("TX Device not connected")
+        self._require_connected()
 
         mgr = LIFUDFUManager(uart=self.uart)
         mgr.update_module(
@@ -1782,7 +879,6 @@ class TxDevice:
         """
         print("TX Device Information") # noqa: T201
         print("  UART Port:") # noqa: T201
-        self.uart.print()
 
 def get_delay_location(channel:int, profile:int=1):
     """
