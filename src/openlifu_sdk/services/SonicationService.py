@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING, Dict, Optional
+from typing import TYPE_CHECKING, Dict, List, Optional
 
 import numpy as np
 import pandas as pd
@@ -13,6 +13,7 @@ from ..io.LIFUTransmitter import LIFUTransmitter, TriggerMode
 
 from ..models.tx_registers import (
     DEFAULT_PATTERN_DUTY_CYCLE,
+    DEFAULT_PULSE_WIDTH_US,
     NUM_CHANNELS,
     Tx7332DelayProfile,
     Tx7332PulseProfile,
@@ -173,6 +174,17 @@ class SonicationService:
         max_voltage.Description = "This table shows the maximum voltage for different duty cycles and sequence times."
         return max_voltage
 
+    def set_module_invert(self, module_invert: bool | List[bool]) -> None:
+        """
+        Set the module invert configuration for the TX device.
+
+        Args:
+            module_invert (bool | List[bool]): The module invert configuration to set.
+        """
+        self.module_invert = module_invert
+        if self.tx_registers is not None:
+            self.tx_registers.module_invert = module_invert
+            
     # -- solution validation -----------------------------------------------
 
     def check_solution(self, solution: Dict) -> None:
@@ -211,7 +223,7 @@ class SonicationService:
                      profile_increment:bool=True,
                      trigger_mode: TriggerMode = TriggerMode.SEQUENCE,
                      _allow_unsafe_solution: bool = False
-                     ) -> None:
+                     ) -> bool:
         """
         Load a solution to the device.
 
@@ -303,13 +315,18 @@ class SonicationService:
             self.tx_registers.add_delay_profile(delay_profile)
 
         sequence = solution['sequence']
+        pulse_interval_float = float(sequence['pulse_interval'] or 1.0)
+        pulse_count_int = int(sequence.get('pulse_count') or 1)
+        pulse_width_int = int(sequence.get('pulse_width') or DEFAULT_PULSE_WIDTH_US) 
+        pulse_train_interval_float = float(sequence.get('pulse_train_interval') or 1.0)
+        pulse_train_count_int = int(sequence.get('pulse_train_count') or 1)
         trigger_mode_int = trigger_mode.value
         trigger_json = {
-            "TriggerFrequencyHz": sequence["pulse_interval"],
-            "TriggerPulseCount": sequence["pulse_count"],
-            "TriggerPulseWidthUsec": sequence["pulse_width"],
-            "TriggerPulseTrainInterval": sequence["pulse_train_interval"] * 1000000,
-            "TriggerPulseTrainCount": sequence["pulse_train_count"],
+            "TriggerFrequencyHz": 1/pulse_interval_float,
+            "TriggerPulseCount": pulse_count_int,
+            "TriggerPulseWidthUsec": pulse_width_int,
+            "TriggerPulseTrainInterval": pulse_train_interval_float * 1000000,
+            "TriggerPulseTrainCount": pulse_train_count_int,
             "TriggerMode": trigger_mode_int,
             "ProfileIndex": profile_index,
             "ProfileIncrement": profile_increment
@@ -336,10 +353,11 @@ class SonicationService:
                 raise OSError(errmsg)
             
             self.status = LIFUInterfaceStatus.STATUS_READY
+            return True
         else:
             logger.warning("Console not connected or invalid voltage value; skipping HV set command")
             self.status = LIFUInterfaceStatus.STATUS_WARNING
-
+            return False
 
     # -- sonication control ------------------------------------------------
 

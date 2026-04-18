@@ -78,7 +78,7 @@ class LIFUInterface:
                      profile_increment:bool=True,
                      trigger_mode: TriggerMode = TriggerMode.SEQUENCE,
                      _allow_unsafe_solution: bool = False
-                     ) -> None:
+                     ) -> bool:
         """
         Load a solution to the device.
 
@@ -91,7 +91,7 @@ class LIFUInterface:
             _allow_unsafe_solution (bool): Allow loading a solution that may be unsafe (defaults to False)
         """
         
-        self.sonication_service.set_solution(
+        return self.sonication_service.set_solution(
                 solution=solution,
                 profile_index=profile_index,
                 profile_increment=profile_increment,
