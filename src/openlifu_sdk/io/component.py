@@ -182,14 +182,17 @@ class OWComponent:
             return bytes(r.data), r.data_len
         return None, 0
 
-    def get_hardware_id(self, module: int = 0) -> str | None:
+    def get_hardware_id(self, module: int = 0, raw_hex: bool = False) -> str | None:
         self._require_connected()
         r = self.send(OW_CMD_HWID, addr=module)
         r.print_packet()
         if r is None:
             raise RuntimeError(f"{self._uart.desc}: HWID request timed out")
         if r.data_len >= HW_ID_DATA_LENGTH:
-            return format_hwid(r.data[:HW_ID_DATA_LENGTH].hex())
+            hwid = r.data[:HW_ID_DATA_LENGTH].hex()
+            if raw_hex:
+                return hwid
+            return format_hwid(hwid)
         return None
 
     def toggle_led(self, module: int = 0) -> bool:

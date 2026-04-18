@@ -294,7 +294,7 @@ class OWUart:
         # TODO: Consider separate signal for unsolicited packets vs responses to async commands      
         # self.signal_data_received.emit(self.desc, packet)
         if packet.packet_type == OW_DATA and packet.id == 0:
-            # Unsolicited data packet with no ID – emit decoded text for convenience
+            # Unsolicited data packet with no ID – emit decoded text for convenience            
             text = packet.data.decode('utf-8', errors='replace')
             self.signal_data_received.emit(self.desc, text)
             
