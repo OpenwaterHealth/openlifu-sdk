@@ -96,6 +96,7 @@ class LIFUInterface:
         self.txdevice = None
         self.hvcontroller = None
         self.status = LIFUInterfaceStatus.STATUS_SYS_OFF
+        self._test_mode = TX_test_mode
 
         self.voltage_table = None
         self.sequence_time = None
@@ -157,29 +158,19 @@ class LIFUInterface:
 
     async def start_monitoring(self, interval: int = 1) -> None:
         """Start monitoring for USB device connections."""
-        try:
-            if self._hv_uart is not None:
-                await asyncio.gather(
-                    self._tx_uart.monitor_usb_status(interval),
-                    self._hv_uart.monitor_usb_status(interval)
-                )
-            else:
-                await self._tx_uart.monitor_usb_status(interval)
-
-        except Exception as e:
-            logger.error("Error starting monitoring: %s", e)
-            raise e
+        if self.txdevice is not None:
+            self.txdevice.start()
+        if self.hvcontroller is not None:
+            self.hvcontroller.start()
+        
 
     def stop_monitoring(self) -> None:
         """Stop monitoring for USB device connections."""
-        try:
-            if self._tx_uart is not None:
-                self._tx_uart.stop_monitoring()
-            if self._hv_uart is not None:
-                self._hv_uart.stop_monitoring()
-        except Exception as e:
-            logger.error("Error stopping monitoring: %s", e)
-            raise e
+        if self.txdevice is not None:
+            self.txdevice.stop()
+        if self.hvcontroller is not None:
+            self.hvcontroller.stop()
+        
 
     def is_device_connected(self) -> tuple:
         """
@@ -360,7 +351,7 @@ class LIFUInterface:
 
         logger.info("%s loaded successfully.", solution_name)
 
-    def start_sonication(self, async_mode: bool | None = None) -> bool:
+    def start_sonication(self, async_mode: bool | None = None) -> bool:   
         """
         Start sonication.
 
@@ -376,7 +367,7 @@ class LIFUInterface:
             if self.hvcontroller is not None:
                 logger.debug("Turn ON HV")
                 bHvOn = self.hvcontroller.turn_hv_on()
-                self.hvcontroller.wait_for_settle()
+                # self.hvcontroller.wait_for_settle()
             else:
                 logger.debug("Using external power supply, HV will not be turned ON.")
                 bHvOn = True
@@ -473,8 +464,10 @@ class LIFUInterface:
     def close(self):
         self.stop_monitoring()
         if self.txdevice:
+            self.txdevice.stop()
             self.txdevice.close()
         if self.hvcontroller:
+            self.hvcontroller.stop()
             self.hvcontroller.close()
 
     def __enter__(self):
