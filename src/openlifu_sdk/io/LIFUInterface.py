@@ -170,7 +170,6 @@ class LIFUInterface:
             self.txdevice.stop()
         if self.hvcontroller is not None:
             self.hvcontroller.stop()
-        
 
     def is_device_connected(self) -> tuple:
         """
@@ -351,7 +350,7 @@ class LIFUInterface:
 
         logger.info("%s loaded successfully.", solution_name)
 
-    def start_sonication(self, async_mode: bool | None = None) -> bool:   
+    def start_sonication(self, async_mode: bool | None = None) -> bool:
         """
         Start sonication.
 
