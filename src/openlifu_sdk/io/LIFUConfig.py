@@ -137,4 +137,7 @@ USB_POLL_INTERVAL = 0.5     # seconds – USB presence polling in async mode
 MAX_DATA_LEN = 4096         # maximum payload bytes (sanity guard)
 HW_ID_DATA_LENGTH = 12      # hardware ID is 12 bytes
 
+SETTLE_TIME_HV_ON = 5
+SETTLE_TIME_HV_OFF = 15
+
 TEMPERATURE_DATA_LENGTH = 4  # temperature responses are 4 bytes (float32)
