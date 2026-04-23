@@ -132,7 +132,7 @@ OW_VID = 0x0483
 OW_CONSOLE_PID = 0x57A0
 OW_TRANSMITTER_PID = 0x57AF
 
-DEFAULT_TIMEOUT = 10.0
+DEFAULT_TIMEOUT = 1.0
 USB_POLL_INTERVAL = 0.5     # seconds – USB presence polling in async mode
 MAX_DATA_LEN = 4096         # maximum payload bytes (sanity guard)
 HW_ID_DATA_LENGTH = 12      # hardware ID is 12 bytes
@@ -141,3 +141,52 @@ SETTLE_TIME_HV_ON = 5
 SETTLE_TIME_HV_OFF = 15
 
 TEMPERATURE_DATA_LENGTH = 4  # temperature responses are 4 bytes (float32)
+
+# ---------------------------------------------------------------------------
+# LIFU SDK error codes
+#
+# These stable numeric codes are attached to every :class:`LIFUError`
+# raised by the I/O layer so that calling applications can programmatically
+# distinguish failure modes (e.g. a timeout vs. a device NAK) without
+# string-matching exception messages.
+#
+# Codes are grouped by tens:
+#   10xx – transport / connection errors
+#   20xx – device-reported errors (firmware returned OW_ERROR)
+#   30xx – protocol / response-parsing errors
+#   40xx – higher-level operation failures
+# ---------------------------------------------------------------------------
+
+# Transport / connection
+LIFU_ERR_NOT_CONNECTED        = 1001  # serial port not open
+LIFU_ERR_SEND_FAILED          = 1002  # OS/serial error while transmitting
+LIFU_ERR_RESPONSE_TIMEOUT     = 1003  # no response received in time
+
+# Device-reported
+LIFU_ERR_DEVICE_NAK           = 2001  # firmware returned OW_ERROR packet
+
+# Protocol / response parsing
+LIFU_ERR_BAD_PAYLOAD_LENGTH   = 3001  # payload length not what we expected
+LIFU_ERR_BAD_PAYLOAD_FORMAT   = 3002  # malformed JSON / struct / encoding
+LIFU_ERR_EMPTY_RESPONSE       = 3003  # response had no payload when one was required
+
+# Higher-level operations
+LIFU_ERR_HV_NOT_SETTLED       = 4001  # HV rail failed to settle in time
+LIFU_ERR_MODULE_COUNT_MISMATCH = 4002 # detected modules != requested modules
+LIFU_ERR_SOLUTION_INVALID     = 4003  # solution failed safety check
+LIFU_ERR_SONICATION_FAILED    = 4004  # start/stop sonication did not complete cleanly
+LIFU_ERR_NO_TRIGGER_STATUS = 4005  # sonication trigger status could not be determined after sonication
+
+LIFU_ERROR_MESSAGES: dict[int, str] = {
+    LIFU_ERR_NOT_CONNECTED:        "Device is not connected",
+    LIFU_ERR_SEND_FAILED:          "Failed to transmit packet to device",
+    LIFU_ERR_RESPONSE_TIMEOUT:     "Timed out waiting for device response",
+    LIFU_ERR_DEVICE_NAK:           "Device returned an error response",
+    LIFU_ERR_BAD_PAYLOAD_LENGTH:   "Device response payload has unexpected length",
+    LIFU_ERR_BAD_PAYLOAD_FORMAT:   "Device response payload is malformed",
+    LIFU_ERR_EMPTY_RESPONSE:       "Device returned an empty response",
+    LIFU_ERR_HV_NOT_SETTLED:       "High-voltage rail failed to settle",
+    LIFU_ERR_MODULE_COUNT_MISMATCH:"Detected module count does not match requested",
+    LIFU_ERR_SOLUTION_INVALID:     "Solution failed safety validation",
+    LIFU_ERR_SONICATION_FAILED:    "Sonication start/stop did not complete successfully",
+}
