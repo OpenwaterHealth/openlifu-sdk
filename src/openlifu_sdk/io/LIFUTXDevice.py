@@ -428,10 +428,10 @@ class TxDevice(OWComponent):
         """
         self._require_connected()
         r = self.send(packet_type=OW_CONTROLLER, command=OW_CTRL_STOP_SWTRIG, addr=0)
-        r.print_packet()
         if r is None or r.packet_type == OW_ERROR:
             logger.error("stop_trigger failed")
             return False
+        r.print_packet()
         return True
     
     def async_mode(self, enable: bool | None = None) -> bool:

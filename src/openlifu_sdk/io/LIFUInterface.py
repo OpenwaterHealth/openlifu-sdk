@@ -9,7 +9,14 @@ from typing import Dict, List, Optional
 import numpy as np
 import pandas as pd
 
-from openlifu_sdk.io.LIFUConfig import DEFAULT_TIMEOUT, OW_CONSOLE_PID, OW_TRANSMITTER_PID, OW_VID
+from openlifu_sdk.io.LIFUConfig import (
+    DEFAULT_TIMEOUT, 
+    OW_CONSOLE_PID, 
+    OW_TRANSMITTER_PID, 
+    OW_VID,
+    SETTLE_TIME_HV_OFF,
+    SETTLE_TIME_HV_ON
+)
 from openlifu_sdk.io.LIFUHVController import HVController
 from openlifu_sdk.io.LIFUTXDevice import TriggerModeOpts, TxDevice
 
@@ -301,6 +308,8 @@ class LIFUInterface:
                      profile_index:int=1,
                      profile_increment:bool=True,
                      trigger_mode: TriggerModeOpts = "sequence",
+                     turn_hv_on: bool = False,
+                     wait_for_settle: bool = False,
                      _allow_unsafe_solution: bool = False
                      ) -> None:
         """
@@ -347,15 +356,27 @@ class LIFUInterface:
 
         if self.hvcontroller is not None:
             self.hvcontroller.set_voltage(voltage)
+            logger.debug(f"Set HV to %.2f", self.hvcontroller.supply_voltage)
+            if turn_hv_on:
+                logger.debug("Turn ON HV")
+                bHvOn = self.hvcontroller.turn_hv_on()
+                if not bHvOn:
+                    logger.error("Failed to turn on HV.")
+                    raise RuntimeError("Failed to turn on HV.")                
+                if wait_for_settle:
+                    logger.debug("Wait for Settle")
+                    self.hvcontroller.wait_for_settle(timeout=SETTLE_TIME_HV_ON)
 
         logger.info("%s loaded successfully.", solution_name)
 
-    def start_sonication(self, async_mode: bool | None = None) -> bool:
+    def start_sonication(self, async_mode: bool | None = None, turn_hv_on: bool = True, wait_for_settle: bool = True) -> bool:
         """
         Start sonication.
 
         Args:
             async_mode (bool | None): Whether to start sonication in asynchronous mode (defaults to None, which means it will use the current async mode setting of the interface).
+            turn_hv_on (bool): Whether to turn on the high voltage (HV) before starting sonication (defaults to True).
+            wait_for_settle (bool): Whether to wait for the HV to settle before starting sonication (defaults to True).
 
         Sets the device to a running state and sends a start command if necessary.
         """
@@ -364,12 +385,16 @@ class LIFUInterface:
                 return True
 
             if self.hvcontroller is not None:
-                logger.debug("Turn ON HV")
-                bHvOn = self.hvcontroller.turn_hv_on()
-                # self.hvcontroller.wait_for_settle()
-            else:
-                logger.debug("Using external power supply, HV will not be turned ON.")
-                bHvOn = True
+                if turn_hv_on:
+                    logger.debug("Turn ON HV")
+                    bHvOn = self.hvcontroller.turn_hv_on()                
+                    if not bHvOn:
+                        logger.error("Failed to turn on HV.")
+                        raise RuntimeError("Failed to turn on HV.")
+                else:
+                    bHvOn = self.hvcontroller.get_hv_status()
+                if bHvOn and wait_for_settle:
+                    self.hvcontroller.wait_for_settle(timeout=SETTLE_TIME_HV_ON)
 
             if async_mode is not None:
                 self.txdevice.async_mode(async_mode)
@@ -421,7 +446,7 @@ class LIFUInterface:
 
         return self.status
 
-    def stop_sonication(self) -> bool:
+    def stop_sonication(self, turn_hv_off: bool = True, wait_for_settle: bool = False) -> bool:
         """
         Stop sonication.
 
@@ -434,18 +459,25 @@ class LIFUInterface:
             logger.debug("Stopping trigger")
             # Send the solution data to the device
             bTriggerOff = self.txdevice.stop_trigger()
-
+            
             if self.hvcontroller is not None:
-                logger.debug("Turn OFF HV")
-                bHvOff = self.hvcontroller.turn_hv_off()
-                # self.hvcontroller.wait_for_settle(timeout=10) #commenting out until better solution is implemented due to long discharge time
+                if turn_hv_off:
+                    logger.debug("Turn OFF HV")
+                    bHvOff = self.hvcontroller.turn_hv_off()
+                    if not bHvOff:
+                        logger.error("Failed to turn off HV.")
+                        raise RuntimeError("Failed to turn off HV.")
+                else:
+                    bHvOff = not self.hvcontroller.get_hv_status()
+                if bHvOff and wait_for_settle:
+                    self.hvcontroller.wait_for_settle(timeout=SETTLE_TIME_HV_OFF)
             else:
                 logger.debug("Using external power supply, HV will not be turned OFF.")
                 bHvOff = True
 
             self.txdevice.async_mode(False)
 
-            if bTriggerOff and bHvOff:
+            if bTriggerOff:
                 logger.info("Sonication stopped successfully.")
                 return True
             else:
