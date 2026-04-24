@@ -116,6 +116,7 @@ class HVController(OWComponent):
             logger.error("Error turning off 12V")
             return False
         logger.info("12V turned off")
+        self.is_12v_on = False
         return True
 
     def turn_12v_on(self):
@@ -126,6 +127,7 @@ class HVController(OWComponent):
             logger.error("Error turning on 12V")
             return False
         logger.info("12V turned on")
+        self.is_12v_on = True
         return True
 
     def get_12v_status(self):
@@ -147,6 +149,7 @@ class HVController(OWComponent):
             logger.error("Error turning on HV")
             return False
         logger.info("HV turned on")
+        self.is_hv_on = True
         return True
 
     def wait_for_settle(self, range_volts: float = 2, settle_time: float = 0.5, timeout: float = 15.0, polling_interval: float = 0.1):
@@ -205,14 +208,15 @@ class HVController(OWComponent):
             logger.error("Error turning off HV")
             return False
         logger.info("HV turned off")
+        self.is_hv_on = False
         return True
 
     def get_hv_status(self) -> bool:
         self._require_connected()
         r = self.send(packet_type=OW_POWER, command=OW_POWER_GET_HVON)
-        r.print_packet()
         if r is None or r.packet_type == OW_ERROR:
             raise RuntimeError("HVController: HV status request failed")
+        r.print_packet()
         return r.reserved == 1
 
     def set_voltage(self, voltage: float) -> bool:
@@ -225,6 +229,7 @@ class HVController(OWComponent):
         Raises:
             ValueError: If the controller is not connected or voltage exceeds supply voltage.
         """
+        logger.debug("Setting HV to %.2f", voltage)
         self._require_connected()
         if not 5.0 <= voltage <= 100.0:
             raise ValueError("HV voltage must be between 5 and 100 V")
@@ -234,6 +239,7 @@ class HVController(OWComponent):
         if r is None or r.packet_type == OW_ERROR:
             logger.error("Error setting HV to %.2f", voltage)
             return False
+        self.supply_voltage = voltage
         return True
     
     def set_dacs(self, hvp: int, hvm: int, hrp: int, hrm: int) -> bool:

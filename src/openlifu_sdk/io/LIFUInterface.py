@@ -356,6 +356,7 @@ class LIFUInterface:
 
         if self.hvcontroller is not None:
             self.hvcontroller.set_voltage(voltage)
+            logger.debug(f"Set HV to %.2f", self.hvcontroller.supply_voltage)
             if turn_hv_on:
                 logger.debug("Turn ON HV")
                 bHvOn = self.hvcontroller.turn_hv_on()
@@ -363,6 +364,7 @@ class LIFUInterface:
                     logger.error("Failed to turn on HV.")
                     raise RuntimeError("Failed to turn on HV.")                
                 if wait_for_settle:
+                    logger.debug("Wait for Settle")
                     self.hvcontroller.wait_for_settle(timeout=SETTLE_TIME_HV_ON)
 
         logger.info("%s loaded successfully.", solution_name)
@@ -457,7 +459,7 @@ class LIFUInterface:
             logger.debug("Stopping trigger")
             # Send the solution data to the device
             bTriggerOff = self.txdevice.stop_trigger()
-
+            
             if self.hvcontroller is not None:
                 if turn_hv_off:
                     logger.debug("Turn OFF HV")
@@ -475,7 +477,7 @@ class LIFUInterface:
 
             self.txdevice.async_mode(False)
 
-            if bTriggerOff and bHvOff:
+            if bTriggerOff:
                 logger.info("Sonication stopped successfully.")
                 return True
             else:
