@@ -222,7 +222,8 @@ class TxDevice(OWComponent):
         """
         self._require_connected()
         r = self.send(packet_type=OW_CONTROLLER, command=OW_CMD_GET_TEMP, addr=module)
-        r.print_packet()
+        if r is not None:
+            r.print_packet()
         if r is None or r.data_len < TEMPERATURE_DATA_LENGTH:
             return None
         
@@ -243,7 +244,8 @@ class TxDevice(OWComponent):
         """
         self._require_connected()
         r = self.send(packet_type=OW_CONTROLLER, command=OW_CMD_GET_AMBIENT, addr=module)
-        r.print_packet()
+        if r is not None:
+            r.print_packet()
         if r is None or r.data_len < TEMPERATURE_DATA_LENGTH:
             return None
         
@@ -326,7 +328,8 @@ class TxDevice(OWComponent):
             raise ValueError("Trigger data cannot be None")
         payload = json.dumps(data).encode("utf-8")
         r = self.send(packet_type=OW_CONTROLLER, command=OW_CTRL_SET_SWTRIG, addr=0, data=payload)
-        r.print_packet()
+        if r is not None:
+            r.print_packet()
         if r is None or r.packet_type == OW_ERROR or r.data_len == 0:
             logger.error("set_trigger failed")
             return None
@@ -349,7 +352,8 @@ class TxDevice(OWComponent):
         """
         self._require_connected()
         r = self.send(packet_type=OW_CONTROLLER, command=OW_CTRL_GET_SWTRIG, addr=0)
-        r.print_packet()
+        if r is not None:
+            r.print_packet()
         if r is None or r.packet_type == OW_ERROR or r.data_len == 0:
             logger.error("get_trigger failed")
             return None
@@ -405,7 +409,8 @@ class TxDevice(OWComponent):
         """
         self._require_connected()
         r = self.send(packet_type=OW_CONTROLLER, command=OW_CTRL_START_SWTRIG, addr=0)
-        r.print_packet()
+        if r is not None:
+            r.print_packet()
         if r is None or r.packet_type == OW_ERROR:
             logger.error("Error starting trigger")
             return False
@@ -428,7 +433,8 @@ class TxDevice(OWComponent):
         """
         self._require_connected()
         r = self.send(packet_type=OW_CONTROLLER, command=OW_CTRL_STOP_SWTRIG, addr=0)
-        r.print_packet()
+        if r is not None:
+            r.print_packet()
         if r is None or r.packet_type == OW_ERROR:
             logger.error("stop_trigger failed")
             return False
@@ -459,7 +465,8 @@ class TxDevice(OWComponent):
             payload = None
 
         r = self.send(packet_type=OW_CONTROLLER, command=OW_CMD_ASYNC, addr=0, data=payload)
-        r.print_packet()
+        if r is not None:
+            r.print_packet()
         if r is None or r.packet_type == OW_ERROR:
             raise RuntimeError("Error running async mode command for device")
         
@@ -480,7 +487,8 @@ class TxDevice(OWComponent):
         tx_module_count = 0
         self._require_connected()
         r = self.send(packet_type=OW_CONTROLLER, command=OW_CTRL_GET_MODULE_COUNT, addr=0)
-        r.print_packet()
+        if r is not None:
+            r.print_packet()
         if r is None or r.packet_type == OW_ERROR:
             raise RuntimeError("Error retrieving TX module count.")
                 
@@ -512,7 +520,8 @@ class TxDevice(OWComponent):
         """
         self._require_connected()
         r = self.send(packet_type=OW_TX7332, command=OW_TX7332_ENUM, addr=0)
-        r.print_packet()
+        if r is not None:
+            r.print_packet()
         if r is None or r.packet_type == OW_ERROR:
             raise RuntimeError("Error enumerating TX7332 devices.")
 
@@ -552,7 +561,8 @@ class TxDevice(OWComponent):
         """
         self._require_connected()
         r = self.send(packet_type=OW_TX7332, command=OW_TX7332_DEMO, addr=identifier)
-        r.print_packet()
+        if r is not None:
+            r.print_packet()
         if r is None or r.packet_type == OW_ERROR:
             raise RuntimeError("Error writing demo TX7332 registers.")
 
@@ -1606,3 +1616,7 @@ class TxDeviceRegisters:
         if profile is None:
             profile = self.active_profile
         return [tx.get_pulse_data_registers(profile, pack=pack, pack_single=pack_single) for tx in self.transmitters]
+
+
+
+

@@ -146,7 +146,8 @@ class OWComponent:
         self._require_connected()
         log.info("Send Ping to %s", self._uart.desc)
         r = self.send(OW_CMD_PING, addr=module)
-        r.print_packet()
+        if r is not None:
+            r.print_packet()
         if r is None or r.packet_type == OW_ERROR:
             log.error("Ping failed on %s", self._uart.desc)
             return False
@@ -155,8 +156,10 @@ class OWComponent:
     def get_version(self, module: int = 0) -> str:
         self._require_connected()
         r = self.send(OW_CMD_VERSION)
-        r.print_packet()
-        r.print_packet()
+        if r is not None:
+            r.print_packet()
+        if r is not None:
+            r.print_packet()
         if r is None:
             raise RuntimeError(f"{self._uart.desc}: version request timed out")
         if r.data_len == 3:
@@ -175,7 +178,8 @@ class OWComponent:
         if not isinstance(echo_data, (bytes, bytearray)):
             raise TypeError("echo_data must be bytes or bytearray")
         r = self.send(OW_CMD_ECHO, addr=module, data=bytearray(echo_data))
-        r.print_packet()
+        if r is not None:
+            r.print_packet()
         if r is None:
             raise RuntimeError(f"{self._uart.desc}: echo request timed out")
         if r.data_len > 0:
@@ -185,7 +189,8 @@ class OWComponent:
     def get_hardware_id(self, module: int = 0, raw_hex: bool = False) -> str | None:
         self._require_connected()
         r = self.send(OW_CMD_HWID, addr=module)
-        r.print_packet()
+        if r is not None:
+            r.print_packet()
         if r is None:
             raise RuntimeError(f"{self._uart.desc}: HWID request timed out")
         if r.data_len >= HW_ID_DATA_LENGTH:
@@ -198,14 +203,16 @@ class OWComponent:
     def toggle_led(self, module: int = 0) -> bool:
         self._require_connected()
         r = self.send(OW_CMD_TOGGLE_LED, addr=module)
-        r.print_packet()
+        if r is not None:
+            r.print_packet()
         return r is not None and r.packet_type != OW_ERROR
 
     def soft_reset(self, module: int = 0) -> bool:
         """Perform a soft reset on the device."""
         self._require_connected()
         r = self.send(OW_CMD_RESET, addr=module)
-        r.print_packet()
+        if r is not None:
+            r.print_packet()
         if r is None or r.packet_type == OW_ERROR:
             log.error("Error resetting %s", self._uart.desc)
             return False
@@ -215,7 +222,8 @@ class OWComponent:
         """Perform a soft reset into DFU mode."""
         self._require_connected()
         r = self.send(OW_CMD_DFU, addr=module)
-        r.print_packet()
+        if r is not None:
+            r.print_packet()
         if r is None or r.packet_type == OW_ERROR:
             log.error("Error entering DFU mode on %s", self._uart.desc)
             return False
@@ -302,3 +310,7 @@ class OWComponent:
         except json.JSONDecodeError as exc:
             raise ValueError(f"Invalid JSON: {exc}") from exc
         return self.write_config(config, module=module)
+
+
+
+

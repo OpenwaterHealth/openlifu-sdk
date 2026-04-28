@@ -54,6 +54,10 @@ class OWUart:
         self._reader_thread: threading.Thread | None = None
         self._monitor_thread: threading.Thread | None = None
 
+        # Retry timed-out requests to tolerate transient serial hiccups.
+        self._timeout_retry_count = 1
+        self._timeout_retry_delay_s = 0.05
+
         # Signals  -- (desc, ...) for all emissions
         self.signal_connected = OWSignal()       # (desc, port)
         self.signal_disconnected = OWSignal()    # (desc, port)
@@ -404,40 +408,83 @@ class OWUart:
 
     def _send_via_queue(self, pkt: OWUartPacket, timeout: float) -> OWUartPacket | None:
         """Enqueue then block until the sender/reader pair complete the round-trip."""
-        entry = _PendingCommand(pkt.id, pkt.to_bytes(), timeout)
-        self._send_queue.put(entry)
-        # The sender thread guarantees the event is set (response, timeout, or error).
-        # Add generous extra time to account for commands queued ahead of this one.
-        entry.event.wait(timeout=timeout + self._send_queue.qsize() * timeout + 5)
-        if entry.error:
-            return None
-        return entry.response
+        max_attempts = self._timeout_retry_count + 1
+        packet_bytes = pkt.to_bytes()
+
+        for attempt in range(1, max_attempts + 1):
+            entry = _PendingCommand(pkt.id, packet_bytes, timeout)
+            self._send_queue.put(entry)
+            # The sender thread guarantees the event is set (response, timeout, or error).
+            # Add generous extra time to account for commands queued ahead of this one.
+            entry.event.wait(timeout=timeout + self._send_queue.qsize() * timeout + 5)
+
+            if not entry.error:
+                return entry.response
+
+            if entry.error != "Timeout" or attempt >= max_attempts:
+                return None
+
+            log.warning(
+                "%s timed out waiting for %s (attempt %d/%d). Retrying...",
+                self.desc,
+                self._packet_summary(pkt),
+                attempt,
+                max_attempts,
+            )
+            if self._timeout_retry_delay_s > 0:
+                time.sleep(self._timeout_retry_delay_s)
+
+        return None
 
     def _send_direct(self, pkt: OWUartPacket, timeout: float) -> OWUartPacket | None:
         """Sync-mode: write packet and read the response in the calling thread."""
-        ser = self._serial
-        if ser is None or not ser.is_open:
-            self.signal_error.emit(self.desc, pkt.id, "Not connected")
-            return None
         request_summary = self._packet_summary(pkt)
-        discarded_bytes = 0
-        try:
+        packet_bytes = pkt.to_bytes()
+        max_attempts = self._timeout_retry_count + 1
+
+        for attempt in range(1, max_attempts + 1):
+            ser = self._serial
+            if ser is None or not ser.is_open:
+                self.signal_error.emit(self.desc, pkt.id, "Not connected")
+                return None
+
+            discarded_bytes = 0
             try:
-                discarded_bytes = ser.in_waiting
-            except (serial.SerialException, OSError):
-                discarded_bytes = 0
-            if discarded_bytes:
-                log.warning("%s sync send discarding %d buffered bytes before %s",
-                            self.desc, discarded_bytes, request_summary)
-            ser.reset_input_buffer()
-            send_start = time.monotonic()
-            ser.write(pkt.to_bytes())
-        except (serial.SerialException, OSError) as exc:
-            self.signal_error.emit(self.desc, pkt.id, str(exc))
-            return None
-        write_elapsed_ms = (time.monotonic() - send_start) * 1000.0
-        log.debug("%s sync send wrote %s in %.2f ms", self.desc, request_summary, write_elapsed_ms)
-        return self._read_response_sync(pkt.id, timeout, request_summary=request_summary)
+                try:
+                    discarded_bytes = ser.in_waiting
+                except (serial.SerialException, OSError):
+                    discarded_bytes = 0
+                if discarded_bytes:
+                    log.warning("%s sync send discarding %d buffered bytes before %s",
+                                self.desc, discarded_bytes, request_summary)
+                ser.reset_input_buffer()
+                send_start = time.monotonic()
+                ser.write(packet_bytes)
+            except (serial.SerialException, OSError) as exc:
+                self.signal_error.emit(self.desc, pkt.id, str(exc))
+                return None
+
+            write_elapsed_ms = (time.monotonic() - send_start) * 1000.0
+            log.debug("%s sync send wrote %s in %.2f ms", self.desc, request_summary, write_elapsed_ms)
+
+            response = self._read_response_sync(pkt.id, timeout, request_summary=request_summary)
+            if response is not None:
+                return response
+
+            if attempt >= max_attempts:
+                return None
+
+            log.warning(
+                "%s sync send timed out waiting for %s (attempt %d/%d). Retrying...",
+                self.desc,
+                request_summary,
+                attempt,
+                max_attempts,
+            )
+            if self._timeout_retry_delay_s > 0:
+                time.sleep(self._timeout_retry_delay_s)
+
+        return None
 
     def _read_response_sync(self, expected_id: int, timeout: float,
                             request_summary: str | None = None) -> OWUartPacket | None:

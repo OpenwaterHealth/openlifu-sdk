@@ -82,7 +82,8 @@ class HVController(OWComponent):
         """
         self._require_connected()
         r = self.send(packet_type=OW_POWER, command=OW_POWER_GET_TEMP1)
-        r.print_packet()
+        if r is not None:
+            r.print_packet()
         if r is None:
             raise RuntimeError("LIFUConsole: temperature1 request timed out")
         if r.data_len == 4:
@@ -101,7 +102,8 @@ class HVController(OWComponent):
         """
         self._require_connected()
         r = self.send(packet_type=OW_POWER, command=OW_POWER_GET_TEMP2)
-        r.print_packet()
+        if r is not None:
+            r.print_packet()
         if r is None:
             raise RuntimeError("HVController: temperature2 request timed out")
         if r.data_len == 4:
@@ -111,7 +113,8 @@ class HVController(OWComponent):
     def turn_12v_off(self):
         self._require_connected()
         r = self.send(packet_type=OW_POWER, command=OW_POWER_12V_OFF)
-        r.print_packet()
+        if r is not None:
+            r.print_packet()
         if r is None or r.packet_type == OW_ERROR:
             logger.error("Error turning off 12V")
             return False
@@ -121,7 +124,8 @@ class HVController(OWComponent):
     def turn_12v_on(self):
         self._require_connected()
         r = self.send(packet_type=OW_POWER, command=OW_POWER_12V_ON)
-        r.print_packet()
+        if r is not None:
+            r.print_packet()
         if r is None or r.packet_type == OW_ERROR:
             logger.error("Error turning on 12V")
             return False
@@ -131,7 +135,8 @@ class HVController(OWComponent):
     def get_12v_status(self):
         self._require_connected()
         r = self.send(packet_type=OW_POWER, command=OW_POWER_GET_12VON)
-        r.print_packet()
+        if r is not None:
+            r.print_packet()
         if r is None or r.packet_type == OW_ERROR:
             raise RuntimeError("HVController: 12V status request failed")
         return r.reserved == 1
@@ -142,7 +147,8 @@ class HVController(OWComponent):
         """
         self._require_connected()
         r = self.send(packet_type=OW_POWER, command=OW_POWER_HV_ON, timeout=timeout)
-        r.print_packet()
+        if r is not None:
+            r.print_packet()
         if r is None or r.packet_type == OW_ERROR:
             logger.error("Error turning on HV")
             return False
@@ -200,7 +206,8 @@ class HVController(OWComponent):
         """
         self._require_connected()
         r = self.send(packet_type=OW_POWER, command=OW_POWER_HV_OFF, timeout=timeout)
-        r.print_packet()
+        if r is not None:
+            r.print_packet()
         if r is None or r.packet_type == OW_ERROR:
             logger.error("Error turning off HV")
             return False
@@ -210,7 +217,8 @@ class HVController(OWComponent):
     def get_hv_status(self) -> bool:
         self._require_connected()
         r = self.send(packet_type=OW_POWER, command=OW_POWER_GET_HVON)
-        r.print_packet()
+        if r is not None:
+            r.print_packet()
         if r is None or r.packet_type == OW_ERROR:
             raise RuntimeError("HVController: HV status request failed")
         return r.reserved == 1
@@ -230,7 +238,8 @@ class HVController(OWComponent):
             raise ValueError("HV voltage must be between 5 and 100 V")
         data = struct.pack('>f', voltage)
         r = self.send(packet_type=OW_POWER, command=OW_POWER_SET_HV, data=data)
-        r.print_packet()
+        if r is not None:
+            r.print_packet()
         if r is None or r.packet_type == OW_ERROR:
             logger.error("Error setting HV to %.2f", voltage)
             return False
@@ -312,7 +321,8 @@ class HVController(OWComponent):
             ValueError: If the controller is not connected.
         """
         r = self.send(packet_type=OW_POWER, command=OW_POWER_GET_HV)
-        r.print_packet()
+        if r is not None:
+            r.print_packet()
         if r is None:
             raise RuntimeError("HVController: get HV request timed out")
         if r.data_len == 4:
@@ -340,7 +350,8 @@ class HVController(OWComponent):
             raise ValueError("Invalid fan speed. Must be 0 to 100")
         r = self.send(packet_type=OW_POWER, command=OW_POWER_SET_FAN, addr=fan_id,
                       data=bytearray([fan_speed & 0xFF]))
-        r.print_packet()
+        if r is not None:
+            r.print_packet()
         if r is None or r.packet_type == OW_ERROR:
             logger.error("Error setting fan %d speed", fan_id)
             return -1
@@ -364,7 +375,8 @@ class HVController(OWComponent):
         if fan_id not in (0, 1):
             raise ValueError("Invalid fan ID. Must be 0 or 1")
         r = self.send(packet_type=OW_POWER, command=OW_POWER_GET_FAN, addr=fan_id)
-        r.print_packet()
+        if r is not None:
+            r.print_packet()
         if r is None or r.packet_type == OW_ERROR:
             logger.error("Error getting fan %d speed", fan_id)
             return -1
@@ -393,7 +405,8 @@ class HVController(OWComponent):
             )
 
         r = self.send(packet_type=OW_POWER, command=OW_POWER_SET_RGB, reserved=rgb_state)
-        r.print_packet()
+        if r is not None:
+            r.print_packet()
         if r is None or r.packet_type == OW_ERROR:
             logger.error("Error setting RGB state")
             return False
@@ -434,7 +447,8 @@ class HVController(OWComponent):
         """
         self._require_connected()
         r = self.send(packet_type=OW_POWER, command=OW_POWER_VMON)
-        r.print_packet()
+        if r is not None:
+            r.print_packet()
         if r is None:
             raise RuntimeError("LIFUConsole: VMON request timed out")
         if r.data_len != 80:
@@ -489,7 +503,8 @@ class HVController(OWComponent):
             command=OW_POWER_RAW_DAC,
             data=data,
         )
-        r.print_packet()
+        if r is not None:
+            r.print_packet()
         if r is None or r.packet_type == OW_ERROR:
             raise RuntimeError("LIFUHVController: RAW DAC request timed out")
 
@@ -517,11 +532,15 @@ class HVController(OWComponent):
             data=None,
         )
 
-        r.print_packet()
-
+        if r is not None:
+            r.print_packet()
         if r is None or r.packet_type == OW_ERROR:
             raise RuntimeError("LIFUHVController: HV enable request timed out")
         
         logger.info(f"High voltage output {'enabled' if enable else 'disabled'} successfully.")
         return True
+
+
+
+
 
