@@ -3,7 +3,7 @@ from __future__ import annotations
 import logging
 import threading
 
-log = logging.getLogger("OWSignal")
+log = logging.getLogger(__name__)
 
 
 class OWSignal:

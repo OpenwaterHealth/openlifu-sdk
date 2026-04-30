@@ -25,7 +25,7 @@ from .uart_packet import OWUartPacket
 from .signal import OWSignal
 
 
-log = logging.getLogger("OWComponent")
+log = logging.getLogger(__name__)
 
 # Build a command -> packet-type lookup so callers only need to specify the
 # command byte; the correct packet type is inferred automatically.

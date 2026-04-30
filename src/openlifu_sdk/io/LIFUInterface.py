@@ -63,11 +63,6 @@ class LIFUInterfaceStatus(Enum):
     STATUS_ERROR = 8
 
 logger = logging.getLogger(__name__)
-ch = logging.StreamHandler()
-formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-ch.setFormatter(formatter)
-logger.addHandler(ch)
-logger.propagate = True
 
 class LIFUInterface:
     hvcontroller: HVController = None

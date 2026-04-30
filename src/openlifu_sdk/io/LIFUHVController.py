@@ -38,11 +38,6 @@ from openlifu_sdk.io.component import OWComponent, register_command_packet_types
 from openlifu_sdk.io.exceptions import LIFUHVSettleError, LIFUProtocolError
 
 logger = logging.getLogger(__name__)
-ch = logging.StreamHandler()
-formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-ch.setFormatter(formatter)
-logger.addHandler(ch)
-logger.propagate = True
 
 class HVController(OWComponent):
     def __init__(self,  vid: int = OW_VID, pid: int = OW_CONSOLE_PID,
@@ -394,7 +389,7 @@ class HVController(OWComponent):
             raise ValueError("Invalid DAC ID. Must be 0, 1, 2, or 3")
         if not 0 <= dac_value <= 4095:
             raise ValueError("Invalid DAC value. Must be 0 to 4095")
-        logger.info("Setting Raw DAC value.")
+        logger.debug("Setting Raw DAC value.")
         data = bytes([(dac_value >> 8) & 0xFF, dac_value & 0xFF])
         self.send_checked(addr=dac_id, packet_type=OW_POWER,
                           command=OW_POWER_RAW_DAC, data=data,
@@ -408,7 +403,7 @@ class HVController(OWComponent):
         Raises:
             LIFUNotConnectedError, LIFUCommunicationError, LIFUDeviceError.
         """
-        logger.info("%s high voltage output.", "Enabling" if enable else "Disabling")
+        logger.debug("%s high voltage output.", "Enabling" if enable else "Disabling")
         self.send_checked(addr=1 if enable else 0, packet_type=OW_POWER,
                           command=OW_POWER_HV_ENABLE, op="hv_enable")
         logger.info("High voltage output %s successfully.",

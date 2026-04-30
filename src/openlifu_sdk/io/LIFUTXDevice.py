@@ -158,17 +158,6 @@ if TYPE_CHECKING:
     pass
 
 logger = logging.getLogger(__name__)
-ch = logging.StreamHandler()
-formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-ch.setFormatter(formatter)
-logger.addHandler(ch)
-logger.propagate = True
-
-if not logger.handlers:
-    handler = logging.StreamHandler()
-    formatter = logging.Formatter("%(asctime)s - %(levelname)s - %(message)s")
-    handler.setFormatter(formatter)
-    logger.addHandler(handler)
 
 class TxDevice(OWComponent):
     def __init__(self, vid: int = OW_VID, pid: int = OW_TRANSMITTER_PID,
@@ -458,7 +447,7 @@ class TxDevice(OWComponent):
             )
 
         self.tx_registers = TxDeviceRegisters(num_transmitters=num_detected_devices, module_invert=self.module_invert)
-        logger.info("TX Device Count: %d", num_detected_devices)
+        logger.info("Found %d Transmit Modules", num_detected_devices)
         return num_detected_devices
 
     def set_module_invert(self, module_invert: bool | List[bool]) -> None:
