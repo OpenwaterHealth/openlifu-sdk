@@ -1,8 +1,8 @@
 from __future__ import annotations
 
-import logging
-
 import json
+import logging
+import struct
 
 from .LIFUConfig import (
     OW_CMD, OW_ERROR,
@@ -10,6 +10,14 @@ from .LIFUConfig import (
     DEFAULT_TIMEOUT, HW_ID_DATA_LENGTH,
     OW_CMD_PING, OW_CMD_VERSION, OW_CMD_ECHO, OW_CMD_HWID,
     OW_CMD_TOGGLE_LED, OW_CMD_DFU, OW_CMD_RESET, OW_CMD_USR_CFG,
+    LIFU_ERR_BAD_PAYLOAD_FORMAT,
+    LIFU_ERR_BAD_PAYLOAD_LENGTH,
+)
+from .exceptions import (
+    LIFUCommunicationError,
+    LIFUDeviceError,
+    LIFUNotConnectedError,
+    LIFUProtocolError,
 )
 from .LIFUUserConfig import LifuUserConfig, LifuUserConfigHeader
 from .uart import OWUart
@@ -17,7 +25,7 @@ from .uart_packet import OWUartPacket
 from .signal import OWSignal
 
 
-log = logging.getLogger("OWComponent")
+log = logging.getLogger(__name__)
 
 # Build a command -> packet-type lookup so callers only need to specify the
 # command byte; the correct packet type is inferred automatically.
@@ -113,12 +121,45 @@ class OWComponent:
     def send(self, command: int, addr: int = 0, reserved: int = 0,
              data: bytearray | None = None, timeout: float | None = None,
              packet_type: int | None = None) -> OWUartPacket | None:
-        """Send *command* and block until the response arrives."""
+        """Send *command* and block until the response arrives.
+
+        Returns ``None`` on transport timeout. Most callers should prefer
+        :meth:`send_checked`, which raises a typed :class:`LIFUError` instead
+        of returning ``None``.
+        """
         pt = self._resolve(command, packet_type)
-        return self._uart.send_packet(
+        r = self._uart.send_packet(
             packet_type=pt, command=command,
             addr=addr, reserved=reserved, data=data, timeout=timeout,
         )
+        if r is not None:
+            r.print_packet()
+        return r
+
+    def send_checked(self, command: int, addr: int = 0, reserved: int = 0,
+                     data: bytearray | None = None, timeout: float | None = None,
+                     packet_type: int | None = None,
+                     op: str | None = None) -> OWUartPacket:
+        """Send *command* and validate the response.
+
+        Raises:
+            LIFUNotConnectedError: If the UART is not open.
+            LIFUCommunicationError: If the request times out.
+            LIFUDeviceError: If the device replies with ``OW_ERROR``.
+        """
+        self._require_connected()
+        r = self.send(command, addr=addr, reserved=reserved, data=data,
+                      timeout=timeout, packet_type=packet_type)
+        label = op or f"cmd 0x{command:02X}"
+        if r is None:
+            raise LIFUCommunicationError(
+                f"{self._uart.desc}: {label} timed out"
+            )
+        if r.packet_type == OW_ERROR:
+            raise LIFUDeviceError(
+                f"{self._uart.desc}: {label} returned device error"
+            )
+        return r
 
     def send_async(self, command: int, addr: int = 0, reserved: int = 0,
                    data: bytearray | None = None, timeout: float | None = None,
@@ -140,25 +181,28 @@ class OWComponent:
 
     def _require_connected(self):
         if not self.is_connected():
-            raise ValueError(f"{self._uart.desc} not connected")
+            raise LIFUNotConnectedError(f"{self._uart.desc} not connected")
 
     def ping(self, module: int = 0) -> bool:
-        self._require_connected()
+        """Send a PING to the device.
+
+        Returns:
+            True if the device responded with a non-error packet.
+
+        Raises:
+            LIFUNotConnectedError, LIFUCommunicationError, LIFUDeviceError.
+        """
         log.info("Send Ping to %s", self._uart.desc)
-        r = self.send(OW_CMD_PING, addr=module)
-        r.print_packet()
-        if r is None or r.packet_type == OW_ERROR:
-            log.error("Ping failed on %s", self._uart.desc)
-            return False
+        self.send_checked(OW_CMD_PING, addr=module, op="ping")
         return True
 
     def get_version(self, module: int = 0) -> str:
-        self._require_connected()
-        r = self.send(OW_CMD_VERSION)
-        r.print_packet()
-        r.print_packet()
-        if r is None:
-            raise RuntimeError(f"{self._uart.desc}: version request timed out")
+        """Query the firmware version string.
+
+        Raises:
+            LIFUNotConnectedError, LIFUCommunicationError, LIFUDeviceError.
+        """
+        r = self.send_checked(OW_CMD_VERSION, addr=module, op="get_version")
         if r.data_len == 3:
             ver = f"v{r.data[0]}.{r.data[1]}.{r.data[2]}"
         elif r.data_len and r.data:
@@ -170,88 +214,92 @@ class OWComponent:
         log.info("%s version: %s", self._uart.desc, ver)
         return ver
 
-    def echo(self, module: int = 0, echo_data: bytes | bytearray = b"Hello LIFU!") -> tuple[bytes | None, int]:
-        self._require_connected()
+    def echo(self, module: int = 0, echo_data: bytes | bytearray = b"Hello LIFU!") -> tuple[bytes, int]:
+        """Echo a payload through the device.
+
+        Raises:
+            TypeError: If *echo_data* is not bytes/bytearray.
+            LIFUNotConnectedError, LIFUCommunicationError, LIFUDeviceError.
+        """
         if not isinstance(echo_data, (bytes, bytearray)):
             raise TypeError("echo_data must be bytes or bytearray")
-        r = self.send(OW_CMD_ECHO, addr=module, data=bytearray(echo_data))
-        r.print_packet()
-        if r is None:
-            raise RuntimeError(f"{self._uart.desc}: echo request timed out")
-        if r.data_len > 0:
-            return bytes(r.data), r.data_len
-        return None, 0
+        r = self.send_checked(OW_CMD_ECHO, addr=module, data=bytearray(echo_data), op="echo")
+        return bytes(r.data[:r.data_len]), r.data_len
 
-    def get_hardware_id(self, module: int = 0, raw_hex: bool = False) -> str | None:
-        self._require_connected()
-        r = self.send(OW_CMD_HWID, addr=module)
-        r.print_packet()
-        if r is None:
-            raise RuntimeError(f"{self._uart.desc}: HWID request timed out")
-        if r.data_len >= HW_ID_DATA_LENGTH:
-            hwid = r.data[:HW_ID_DATA_LENGTH].hex()
-            if raw_hex:
-                return hwid
-            return format_hwid(hwid)
-        return None
+    def get_hardware_id(self, module: int = 0, raw_hex: bool = False) -> str:
+        """Read the device hardware ID.
+
+        Raises:
+            LIFUNotConnectedError, LIFUCommunicationError, LIFUDeviceError,
+            LIFUProtocolError: If the payload length is wrong.
+        """
+        r = self.send_checked(OW_CMD_HWID, addr=module, op="get_hardware_id")
+        if r.data_len < HW_ID_DATA_LENGTH:
+            raise LIFUProtocolError(
+                f"{self._uart.desc}: HWID payload too short "
+                f"(got {r.data_len}, expected {HW_ID_DATA_LENGTH})",
+                code=LIFU_ERR_BAD_PAYLOAD_LENGTH,
+            )
+        hwid = r.data[:HW_ID_DATA_LENGTH].hex()
+        return hwid if raw_hex else format_hwid(hwid)
 
     def toggle_led(self, module: int = 0) -> bool:
-        self._require_connected()
-        r = self.send(OW_CMD_TOGGLE_LED, addr=module)
-        r.print_packet()
-        return r is not None and r.packet_type != OW_ERROR
+        """Toggle the device's indicator LED.
+
+        Raises:
+            LIFUNotConnectedError, LIFUCommunicationError, LIFUDeviceError.
+        """
+        self.send_checked(OW_CMD_TOGGLE_LED, addr=module, op="toggle_led")
+        return True
 
     def soft_reset(self, module: int = 0) -> bool:
-        """Perform a soft reset on the device."""
-        self._require_connected()
-        r = self.send(OW_CMD_RESET, addr=module)
-        r.print_packet()
-        if r is None or r.packet_type == OW_ERROR:
-            log.error("Error resetting %s", self._uart.desc)
-            return False
+        """Perform a soft reset on the device.
+
+        Raises:
+            LIFUNotConnectedError, LIFUCommunicationError, LIFUDeviceError.
+        """
+        self.send_checked(OW_CMD_RESET, addr=module, op="soft_reset")
         return True
 
     def enter_dfu(self, module: int = 0) -> bool:
-        """Perform a soft reset into DFU mode."""
-        self._require_connected()
-        r = self.send(OW_CMD_DFU, addr=module)
-        r.print_packet()
-        if r is None or r.packet_type == OW_ERROR:
-            log.error("Error entering DFU mode on %s", self._uart.desc)
-            return False
+        """Reboot the device into DFU mode.
+
+        Raises:
+            LIFUNotConnectedError, LIFUCommunicationError, LIFUDeviceError.
+        """
+        self.send_checked(OW_CMD_DFU, addr=module, op="enter_dfu")
         return True
 
     # ------------------------------------------------------------------
     # User configuration helpers
     # ------------------------------------------------------------------
 
-    def read_config(self, module: int = 0) -> LifuUserConfig | None:
+    def read_config(self, module: int = 0) -> LifuUserConfig:
         """Read the user configuration from device flash.
 
         Args:
             module: Target module address (default 0).
 
         Returns:
-            Parsed LifuUserConfig, or None on error.
+            Parsed LifuUserConfig.
 
         Raises:
-            ValueError: If the device is not connected.
+            LIFUNotConnectedError, LIFUCommunicationError, LIFUDeviceError,
+            LIFUProtocolError: If the response payload cannot be parsed.
         """
-        self._require_connected()
         log.debug("Reading user config from %s ...", self._uart.desc)
-        r = self.send(OW_CMD_USR_CFG, addr=module, reserved=0)  # 0 = READ
-        if r is None or r.packet_type == OW_ERROR:
-            log.error("Error reading config from %s", self._uart.desc)
-            return None
+        r = self.send_checked(OW_CMD_USR_CFG, addr=module, reserved=0, op="read_config")
         try:
             config = LifuUserConfig.from_wire_bytes(r.data)
-            log.debug("Read config: seq=%d, json_len=%d", config.header.seq, config.header.json_len)
-            return config
-        except Exception as exc:
-            log.error("Failed to parse config response: %s", exc)
-            return None
+        except (ValueError, struct.error) as exc:
+            raise LIFUProtocolError(
+                f"{self._uart.desc}: failed to parse config response: {exc}",
+                code=LIFU_ERR_BAD_PAYLOAD_FORMAT,
+            ) from exc
+        log.debug("Read config: seq=%d, json_len=%d", config.header.seq, config.header.json_len)
+        return config
 
-    def write_config(self, config: LifuUserConfig, module: int = 0) -> LifuUserConfig | None:
+    def write_config(self, config: LifuUserConfig, module: int = 0) -> LifuUserConfig:
         """Write user configuration to device flash.
 
         Args:
@@ -259,42 +307,34 @@ class OWComponent:
             module: Target module address (default 0).
 
         Returns:
-            Updated LifuUserConfig (with new seq/crc from the device),
-            or None on error.
+            Updated LifuUserConfig (with new seq/crc from the device).
 
         Raises:
-            ValueError: If the device is not connected.
+            LIFUNotConnectedError, LIFUCommunicationError, LIFUDeviceError,
+            LIFUProtocolError: If the response header cannot be parsed.
         """
-        self._require_connected()
         wire_data = config.to_wire_bytes()
         log.debug("Writing config to %s: %d bytes", self._uart.desc, len(wire_data))
-        r = self.send(OW_CMD_USR_CFG, addr=module, reserved=1, data=bytearray(wire_data))  # 1 = WRITE
-        if r is None or r.packet_type == OW_ERROR:
-            log.error("Error writing config to %s", self._uart.desc)
-            return None
+        r = self.send_checked(OW_CMD_USR_CFG, addr=module, reserved=1,
+                              data=bytearray(wire_data), op="write_config")
         try:
             updated_header = LifuUserConfigHeader.from_bytes(r.data[:16])
-            updated_config = LifuUserConfig(header=updated_header, json_data=config.json_data)
-            log.debug("Config written: new seq=%d", updated_config.header.seq)
-            return updated_config
-        except Exception as exc:
-            log.error("Failed to parse write response: %s", exc)
-            return None
+        except (ValueError, IndexError) as exc:
+            raise LIFUProtocolError(
+                f"{self._uart.desc}: failed to parse write response: {exc}",
+                code=LIFU_ERR_BAD_PAYLOAD_FORMAT,
+            ) from exc
+        updated_config = LifuUserConfig(header=updated_header, json_data=config.json_data)
+        log.debug("Config written: new seq=%d", updated_config.header.seq)
+        return updated_config
 
-    def write_config_json(self, json_str: str, module: int = 0) -> LifuUserConfig | None:
+    def write_config_json(self, json_str: str, module: int = 0) -> LifuUserConfig:
         """Write user configuration from a JSON string.
 
-        Convenience wrapper around :meth:`write_config`.
-
-        Args:
-            json_str: JSON string to write.
-            module: Target module address (default 0).
-
-        Returns:
-            Updated LifuUserConfig from device, or None on error.
-
         Raises:
-            ValueError: If JSON is invalid or device is not connected.
+            ValueError: If *json_str* is not valid JSON.
+            LIFUNotConnectedError, LIFUCommunicationError, LIFUDeviceError,
+            LIFUProtocolError.
         """
         try:
             config = LifuUserConfig()
