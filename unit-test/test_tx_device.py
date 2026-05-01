@@ -44,7 +44,7 @@ from openlifu_sdk.io.LIFUTXDevice import (
     TEMPERATURE_DATA_LENGTH,
     TxDevice,
 )
-from openlifu_sdk.io.LIFUUart import LIFUUart
+from openlifu_sdk.io.uart import OWUart
 
 
 # ---------------------------------------------------------------------------
@@ -64,10 +64,10 @@ def _make_packet(data: bytes = b"", packet_type: int = OW_RESP, reserved: int = 
 # Unit Tests  (pytest / unittest)
 # ===========================================================================
 class TestTxDeviceUnit(unittest.TestCase):
-    """Unit tests for TxDevice using a fully mocked LIFUUart."""
+    """Unit tests for TxDevice using a fully mocked OWUart."""
 
     def setUp(self):
-        self.uart = MagicMock(spec=LIFUUart)
+        self.uart = MagicMock(spec=OWUart)
         self.uart.demo_mode = False
         self.uart.asyncMode = False
         self.uart.is_connected.return_value = True
@@ -295,7 +295,7 @@ class TestTX7332Commands(unittest.TestCase):
     """
 
     def setUp(self):
-        self.uart = MagicMock(spec=LIFUUart)
+        self.uart = MagicMock(spec=OWUart)
         self.uart.demo_mode = False
         self.uart.asyncMode = False
         self.uart.is_connected.return_value = True

@@ -111,6 +111,10 @@ from openlifu_sdk.io.LIFUConfig import (
     CONTROLLER_COMMANDS,
     DEFAULT_TIMEOUT,
     GLOBAL_COMMANDS,
+    LIFU_ERR_BAD_PAYLOAD_FORMAT,
+    LIFU_ERR_BAD_PAYLOAD_LENGTH,
+    LIFU_ERR_EMPTY_RESPONSE,
+    LIFU_ERR_MODULE_COUNT_MISMATCH,
     OW_CMD,
     OW_CMD_ASYNC,
     OW_CMD_DFU,
@@ -148,22 +152,12 @@ from openlifu_sdk.io.LIFUConfig import (
     HW_ID_DATA_LENGTH,
     TX7332_COMMANDS
 )
+from openlifu_sdk.io.exceptions import LIFUError, LIFUProtocolError
 
 if TYPE_CHECKING:
     pass
 
 logger = logging.getLogger(__name__)
-ch = logging.StreamHandler()
-formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-ch.setFormatter(formatter)
-logger.addHandler(ch)
-logger.propagate = True
-
-if not logger.handlers:
-    handler = logging.StreamHandler()
-    formatter = logging.Formatter("%(asctime)s - %(levelname)s - %(message)s")
-    handler.setFormatter(formatter)
-    logger.addHandler(handler)
 
 class TxDevice(OWComponent):
     def __init__(self, vid: int = OW_VID, pid: int = OW_TRANSMITTER_PID,
@@ -209,47 +203,37 @@ class TxDevice(OWComponent):
 
         return parsed_data
 
-    def get_temperature(self, module:int=0) -> float | None:
-        """
-        Retrieve the temperature reading from the TX device.
-
-        Returns:
-            float: Temperature value in Celsius.
+    def get_temperature(self, module:int=0) -> float:
+        """Retrieve the core temperature reading from the TX device.
 
         Raises:
-            ValueError: If the UART is not connected.
-            Exception: If an error occurs or the received data length is invalid.
+            LIFUNotConnectedError, LIFUCommunicationError, LIFUDeviceError,
+            LIFUProtocolError: If the payload length is invalid.
         """
-        self._require_connected()
-        r = self.send(packet_type=OW_CONTROLLER, command=OW_CMD_GET_TEMP, addr=module)
-        r.print_packet()
-        if r is None or r.data_len < TEMPERATURE_DATA_LENGTH:
-            return None
-        
-        temperature = struct.unpack('<f', r.data)[0]
-        truncated_temperature = round(temperature, 2)
-        return truncated_temperature
+        r = self.send_checked(packet_type=OW_CONTROLLER, command=OW_CMD_GET_TEMP,
+                              addr=module, op="get_temperature")
+        if r.data_len < TEMPERATURE_DATA_LENGTH:
+            raise LIFUProtocolError(
+                f"TX: temperature payload too short ({r.data_len} < {TEMPERATURE_DATA_LENGTH})",
+                code=LIFU_ERR_BAD_PAYLOAD_LENGTH,
+            )
+        return round(struct.unpack('<f', r.data[:TEMPERATURE_DATA_LENGTH])[0], 2)
 
-    def get_ambient_temperature(self, module:int=0) -> float | None:
-        """
-        Retrieve the ambient temperature reading from the TX device.
-
-        Returns:
-            float: Temperature value in Celsius.
+    def get_ambient_temperature(self, module:int=0) -> float:
+        """Retrieve the ambient temperature reading from the TX device.
 
         Raises:
-            ValueError: If the UART is not connected.
-            Exception: If an error occurs or the received data length is invalid.
+            LIFUNotConnectedError, LIFUCommunicationError, LIFUDeviceError,
+            LIFUProtocolError: If the payload length is invalid.
         """
-        self._require_connected()
-        r = self.send(packet_type=OW_CONTROLLER, command=OW_CMD_GET_AMBIENT, addr=module)
-        r.print_packet()
-        if r is None or r.data_len < TEMPERATURE_DATA_LENGTH:
-            return None
-        
-        temperature = struct.unpack('<f', r.data)[0]
-        truncated_temperature = round(temperature, 2)
-        return truncated_temperature
+        r = self.send_checked(packet_type=OW_CONTROLLER, command=OW_CMD_GET_AMBIENT,
+                              addr=module, op="get_ambient_temperature")
+        if r.data_len < TEMPERATURE_DATA_LENGTH:
+            raise LIFUProtocolError(
+                f"TX: ambient temperature payload too short ({r.data_len} < {TEMPERATURE_DATA_LENGTH})",
+                code=LIFU_ERR_BAD_PAYLOAD_LENGTH,
+            )
+        return round(struct.unpack('<f', r.data[:TEMPERATURE_DATA_LENGTH])[0], 2)
 
     def set_trigger(self,
                     pulse_interval: float,
@@ -307,226 +291,163 @@ class TxDevice(OWComponent):
         }
         return self.set_trigger_json(data=trigger_json)
 
-    def set_trigger_json(self, data=None) -> dict:
-        """
-        Set the trigger configuration on the TX device.
-
-        Args:
-            data (dict): A dictionary containing the trigger configuration.
-
-        Returns:
-            dict: JSON response from the device.
+    def set_trigger_json(self, data) -> dict:
+        """Set the trigger configuration on the TX device from a dict.
 
         Raises:
-            ValueError: If `data` is None or the UART is not connected.
-            Exception: If an error occurs while setting the trigger.
+            LIFUNotConnectedError, LIFUCommunicationError, LIFUDeviceError,
+            LIFUProtocolError: If the response payload is empty or malformed.
         """
-        self._require_connected()
-        if data is None:
-            raise ValueError("Trigger data cannot be None")
         payload = json.dumps(data).encode("utf-8")
-        r = self.send(packet_type=OW_CONTROLLER, command=OW_CTRL_SET_SWTRIG, addr=0, data=payload)
-        r.print_packet()
-        if r is None or r.packet_type == OW_ERROR or r.data_len == 0:
-            logger.error("set_trigger failed")
-            return None
+        r = self.send_checked(packet_type=OW_CONTROLLER, command=OW_CTRL_SET_SWTRIG,
+                              addr=0, data=payload, op="set_trigger_json")
+        if r.data_len == 0:
+            raise LIFUProtocolError(
+                "TX: set_trigger_json returned empty payload",
+                code=LIFU_ERR_EMPTY_RESPONSE,
+            )
         try:
             return json.loads(r.data[:r.data_len].decode("utf-8"))
-        except (json.JSONDecodeError, UnicodeDecodeError) as e:
-            logger.error("set_trigger JSON decode error: %s", e)
-            return None
+        except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+            raise LIFUProtocolError(
+                f"TX: set_trigger_json decode error: {exc}",
+                code=LIFU_ERR_BAD_PAYLOAD_FORMAT,
+            ) from exc
 
-    def get_trigger_json(self) -> dict | None:
-        """
-        Start the trigger on the TX device.
-
-        Returns:
-            bool: True if the trigger was started successfully, False otherwise.
+    def get_trigger_json(self) -> dict:
+        """Read the current trigger configuration as a raw JSON dict.
 
         Raises:
-            ValueError: If the UART is not connected.
-            Exception: If an error occurs while starting the trigger.
+            LIFUNotConnectedError, LIFUCommunicationError, LIFUDeviceError,
+            LIFUProtocolError: If the response payload is empty or malformed.
         """
-        self._require_connected()
-        r = self.send(packet_type=OW_CONTROLLER, command=OW_CTRL_GET_SWTRIG, addr=0)
-        r.print_packet()
-        if r is None or r.packet_type == OW_ERROR or r.data_len == 0:
-            logger.error("get_trigger failed")
-            return None
+        r = self.send_checked(packet_type=OW_CONTROLLER, command=OW_CTRL_GET_SWTRIG,
+                              addr=0, op="get_trigger_json")
+        if r.data_len == 0:
+            raise LIFUProtocolError(
+                "TX: get_trigger_json returned empty payload",
+                code=LIFU_ERR_EMPTY_RESPONSE,
+            )
         try:
             return json.loads(r.data[:r.data_len].decode("utf-8"))
-        except (json.JSONDecodeError, UnicodeDecodeError) as e:
-            logger.error("get_trigger JSON decode error: %s", e)
-            return None
+        except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+            raise LIFUProtocolError(
+                f"TX: get_trigger_json decode error: {exc}",
+                code=LIFU_ERR_BAD_PAYLOAD_FORMAT,
+            ) from exc
 
-    def get_trigger(self):
-        """
-        Retrieve the current trigger configuration from the TX device.
-
-        Returns:
-            dict: The trigger configuration as a dictionary.
+    def get_trigger(self) -> dict:
+        """Retrieve the current trigger configuration as a canonical dict.
 
         Raises:
-            ValueError: If the UART is not connected.
-            Exception: If an error occurs while fetching the trigger configuration.
+            LIFUNotConnectedError, LIFUCommunicationError, LIFUDeviceError,
+            LIFUProtocolError.
         """
         trigger_json = self.get_trigger_json()
-        if trigger_json:
-            if trigger_json["TriggerMode"] == TRIGGER_MODE_SEQUENCE:
-                mode = "sequence"
-            elif trigger_json["TriggerMode"] == TRIGGER_MODE_CONTINUOUS:
-                mode = "continuous"
-            elif trigger_json["TriggerMode"] == TRIGGER_MODE_SINGLE:
-                mode = "single"
-            else:
-                mode = "unknown"
-            trigger_dict = {
-                "pulse_interval": 1 / trigger_json["TriggerFrequencyHz"],
-                "pulse_count": trigger_json["TriggerPulseCount"],
-                "pulse_width": trigger_json["TriggerPulseWidthUsec"],
-                "pulse_train_interval": trigger_json["TriggerPulseTrainInterval"],
-                "pulse_train_count": trigger_json["TriggerPulseTrainCount"],
-                "mode": mode,
-                "profile_index": trigger_json["ProfileIndex"],
-                "profile_increment": bool(trigger_json["ProfileIncrement"])
-            }
-            return trigger_dict
+        if trigger_json["TriggerMode"] == TRIGGER_MODE_SEQUENCE:
+            mode = "sequence"
+        elif trigger_json["TriggerMode"] == TRIGGER_MODE_CONTINUOUS:
+            mode = "continuous"
+        elif trigger_json["TriggerMode"] == TRIGGER_MODE_SINGLE:
+            mode = "single"
+        else:
+            mode = "unknown"
+        return {
+            "pulse_interval": 1 / trigger_json["TriggerFrequencyHz"],
+            "pulse_count": trigger_json["TriggerPulseCount"],
+            "pulse_width": trigger_json["TriggerPulseWidthUsec"],
+            "pulse_train_interval": trigger_json["TriggerPulseTrainInterval"],
+            "pulse_train_count": trigger_json["TriggerPulseTrainCount"],
+            "mode": mode,
+            "profile_index": trigger_json["ProfileIndex"],
+            "profile_increment": bool(trigger_json["ProfileIncrement"]),
+        }
 
     def start_trigger(self) -> bool:
-        """
-        Start the trigger on the TX device.
-
-        Returns:
-            bool: True if the trigger was started successfully, False otherwise.
+        """Start the software trigger on the TX device.
 
         Raises:
-            ValueError: If the UART is not connected.
-            Exception: If an error occurs while starting the trigger.
+            LIFUNotConnectedError, LIFUCommunicationError, LIFUDeviceError.
         """
-        self._require_connected()
-        r = self.send(packet_type=OW_CONTROLLER, command=OW_CTRL_START_SWTRIG, addr=0)
-        r.print_packet()
-        if r is None or r.packet_type == OW_ERROR:
-            logger.error("Error starting trigger")
-            return False
-        else:
-            return True
+        self.send_checked(packet_type=OW_CONTROLLER, command=OW_CTRL_START_SWTRIG,
+                          addr=0, op="start_trigger")
+        return True
 
     def stop_trigger(self) -> bool:
-        """
-        Stop the trigger on the TX device.
-
-        This method sends a command to stop the software trigger on the TX device.
-        It checks the device's connection status and handles errors appropriately.
-
-        Returns:
-            bool: True if the trigger was successfully stopped, False otherwise.
+        """Stop the software trigger on the TX device.
 
         Raises:
-            ValueError: If the UART is not connected.
-            Exception: If an error occurs during the operation.
+            LIFUNotConnectedError, LIFUCommunicationError, LIFUDeviceError.
         """
-        self._require_connected()
-        r = self.send(packet_type=OW_CONTROLLER, command=OW_CTRL_STOP_SWTRIG, addr=0)
-        if r is None or r.packet_type == OW_ERROR:
-            logger.error("stop_trigger failed")
-            return False
+        r = self.send_checked(packet_type=OW_CONTROLLER, command=OW_CTRL_STOP_SWTRIG,
+                              addr=0, op="stop_trigger")
         r.print_packet()
         return True
-    
+
     def async_mode(self, enable: bool | None = None) -> bool:
-        """
-        Enable or disable asynchronous mode for the TX device.
+        """Enable, disable, or read the TX device's asynchronous mode.
 
         Args:
-            enable (bool | None): If True, enable async mode; if False, disable it; if None read the current state.
-
-        Returns:
-            bool: True if async mode is enabled, False otherwise.
+            enable: True/False to set the mode; None to query the current state.
 
         Raises:
-            ValueError: If the UART is not connected.
-            Exception: If an error occurs while setting async mode.
+            LIFUNotConnectedError, LIFUCommunicationError, LIFUDeviceError.
         """
-        self._require_connected()
-
-        if enable is not None:
-            if enable:
-                payload = struct.pack('<B', 1)
-            else:
-                payload = struct.pack('<B', 0)
-        else:
+        if enable is None:
             payload = None
-
-        r = self.send(packet_type=OW_CONTROLLER, command=OW_CMD_ASYNC, addr=0, data=payload)
-        r.print_packet()
-        if r is None or r.packet_type == OW_ERROR:
-            raise RuntimeError("Error running async mode command for device")
-        
-        return r.reserved == 1  # reserved field indicates async mode status
+        else:
+            payload = struct.pack('<B', 1 if enable else 0)
+        r = self.send_checked(packet_type=OW_CONTROLLER, command=OW_CMD_ASYNC,
+                              addr=0, data=payload, op="async_mode")
+        return r.reserved == 1
 
     def get_tx_module_count(self) -> int:
-        """
-        Retrieve the number of detected Transmit modules.
-
-        Args:
-        Returns:
-            tx_module_count: number of transmitter modules connected.
+        """Return the number of connected TX modules.
 
         Raises:
-            ValueError: If the UART is not connected.
-            Exception: If an error occurs during enumeration.
+            LIFUNotConnectedError, LIFUCommunicationError, LIFUDeviceError,
+            LIFUProtocolError: If the payload length is invalid.
         """
-        tx_module_count = 0
-        self._require_connected()
-        r = self.send(packet_type=OW_CONTROLLER, command=OW_CTRL_GET_MODULE_COUNT, addr=0)
-        r.print_packet()
-        if r is None or r.packet_type == OW_ERROR:
-            raise RuntimeError("Error retrieving TX module count.")
-                
-        # 
-        if r.data_len == 1:
-            tx_module_count = r.data[0]
-        else:
-            logger.error("Error retrieving TX module count.")
+        r = self.send_checked(packet_type=OW_CONTROLLER, command=OW_CTRL_GET_MODULE_COUNT,
+                              addr=0, op="get_tx_module_count")
+        if r.data_len != 1:
+            raise LIFUProtocolError(
+                f"TX: get_tx_module_count payload length {r.data_len} != 1",
+                code=LIFU_ERR_BAD_PAYLOAD_LENGTH,
+            )
+        tx_module_count = r.data[0]
         logger.debug("TX Module Count: %d", tx_module_count)
         return tx_module_count
 
     def enum_tx7332_devices(self,
                             num_devices: int | None = None) -> int:
-        """
-        Enumerate TX7332 devices connected to the TX device.
+        """Enumerate TX7332 chips connected to the TX device.
 
         Args:
-            num_transmitters (int): The number of transmitters expected to be enumerated. If None, the number of
-                transmitters will be determined from the response. If provided and the number enumerated does not
-                match the expected number, an error will be raised. If the UART is in demo mode, this argument is
-                used to set the number of transmitters for the demo (or set to a default if omitted/None)
-
-        Returns:
-            n_transmitters: number of devices detected.
+            num_devices: Expected chip count. If the device reports a
+                different number an exception is raised.
 
         Raises:
-            ValueError: If the UART is not connected.
-            Exception: If an error occurs during enumeration.
+            LIFUNotConnectedError, LIFUCommunicationError, LIFUDeviceError,
+            LIFUError: If the detected count does not match *num_devices*.
         """
-        self._require_connected()
-        r = self.send(packet_type=OW_TX7332, command=OW_TX7332_ENUM, addr=0)
-        r.print_packet()
-        if r is None or r.packet_type == OW_ERROR:
-            raise RuntimeError("Error enumerating TX7332 devices.")
+        r = self.send_checked(packet_type=OW_TX7332, command=OW_TX7332_ENUM,
+                              addr=0, op="enum_tx7332_devices")
+        if r.reserved == 0:
+            raise LIFUProtocolError(
+                "TX: enum_tx7332_devices returned zero chips",
+                code=LIFU_ERR_EMPTY_RESPONSE,
+            )
+        num_detected_devices = r.reserved
 
-        if r.reserved > 0:
-            num_detected_devices = r.reserved
-        else:
-            logger.error("Error enumerating TX7332 devices.")
-            num_detected_devices = 0
-        
         if num_devices is not None and num_detected_devices != num_devices:
-            raise ValueError(f"Expected {num_devices} devices, but detected {num_detected_devices} devices")
+            raise LIFUError(
+                f"TX: expected {num_devices} TX7332 chip(s), detected {num_detected_devices}",
+                code=LIFU_ERR_MODULE_COUNT_MISMATCH,
+            )
 
         self.tx_registers = TxDeviceRegisters(num_transmitters=num_detected_devices, module_invert=self.module_invert)
-        logger.info("TX Device Count: %d", num_detected_devices)
+        logger.info("Found %d Transmit Modules", num_detected_devices)
         return num_detected_devices
 
     def set_module_invert(self, module_invert: bool | List[bool]) -> None:
@@ -541,66 +462,48 @@ class TxDevice(OWComponent):
             self.tx_registers.module_invert = module_invert
 
     def demo_tx7332(self, identifier:int) -> bool:
-        """
-        Sets all TX7332 chip registers with a test waveform.
-
-        Returns:
-            bool: True if all chips are programmed successfully, False otherwise.
+        """Program the TX7332 chip with a demo waveform.
 
         Raises:
-            ValueError: If the UART is not connected.
+            LIFUNotConnectedError, LIFUCommunicationError, LIFUDeviceError.
         """
-        self._require_connected()
-        r = self.send(packet_type=OW_TX7332, command=OW_TX7332_DEMO, addr=identifier)
-        r.print_packet()
-        if r is None or r.packet_type == OW_ERROR:
-            raise RuntimeError("Error writing demo TX7332 registers.")
-
+        self.send_checked(packet_type=OW_TX7332, command=OW_TX7332_DEMO,
+                          addr=identifier, op="demo_tx7332")
         return True
-        
+
     def write_register(self, identifier:int, address: int, value: int) -> bool:
         """Write a single TX7332 register.
 
-        Args:
-            identifier: TX7332 chip index.
-            address: Register address.
-            value: 32-bit value to write.
-
-        Returns:
-            True on success, False on error.
+        Raises:
+            ValueError: If *identifier* is negative.
+            LIFUNotConnectedError, LIFUCommunicationError, LIFUDeviceError.
         """
-        self._require_connected()
         if identifier < 0:
             raise ValueError("TX chip identifier must be >= 0")
         data = struct.pack("<HI", address, value)
-        r = self.send(packet_type=OW_TX7332, command=OW_TX7332_WREG, addr=identifier, data=data)
-        if r is None or r.packet_type == OW_ERROR:
-            logger.error("write_register failed (chip=%d addr=0x%04X)", identifier, address)
-            return False
+        self.send_checked(packet_type=OW_TX7332, command=OW_TX7332_WREG,
+                          addr=identifier, data=data, op="write_register")
         logger.debug("Wrote 0x%08X to chip %d reg 0x%04X", value, identifier, address)
         return True
 
     def read_register(self, identifier:int, address: int) -> int:
         """Read a single TX7332 register.
 
-        Args:
-            identifier: TX7332 chip index.
-            address: Register address.
-
-        Returns:
-            32-bit register value, or None on error.
+        Raises:
+            ValueError: If *identifier* is negative.
+            LIFUNotConnectedError, LIFUCommunicationError, LIFUDeviceError,
+            LIFUProtocolError: If the payload length is invalid.
         """
-        self._require_connected()
         if identifier < 0:
             raise ValueError("TX chip identifier must be >= 0")
         data = struct.pack("<H", address)
-        r = self.send(packet_type=OW_TX7332, command=OW_TX7332_RREG, addr=identifier, data=data)
-        if r is None or r.packet_type == OW_ERROR:
-            logger.error("read_register failed (chip=%d addr=0x%04X)", identifier, address)
-            return None
+        r = self.send_checked(packet_type=OW_TX7332, command=OW_TX7332_RREG,
+                              addr=identifier, data=data, op="read_register")
         if r.data_len < 4:
-            logger.error("read_register: unexpected data_len=%d", r.data_len)
-            return None
+            raise LIFUProtocolError(
+                f"TX: read_register payload too short ({r.data_len} < 4)",
+                code=LIFU_ERR_BAD_PAYLOAD_LENGTH,
+            )
         value = struct.unpack("<I", r.data[:4])[0]
         logger.debug("Read 0x%08X from chip %d reg 0x%04X", value, identifier, address)
         return value
@@ -610,15 +513,10 @@ class TxDevice(OWComponent):
 
         Large blocks are automatically split into chunks of up to 62 registers.
 
-        Args:
-            identifier: TX7332 chip index.
-            start_address: Starting register address.
-            reg_values: List of 32-bit register values.
-
-        Returns:
-            True on success, False on error.
+        Raises:
+            ValueError: If *identifier* is negative or *reg_values* is empty.
+            LIFUNotConnectedError, LIFUCommunicationError, LIFUDeviceError.
         """
-        self._require_connected()
         if identifier < 0:
             raise ValueError("TX chip identifier must be >= 0")
         if not reg_values:
@@ -629,38 +527,33 @@ class TxDevice(OWComponent):
             chunk = reg_values[chunk_start : chunk_start + max_regs]
             fmt = "<HBB" + "I" * len(chunk)
             data = struct.pack(fmt, start_address + chunk_start, len(chunk), 0, *chunk)
-            r = self.send(packet_type=OW_TX7332, command=OW_TX7332_WBLOCK, addr=identifier, data=data)
-            if r is None or r.packet_type == OW_ERROR:
-                logger.error("write_block failed (chip=%d chunk at 0x%04X)", identifier, start_address + chunk_start)
-                return False
+            self.send_checked(packet_type=OW_TX7332, command=OW_TX7332_WBLOCK,
+                              addr=identifier, data=data,
+                              op=f"write_block[{chunk_start}]")
         logger.debug("write_block: %d regs from 0x%04X on chip %d", len(reg_values), start_address, identifier)
         return True
 
-    def read_block(self, identifier: int, start_address: int, count: int)-> list[int] | None:
+    def read_block(self, identifier: int, start_address: int, count: int) -> list[int]:
         """Read a contiguous block of TX7332 registers.
 
-        Args:
-            identifier: TX7332 chip index.
-            start_address: Starting register address.
-            count: Number of registers to read (1-62).
-
-        Returns:
-            List of 32-bit values, or None on error.
+        Raises:
+            ValueError: If *identifier* is negative or *count* is out of range.
+            LIFUNotConnectedError, LIFUCommunicationError, LIFUDeviceError,
+            LIFUProtocolError: If the payload length is invalid.
         """
-        self._require_connected()
         if identifier < 0:
             raise ValueError("TX chip identifier must be >= 0")
         if count <= 0 or count > 62:
             raise ValueError(f"count must be 1-62, got {count}")
         data = struct.pack("<HBB", start_address, count, 0)
-        r = self.send(packet_type=OW_TX7332, command=OW_TX7332_RBLOCK, addr=identifier, data=data)
-        if r is None or r.packet_type == OW_ERROR:
-            logger.error("read_block failed (chip=%d addr=0x%04X count=%d)", identifier, start_address, count)
-            return None
+        r = self.send_checked(packet_type=OW_TX7332, command=OW_TX7332_RBLOCK,
+                              addr=identifier, data=data, op="read_block")
         expected = count * 4
         if r.data_len < expected:
-            logger.error("read_block: data_len=%d, expected=%d", r.data_len, expected)
-            return None
+            raise LIFUProtocolError(
+                f"TX: read_block payload too short ({r.data_len} < {expected})",
+                code=LIFU_ERR_BAD_PAYLOAD_LENGTH,
+            )
         values = list(struct.unpack(f"<{count}I", r.data[:expected]))
         logger.debug("read_block: %d regs from 0x%04X on chip %d", count, start_address, identifier)
         return values
@@ -672,18 +565,13 @@ class TxDevice(OWComponent):
                      sequence: Dict,
                      trigger_mode: TriggerModeOpts = "sequence",
                      profile_index: int = 1,
-                     profile_increment: bool = True):
-        """
-        Set the solution parameters on the TX device.
+                     profile_increment: bool = True) -> bool:
+        """Program the TX device with the supplied beamforming solution.
 
-        Args:
-            pulse (Dict): The pulse parameters to set.
-            delays (list): The delays to set.
-            apodizations (list): The apodizations to set.
-            sequence (Dict): The sequence parameters to set.
-            mode: The trigger mode to use.
-            profile_index (int): The pulse profile to use.
-            profile_increment (bool): Whether to increment the pulse profile.
+        Raises:
+            ValueError: If the inputs are malformed.
+            NotImplementedError: Multiple foci are not yet supported.
+            LIFUError: On any device-communication failure.
         """
         delays = np.array(delays)
         if delays.ndim == 1:
@@ -692,21 +580,16 @@ class TxDevice(OWComponent):
         if apodizations.ndim == 1:
             apodizations = apodizations.reshape(1, -1)
         n = delays.shape[0]
-        n_elements = delays.shape[1]
-        n_required_devices = int(n_elements / NUM_CHANNELS)
-        n_detected_tx = self.enum_tx7332_devices(num_devices=n_required_devices)
-        n_modules = n_detected_tx / TRANSMITTERS_PER_MODULE
-        if n_required_devices != n_detected_tx:
-            errmsg = f"Number of detected TX devices ({n_detected_tx}) does not match required ({n_required_devices})"
-            logger.exception(errmsg)
-            raise OSError(errmsg)
-
         if n != apodizations.shape[0]:
             raise ValueError("Delays and apodizations must have the same number of rows")
         if n > 1:
             raise NotImplementedError("Multiple foci not supported yet")
+        n_elements = delays.shape[1]
+        n_required_devices = int(n_elements / NUM_CHANNELS)
+        # enum_tx7332_devices raises LIFUError on mismatch
+        self.enum_tx7332_devices(num_devices=n_required_devices)
         for profile in range(n):
-            duty_cycle=DEFAULT_PATTERN_DUTY_CYCLE * max(apodizations[profile,:]) * pulse["amplitude"]
+            duty_cycle = DEFAULT_PATTERN_DUTY_CYCLE * max(apodizations[profile, :]) * pulse["amplitude"]
             pulse_profile = Tx7332PulseProfile(
                 profile=profile+1,
                 frequency=pulse["frequency"],
@@ -716,7 +599,7 @@ class TxDevice(OWComponent):
             self.tx_registers.add_pulse_profile(pulse_profile)
             delay_profile = Tx7332DelayProfile(
                 profile=profile+1,
-                delays=delays[profile,:],
+                delays=delays[profile, :],
                 apodizations=apodizations[profile, :]
             )
             self.tx_registers.add_delay_profile(delay_profile)
@@ -727,98 +610,68 @@ class TxDevice(OWComponent):
             pulse_train_count=sequence["pulse_train_count"],
             trigger_mode=trigger_mode,
             profile_index=profile_index,
-            profile_increment=profile_increment
+            profile_increment=profile_increment,
         )
         self.apply_all_registers()
 
-        # Buffer the pulse and delay profiles in the microcontroller(s), so that they can be used to switch profiles on trigger detection
-        delay_control_registers = {profile:self.tx_registers.get_delay_control_registers(profile) for profile in self.tx_registers.configured_delay_profiles()}
-        pulse_control_registers = {profile:self.tx_registers.get_pulse_control_registers(profile) for profile in self.tx_registers.configured_pulse_profiles()}
+        if n > 1:
+            # Buffer the pulse and delay profiles in the microcontroller(s), so that they can be used to switch profiles on trigger detection
+            delay_control_registers = {profile: self.tx_registers.get_delay_control_registers(profile) for profile in self.tx_registers.configured_delay_profiles()}
+            pulse_control_registers = {profile: self.tx_registers.get_pulse_control_registers(profile) for profile in self.tx_registers.configured_pulse_profiles()}
 
+        return True
 
-
-    def apply_all_registers(self):
-        """
-        Apply all registers to the TX device.
+    def apply_all_registers(self) -> bool:
+        """Flush all configured TX7332 registers to the device.
 
         Raises:
-            ValueError: If the device is not connected.
+            LIFUNotConnectedError, LIFUCommunicationError, LIFUDeviceError.
         """
         registers = self.tx_registers.get_registers(pack=True, pack_single=True)
         for txi, txregs in enumerate(registers):
             for addr, reg_values in txregs.items():
-                if not self.write_block(identifier=txi, start_address=addr, reg_values=reg_values):
-                    logger.error(f"Error applying TX CHIP ID: {txi} registers")
-                    return False
+                self.write_block(identifier=txi, start_address=addr, reg_values=reg_values)
         return True
 
     def write_ti_config_to_tx_device(self, file_path: str, txchip_id: int) -> bool:
+        """Parse a TI configuration file and program its registers.
+
+        Raises:
+            FileNotFoundError: If *file_path* does not exist.
+            ValueError: If the config file yields no registers.
+            LIFUNotConnectedError, LIFUCommunicationError, LIFUDeviceError.
         """
-        Parse a TI configuration file and write the register values to the TX device.
+        parsed_registers = self.__parse_ti_cfg_file(file_path)
+        if not parsed_registers:
+            raise ValueError(f"No registers parsed from TI configuration file: {file_path}")
 
-        Args:
-            file_path (str): Path to the TI configuration file.
-            txchip_id (int): The ID of the TX chip to write the registers to.
+        for group, addr, value in parsed_registers:
+            logger.debug("Writing to %s | Address: 0x%02X | Value: 0x%08X", group, addr, value)
+            self.write_register(identifier=txchip_id, address=addr, value=value)
 
-        Returns:
-            bool: True if all registers were written successfully, False otherwise.
-        """
-        try:
-            # Parse the TI configuration file
-            parsed_registers = self.__parse_ti_cfg_file(file_path)
-            if not parsed_registers:
-                logger.error("No registers parsed from the TI configuration file.")
-                return False
-
-            # Write each register to the TX device
-            for group, addr, value in parsed_registers:
-                logger.debug(f"Writing to {group:<20} | Address: 0x{addr:02X} | Value: 0x{value:08X}")
-                if not self.write_register(identifier=txchip_id, address=addr, value=value):
-                    logger.error(
-                        f"Failed to write to TX CHIP ID: {txchip_id} | "
-                        f"Register: 0x{addr:02X} | Value: 0x{value:08X}"
-                    )
-                    return False
-
-            logger.debug("Successfully wrote all registers to the TX device.")
-            return True
-
-        except FileNotFoundError as e:
-            logger.error(f"TI configuration file not found: {file_path}. Error: {e}")
-            raise
-        except ValueError as e:
-            logger.error(f"Invalid input or device state: {e}")
-            raise
-        except Exception as e:
-            logger.error(f"Unexpected error while writing TI config to TX Device: {e}")
-            raise
+        logger.debug("Successfully wrote all registers to the TX device.")
+        return True
 
     # ------------------------------------------------------------------
     # Firmware update (delegates to LIFUDFU.LIFUDFUManager)
     # ------------------------------------------------------------------
 
     def get_module_count(self) -> int:
-        """Return the number of connected LIFU transmitter modules (including master).
+        """Return the number of connected LIFU transmitter modules.
 
-        Sends ``OW_CTRL_GET_MODULE_COUNT`` (0x10) to the firmware. Falls back to
-        deriving the count from the TX7332 chip count when the firmware does not
-        yet support the command.
+        Raises:
+            LIFUNotConnectedError, LIFUCommunicationError, LIFUDeviceError,
+            LIFUProtocolError: If the payload length is invalid.
         """
-        self._require_connected()
-        r = self.send(packet_type=OW_CONTROLLER, command=OW_CTRL_GET_MODULE_COUNT, addr=0)
-        
-        # Check for transport failure or hardware error reporting
-        if r is None or r.packet_type == OW_ERROR:
-            logger.error("get_module_count: Communication error or hardware NACK")
-            return 0
-        
-        # Check for malformed payload
+        r = self.send_checked(packet_type=OW_CONTROLLER, command=OW_CTRL_GET_MODULE_COUNT,
+                              addr=0, op="get_module_count")
         if not r.data or len(r.data) < 1:
-            logger.error(f"get_module_count: Unexpected payload length ({r.data_len})")
-            return 0
-
+            raise LIFUProtocolError(
+                f"TX: get_module_count payload length {r.data_len} < 1",
+                code=LIFU_ERR_BAD_PAYLOAD_LENGTH,
+            )
         count = r.data[0]
-        logger.debug(f"Detected {count} module(s)")
+        logger.debug("Detected %d module(s)", count)
         return count
         
     def update_firmware(self, module: int, package_file: str,

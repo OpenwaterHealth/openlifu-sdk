@@ -15,8 +15,8 @@ from .LIFUConfig import (
 from .uart_packet import OWUartPacket
 from .signal import OWSignal
 
-log = logging.getLogger("OWUart")
-
+log = logging.getLogger(__name__)
+log.setLevel(logging.WARNING)
 
 class _PendingCommand:
     __slots__ = ("packet_id", "packet_bytes", "timeout", "event", "response", "error")

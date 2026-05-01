@@ -48,15 +48,8 @@ def util_crc16(buf):
 
 
 # Set up logging
-log = logging.getLogger("UART_PACKET")
-log.setLevel(logging.ERROR)  # Default to ERROR level; adjust as needed
-log.propagate = False
-
-handler = logging.StreamHandler()
-handler.setLevel(logging.ERROR)
-formatter = logging.Formatter("%(asctime)s - %(levelname)s - %(message)s")
-handler.setFormatter(formatter)
-log.addHandler(handler)
+log = logging.getLogger(__name__)
+log.setLevel(logging.WARNING)
 
 class OWUartPacket:
     def __init__(self, id=None, packet_type=None, command=None, addr=None, reserved=None, data=None, buffer=None):
