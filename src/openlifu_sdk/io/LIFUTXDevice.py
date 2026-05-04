@@ -10,7 +10,6 @@ from typing import TYPE_CHECKING, Annotated, Dict, List, Literal, Optional
 
 import numpy as np
 
-from openlifu_sdk.io.LIFUUserConfig import LifuUserConfig
 from openlifu_sdk.io.component import OWComponent, register_command_packet_types
 from openlifu_sdk.util.annotations import OpenLIFUFieldData
 from openlifu_sdk.util.units import getunitconversion
