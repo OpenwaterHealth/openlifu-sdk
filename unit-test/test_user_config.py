@@ -361,11 +361,16 @@ class UserConfigInteractiveTests:
         original state.
     """
 
-    def __init__(self, component, device_label: str):
+    def __init__(self, component, device_label: str, module: int = 0,
+                 module_count: int | None = None):
         self.component = component
         self.device_label = device_label
-        self._snapshot: LifuUserConfig | None = None
+        self.module = module                     # currently-selected TX module index
+        self.module_count = module_count         # None for HV (single module)
+        # snapshot is per-module: { module_index: LifuUserConfig }
+        self._snapshots: dict[int, LifuUserConfig] = {}
         self.menu_items = [
+            ("Show / Change Module Index",   self.test_select_module),
             ("Read Current Config",          self.test_read_config),
             ("Show Snapshot (original)",     self.test_show_snapshot),
             ("Add Scratch Key",              self.test_add_scratch_key),
@@ -373,8 +378,10 @@ class UserConfigInteractiveTests:
             ("Remove Scratch Key",           self.test_remove_scratch_key),
             ("Round-Trip Scratch Key",       self.test_roundtrip_scratch),
             ("Write Custom JSON (scratch)",  self.test_write_custom_json),
-            ("Restore Original Config",      self.test_restore_original),
-            ("Run Safe Test Suite",          self.run_all_safe),
+            ("Restore Original Config (this module)", self.test_restore_original),
+            ("Restore ALL Snapshots",        self.test_restore_all),
+            ("Run Safe Test Suite (this module)",     self.run_all_safe),
+            ("Run Safe Test Suite (ALL modules)",     self.run_all_safe_all_modules),
         ]
 
     # ------------------------------------------------------------------
@@ -388,88 +395,140 @@ class UserConfigInteractiveTests:
     def _err(msg: str):
         print(f"  [FAIL] {msg}")
 
-    def _take_snapshot(self):
-        """Read and cache the original device config (call once at startup)."""
-        if self._snapshot is not None:
-            return
-        print(f"Reading original {self.device_label} config (snapshot)...")
-        self._snapshot = self.component.read_config()
-        print(f"  Snapshot taken: seq={self._snapshot.header.seq}, "
-              f"json_len={self._snapshot.header.json_len}")
+    def _module_label(self, module: int | None = None) -> str:
+        m = self.module if module is None else module
+        if self.module_count is None:
+            return self.device_label
+        return f"{self.device_label}[{m}]"
 
-    def _restore_snapshot(self) -> bool:
-        """Write the cached snapshot back to the device."""
-        if self._snapshot is None:
-            print("  No snapshot available, nothing to restore.")
+    def _take_snapshot(self, module: int | None = None):
+        """Read and cache the original device config for a module."""
+        m = self.module if module is None else module
+        if m in self._snapshots:
+            return self._snapshots[m]
+        print(f"Reading original {self._module_label(m)} config (snapshot)...")
+        snap = self.component.read_config(module=m)
+        self._snapshots[m] = snap
+        print(f"  Snapshot taken: seq={snap.header.seq}, "
+              f"json_len={snap.header.json_len}")
+        return snap
+
+    def _restore_snapshot(self, module: int | None = None) -> bool:
+        """Write the cached snapshot for *module* back to the device."""
+        m = self.module if module is None else module
+        snap = self._snapshots.get(m)
+        if snap is None:
+            print(f"  No snapshot available for {self._module_label(m)}.")
             return False
-        print(f"Restoring original {self.device_label} config to device...")
+        print(f"Restoring original {self._module_label(m)} config to device...")
         # Write a fresh copy so internal header.json_len gets re-derived
         restore_cfg = LifuUserConfig(
-            json_data=copy.deepcopy(self._snapshot.json_data)
+            json_data=copy.deepcopy(snap.json_data)
         )
-        result = self.component.write_config(restore_cfg)
+        result = self.component.write_config(restore_cfg, module=m)
         print(f"  Restore complete. New device seq={result.header.seq}")
         return True
+
+    def _restore_all_snapshots(self):
+        for m in sorted(self._snapshots.keys()):
+            try:
+                self._restore_snapshot(m)
+            except Exception as exc:
+                print(f"  [WARN] Restore of {self._module_label(m)} failed: {exc}")
 
     # ------------------------------------------------------------------
     # Individual tests
     # ------------------------------------------------------------------
+    def test_select_module(self):
+        """Show current module index and optionally change it."""
+        if self.module_count is None:
+            print(f"  {self.device_label} has a single module (index always 0).")
+            return self.module
+        print(f"  Current module index: {self.module}  (of {self.module_count} module(s))")
+        raw = input(f"  New index [0..{self.module_count - 1}] (blank to keep): ").strip()
+        if not raw:
+            return self.module
+        try:
+            new_idx = int(raw)
+        except ValueError:
+            self._err("Invalid input.")
+            return self.module
+        if not 0 <= new_idx < self.module_count:
+            self._err(f"Index out of range (0..{self.module_count - 1}).")
+            return self.module
+        self.module = new_idx
+        # Take a snapshot for this module if we haven't already
+        try:
+            self._take_snapshot()
+        except Exception as exc:
+            self._err(f"Failed to snapshot module {new_idx}: {exc}")
+        self._ok(f"Now targeting {self._module_label()}")
+        return self.module
+
     def test_read_config(self):
-        cfg = self.component.read_config()
-        print(f"  seq={cfg.header.seq}  crc=0x{cfg.header.crc:04X}  "
-              f"json_len={cfg.header.json_len}")
+        cfg = self.component.read_config(module=self.module)
+        print(f"  [{self._module_label()}]  seq={cfg.header.seq}  "
+              f"crc=0x{cfg.header.crc:04X}  json_len={cfg.header.json_len}")
         print(f"  data={json.dumps(cfg.json_data, indent=2)}")
         self._ok("Config read.")
         return cfg
 
     def test_show_snapshot(self):
-        if self._snapshot is None:
-            self._err("No snapshot available.")
+        snap = self._snapshots.get(self.module)
+        if snap is None:
+            self._err(f"No snapshot for {self._module_label()}.")
             return None
-        print(f"  seq={self._snapshot.header.seq}  "
-              f"crc=0x{self._snapshot.header.crc:04X}")
-        print(f"  data={json.dumps(self._snapshot.json_data, indent=2)}")
+        print(f"  [{self._module_label()}]  seq={snap.header.seq}  "
+              f"crc=0x{snap.header.crc:04X}")
+        print(f"  data={json.dumps(snap.json_data, indent=2)}")
         self._ok("Snapshot displayed.")
-        return self._snapshot
+        return snap
 
     def test_add_scratch_key(self):
         """Read, add SCRATCH_KEY, write back."""
-        cfg = self.component.read_config()
-        cfg.set(SCRATCH_KEY, {"created": int(time.time()), "iter": 0})
-        updated = self.component.write_config(cfg)
-        verify = self.component.read_config()
+        cfg = self.component.read_config(module=self.module)
+        cfg.set(SCRATCH_KEY, {
+            "created": int(time.time()),
+            "iter": 0,
+            "module": self.module,
+        })
+        updated = self.component.write_config(cfg, module=self.module)
+        verify = self.component.read_config(module=self.module)
         if SCRATCH_KEY in verify.json_data:
-            self._ok(f"Scratch key added. New seq={updated.header.seq}")
+            self._ok(f"Scratch key added on {self._module_label()}. "
+                     f"New seq={updated.header.seq}")
             return True
         self._err("Scratch key not present after read-back.")
         return False
 
     def test_update_scratch_key(self):
         """Bump an iter counter inside the scratch key."""
-        cfg = self.component.read_config()
-        existing = cfg.get(SCRATCH_KEY) or {"created": int(time.time()), "iter": 0}
+        cfg = self.component.read_config(module=self.module)
+        existing = cfg.get(SCRATCH_KEY) or {
+            "created": int(time.time()), "iter": 0, "module": self.module,
+        }
         existing["iter"] = existing.get("iter", 0) + 1
         existing["last_update"] = int(time.time())
         cfg.set(SCRATCH_KEY, existing)
-        self.component.write_config(cfg)
-        verify = self.component.read_config()
+        self.component.write_config(cfg, module=self.module)
+        verify = self.component.read_config(module=self.module)
         if verify.get(SCRATCH_KEY, {}).get("iter") == existing["iter"]:
-            self._ok(f"Scratch iter -> {existing['iter']}")
+            self._ok(f"{self._module_label()} scratch iter -> {existing['iter']}")
             return True
         self._err("Scratch iter did not update.")
         return False
 
     def test_remove_scratch_key(self):
         """Remove SCRATCH_KEY (does not touch any other keys)."""
-        cfg = self.component.read_config()
+        cfg = self.component.read_config(module=self.module)
         if SCRATCH_KEY not in cfg.json_data:
             print("  Scratch key not present; nothing to remove.")
             return True
         del cfg.json_data[SCRATCH_KEY]
-        self.component.write_config(cfg)
-        verify = self.component.read_config()
+        self.component.write_config(cfg, module=self.module)
+        verify = self.component.read_config(module=self.module)
         if SCRATCH_KEY not in verify.json_data:
-            self._ok("Scratch key removed.")
+            self._ok(f"Scratch key removed from {self._module_label()}.")
             return True
         self._err("Scratch key still present after delete.")
         return False
@@ -491,8 +550,8 @@ class UserConfigInteractiveTests:
         Never overwrites original keys.
         """
         raw = input(
-            f"  Enter JSON object to store under '{SCRATCH_KEY}' "
-            f"(or blank to skip): "
+            f"  Enter JSON object to store under '{SCRATCH_KEY}' on "
+            f"{self._module_label()} (or blank to skip): "
         ).strip()
         if not raw:
             print("  Skipped.")
@@ -502,10 +561,10 @@ class UserConfigInteractiveTests:
         except json.JSONDecodeError as exc:
             self._err(f"Invalid JSON: {exc}")
             return False
-        cfg = self.component.read_config()
+        cfg = self.component.read_config(module=self.module)
         cfg.set(SCRATCH_KEY, payload)
-        self.component.write_config(cfg)
-        verify = self.component.read_config()
+        self.component.write_config(cfg, module=self.module)
+        verify = self.component.read_config(module=self.module)
         if verify.get(SCRATCH_KEY) == payload:
             self._ok("Custom JSON written under scratch key.")
             return True
@@ -513,12 +572,17 @@ class UserConfigInteractiveTests:
         return False
 
     def test_restore_original(self):
-        """Force-restore the snapshot taken at startup."""
+        """Force-restore the snapshot taken at startup for the current module."""
         return self._restore_snapshot()
 
+    def test_restore_all(self):
+        """Force-restore snapshots for all modules we've touched."""
+        self._restore_all_snapshots()
+        return True
+
     def run_all_safe(self):
-        """Run only non-destructive scratch-key tests, then restore."""
-        print("\n=== Running Safe Test Suite ===")
+        """Run non-destructive scratch tests on the current module, then restore."""
+        print(f"\n=== Running Safe Test Suite on {self._module_label()} ===")
         sequence = [
             ("Read Current Config",      self.test_read_config),
             ("Add Scratch Key",          self.test_add_scratch_key),
@@ -538,6 +602,24 @@ class UserConfigInteractiveTests:
         except Exception as exc:
             self._err(f"Restore failed: {exc}")
 
+    def run_all_safe_all_modules(self):
+        """Run the safe suite on every available module index."""
+        if self.module_count is None:
+            self.run_all_safe()
+            return
+        original_module = self.module
+        try:
+            for m in range(self.module_count):
+                self.module = m
+                try:
+                    self._take_snapshot()
+                except Exception as exc:
+                    self._err(f"Snapshot of {self._module_label()} failed: {exc}")
+                    continue
+                self.run_all_safe()
+        finally:
+            self.module = original_module
+
     # ------------------------------------------------------------------
     # Menu loop
     # ------------------------------------------------------------------
@@ -546,11 +628,13 @@ class UserConfigInteractiveTests:
         try:
             while True:
                 print("\n" + "=" * 56)
-                print(f"   User Config Interactive Test Menu  ({self.device_label})")
+                print(f"   User Config Interactive Test Menu  ({self._module_label()})")
+                if self.module_count is not None:
+                    print(f"   TX modules detected: {self.module_count}")
                 print("=" * 56)
                 for idx, (label, _) in enumerate(self.menu_items, 1):
                     print(f"  {idx:2d}. {label}")
-                print("   0. Exit (auto-restores original config)")
+                print("   0. Exit (auto-restores all snapshots)")
                 choice = input("Select: ").strip()
                 if choice == "0":
                     break
@@ -568,18 +652,19 @@ class UserConfigInteractiveTests:
                 except ValueError:
                     print("Please enter a number.")
         finally:
-            print("\n--- Final cleanup: restoring original config ---")
-            try:
-                self._restore_snapshot()
-            except Exception as exc:
-                print(f"  [WARN] Restore failed: {exc}")
+            print("\n--- Final cleanup: restoring all snapshots ---")
+            self._restore_all_snapshots()
 
 
 # ===========================================================================
 # Hardware connection helper
 # ===========================================================================
 def _connect_component(device: str):
-    """Return (component, label) for the requested device ('tx' or 'hv')."""
+    """Return (component, label, module_count) for the requested device.
+
+    *module_count* is the number of TX modules on the bus (queried from the
+    device) or ``None`` when the device has only one logical module (HV).
+    """
     from openlifu_sdk.io.LIFUInterface import LIFUInterface
 
     print("Connecting to LIFU device(s)...")
@@ -591,12 +676,22 @@ def _connect_component(device: str):
         if not tx_connected:
             print("TX device not connected. Exiting.")
             sys.exit(1)
-        return iface.txdevice, "TX"
+        tx = iface.txdevice
+        try:
+            count = tx.get_tx_module_count()
+        except Exception as exc:
+            print(f"  [WARN] Could not query TX module count: {exc}. "
+                  f"Defaulting to 1.")
+            count = 1
+        if count <= 0:
+            count = 1
+        print(f"  Detected {count} TX module(s).")
+        return tx, "TX", count
     if device == "hv":
         if not hv_connected:
             print("HV controller not connected. Exiting.")
             sys.exit(1)
-        return iface.hvcontroller, "HV"
+        return iface.hvcontroller, "HV", None
     print(f"Unknown device '{device}' (use 'tx' or 'hv').")
     sys.exit(2)
 
@@ -614,11 +709,24 @@ if __name__ == "__main__":
         "--device", choices=["tx", "hv"], default="tx",
         help="Which device to target in interactive mode (default: tx)",
     )
+    parser.add_argument(
+        "--module", type=int, default=0,
+        help="Initial TX module index to target (default: 0). Ignored for HV.",
+    )
     args, remaining = parser.parse_known_args()
 
     if args.interactive:
-        component, label = _connect_component(args.device)
-        suite = UserConfigInteractiveTests(component, label)
+        component, label, module_count = _connect_component(args.device)
+        initial_module = args.module
+        if module_count is not None and not 0 <= initial_module < module_count:
+            print(f"--module {initial_module} out of range "
+                  f"(0..{module_count - 1}); using 0.")
+            initial_module = 0
+        suite = UserConfigInteractiveTests(
+            component, label,
+            module=initial_module,
+            module_count=module_count,
+        )
         try:
             suite.run_menu()
         finally:
