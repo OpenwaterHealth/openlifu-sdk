@@ -446,7 +446,7 @@ class TxDevice(OWComponent):
             )
 
         self.tx_registers = TxDeviceRegisters(num_transmitters=num_detected_devices, module_invert=self.module_invert)
-        logger.info("Found %d Transmit Modules", num_detected_devices)
+        logger.info("Found %d Transmit Modules (%d tx chips)", num_detected_devices // TRANSMITTERS_PER_MODULE, num_detected_devices)
         return num_detected_devices
 
     def set_module_invert(self, module_invert: bool | List[bool]) -> None:
