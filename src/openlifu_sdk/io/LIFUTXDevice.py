@@ -2,16 +2,19 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import re
 import struct
+import time
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Annotated, Dict, List, Literal
+from typing import TYPE_CHECKING, Annotated, Dict, List, Literal, Optional
 
 import numpy as np
 
 from openlifu_sdk.io.component import OWComponent, register_command_packet_types
 from openlifu_sdk.util.annotations import OpenLIFUFieldData
 from openlifu_sdk.util.units import getunitconversion
+from openlifu_sdk.util.hwid import format_hwid
 
 DEFAULT_NUM_TRANSMITTERS = 2
 TRANSMITTERS_PER_MODULE = 2
@@ -30,6 +33,7 @@ ADDRESS_PATTERN_SEL_G2 = 0x1E
 ADDRESS_PATTERN_SEL_G1 = 0x1F
 ADDRESS_TRSW = 0x1A
 ADDRESS_APODIZATION = 0x1B
+ADDRESS_GLOBAL_CONTROL = 0x00
 ADDRESSES_GLOBAL = [ADDRESS_GLOBAL_MODE,
                     ADDRESS_STANDBY,
                     ADDRESS_DYNPWR_2,
@@ -104,7 +108,7 @@ TriggerModeOpts = Literal['sequence', 'continuous','single']
 DEFAULT_PULSE_WIDTH_US = 20
 TEMPERATURE_DATA_LENGTH = 4
 
-from openlifu_sdk.io.LIFUConfig import (  # noqa: E402 -- protocol constants above are needed before this import block
+from openlifu_sdk.io.LIFUConfig import (
     CONTROLLER_COMMANDS,
     DEFAULT_TIMEOUT,
     GLOBAL_COMMANDS,
@@ -112,18 +116,32 @@ from openlifu_sdk.io.LIFUConfig import (  # noqa: E402 -- protocol constants abo
     LIFU_ERR_BAD_PAYLOAD_LENGTH,
     LIFU_ERR_EMPTY_RESPONSE,
     LIFU_ERR_MODULE_COUNT_MISMATCH,
+    OW_CMD,
     OW_CMD_ASYNC,
+    OW_CMD_DFU,
+    OW_CMD_ECHO,
+    OW_CMD_FLASH_WRITE,
+    OW_CMD_FLASH_READ,
     OW_CMD_GET_AMBIENT,
     OW_CTRL_GET_MODULE_COUNT,
     OW_CTRL_GET_MODULE_MODE,
     OW_CTRL_ENUMERATE,
+    NODE_MODE_APP,
+    NODE_MODE_BOOTLOADER,
     NODE_MODE_UNKNOWN,
     OW_CMD_GET_TEMP,
+    OW_CMD_HWID,
+    OW_CMD_PING,
+    OW_CMD_RESET,
+    OW_CMD_TOGGLE_LED,
+    OW_CMD_USR_CFG,
+    OW_CMD_VERSION,
     OW_CONTROLLER,
     OW_CTRL_GET_SWTRIG,
     OW_CTRL_SET_SWTRIG,
     OW_CTRL_START_SWTRIG,
     OW_CTRL_STOP_SWTRIG,
+    OW_ERROR,
     OW_TRANSMITTER_PID,
     OW_TX7332,
     OW_TX7332_DEMO,
@@ -131,16 +149,18 @@ from openlifu_sdk.io.LIFUConfig import (  # noqa: E402 -- protocol constants abo
     OW_TX7332_ENUM,
     OW_TX7332_RREG,
     OW_TX7332_RBLOCK,
+    OW_TX7332_VWBLOCK,
+    OW_TX7332_VWREG,
     OW_TX7332_WBLOCK,
     OW_TX7332_WREG,
     OW_VID,
     TRIGGER_MODE_CONTINUOUS,
     TRIGGER_MODE_SEQUENCE,
     TRIGGER_MODE_SINGLE,
+    HW_ID_DATA_LENGTH,
     TX7332_COMMANDS
 )
-from openlifu_sdk.io.LIFUConfig import HW_ID_DATA_LENGTH as HW_ID_DATA_LENGTH  # noqa: E402 -- re-exported; unit tests import it from this module
-from openlifu_sdk.io.exceptions import LIFUError, LIFUProtocolError  # noqa: E402
+from openlifu_sdk.io.exceptions import LIFUError, LIFUProtocolError
 
 if TYPE_CHECKING:
     pass
@@ -562,6 +582,187 @@ class TxDevice(OWComponent):
         logger.debug("write_block: %d regs from 0x%04X on chip %d", len(reg_values), start_address, identifier)
         return True
 
+    def _iter_tx_ids(self) -> List[int]:
+        if self.tx_registers is None:
+            raise ValueError("TX devices not enumerated. Call enum_tx7332_devices() first.")
+        return list(range(self.tx_registers.num_transmitters))
+
+    def _iter_target_tx_ids(self, identifier: int | None = None) -> List[int]:
+        if identifier is None:
+            return self._iter_tx_ids()
+        if identifier < 0:
+            raise ValueError("TX chip identifier must be >= 0")
+        return [identifier]
+
+    def _build_pattern_mode_register(self,
+                                     tx_start_del: int,
+                                     tx_bf_mode: bool = True,
+                                     tr_sw_del_mode: bool = True,
+                                     template: int | None = None) -> int:
+        reg = 0 if template is None else int(template)
+        reg = set_register_value(reg, 1 if tx_bf_mode else 0, lsb=0, width=1)
+        reg = set_register_value(reg, 1 if tr_sw_del_mode else 0, lsb=1, width=1)
+        reg = set_register_value(reg, tx_start_del, lsb=18, width=9)
+        return reg
+
+    @staticmethod
+    def min_tx_start_delay(bf_clk_hz: float = 200e6, tr_off_time_s: float = 2e-6) -> int:
+        required_cycles = tr_off_time_s * bf_clk_hz
+        # Enforce (8 * TX_START_DEL + 121) > required_cycles.
+        tx_start_del = math.ceil((required_cycles - 120.0) / 8.0)
+        return max(0, tx_start_del)
+
+    def init_onchip_raster_mode(self,
+                                tx_start_del: int | None = None,
+                                bf_clk_hz: float = 200e6,
+                                tr_sw_del_mode: bool = True,
+                                identifier: int | None = None) -> bool:
+        """Initialize TX7332 register set for on-chip beamforming profile RAM use.
+
+        This applies the datasheet-safe bring-up register sequence:
+        1) zero profile-1 delays (0x20-0x2F)
+        2) set profile-1 pattern to Hi-Z terminator (0x120 = 0x78)
+        3) enable on-chip mode in 0x18
+        """
+        if tx_start_del is None:
+            tx_start_del = self.min_tx_start_delay(bf_clk_hz=bf_clk_hz)
+
+        tx_ids = self._iter_target_tx_ids(identifier)
+        for tx_id in tx_ids:
+            self.write_block(tx_id, 0x20, [0x00000000] * 16)
+            self.write_register(tx_id, 0x120, 0x00000078)
+            reg_mode = self._build_pattern_mode_register(
+                tx_start_del=tx_start_del,
+                tx_bf_mode=True,
+                tr_sw_del_mode=tr_sw_del_mode,
+                template=0,
+            )
+            self.write_register(tx_id, ADDRESS_PATTERN_MODE, reg_mode)
+
+        # Wait >=200 BF_CLK cycles before profile RAM programming.
+        time.sleep(max(200.0 / bf_clk_hz, 0.0))
+        return True
+
+    def commit_profile_ram(self, identifier: int | None = None) -> bool:
+        """Commit profile RAM writes by pulsing LOAD_PROF (0x00 bit 3)."""
+        tx_ids = self._iter_target_tx_ids(identifier)
+        for tx_id in tx_ids:
+            self.write_register(tx_id, ADDRESS_GLOBAL_CONTROL, 0x00000008)
+        return True
+
+    def set_delay_profile_select(self,
+                                 profile: int,
+                                 identifier: int | None = None,
+                                 tr_sw_del_g1: int | None = None,
+                                 tr_sw_del_g2: int | None = None) -> bool:
+        """Select active delay profile (1-16) by writing TX7332 register 0x16.
+
+        For raster hot-path updates, this performs one register write per selected chip.
+        """
+        if profile not in VALID_DELAY_PROFILES:
+            raise ValueError(f"Invalid delay profile {profile}. Expected 1-16.")
+        profile_sel = profile - 1
+
+        tx_ids = self._iter_target_tx_ids(identifier)
+        for tx_id in tx_ids:
+            reg = self.read_register(tx_id, ADDRESS_DELAY_SEL)
+            if tr_sw_del_g1 is not None:
+                reg = set_register_value(reg, tr_sw_del_g1, lsb=16, width=12)
+            if tr_sw_del_g2 is not None:
+                reg = set_register_value(reg, tr_sw_del_g2, lsb=0, width=12)
+            reg = set_register_value(reg, profile_sel, lsb=28, width=4)
+            reg = set_register_value(reg, profile_sel, lsb=12, width=4)
+            self.write_register(tx_id, ADDRESS_DELAY_SEL, reg)
+        return True
+
+    def set_pattern_profile_select(self,
+                                   profile: int,
+                                   identifier: int | None = None) -> bool:
+        """Select active pattern profile (1-32) via registers 0x1F/0x1E."""
+        if profile not in VALID_PATTERN_PROFILES:
+            raise ValueError(f"Invalid pattern profile {profile}. Expected 1-32.")
+        profile_sel = profile - 1
+
+        tx_ids = self._iter_target_tx_ids(identifier)
+        for tx_id in tx_ids:
+            self.write_register(tx_id, ADDRESS_PATTERN_SEL_G1, profile_sel)
+            self.write_register(tx_id, ADDRESS_PATTERN_SEL_G2, profile_sel)
+        return True
+    
+    def flash_write(self, data: None, module:int=0) -> bool:
+        """
+        Write the current configuration to flash memory on the TX device.
+
+        Returns:
+            bool: True if the write operation was successful, False otherwise.
+
+        Raises:
+            ValueError: If the UART is not connected.
+            Exception: If an error occurs while writing to flash.
+        """
+        try:
+            if self.uart.demo_mode:
+                return True
+
+            if not self.uart.is_connected():
+                raise ValueError("TX Device not connected")
+
+            r = self.uart.send_packet(id=None,
+                                      packetType=OW_CONTROLLER,
+                                      command=OW_CMD_FLASH_WRITE,
+                                      addr=module,
+                                      data=data)
+            self.uart.clear_buffer()
+            # r.print_packet()
+            if r.packet_type == OW_ERROR:
+                logger.error("Error writing to flash for device")
+                return False
+            else:
+                return True
+        except ValueError as v:
+            logger.error("ValueError: %s", v)
+            raise  # Re-raise the exception for the caller to handle
+        except Exception as e:
+            logger.error("Unexpected error during process: %s", e)
+            raise  # Re-raise the exception for the caller to handle
+
+    def flash_read(self, module:int=0) -> Dict:
+        """
+        Write the current configuration to flash memory on the TX device.
+
+        Returns:
+            Dict: The data read from flash memory.
+
+        Raises:
+            ValueError: If the UART is not connected.
+            Exception: If an error occurs while reading from flash.
+        """
+        try:
+            if self.uart.demo_mode:
+                return {}
+
+            if not self.uart.is_connected():
+                raise ValueError("TX Device not connected")
+
+            r = self.uart.send_packet(id=None,
+                                      packetType=OW_CONTROLLER,
+                                      command=OW_CMD_FLASH_READ,
+                                      addr=module)
+            self.uart.clear_buffer()
+            # r.print_packet()
+            if r.packet_type == OW_ERROR:
+                logger.error("Error reading flash for device")
+                return False
+            else:
+                return r.data
+        except ValueError as v:
+            logger.error("ValueError: %s", v)
+            raise  # Re-raise the exception for the caller to handle
+
+        except Exception as e:
+            logger.error("Unexpected error during process: %s", e)
+            raise  # Re-raise the exception for the caller to handle
+
     def read_block(self, identifier: int, start_address: int, count: int) -> list[int]:
         """Read a contiguous block of TX7332 registers.
 
@@ -645,12 +846,12 @@ class TxDevice(OWComponent):
 
         if n > 1:
             # Buffer the pulse and delay profiles in the microcontroller(s), so that they can be used to switch profiles on trigger detection
-            delay_control_registers = {profile: self.tx_registers.get_delay_control_registers(profile) for profile in self.tx_registers.configured_delay_profiles()}  # noqa: F841 -- consumed by the profile-buffering feature in development on a branch
-            pulse_control_registers = {profile: self.tx_registers.get_pulse_control_registers(profile) for profile in self.tx_registers.configured_pulse_profiles()}  # noqa: F841 -- consumed by the profile-buffering feature in development on a branch
+            delay_control_registers = {profile: self.tx_registers.get_delay_control_registers(profile) for profile in self.tx_registers.configured_delay_profiles()}
+            pulse_control_registers = {profile: self.tx_registers.get_pulse_control_registers(profile) for profile in self.tx_registers.configured_pulse_profiles()}
 
         return True
 
-    def apply_all_registers(self) -> bool:
+    def apply_all_registers(self, load_profile: bool = True) -> bool:
         """Flush all configured TX7332 registers to the device.
 
         Raises:
@@ -660,6 +861,8 @@ class TxDevice(OWComponent):
         for txi, txregs in enumerate(registers):
             for addr, reg_values in txregs.items():
                 self.write_block(identifier=txi, start_address=addr, reg_values=reg_values)
+        if load_profile:
+            self.commit_profile_ram()
         return True
 
     def write_ti_config_to_tx_device(self, file_path: str, txchip_id: int) -> bool:
@@ -1219,6 +1422,7 @@ class Tx7332Registers:
             y = pattern['y']*int(cycles+1)
             y = y[:(16*elastic_repeat)]
             y = y + ([0]*pulse_profile.tail_count)
+            t = np.arange(len(y))*(1/clk_n)
             elastic_mode = 1
             if elastic_repeat > MAX_ELASTIC_REPEAT:
                 raise ValueError("Pattern duration too long for elastic repeat")
