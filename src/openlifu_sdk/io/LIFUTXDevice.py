@@ -789,7 +789,7 @@ class TxDevice(OWComponent):
         return values
 
     def set_solution(self,
-                     pulse: Dict,
+                     pulse: Dict | List[Dict],
                      delays: np.ndarray,
                      apodizations: np.ndarray,
                      sequence: Dict,
@@ -798,9 +798,12 @@ class TxDevice(OWComponent):
                      profile_increment: bool = True) -> bool:
         """Program the TX device with the supplied beamforming solution.
 
+        For multi-profile solutions, row ``i`` of ``delays`` and ``apodizations``
+        is grouped with profile ``i+1``. ``pulse`` may be a single dict (shared
+        across all profiles) or a list of dicts (one per profile row).
+
         Raises:
             ValueError: If the inputs are malformed.
-            NotImplementedError: Multiple foci are not yet supported.
             LIFUError: On any device-communication failure.
         """
         delays = np.array(delays)
@@ -810,20 +813,37 @@ class TxDevice(OWComponent):
         if apodizations.ndim == 1:
             apodizations = apodizations.reshape(1, -1)
         n = delays.shape[0]
+
+        if n == 0:
+            raise ValueError("At least one profile row is required")
         if n != apodizations.shape[0]:
             raise ValueError("Delays and apodizations must have the same number of rows")
-        if n > 1:
-            raise NotImplementedError("Multiple foci not supported yet")
+        if delays.shape[1] != apodizations.shape[1]:
+            raise ValueError("Delays and apodizations must have the same number of elements per row")
+
+        # Delay RAM supports 16 profile slots on TX7332.
+        if n > len(VALID_DELAY_PROFILES):
+            raise ValueError(f"Too many profile rows ({n}). Max supported is {len(VALID_DELAY_PROFILES)}")
+
+        if isinstance(pulse, list):
+            if len(pulse) != n:
+                raise ValueError("When pulse is a list, it must contain one entry per profile row")
+            pulse_profiles = pulse
+        else:
+            pulse_profiles = [pulse] * n
+
         n_elements = delays.shape[1]
         n_required_devices = int(n_elements / NUM_CHANNELS)
         # enum_tx7332_devices raises LIFUError on mismatch
         self.enum_tx7332_devices(num_devices=n_required_devices)
+
         for profile in range(n):
-            duty_cycle = DEFAULT_PATTERN_DUTY_CYCLE * max(apodizations[profile, :]) * pulse["amplitude"]
+            pulse_cfg = pulse_profiles[profile]
+            duty_cycle = DEFAULT_PATTERN_DUTY_CYCLE * max(apodizations[profile, :]) * pulse_cfg["amplitude"]
             pulse_profile = Tx7332PulseProfile(
                 profile=profile+1,
-                frequency=pulse["frequency"],
-                cycles=int(pulse["duration"] * pulse["frequency"]),
+                frequency=pulse_cfg["frequency"],
+                cycles=int(pulse_cfg["duration"] * pulse_cfg["frequency"]),
                 duty_cycle=duty_cycle
             )
             self.tx_registers.add_pulse_profile(pulse_profile)
@@ -833,6 +853,21 @@ class TxDevice(OWComponent):
                 apodizations=apodizations[profile, :]
             )
             self.tx_registers.add_delay_profile(delay_profile)
+
+        if profile_index not in self.tx_registers.configured_delay_profiles():
+            raise ValueError(
+                f"profile_index={profile_index} is not configured. "
+                f"Configured profiles: {self.tx_registers.configured_delay_profiles()}"
+            )
+        if profile_index not in self.tx_registers.configured_pulse_profiles():
+            raise ValueError(
+                f"profile_index={profile_index} is not configured. "
+                f"Configured pulse profiles: {self.tx_registers.configured_pulse_profiles()}"
+            )
+
+        self.tx_registers.activate_delay_profile(profile_index)
+        self.tx_registers.activate_pulse_profile(profile_index)
+
         self.set_trigger(
             pulse_interval=sequence["pulse_interval"],
             pulse_count=sequence["pulse_count"],
@@ -845,9 +880,34 @@ class TxDevice(OWComponent):
         self.apply_all_registers()
 
         if n > 1:
-            # Buffer the pulse and delay profiles in the microcontroller(s), so that they can be used to switch profiles on trigger detection
-            delay_control_registers = {profile: self.tx_registers.get_delay_control_registers(profile) for profile in self.tx_registers.configured_delay_profiles()}
-            pulse_control_registers = {profile: self.tx_registers.get_pulse_control_registers(profile) for profile in self.tx_registers.configured_pulse_profiles()}
+            # Keep grouped runtime control registers (delay+pattern+apodization)
+            # so profile i can be restored as a unit during runtime switching.
+            self._runtime_profile_groups = {}
+            for profile in self.tx_registers.configured_delay_profiles():
+                self._runtime_profile_groups[profile] = {
+                    "delay_control": self.tx_registers.get_delay_control_registers(profile),
+                    "pulse_control": self.tx_registers.get_pulse_control_registers(profile),
+                }
+
+            # Write grouped control registers once so firmware runtime has all
+            # profile apodization/control combinations available from host writes.
+            for profile in self.tx_registers.configured_delay_profiles():
+                delay_groups = self._runtime_profile_groups[profile]["delay_control"]
+                pulse_groups = self._runtime_profile_groups[profile]["pulse_control"]
+                for txi, regs in enumerate(delay_groups):
+                    self.write_register(txi, ADDRESS_DELAY_SEL, regs[ADDRESS_DELAY_SEL])
+                    self.write_register(txi, ADDRESS_APODIZATION, regs[ADDRESS_APODIZATION])
+                    self.write_register(txi, ADDRESS_PATTERN_SEL_G1, pulse_groups[txi][ADDRESS_PATTERN_SEL_G1])
+                    self.write_register(txi, ADDRESS_PATTERN_SEL_G2, pulse_groups[txi][ADDRESS_PATTERN_SEL_G2])
+
+            # Restore selected active profile group for immediate triggering.
+            active_delay_groups = self.tx_registers.get_delay_control_registers(profile_index)
+            active_pulse_groups = self.tx_registers.get_pulse_control_registers(profile_index)
+            for txi, regs in enumerate(active_delay_groups):
+                self.write_register(txi, ADDRESS_DELAY_SEL, regs[ADDRESS_DELAY_SEL])
+                self.write_register(txi, ADDRESS_APODIZATION, regs[ADDRESS_APODIZATION])
+                self.write_register(txi, ADDRESS_PATTERN_SEL_G1, active_pulse_groups[txi][ADDRESS_PATTERN_SEL_G1])
+                self.write_register(txi, ADDRESS_PATTERN_SEL_G2, active_pulse_groups[txi][ADDRESS_PATTERN_SEL_G2])
 
         return True
 
