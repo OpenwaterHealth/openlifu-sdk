@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import queue
+import sys
 import threading
 import time
 
@@ -253,7 +254,32 @@ class OWUart:
     # Reader thread – continuous packet reception
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _boost_reader_priority():
+        """Best-effort raise of the current thread's OS priority on Windows.
+
+        The reader needs to wake quickly when bytes arrive so the
+        per-command response is dispatched before the sender's wait
+        timeout expires. Under Qt GUI load (qasync event loop, QML
+        rendering, plus other Python worker threads) the GIL handoff to
+        a freshly-readable reader can be delayed by tens to hundreds of
+        ms on Windows. Bumping the OS thread priority shortens that
+        window without changing semantics on other platforms.
+        """
+        if not sys.platform.startswith("win"):
+            return
+        try:
+            import ctypes  # local import keeps non-Windows hosts clean
+            THREAD_PRIORITY_ABOVE_NORMAL = 1
+            k32 = ctypes.windll.kernel32
+            k32.SetThreadPriority(k32.GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL)
+        except Exception:
+            # Priority is a hint, not a correctness requirement; log and
+            # continue if Windows refuses (e.g. in a restricted sandbox).
+            log.debug("Could not raise reader thread priority", exc_info=True)
+
     def _reader_loop(self):
+        self._boost_reader_priority()
         buf = bytearray()
         while self._running:
             if not self._connected:
@@ -267,7 +293,17 @@ class OWUart:
 
             try:
                 waiting = ser.in_waiting
-                data = ser.read(waiting) if waiting > 0 else ser.read(1)
+                # Read everything available in one syscall (up to
+                # MAX_DATA_LEN) so a single packet doesn't span multiple
+                # reader iterations -- each iteration round-trips through
+                # the GIL and costs ~one preemption opportunity. When the
+                # buffer is empty fall back to a blocking 1-byte read so
+                # we don't burn CPU; the underlying serial.Serial timeout
+                # (100 ms) caps that wait.
+                if waiting > 0:
+                    data = ser.read(min(waiting, MAX_DATA_LEN))
+                else:
+                    data = ser.read(1)
             except (serial.SerialException, OSError):
                 continue
 

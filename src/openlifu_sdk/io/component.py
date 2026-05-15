@@ -139,27 +139,58 @@ class OWComponent:
     def send_checked(self, command: int, addr: int = 0, reserved: int = 0,
                      data: bytearray | None = None, timeout: float | None = None,
                      packet_type: int | None = None,
-                     op: str | None = None) -> OWUartPacket:
+                     op: str | None = None,
+                     retries: int = 1) -> OWUartPacket:
         """Send *command* and validate the response.
+
+        Args:
+            retries: Number of automatic retries on transient transport
+                timeouts (``LIFUCommunicationError``). Default 1 (so up to
+                2 attempts total) — see motivation below. Set to 0 to
+                disable retries for callers that handle retry themselves
+                (e.g. firmware-update progress loops where a duplicate
+                send would corrupt sequencing). Device errors
+                (``OW_ERROR``) are NOT retried.
+
+        Why retry by default? When the SDK is driven from a heavily
+        threaded host (Qt UI + qasync + telemetry poll thread + the
+        three UART daemon threads), the response packet can occasionally
+        be delayed by Python GIL / OS-scheduler jitter for longer than
+        the per-command timeout, producing a spurious
+        ``LIFUCommunicationError`` even though the device responded
+        correctly. A single in-SDK retry recovers from this transparently
+        without every caller having to wrap the call themselves.
 
         Raises:
             LIFUNotConnectedError: If the UART is not open.
-            LIFUCommunicationError: If the request times out.
+            LIFUCommunicationError: If every attempt times out.
             LIFUDeviceError: If the device replies with ``OW_ERROR``.
         """
         self._require_connected()
-        r = self.send(command, addr=addr, reserved=reserved, data=data,
-                      timeout=timeout, packet_type=packet_type)
         label = op or f"cmd 0x{command:02X}"
-        if r is None:
-            raise LIFUCommunicationError(
-                f"{self._uart.desc}: {label} timed out"
-            )
-        if r.packet_type == OW_ERROR:
-            raise LIFUDeviceError(
-                f"{self._uart.desc}: {label} returned device error"
-            )
-        return r
+        total_attempts = max(1, retries + 1)
+        last_timeout_exc: LIFUCommunicationError | None = None
+        for attempt in range(1, total_attempts + 1):
+            r = self.send(command, addr=addr, reserved=reserved, data=data,
+                          timeout=timeout, packet_type=packet_type)
+            if r is None:
+                last_timeout_exc = LIFUCommunicationError(
+                    f"{self._uart.desc}: {label} timed out"
+                )
+                if attempt < total_attempts:
+                    log.warning(
+                        "%s: %s timed out on attempt %d/%d; retrying...",
+                        self._uart.desc, label, attempt, total_attempts,
+                    )
+                    continue
+                raise last_timeout_exc
+            if r.packet_type == OW_ERROR:
+                raise LIFUDeviceError(
+                    f"{self._uart.desc}: {label} returned device error"
+                )
+            return r
+        # Unreachable: the loop either returns or raises above.
+        raise last_timeout_exc  # pragma: no cover
 
     def send_async(self, command: int, addr: int = 0, reserved: int = 0,
                    data: bytearray | None = None, timeout: float | None = None,
