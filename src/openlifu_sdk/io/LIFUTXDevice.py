@@ -11,6 +11,7 @@ from typing import TYPE_CHECKING, Annotated, Dict, List, Literal, Optional
 
 import numpy as np
 
+from openlifu_sdk.io.LIFUUserConfig import LifuUserConfig
 from openlifu_sdk.io.component import OWComponent, register_command_packet_types
 from openlifu_sdk.util.annotations import OpenLIFUFieldData
 from openlifu_sdk.util.units import getunitconversion
@@ -86,6 +87,7 @@ DEFAULT_PATTERN_DUTY_CYCLE = 0.66
 PATTERN_PROFILE_OFFSET = 4
 NUM_PATTERN_PROFILES = 32
 VALID_PATTERN_PROFILES = list(range(1, NUM_PATTERN_PROFILES+1))
+PATTERN_PROFILE_SELECT_MASK = 0x3F
 MAX_PATTERN_PERIODS = 16
 PATTERN_PERIOD_ORDER = [[1, 2, 3, 4],
                  [5, 6, 7, 8],
@@ -129,6 +131,7 @@ from openlifu_sdk.io.LIFUConfig import (
     NODE_MODE_APP,
     NODE_MODE_BOOTLOADER,
     NODE_MODE_UNKNOWN,
+    OW_CTRL_SET_PROFILE_CYCLE,
     OW_CMD_GET_TEMP,
     OW_CMD_HWID,
     OW_CMD_PING,
@@ -795,17 +798,48 @@ class TxDevice(OWComponent):
                      sequence: Dict,
                      trigger_mode: TriggerModeOpts = "sequence",
                      profile_index: int = 1,
-                     profile_increment: bool = True) -> bool:
+                     profile_increment: bool = True,
+                     execution_order: List[int] | None = None) -> bool:
         """Program the TX device with the supplied beamforming solution.
 
         For multi-profile solutions, row ``i`` of ``delays`` and ``apodizations``
         is grouped with profile ``i+1``. ``pulse`` may be a single dict (shared
         across all profiles) or a list of dicts (one per profile row).
 
+        Grouped Profile Package System:
+        ================================
+        Each profile i (1-16) is bundled with:
+          - Pulse configuration (frequency, cycles, duty cycle)
+          - Delay profile (register 0x16 selector + delay values)
+          - Apodization configuration (register 0x1B + apodization values)
+
+        This bundle is sent as an atomic unit to the firmware, allowing the MCU
+        to cache all profile configurations and apply them coherently during
+        runtime profile switching.
+
+        Profile Execution Order:
+        ========================
+        If execution_order is provided (e.g., [1, 2, 3, 1, 2, 3]), the firmware
+        will automatically cycle through these profiles on each trigger sequence
+        completion. The apodization for the active profile is automatically applied
+        alongside the delay/pattern selectors.
+
+        Args:
+            pulse:              Dict or List[Dict] of pulse configs (frequency, duration, amplitude)
+            delays:             np.ndarray of shape (N, 64) for N profiles
+            apodizations:       np.ndarray of shape (N, 64) for N profiles
+            sequence:           Dict with trigger timing (pulse_interval, pulse_count, etc.)
+            trigger_mode:       "sequence", "continuous", or "single"
+            profile_index:      Initial active profile (1-16)
+            profile_increment:  Whether firmware auto-increments profile on sequence end
+            execution_order:    List[int] of profile indices to cycle (e.g., [1,2,3,1,2,3])
+                               If None, defaults to [1, 2, ..., N]
+
         Raises:
-            ValueError: If the inputs are malformed.
+            ValueError: If the inputs are malformed or execution_order is invalid.
             LIFUError: On any device-communication failure.
         """
+        # ========== VALIDATE AND NORMALIZE INPUTS ==========
         delays = np.array(delays)
         if delays.ndim == 1:
             delays = delays.reshape(1, -1)
@@ -831,6 +865,22 @@ class TxDevice(OWComponent):
             pulse_profiles = pulse
         else:
             pulse_profiles = [pulse] * n
+
+        # ========== SET EXECUTION ORDER ==========
+        # If not provided, create sequential order: [1, 2, ..., n]
+        if execution_order is None:
+            execution_order = list(range(1, n + 1))
+        
+        # Validate execution_order
+        if not isinstance(execution_order, list):
+            raise ValueError("execution_order must be a list of profile indices")
+        if len(execution_order) == 0:
+            raise ValueError("execution_order cannot be empty")
+        for idx in execution_order:
+            if not isinstance(idx, int) or idx < 1 or idx > n:
+                raise ValueError(f"execution_order contains invalid profile index {idx}. Must be in 1-{n}")
+        
+        logger.info(f"Grouped profile package system: {n} profiles, execution_order={execution_order}")
 
         n_elements = delays.shape[1]
         n_required_devices = int(n_elements / NUM_CHANNELS)
@@ -897,8 +947,10 @@ class TxDevice(OWComponent):
                 for txi, regs in enumerate(delay_groups):
                     self.write_register(txi, ADDRESS_DELAY_SEL, regs[ADDRESS_DELAY_SEL])
                     self.write_register(txi, ADDRESS_APODIZATION, regs[ADDRESS_APODIZATION])
-                    self.write_register(txi, ADDRESS_PATTERN_SEL_G1, pulse_groups[txi][ADDRESS_PATTERN_SEL_G1])
-                    self.write_register(txi, ADDRESS_PATTERN_SEL_G2, pulse_groups[txi][ADDRESS_PATTERN_SEL_G2])
+                    # Keep grouped profile writes semantically aligned: profile N uses
+                    # pattern selector N (1-based), matching firmware GET/SET profile logic.
+                    self.write_register(txi, ADDRESS_PATTERN_SEL_G1, profile & PATTERN_PROFILE_SELECT_MASK)
+                    self.write_register(txi, ADDRESS_PATTERN_SEL_G2, profile & PATTERN_PROFILE_SELECT_MASK)
 
             # Restore selected active profile group for immediate triggering.
             active_delay_groups = self.tx_registers.get_delay_control_registers(profile_index)
@@ -906,9 +958,74 @@ class TxDevice(OWComponent):
             for txi, regs in enumerate(active_delay_groups):
                 self.write_register(txi, ADDRESS_DELAY_SEL, regs[ADDRESS_DELAY_SEL])
                 self.write_register(txi, ADDRESS_APODIZATION, regs[ADDRESS_APODIZATION])
-                self.write_register(txi, ADDRESS_PATTERN_SEL_G1, active_pulse_groups[txi][ADDRESS_PATTERN_SEL_G1])
-                self.write_register(txi, ADDRESS_PATTERN_SEL_G2, active_pulse_groups[txi][ADDRESS_PATTERN_SEL_G2])
+                self.write_register(txi, ADDRESS_PATTERN_SEL_G1, profile_index & PATTERN_PROFILE_SELECT_MASK)
+                self.write_register(txi, ADDRESS_PATTERN_SEL_G2, profile_index & PATTERN_PROFILE_SELECT_MASK)
 
+            # ========== SEND GROUPED PROFILE PACKAGE TO FIRMWARE ==========
+            # For multi-profile solutions, communicate the execution_order and all
+            # profile apodization data to the firmware so it can auto-cycle and apply
+            # correct apodization per profile.
+            self._send_grouped_profile_cycle(execution_order, apodizations)
+
+        return True
+
+    def _send_grouped_profile_cycle(self, execution_order: List[int], apodizations: np.ndarray) -> bool:
+        """Send grouped profile cycle command and apodization data to firmware.
+
+        This command instructs the firmware to:
+          1. Store the execution_order list (which profiles to cycle through)
+          2. Store apodization data for each profile
+          3. On trigger sequence completion, auto-advance to the next profile
+             in the execution_order and apply the correct apodization
+
+        Protocol:
+          Packet format: [command] [data_len] [profile_count] [apod_count] [execution_order...] [apod_data...]
+          - profile_count: Number of configured profiles (1-16)
+          - apod_count: Apodization vector length (typically 64)
+          - execution_order: Array of profile indices to cycle through
+          - apod_data: Concatenated apodization vectors, one per profile
+        """
+        if not hasattr(self, 'uart') or self.uart is None:
+            raise ValueError("UART not initialized for grouped profile cycle setup")
+
+        n_profiles = apodizations.shape[0]
+        n_channels = apodizations.shape[1]
+
+        # Build payload: [profile_count] [apod_count] [exec_order...] [apod_data...]
+        payload = bytearray()
+
+        # Header: number of profiles and apodization channels
+        payload.append(n_profiles)  # 1 byte: profile count
+        payload.append(n_channels)  # 1 byte: apodization channels (typically 64)
+        payload.append(len(execution_order))  # 1 byte: execution order length
+
+        # Execution order indices (1-based profile numbers)
+        for profile_idx in execution_order:
+            payload.append(profile_idx & 0xFF)
+
+        # Apodization data: for each profile, pack all apodization values as 8-bit scaled integers
+        for profile_idx in range(n_profiles):
+            apod_row = apodizations[profile_idx, :]
+            # Scale to 0-255 range based on max value in profile
+            max_apod = np.max(apod_row) if np.max(apod_row) > 0 else 1.0
+            scaled_apod = (apod_row / max_apod * 255).astype(np.uint8)
+            payload.extend(scaled_apod.tolist())
+            
+        logger.info(
+            f"Sending grouped profile cycle: {n_profiles} profiles, "
+            f"execution_order={execution_order}, payload_size={len(payload)} bytes"
+        )
+
+        # Send via controller command packet. This is a required part of
+        # grouped multi-profile operation and must succeed.
+        self.send_checked(
+            packet_type=OW_CONTROLLER,
+            command=OW_CTRL_SET_PROFILE_CYCLE,
+            addr=0,
+            data=bytes(payload),
+            op="set_grouped_profile_cycle"
+        )
+        logger.debug("Grouped profile cycle command sent successfully")
         return True
 
     def apply_all_registers(self, load_profile: bool = True) -> bool:
