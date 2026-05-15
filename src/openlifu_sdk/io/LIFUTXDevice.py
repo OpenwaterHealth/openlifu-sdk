@@ -269,6 +269,8 @@ class TxDevice(OWComponent):
 
         if pulse_train_interval > 0 and (pulse_train_interval < pulse_interval * pulse_count):
             raise ValueError("Pulse train interval cannot be less than pulse interval * pulse count")
+        elif pulse_train_interval == 0:
+            pulse_train_interval = pulse_interval * pulse_count
 
         logger.info(f"Setting trigger with parameters: "
                         f"pulse_interval={pulse_interval}, "
