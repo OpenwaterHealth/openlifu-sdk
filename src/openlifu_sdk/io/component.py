@@ -188,6 +188,16 @@ class OWComponent:
                 raise LIFUDeviceError(
                     f"{self._uart.desc}: {label} returned device error"
                 )
+            if attempt > 1:
+                # Make it visible WHEN slow responses are recovering --
+                # if rt is comfortably under the per-call timeout the
+                # issue was the timeout itself; if it's close to (or
+                # past) the timeout, the device / link is genuinely slow.
+                rt = getattr(r, "_owuart_rt", 0.0)
+                log.warning(
+                    "%s: %s recovered on attempt %d/%d (rt=%.2fs)",
+                    self._uart.desc, label, attempt, total_attempts, rt,
+                )
             return r
         # Unreachable: the loop either returns or raises above.
         raise last_timeout_exc  # pragma: no cover

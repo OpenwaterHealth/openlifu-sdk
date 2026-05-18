@@ -20,7 +20,8 @@ log = logging.getLogger(__name__)
 log.setLevel(logging.WARNING)
 
 class _PendingCommand:
-    __slots__ = ("packet_id", "packet_bytes", "timeout", "event", "response", "error")
+    __slots__ = ("packet_id", "packet_bytes", "timeout", "event", "response",
+                 "error", "send_time", "response_time")
 
     def __init__(self, packet_id: int, packet_bytes: bytes, timeout: float):
         self.packet_id = packet_id
@@ -29,6 +30,11 @@ class _PendingCommand:
         self.event = threading.Event()
         self.response: OWUartPacket | None = None
         self.error: str | None = None
+        # Filled in by the sender right before write(); used by the
+        # reader to record the round-trip elapsed, and by send_checked
+        # retry diagnostics.
+        self.send_time: float = 0.0
+        self.response_time: float = 0.0
 
 
 class OWUart:
@@ -225,6 +231,7 @@ class OWUart:
             ser = self._serial
             if ser is not None and ser.is_open:
                 try:
+                    entry.send_time = time.monotonic()
                     ser.write(entry.packet_bytes)
                 except (serial.SerialException, OSError) as exc:
                     log.error("%s write error: %s", self.desc, exc)
@@ -242,13 +249,32 @@ class OWUart:
                 self.signal_error.emit(self.desc, entry.packet_id, entry.error)
                 continue
 
-            # Block until response or timeout (one command at a time)
+            # Block until response or timeout (one command at a time).
+            # The race we have to avoid: the reader can dispatch a
+            # response in the narrow window between event.wait() timing
+            # out and us taking _pending_lock here. Resolution:
+            #   - Reader sets entry.response + entry.event INSIDE the
+            #     lock (see _dispatch_response).
+            #   - Sender only marks "Timeout" if its own pop returns the
+            #     entry (i.e. the reader hasn't claimed it concurrently).
             if not entry.event.wait(timeout=entry.timeout):
                 with self._pending_lock:
-                    self._pending.pop(entry.packet_id, None)
-                entry.error = "Timeout"
-                entry.event.set()
-                self.signal_error.emit(self.desc, entry.packet_id, "Timeout")
+                    popped = self._pending.pop(entry.packet_id, None)
+                    if popped is not None:
+                        entry.error = "Timeout"
+                        entry.event.set()
+                        timed_out = True
+                    else:
+                        # Reader claimed it inside the lock -- response
+                        # is valid; this wasn't really a timeout.
+                        timed_out = False
+                if timed_out:
+                    elapsed = time.monotonic() - entry.send_time
+                    log.warning(
+                        "%s id=%d timed out after %.2fs (timeout=%.2fs)",
+                        self.desc, entry.packet_id, elapsed, entry.timeout,
+                    )
+                    self.signal_error.emit(self.desc, entry.packet_id, "Timeout")
 
     # ------------------------------------------------------------------
     # Reader thread – continuous packet reception
@@ -321,11 +347,17 @@ class OWUart:
                     break
 
     def _dispatch_response(self, packet: OWUartPacket):
+        # Pop + populate + signal under the lock so the sender's
+        # timeout-path cannot clobber a response that arrived in the
+        # exact same instant. See _sender_loop for the matching half of
+        # this protocol.
         with self._pending_lock:
             entry = self._pending.pop(packet.id, None)
-        if entry is not None:
-            entry.response = packet
-            entry.event.set()
+            if entry is not None:
+                entry.response = packet
+                if entry.send_time:
+                    entry.response_time = time.monotonic() - entry.send_time
+                entry.event.set()
         # Always emit so async listeners see every packet (including unsolicited)  
         # TODO: Consider separate signal for unsolicited packets vs responses to async commands      
         # self.signal_data_received.emit(self.desc, packet)
@@ -447,6 +479,13 @@ class OWUart:
         entry.event.wait(timeout=timeout + self._send_queue.qsize() * timeout + 5)
         if entry.error:
             return None
+        if entry.response is not None:
+            # Stash round-trip time on the packet so retry / diagnostic
+            # callers can see how close we came to the timeout.
+            try:
+                entry.response._owuart_rt = entry.response_time  # type: ignore[attr-defined]
+            except Exception:
+                pass
         return entry.response
 
     def _send_direct(self, pkt: OWUartPacket, timeout: float) -> OWUartPacket | None:
