@@ -4,7 +4,7 @@ on:
   push:
     tags:
       - "[0-9]*.[0-9]*.[0-9]*"
-      - "pre-[0-9]*.[0-9]*.[0-9]*"
+      - "*.*.*-rc.*"
   workflow_dispatch:
     inputs:
       pretend_version:
@@ -39,11 +39,10 @@ jobs:
           TAG_NAME="${GITHUB_REF#refs/tags/}"
           BASE_VERSION="$TAG_NAME"
 
-          if [[ "$BASE_VERSION" == pre-* ]]; then
-            BASE_VERSION="${BASE_VERSION#pre-}"
-            BASE_VERSION="${BASE_VERSION#v}"
+          if [[ "$BASE_VERSION" == *-rc.* ]]; then
+            RC_NUM=$(echo "$BASE_VERSION" | grep -oE 'rc\.([0-9]+)$' | grep -oE '[0-9]+$')
             BASE_VERSION=$(echo "$BASE_VERSION" | grep -oE '^[0-9]+\.[0-9]+\.[0-9]+')
-            echo "SETUPTOOLS_SCM_PRETEND_VERSION=${BASE_VERSION}rc0" >> $GITHUB_ENV
+            echo "SETUPTOOLS_SCM_PRETEND_VERSION=${BASE_VERSION}rc${RC_NUM}" >> $GITHUB_ENV
           else
             BASE_VERSION="${BASE_VERSION#v}"
             BASE_VERSION=$(echo "$BASE_VERSION" | grep -oE '^[0-9]+\.[0-9]+\.[0-9]+')
@@ -84,7 +83,7 @@ jobs:
         run: |
           TAG_NAME="${GITHUB_REF#refs/tags/}"
 
-          if [[ "$TAG_NAME" == pre-* ]] || [[ "$TAG_NAME" == *"-rc"* ]] || [[ "$TAG_NAME" == *"-beta"* ]]; then
+          if [[ "$TAG_NAME" == *"-rc"* ]] || [[ "$TAG_NAME" == *"-beta"* ]]; then
             echo "prerelease=true" >> $GITHUB_OUTPUT
           else
             echo "prerelease=false" >> $GITHUB_OUTPUT
@@ -110,7 +109,7 @@ jobs:
           fi
 
           PREV_TAG=$(git tag --merged HEAD --sort=-creatordate \
-            | grep -E '^(pre-)?[0-9]+\.[0-9]+\.[0-9]+$' \
+            | grep -E '^[0-9]+\.[0-9]+\.[0-9]+(-rc\.[0-9]+)?$' \
             | grep -v "^${TAG_NAME}$" \
             | head -n 1)
 
