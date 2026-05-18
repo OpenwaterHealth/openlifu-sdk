@@ -44,6 +44,13 @@ from openlifu_sdk.io.LIFUTXDevice import (
     TEMPERATURE_DATA_LENGTH,
     TxDevice,
 )
+from openlifu_sdk.io.exceptions import (
+    LIFUDeviceError,
+    LIFUError,
+    LIFUNotConnectedError,
+    LIFUProtocolError,
+)
+from openlifu_sdk.io.component import format_hwid
 from openlifu_sdk.io.uart import OWUart
 
 
@@ -67,23 +74,24 @@ class TestTxDeviceUnit(unittest.TestCase):
     """Unit tests for TxDevice using a fully mocked OWUart."""
 
     def setUp(self):
+        self.tx = TxDevice()
         self.uart = MagicMock(spec=OWUart)
+        self.uart.desc = "TX"
         self.uart.demo_mode = False
         self.uart.asyncMode = False
-        self.uart.is_connected.return_value = True
-        self.uart.clear_buffer.return_value = None
-        self.tx = TxDevice(uart=self.uart)
+        self.uart.is_connected = True
+        self.tx._uart = self.uart
 
     # --- connection state ---------------------------------------------------
 
     def test_01_is_connected_true(self):
         """is_connected() mirrors UART state (True)."""
-        self.uart.is_connected.return_value = True
+        self.uart.is_connected = True
         self.assertTrue(self.tx.is_connected())
 
     def test_02_is_connected_false(self):
         """is_connected() mirrors UART state (False)."""
-        self.uart.is_connected.return_value = False
+        self.uart.is_connected = False
         self.assertFalse(self.tx.is_connected())
 
     # --- ping ---------------------------------------------------------------
@@ -94,14 +102,16 @@ class TestTxDeviceUnit(unittest.TestCase):
         self.assertTrue(self.tx.ping())
 
     def test_04_ping_error_packet(self):
-        """ping() returns False when device replies with OW_ERROR."""
+        """ping() raises LIFUDeviceError when device replies with OW_ERROR."""
         self.uart.send_packet.return_value = _make_packet(packet_type=OW_ERROR)
-        self.assertFalse(self.tx.ping())
+        with self.assertRaises(LIFUDeviceError):
+            self.tx.ping()
 
     def test_05_ping_disconnected(self):
-        """ping() returns False when UART is not connected."""
-        self.uart.is_connected.return_value = False
-        self.assertFalse(self.tx.ping())
+        """ping() raises LIFUNotConnectedError when UART is not connected."""
+        self.uart.is_connected = False
+        with self.assertRaises(LIFUNotConnectedError):
+            self.tx.ping()
 
     # --- version ------------------------------------------------------------
 
@@ -111,9 +121,10 @@ class TestTxDeviceUnit(unittest.TestCase):
         self.assertEqual(self.tx.get_version(), "v1.2.3")
 
     def test_07_get_version_disconnected(self):
-        """get_version() returns 'v0.0.0' when not connected."""
-        self.uart.is_connected.return_value = False
-        self.assertEqual(self.tx.get_version(), "v0.0.0")
+        """get_version() raises LIFUNotConnectedError when not connected."""
+        self.uart.is_connected = False
+        with self.assertRaises(LIFUNotConnectedError):
+            self.tx.get_version()
 
     # --- echo ---------------------------------------------------------------
 
@@ -138,30 +149,39 @@ class TestTxDeviceUnit(unittest.TestCase):
         self.assertTrue(self.tx.toggle_led())
 
     def test_11_toggle_led_disconnected(self):
-        """toggle_led() returns False when UART is not connected."""
-        self.uart.is_connected.return_value = False
-        self.assertFalse(self.tx.toggle_led())
+        """toggle_led() raises LIFUNotConnectedError when UART is not connected."""
+        self.uart.is_connected = False
+        with self.assertRaises(LIFUNotConnectedError):
+            self.tx.toggle_led()
 
     # --- hardware ID --------------------------------------------------------
 
     def test_12_get_hardware_id_valid(self):
-        """get_hardware_id() returns a hex string when 12 bytes returned."""
+        """get_hardware_id() returns a formatted HWID string when 12 bytes returned."""
         hw_id = bytes(range(HW_ID_DATA_LENGTH))
         self.uart.send_packet.return_value = _make_packet(hw_id)
         result = self.tx.get_hardware_id()
         self.assertIsNotNone(result)
+        self.assertEqual(result, format_hwid(hw_id.hex()))
+
+    def test_12b_get_hardware_id_raw_hex(self):
+        """get_hardware_id(raw_hex=True) returns the raw hex string."""
+        hw_id = bytes(range(HW_ID_DATA_LENGTH))
+        self.uart.send_packet.return_value = _make_packet(hw_id)
+        result = self.tx.get_hardware_id(raw_hex=True)
         self.assertEqual(result, hw_id.hex())
 
     def test_13_get_hardware_id_wrong_length(self):
-        """get_hardware_id() returns None when payload length is wrong."""
+        """get_hardware_id() raises LIFUProtocolError when payload length is wrong."""
         self.uart.send_packet.return_value = _make_packet(b"\x01\x02")  # only 2 bytes
-        result = self.tx.get_hardware_id()
-        self.assertIsNone(result)
+        with self.assertRaises(LIFUProtocolError):
+            self.tx.get_hardware_id()
 
     def test_14_get_hardware_id_disconnected(self):
-        """get_hardware_id() returns None when not connected."""
-        self.uart.is_connected.return_value = False
-        self.assertIsNone(self.tx.get_hardware_id())
+        """get_hardware_id() raises LIFUNotConnectedError when not connected."""
+        self.uart.is_connected = False
+        with self.assertRaises(LIFUNotConnectedError):
+            self.tx.get_hardware_id()
 
     # --- temperature --------------------------------------------------------
 
@@ -173,9 +193,10 @@ class TestTxDeviceUnit(unittest.TestCase):
         self.assertAlmostEqual(result, expected, places=1)
 
     def test_16_get_temperature_disconnected(self):
-        """get_temperature() returns 0 when not connected."""
-        self.uart.is_connected.return_value = False
-        self.assertEqual(self.tx.get_temperature(), 0)
+        """get_temperature() raises LIFUNotConnectedError when not connected."""
+        self.uart.is_connected = False
+        with self.assertRaises(LIFUNotConnectedError):
+            self.tx.get_temperature()
 
     def test_17_get_ambient_temperature_valid(self):
         """get_ambient_temperature() decodes a little-endian float correctly."""
@@ -185,9 +206,10 @@ class TestTxDeviceUnit(unittest.TestCase):
         self.assertAlmostEqual(result, expected, places=1)
 
     def test_18_get_ambient_temperature_disconnected(self):
-        """get_ambient_temperature() returns 0 when not connected."""
-        self.uart.is_connected.return_value = False
-        self.assertEqual(self.tx.get_ambient_temperature(), 0)
+        """get_ambient_temperature() raises LIFUNotConnectedError when not connected."""
+        self.uart.is_connected = False
+        with self.assertRaises(LIFUNotConnectedError):
+            self.tx.get_ambient_temperature()
 
     # --- set_trigger_json ---------------------------------------------------
 
@@ -210,14 +232,19 @@ class TestTxDeviceUnit(unittest.TestCase):
         self.assertEqual(result["TriggerMode"], TRIGGER_MODE_SEQUENCE)
 
     def test_20_set_trigger_json_none_data(self):
-        """set_trigger_json() returns None when data is None."""
+        """set_trigger_json(data=None) sends 'null' and returns parsed response."""
+        response = {"TriggerStatus": "READY"}
+        self.uart.send_packet.return_value = _make_packet(json.dumps(response).encode())
         result = self.tx.set_trigger_json(data=None)
-        self.assertIsNone(result)
+        self.assertEqual(result, response)
+        # Verify the wire payload was JSON 'null'
+        _, kwargs = self.uart.send_packet.call_args
+        self.assertEqual(bytes(kwargs["data"]), b"null")
 
     def test_21_set_trigger_json_disconnected(self):
-        """set_trigger_json() raises ValueError when not connected."""
-        self.uart.is_connected.return_value = False
-        with self.assertRaises(ValueError):
+        """set_trigger_json() raises LIFUNotConnectedError when not connected."""
+        self.uart.is_connected = False
+        with self.assertRaises(LIFUNotConnectedError):
             self.tx.set_trigger_json(data={"TriggerFrequencyHz": 1.0})
 
     # --- set_trigger (high-level) ------------------------------------------
@@ -243,9 +270,10 @@ class TestTxDeviceUnit(unittest.TestCase):
         self.assertTrue(self.tx.start_trigger())
 
     def test_25_start_trigger_error_packet(self):
-        """start_trigger() returns False on OW_ERROR response."""
+        """start_trigger() raises LIFUDeviceError on OW_ERROR response."""
         self.uart.send_packet.return_value = _make_packet(packet_type=OW_ERROR)
-        self.assertFalse(self.tx.start_trigger())
+        with self.assertRaises(LIFUDeviceError):
+            self.tx.start_trigger()
 
     def test_26_stop_trigger_success(self):
         """stop_trigger() returns True on a non-error response."""
@@ -253,9 +281,10 @@ class TestTxDeviceUnit(unittest.TestCase):
         self.assertTrue(self.tx.stop_trigger())
 
     def test_27_stop_trigger_error_packet(self):
-        """stop_trigger() returns False on OW_ERROR response."""
+        """stop_trigger() raises LIFUDeviceError on OW_ERROR response."""
         self.uart.send_packet.return_value = _make_packet(packet_type=OW_ERROR)
-        self.assertFalse(self.tx.stop_trigger())
+        with self.assertRaises(LIFUDeviceError):
+            self.tx.stop_trigger()
 
     # --- get_trigger_json ---------------------------------------------------
 
@@ -276,9 +305,9 @@ class TestTxDeviceUnit(unittest.TestCase):
         self.assertTrue(self.tx.soft_reset())
 
     def test_30_soft_reset_disconnected(self):
-        """soft_reset() raises ValueError when not connected."""
-        self.uart.is_connected.return_value = False
-        with self.assertRaises(ValueError):
+        """soft_reset() raises LIFUNotConnectedError when not connected."""
+        self.uart.is_connected = False
+        with self.assertRaises(LIFUNotConnectedError):
             self.tx.soft_reset()
 
 
@@ -295,12 +324,13 @@ class TestTX7332Commands(unittest.TestCase):
     """
 
     def setUp(self):
+        self.tx = TxDevice()
         self.uart = MagicMock(spec=OWUart)
+        self.uart.desc = "TX"
         self.uart.demo_mode = False
         self.uart.asyncMode = False
-        self.uart.is_connected.return_value = True
-        self.uart.clear_buffer.return_value = None
-        self.tx = TxDevice(uart=self.uart)
+        self.uart.is_connected = True
+        self.tx._uart = self.uart
         self.chip_id = 0   # TX7332 chip index 0
 
     # --- OW_TX7332_DEVICE_COUNT ----------------------------------------
@@ -312,15 +342,15 @@ class TestTX7332Commands(unittest.TestCase):
         self.assertEqual(result, 2)
 
     def test_t02_get_tx_module_count_error_packet(self):
-        """get_tx_module_count(): returns 0 on OW_ERROR response."""
+        """get_tx_module_count(): raises LIFUDeviceError on OW_ERROR response."""
         self.uart.send_packet.return_value = _make_packet(packet_type=OW_ERROR)
-        result = self.tx.get_tx_module_count()
-        self.assertEqual(result, 0)
+        with self.assertRaises(LIFUDeviceError):
+            self.tx.get_tx_module_count()
 
     def test_t03_get_tx_module_count_disconnected(self):
-        """get_tx_module_count(): raises ValueError when not connected."""
-        self.uart.is_connected.return_value = False
-        with self.assertRaises(ValueError):
+        """get_tx_module_count(): raises LIFUNotConnectedError when not connected."""
+        self.uart.is_connected = False
+        with self.assertRaises(LIFUNotConnectedError):
             self.tx.get_tx_module_count()
 
     # --- OW_TX7332_ENUM -------------------------------------------------
@@ -338,15 +368,15 @@ class TestTX7332Commands(unittest.TestCase):
         self.assertEqual(result, 2)
 
     def test_t06_enum_devices_count_mismatch_raises(self):
-        """enum_tx7332_devices(): raises ValueError when detected != num_devices."""
+        """enum_tx7332_devices(): raises LIFUError when detected != num_devices."""
         self.uart.send_packet.return_value = _make_packet(reserved=1)
-        with self.assertRaises(ValueError):
+        with self.assertRaises(LIFUError):
             self.tx.enum_tx7332_devices(num_devices=2)
 
     def test_t07_enum_devices_disconnected(self):
-        """enum_tx7332_devices(): raises ValueError when not connected."""
-        self.uart.is_connected.return_value = False
-        with self.assertRaises(ValueError):
+        """enum_tx7332_devices(): raises LIFUNotConnectedError when not connected."""
+        self.uart.is_connected = False
+        with self.assertRaises(LIFUNotConnectedError):
             self.tx.enum_tx7332_devices()
 
     # --- OW_TX7332_DEMO -------------------------------------------------
@@ -357,14 +387,15 @@ class TestTX7332Commands(unittest.TestCase):
         self.assertTrue(self.tx.demo_tx7332(self.chip_id))
 
     def test_t09_demo_tx7332_error_packet(self):
-        """demo_tx7332(): returns False on OW_ERROR."""
+        """demo_tx7332(): raises LIFUDeviceError on OW_ERROR."""
         self.uart.send_packet.return_value = _make_packet(packet_type=OW_ERROR)
-        self.assertFalse(self.tx.demo_tx7332(self.chip_id))
+        with self.assertRaises(LIFUDeviceError):
+            self.tx.demo_tx7332(self.chip_id)
 
     def test_t10_demo_tx7332_disconnected(self):
-        """demo_tx7332(): raises ValueError when not connected."""
-        self.uart.is_connected.return_value = False
-        with self.assertRaises(ValueError):
+        """demo_tx7332(): raises LIFUNotConnectedError when not connected."""
+        self.uart.is_connected = False
+        with self.assertRaises(LIFUNotConnectedError):
             self.tx.demo_tx7332(self.chip_id)
 
     # --- OW_TX7332_WREG -------------------------------------------------
@@ -389,9 +420,10 @@ class TestTX7332Commands(unittest.TestCase):
         self.assertEqual(bytes(sent_data), expected)
 
     def test_t13_write_register_error_packet(self):
-        """write_register(): returns False on OW_ERROR response."""
+        """write_register(): raises LIFUDeviceError on OW_ERROR response."""
         self.uart.send_packet.return_value = _make_packet(packet_type=OW_ERROR)
-        self.assertFalse(self.tx.write_register(self.chip_id, 0x0010, 0x1234))
+        with self.assertRaises(LIFUDeviceError):
+            self.tx.write_register(self.chip_id, 0x0010, 0x1234)
 
     def test_t14_write_register_negative_identifier(self):
         """write_register(): raises ValueError for negative chip identifier."""
@@ -399,9 +431,9 @@ class TestTX7332Commands(unittest.TestCase):
             self.tx.write_register(-1, 0x0010, 0x1234)
 
     def test_t15_write_register_disconnected(self):
-        """write_register(): raises ValueError when not connected."""
-        self.uart.is_connected.return_value = False
-        with self.assertRaises(ValueError):
+        """write_register(): raises LIFUNotConnectedError when not connected."""
+        self.uart.is_connected = False
+        with self.assertRaises(LIFUNotConnectedError):
             self.tx.write_register(self.chip_id, 0x0010, 0x1234)
 
     # --- OW_TX7332_RREG -------------------------------------------------
@@ -429,14 +461,16 @@ class TestTX7332Commands(unittest.TestCase):
         self.assertEqual(bytes(sent_data), struct.pack('<H', address))   # 2 bytes
 
     def test_t18_read_register_error_packet(self):
-        """read_register(): returns 0 on OW_ERROR response."""
+        """read_register(): raises LIFUDeviceError on OW_ERROR response."""
         self.uart.send_packet.return_value = _make_packet(packet_type=OW_ERROR)
-        self.assertEqual(self.tx.read_register(self.chip_id, 0x0010), 0)
+        with self.assertRaises(LIFUDeviceError):
+            self.tx.read_register(self.chip_id, 0x0010)
 
     def test_t19_read_register_wrong_data_length(self):
-        """read_register(): returns 0 when response is not exactly 4 bytes."""
+        """read_register(): raises LIFUProtocolError when response is too short."""
         self.uart.send_packet.return_value = _make_packet(b"\x01\x02")  # 2 bytes
-        self.assertEqual(self.tx.read_register(self.chip_id, 0x0010), 0)
+        with self.assertRaises(LIFUProtocolError):
+            self.tx.read_register(self.chip_id, 0x0010)
 
     def test_t20_read_register_negative_identifier(self):
         """read_register(): raises ValueError for negative chip identifier."""
@@ -444,9 +478,9 @@ class TestTX7332Commands(unittest.TestCase):
             self.tx.read_register(-1, 0x0010)
 
     def test_t21_read_register_disconnected(self):
-        """read_register(): raises ValueError when not connected."""
-        self.uart.is_connected.return_value = False
-        with self.assertRaises(ValueError):
+        """read_register(): raises LIFUNotConnectedError when not connected."""
+        self.uart.is_connected = False
+        with self.assertRaises(LIFUNotConnectedError):
             self.tx.read_register(self.chip_id, 0x0010)
 
     # --- OW_TX7332_WBLOCK ----------------------------------------------
@@ -481,9 +515,10 @@ class TestTX7332Commands(unittest.TestCase):
         self.assertEqual(self.uart.send_packet.call_count, 2)
 
     def test_t25_write_block_error_on_first_chunk(self):
-        """write_block(): returns False when first chunk gets OW_ERROR."""
+        """write_block(): raises LIFUDeviceError when first chunk gets OW_ERROR."""
         self.uart.send_packet.return_value = _make_packet(packet_type=OW_ERROR)
-        self.assertFalse(self.tx.write_block(self.chip_id, 0x0020, [1, 2, 3]))
+        with self.assertRaises(LIFUDeviceError):
+            self.tx.write_block(self.chip_id, 0x0020, [1, 2, 3])
 
     def test_t26_write_block_empty_list_raises(self):
         """write_block(): raises ValueError for empty register list."""
@@ -491,8 +526,9 @@ class TestTX7332Commands(unittest.TestCase):
             self.tx.write_block(self.chip_id, 0x0020, [])
 
     def test_t27_write_block_non_integer_values_raises(self):
-        """write_block(): raises ValueError when list contains non-integers."""
-        with self.assertRaises(ValueError):
+        """write_block(): raises struct.error when list contains non-integers."""
+        self.uart.send_packet.return_value = _make_packet()
+        with self.assertRaises(struct.error):
             self.tx.write_block(self.chip_id, 0x0020, [1, 2, 3.5])
 
     def test_t28_write_block_negative_identifier(self):
@@ -501,9 +537,9 @@ class TestTX7332Commands(unittest.TestCase):
             self.tx.write_block(-1, 0x0020, [1, 2, 3])
 
     def test_t29_write_block_disconnected(self):
-        """write_block(): raises ValueError when not connected."""
-        self.uart.is_connected.return_value = False
-        with self.assertRaises(ValueError):
+        """write_block(): raises LIFUNotConnectedError when not connected."""
+        self.uart.is_connected = False
+        with self.assertRaises(LIFUNotConnectedError):
             self.tx.write_block(self.chip_id, 0x0020, [1, 2, 3])
 
     # --- Register round-trip sanity check --------------------------------
@@ -539,9 +575,13 @@ class TestTX7332Commands(unittest.TestCase):
 class TxDeviceInteractiveTests:
     """Menu-driven tests that exercise TxDevice against real connected hardware."""
 
-    def __init__(self, tx_device: TxDevice):
+    def __init__(self, tx_device: TxDevice, module: int = 0,
+                 module_count: int | None = None):
         self.tx = tx_device
+        self.module = module                  # currently-selected TX module
+        self.module_count = module_count      # auto-discovered when available
         self.menu_items = [
+            ("Show / Change TX Module Index",  self.test_select_module),
             ("Ping Device",                    self.test_ping),
             ("Get Firmware Version",           self.test_get_version),
             ("Echo Test",                      self.test_echo),
@@ -561,7 +601,8 @@ class TxDeviceInteractiveTests:
             ("TX7332: Read Register",           self.test_tx7332_read_register),
             ("TX7332: Write Block",             self.test_tx7332_write_block),
             ("TX7332: Register Round-Trip",     self.test_tx7332_roundtrip),
-            ("Run All Tests",                  self.run_all),
+            ("Run All Tests (current module)", self.run_all),
+            ("Run All Tests (ALL modules)",    self.run_all_modules),
         ]
 
     # ------------------------------------------------------------------
@@ -575,25 +616,59 @@ class TxDeviceInteractiveTests:
     def _err(msg: str):
         print(f"  [FAIL] {msg}")
 
+    def _module_label(self) -> str:
+        if self.module_count is None:
+            return f"module {self.module}"
+        return f"module {self.module}/{self.module_count - 1}"
+
+    # ------------------------------------------------------------------
+    # Module selection
+    # ------------------------------------------------------------------
+    def test_select_module(self):
+        """Show / change which TX module subsequent commands target."""
+        if self.module_count is None:
+            try:
+                self.module_count = self.tx.get_tx_module_count()
+            except Exception as exc:
+                self._err(f"Could not query module count: {exc}")
+                self.module_count = 1
+        print(f"  Current module index: {self.module}  "
+              f"(of {self.module_count} module(s))")
+        upper = max(self.module_count - 1, 0)
+        raw = input(f"  New index [0..{upper}] (blank to keep): ").strip()
+        if not raw:
+            return self.module
+        try:
+            new_idx = int(raw)
+        except ValueError:
+            self._err("Invalid input.")
+            return self.module
+        if not 0 <= new_idx < self.module_count:
+            self._err(f"Index out of range (0..{upper}).")
+            return self.module
+        self.module = new_idx
+        self._ok(f"Now targeting TX module {self.module}")
+        return self.module
+
     # ------------------------------------------------------------------
     # Individual tests
     # ------------------------------------------------------------------
     def test_ping(self):
-        print("Pinging device...")
-        result = self.tx.ping()
+        print(f"Pinging {self._module_label()}...")
+        result = self.tx.ping(module=self.module)
         self._ok("Device responded.") if result else self._err("No response.")
         return result
 
     def test_get_version(self):
-        print("Reading firmware version...")
-        ver = self.tx.get_version()
+        print(f"Reading firmware version from {self._module_label()}...")
+        ver = self.tx.get_version(module=self.module)
         self._ok(f"Version: {ver}")
         return ver
 
     def test_echo(self):
         payload = bytearray(b"\xDE\xAD\xBE\xEF\x01\x02\x03\x04")
-        print(f"Sending echo: {payload.hex()}")
-        echoed, length = self.tx.echo(echo_data=payload)
+        print(f"Sending echo to {self._module_label()}: {payload.hex()}")
+        echoed, length = self.tx.echo(module=self.module, echo_data=payload)
         if echoed and bytes(echoed[:length]) == bytes(payload):
             self._ok(f"Echo matched: {bytes(echoed[:length]).hex()}")
             return True
@@ -601,14 +676,14 @@ class TxDeviceInteractiveTests:
         return False
 
     def test_toggle_led(self):
-        print("Toggling LED...")
-        result = self.tx.toggle_led()
+        print(f"Toggling LED on {self._module_label()}...")
+        result = self.tx.toggle_led(module=self.module)
         self._ok("LED toggled.") if result else self._err("Toggle failed.")
         return result
 
     def test_get_hardware_id(self):
-        print("Reading hardware ID...")
-        hw_id = self.tx.get_hardware_id()
+        print(f"Reading hardware ID from {self._module_label()}...")
+        hw_id = self.tx.get_hardware_id(module=self.module)
         if hw_id:
             self._ok(f"Hardware ID: {hw_id}")
         else:
@@ -616,14 +691,14 @@ class TxDeviceInteractiveTests:
         return hw_id
 
     def test_get_temperature(self):
-        print("Reading core temperature...")
-        temp = self.tx.get_temperature()
+        print(f"Reading core temperature from {self._module_label()}...")
+        temp = self.tx.get_temperature(module=self.module)
         self._ok(f"Core temperature: {temp:.2f} °C")
         return temp
 
     def test_get_ambient_temperature(self):
-        print("Reading ambient temperature...")
-        temp = self.tx.get_ambient_temperature()
+        print(f"Reading ambient temperature from {self._module_label()}...")
+        temp = self.tx.get_ambient_temperature(module=self.module)
         self._ok(f"Ambient temperature: {temp:.2f} °C")
         return temp
 
@@ -689,12 +764,13 @@ class TxDeviceInteractiveTests:
         return self._run_trigger("CONTINUOUS", TRIGGER_MODE_CONTINUOUS)
 
     def test_soft_reset(self):
-        confirm = input("  Soft reset will restart the firmware. Continue? [y/N]: ").strip().lower()
+        confirm = input(f"  Soft reset {self._module_label()} "
+                        f"(restarts firmware). Continue? [y/N]: ").strip().lower()
         if confirm != "y":
             print("  Skipped.")
             return None
-        print("Resetting device...")
-        result = self.tx.soft_reset()
+        print(f"Resetting {self._module_label()}...")
+        result = self.tx.soft_reset(module=self.module)
         self._ok("Reset successful.") if result else self._err("Reset failed.")
         return result
 
@@ -789,21 +865,56 @@ class TxDeviceInteractiveTests:
         return False
 
     def run_all(self):
-        print("\n=== Running All Tests ===")
-        for label, fn in self.menu_items[:-1]:  # exclude 'Run All' itself
+        print(f"\n=== Running All Tests on {self._module_label()} ===")
+        skip_labels = {
+            "Show / Change TX Module Index",
+            "Run All Tests (current module)",
+            "Run All Tests (ALL modules)",
+        }
+        for label, fn in self.menu_items:
+            if label in skip_labels:
+                continue
             print(f"\n[{label}]")
             try:
                 fn()
             except Exception as exc:
                 self._err(f"Exception: {exc}")
 
+    def run_all_modules(self):
+        """Iterate over every TX module index and run the full suite."""
+        if self.module_count is None:
+            try:
+                self.module_count = self.tx.get_tx_module_count()
+            except Exception as exc:
+                self._err(f"Could not query module count: {exc}")
+                self.module_count = 1
+        original = self.module
+        try:
+            for m in range(max(self.module_count, 1)):
+                self.module = m
+                print(f"\n##### TX MODULE {m} #####")
+                self.run_all()
+        finally:
+            self.module = original
+
     # ------------------------------------------------------------------
     # Menu loop
     # ------------------------------------------------------------------
     def run_menu(self):
+        # Auto-discover module count once
+        if self.module_count is None:
+            try:
+                self.module_count = self.tx.get_tx_module_count()
+                if self.module_count <= 0:
+                    self.module_count = 1
+                print(f"Detected {self.module_count} TX module(s).")
+            except Exception as exc:
+                print(f"[WARN] Could not query module count: {exc}")
+                self.module_count = 1
         while True:
             print("\n" + "=" * 46)
             print("   TxDevice Interactive Test Menu")
+            print(f"   Active TX module: {self._module_label()}")
             print("=" * 46)
             for idx, (label, _) in enumerate(self.menu_items, 1):
                 print(f"  {idx:2d}. {label}")
@@ -853,11 +964,15 @@ if __name__ == "__main__":
         action="store_true",
         help="Run menu-driven tests against real hardware",
     )
+    parser.add_argument(
+        "--module", type=int, default=0,
+        help="Initial TX module index to target (default: 0)",
+    )
     args, remaining = parser.parse_known_args()
 
     if args.interactive:
         tx = _connect_tx_device()
-        suite = TxDeviceInteractiveTests(tx)
+        suite = TxDeviceInteractiveTests(tx, module=args.module)
         suite.run_menu()
     else:
         # Pass remaining argv to unittest so pytest-style -v etc. still work

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import queue
+import sys
 import threading
 import time
 
@@ -19,7 +20,8 @@ log = logging.getLogger(__name__)
 log.setLevel(logging.WARNING)
 
 class _PendingCommand:
-    __slots__ = ("packet_id", "packet_bytes", "timeout", "event", "response", "error")
+    __slots__ = ("packet_id", "packet_bytes", "timeout", "event", "response",
+                 "error", "send_time", "response_time")
 
     def __init__(self, packet_id: int, packet_bytes: bytes, timeout: float):
         self.packet_id = packet_id
@@ -28,6 +30,11 @@ class _PendingCommand:
         self.event = threading.Event()
         self.response: OWUartPacket | None = None
         self.error: str | None = None
+        # Filled in by the sender right before write(); used by the
+        # reader to record the round-trip elapsed, and by send_checked
+        # retry diagnostics.
+        self.send_time: float = 0.0
+        self.response_time: float = 0.0
 
 
 class OWUart:
@@ -224,6 +231,7 @@ class OWUart:
             ser = self._serial
             if ser is not None and ser.is_open:
                 try:
+                    entry.send_time = time.monotonic()
                     ser.write(entry.packet_bytes)
                 except (serial.SerialException, OSError) as exc:
                     log.error("%s write error: %s", self.desc, exc)
@@ -241,19 +249,63 @@ class OWUart:
                 self.signal_error.emit(self.desc, entry.packet_id, entry.error)
                 continue
 
-            # Block until response or timeout (one command at a time)
+            # Block until response or timeout (one command at a time).
+            # The race we have to avoid: the reader can dispatch a
+            # response in the narrow window between event.wait() timing
+            # out and us taking _pending_lock here. Resolution:
+            #   - Reader sets entry.response + entry.event INSIDE the
+            #     lock (see _dispatch_response).
+            #   - Sender only marks "Timeout" if its own pop returns the
+            #     entry (i.e. the reader hasn't claimed it concurrently).
             if not entry.event.wait(timeout=entry.timeout):
                 with self._pending_lock:
-                    self._pending.pop(entry.packet_id, None)
-                entry.error = "Timeout"
-                entry.event.set()
-                self.signal_error.emit(self.desc, entry.packet_id, "Timeout")
+                    popped = self._pending.pop(entry.packet_id, None)
+                    if popped is not None:
+                        entry.error = "Timeout"
+                        entry.event.set()
+                        timed_out = True
+                    else:
+                        # Reader claimed it inside the lock -- response
+                        # is valid; this wasn't really a timeout.
+                        timed_out = False
+                if timed_out:
+                    elapsed = time.monotonic() - entry.send_time
+                    log.warning(
+                        "%s id=%d timed out after %.2fs (timeout=%.2fs)",
+                        self.desc, entry.packet_id, elapsed, entry.timeout,
+                    )
+                    self.signal_error.emit(self.desc, entry.packet_id, "Timeout")
 
     # ------------------------------------------------------------------
     # Reader thread – continuous packet reception
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _boost_reader_priority():
+        """Best-effort raise of the current thread's OS priority on Windows.
+
+        The reader needs to wake quickly when bytes arrive so the
+        per-command response is dispatched before the sender's wait
+        timeout expires. Under Qt GUI load (qasync event loop, QML
+        rendering, plus other Python worker threads) the GIL handoff to
+        a freshly-readable reader can be delayed by tens to hundreds of
+        ms on Windows. Bumping the OS thread priority shortens that
+        window without changing semantics on other platforms.
+        """
+        if not sys.platform.startswith("win"):
+            return
+        try:
+            import ctypes  # local import keeps non-Windows hosts clean
+            THREAD_PRIORITY_ABOVE_NORMAL = 1
+            k32 = ctypes.windll.kernel32
+            k32.SetThreadPriority(k32.GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL)
+        except Exception:
+            # Priority is a hint, not a correctness requirement; log and
+            # continue if Windows refuses (e.g. in a restricted sandbox).
+            log.debug("Could not raise reader thread priority", exc_info=True)
+
     def _reader_loop(self):
+        self._boost_reader_priority()
         buf = bytearray()
         while self._running:
             if not self._connected:
@@ -267,7 +319,17 @@ class OWUart:
 
             try:
                 waiting = ser.in_waiting
-                data = ser.read(waiting) if waiting > 0 else ser.read(1)
+                # Read everything available in one syscall (up to
+                # MAX_DATA_LEN) so a single packet doesn't span multiple
+                # reader iterations -- each iteration round-trips through
+                # the GIL and costs ~one preemption opportunity. When the
+                # buffer is empty fall back to a blocking 1-byte read so
+                # we don't burn CPU; the underlying serial.Serial timeout
+                # (100 ms) caps that wait.
+                if waiting > 0:
+                    data = ser.read(min(waiting, MAX_DATA_LEN))
+                else:
+                    data = ser.read(1)
             except (serial.SerialException, OSError):
                 continue
 
@@ -285,11 +347,17 @@ class OWUart:
                     break
 
     def _dispatch_response(self, packet: OWUartPacket):
+        # Pop + populate + signal under the lock so the sender's
+        # timeout-path cannot clobber a response that arrived in the
+        # exact same instant. See _sender_loop for the matching half of
+        # this protocol.
         with self._pending_lock:
             entry = self._pending.pop(packet.id, None)
-        if entry is not None:
-            entry.response = packet
-            entry.event.set()
+            if entry is not None:
+                entry.response = packet
+                if entry.send_time:
+                    entry.response_time = time.monotonic() - entry.send_time
+                entry.event.set()
         # Always emit so async listeners see every packet (including unsolicited)  
         # TODO: Consider separate signal for unsolicited packets vs responses to async commands      
         # self.signal_data_received.emit(self.desc, packet)
@@ -411,6 +479,13 @@ class OWUart:
         entry.event.wait(timeout=timeout + self._send_queue.qsize() * timeout + 5)
         if entry.error:
             return None
+        if entry.response is not None:
+            # Stash round-trip time on the packet so retry / diagnostic
+            # callers can see how close we came to the timeout.
+            try:
+                entry.response._owuart_rt = entry.response_time  # type: ignore[attr-defined]
+            except Exception:
+                pass
         return entry.response
 
     def _send_direct(self, pkt: OWUartPacket, timeout: float) -> OWUartPacket | None:

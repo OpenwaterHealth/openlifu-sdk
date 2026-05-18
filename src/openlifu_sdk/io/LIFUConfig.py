@@ -132,7 +132,15 @@ OW_VID = 0x0483
 OW_CONSOLE_PID = 0x57A0
 OW_TRANSMITTER_PID = 0x57AF
 
-DEFAULT_TIMEOUT = 1.0
+# Per-command UART round-trip timeout. Real round trips are sub-millisecond
+# for most commands; the generous default is here to absorb Python GIL /
+# thread-scheduler jitter when the SDK is driven from a heavily threaded
+# host (Qt UI + qasync + telemetry poll thread + sender/reader/monitor
+# threads). 1.0 s was historically tight enough that scheduling slop on
+# Windows under GUI load occasionally manifested as spurious
+# LIFUCommunicationError timeouts; 2.0 s comfortably absorbs that without
+# noticeably delaying legitimate failures.
+DEFAULT_TIMEOUT = 2.0
 USB_POLL_INTERVAL = 0.5     # seconds – USB presence polling in async mode
 MAX_DATA_LEN = 4096         # maximum payload bytes (sanity guard)
 HW_ID_DATA_LENGTH = 12      # hardware ID is 12 bytes

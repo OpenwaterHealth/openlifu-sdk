@@ -10,7 +10,6 @@ from typing import TYPE_CHECKING, Annotated, Dict, List, Literal, Optional
 
 import numpy as np
 
-from openlifu_sdk.io.LIFUUserConfig import LifuUserConfig
 from openlifu_sdk.io.component import OWComponent, register_command_packet_types
 from openlifu_sdk.util.annotations import OpenLIFUFieldData
 from openlifu_sdk.util.units import getunitconversion
@@ -270,6 +269,8 @@ class TxDevice(OWComponent):
 
         if pulse_train_interval > 0 and (pulse_train_interval < pulse_interval * pulse_count):
             raise ValueError("Pulse train interval cannot be less than pulse interval * pulse count")
+        elif pulse_train_interval == 0:
+            pulse_train_interval = pulse_interval * pulse_count
 
         logger.info(f"Setting trigger with parameters: "
                         f"pulse_interval={pulse_interval}, "
@@ -447,7 +448,7 @@ class TxDevice(OWComponent):
             )
 
         self.tx_registers = TxDeviceRegisters(num_transmitters=num_detected_devices, module_invert=self.module_invert)
-        logger.info("Found %d Transmit Modules", num_detected_devices)
+        logger.info("Found %d Transmit Modules (%d tx chips)", num_detected_devices // TRANSMITTERS_PER_MODULE, num_detected_devices)
         return num_detected_devices
 
     def set_module_invert(self, module_invert: bool | List[bool]) -> None:

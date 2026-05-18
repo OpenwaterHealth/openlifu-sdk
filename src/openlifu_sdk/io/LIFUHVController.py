@@ -406,6 +406,7 @@ class HVController(OWComponent):
         logger.debug("%s high voltage output.", "Enabling" if enable else "Disabling")
         self.send_checked(addr=1 if enable else 0, packet_type=OW_POWER,
                           command=OW_POWER_HV_ENABLE, op="hv_enable")
+        self.is_hv_on = enable
         logger.info("High voltage output %s successfully.",
                     "enabled" if enable else "disabled")
         return True
