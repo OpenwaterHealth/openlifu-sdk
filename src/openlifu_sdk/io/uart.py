@@ -138,6 +138,34 @@ class OWUart:
                 pass
         self._fail_all_pending("Disconnected")
 
+    def _detect_device_removed(self, exc: BaseException) -> None:
+        """Mark the port disconnected and notify listeners after an I/O
+        error indicates the underlying USB device is gone.
+
+        Called from the sender / sync-write paths when ``ser.write``
+        raises (typically a ``serial.SerialException`` wrapping a Windows
+        ``PermissionError`` / ``FileNotFoundError``). Idempotent: only
+        the first call after a successful connect emits the
+        ``signal_disconnected`` event and the one-shot INFO log; later
+        calls are no-ops so a burst of failing in-flight commands does
+        not produce a burst of duplicate log lines. The monitor thread
+        will reopen the port when the device returns.
+        """
+        if not self._connected:
+            return
+        log.info("%s port lost (%s); waiting for device to return",
+                 self.desc, exc)
+        self._connected = False
+        ser = self._serial
+        self._serial = None
+        if ser:
+            try:
+                ser.close()
+            except Exception:
+                pass
+        self._fail_all_pending("Disconnected")
+        self.signal_disconnected.emit(self.desc, "")
+
     def _fail_all_pending(self, reason: str):
         with self._pending_lock:
             entries = list(self._pending.values())
@@ -203,7 +231,13 @@ class OWUart:
                         log.info("%s connected on %s", self.desc, port)
                         self.signal_connected.emit(self.desc, port)
                     except serial.SerialException as exc:
-                        log.error("%s auto-connect failed: %s", self.desc, exc)
+                        # Routine during USB re-enumeration after a power
+                        # cycle: Windows may briefly list a COM port that
+                        # cannot yet be opened. Log at debug so we don't
+                        # flood the console while waiting for the device
+                        # to finish coming back; the next monitor tick
+                        # will retry.
+                        log.debug("%s auto-connect attempt failed: %s", self.desc, exc)
                 elif not port and self._connected:
                     log.info("%s disconnected", self.desc)
                     self.disconnect()
@@ -234,12 +268,22 @@ class OWUart:
                     entry.send_time = time.monotonic()
                     ser.write(entry.packet_bytes)
                 except (serial.SerialException, OSError) as exc:
-                    log.error("%s write error: %s", self.desc, exc)
+                    # Pyserial wraps the underlying Windows error
+                    # (PermissionError / FileNotFoundError) when the USB
+                    # device is yanked or power-cycled. That's an
+                    # expected event, not an error worth flooding the
+                    # console for. Log at debug, then proactively mark
+                    # the port disconnected so the upper layer stops
+                    # issuing further commands rather than racking up a
+                    # full poll cycle of timeouts.
+                    log.debug("%s write failed (device likely removed): %s",
+                              self.desc, exc)
                     with self._pending_lock:
                         self._pending.pop(entry.packet_id, None)
-                    entry.error = f"Send failed: {exc}"
+                    entry.error = "Disconnected"
                     entry.event.set()
                     self.signal_error.emit(self.desc, entry.packet_id, entry.error)
+                    self._detect_device_removed(exc)
                     continue
             else:
                 with self._pending_lock:
@@ -508,7 +552,13 @@ class OWUart:
             send_start = time.monotonic()
             ser.write(pkt.to_bytes())
         except (serial.SerialException, OSError) as exc:
-            self.signal_error.emit(self.desc, pkt.id, str(exc))
+            # See _sender_loop: USB-removal raises here as a wrapped
+            # PermissionError / FileNotFoundError. Log at debug and mark
+            # the port disconnected so callers stop trying.
+            log.debug("%s sync write failed (device likely removed): %s",
+                      self.desc, exc)
+            self._detect_device_removed(exc)
+            self.signal_error.emit(self.desc, pkt.id, "Disconnected")
             return None
         write_elapsed_ms = (time.monotonic() - send_start) * 1000.0
         log.debug("%s sync send wrote %s in %.2f ms", self.desc, request_summary, write_elapsed_ms)
