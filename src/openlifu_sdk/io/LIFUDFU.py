@@ -525,14 +525,13 @@ class STM32I2CDFUviaMaster:
     def _write(self, payload: bytes) -> None:
         """Send a write-only passthrough packet to the I2C slave."""
         r = self._uart.send_packet(
-            id=None,
-            packetType=OW_I2C_PASSTHRU,
+            packet_id=None,
+            packet_type=OW_I2C_PASSTHRU,
             command=_PASSTHRU_WRITE,
             addr=self._addr,
             reserved=0,
             data=payload,
         )
-        self._uart.clear_buffer()
         if r is None or r.packet_type == OW_ERROR:
             raise RuntimeError(
                 f"I2C passthrough write failed (addr=0x{self._addr:02X}, "
@@ -551,14 +550,13 @@ class STM32I2CDFUviaMaster:
             time.sleep(pre_read_delay_s)
 
         r = self._uart.send_packet(
-            id=None,
-            packetType=OW_I2C_PASSTHRU,
+            packet_id=None,
+            packet_type=OW_I2C_PASSTHRU,
             command=_PASSTHRU_WRITE_READ,
             addr=self._addr,
             reserved=read_len,
             data=payload,
         )
-        self._uart.clear_buffer()
         if r is None or r.packet_type == OW_ERROR:
             raise RuntimeError(
                 f"I2C passthrough exchange failed (addr=0x{self._addr:02X}, "
