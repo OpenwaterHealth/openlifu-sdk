@@ -90,7 +90,7 @@ def main():
             "TriggerPulseWidthUsec": params["pulse_width"],
             "TriggerPulseTrainInterval": 600000,
             "TriggerPulseTrainCount": 3,
-            "TriggerMode": TRIGGER_MODE_SINGLE, # Change to TRIGGER_MODE_CONTINUOUS or TRIGGER_MODE_SEQUENCE or TRIGGER_MODE_SINGLE as needed
+            "TriggerMode": TRIGGER_MODE_CONTINUOUS, # Change to TRIGGER_MODE_CONTINUOUS or TRIGGER_MODE_SEQUENCE or TRIGGER_MODE_SINGLE as needed
             "ProfileIndex": 0,
             "ProfileIncrement": 0
         }
