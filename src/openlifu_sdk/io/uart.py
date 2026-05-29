@@ -16,8 +16,12 @@ from .LIFUConfig import (
 from .uart_packet import OWUartPacket
 from .signal import OWSignal
 
+# Module logger. Do NOT pin a level here -- doing so overrides any
+# level configured by the embedding application (e.g. a Qt GUI host
+# running with --loglevel=debug) and silently drops INFO/DEBUG that
+# the host explicitly asked for. Leave at NOTSET so the effective
+# level is inherited from the root/parent logger.
 log = logging.getLogger(__name__)
-log.setLevel(logging.WARNING)
 
 class _PendingCommand:
     __slots__ = ("packet_id", "packet_bytes", "timeout", "event", "response",
@@ -302,6 +306,25 @@ class OWUart:
             #   - Sender only marks "Timeout" if its own pop returns the
             #     entry (i.e. the reader hasn't claimed it concurrently).
             if not entry.event.wait(timeout=entry.timeout):
+                # Diagnostic: before declaring the timeout, peek at the OS
+                # serial buffer and give the reader a brief grace window
+                # to dispatch a late-arriving response. Distinguishes
+                # host-side scheduling stalls ("mode B": in_waiting>0 OR
+                # late_response=True) from genuine device/wire losses
+                # ("mode A": both zero/False). The grace window is
+                # bounded so we never extend the reported timeout by
+                # more than ~50 ms, and we re-check entry.event so a
+                # response that arrives during the grace is treated as
+                # success, not as a timeout.
+                in_waiting_now = -1
+                ser_now = self._serial
+                if ser_now is not None and ser_now.is_open:
+                    try:
+                        in_waiting_now = ser_now.in_waiting
+                    except (serial.SerialException, OSError):
+                        in_waiting_now = -1
+                late_arrived = entry.event.wait(timeout=0.05)
+
                 with self._pending_lock:
                     popped = self._pending.pop(entry.packet_id, None)
                     if popped is not None:
@@ -312,11 +335,26 @@ class OWUart:
                         # Reader claimed it inside the lock -- response
                         # is valid; this wasn't really a timeout.
                         timed_out = False
+                if not timed_out and late_arrived:
+                    # The bytes were there, the reader just hadn't run
+                    # yet when our event.wait expired. Log so we can
+                    # count "ghost timeouts" that the grace window
+                    # absorbed (no caller-visible retry needed).
+                    elapsed = time.monotonic() - entry.send_time
+                    log.warning(
+                        "%s id=%d late response absorbed by grace window "
+                        "(elapsed=%.3fs, timeout=%.2fs, in_waiting_at_timeout=%d) "
+                        "-- host-side stall, not a device timeout",
+                        self.desc, entry.packet_id, elapsed, entry.timeout,
+                        in_waiting_now,
+                    )
                 if timed_out:
                     elapsed = time.monotonic() - entry.send_time
                     log.warning(
-                        "%s id=%d timed out after %.2fs (timeout=%.2fs)",
+                        "%s id=%d timed out after %.3fs (timeout=%.2fs) "
+                        "in_waiting_at_timeout=%d late_arrived_within_50ms=%s",
                         self.desc, entry.packet_id, elapsed, entry.timeout,
+                        in_waiting_now, late_arrived,
                     )
                     self.signal_error.emit(self.desc, entry.packet_id, "Timeout")
 
@@ -402,6 +440,17 @@ class OWUart:
                 if entry.send_time:
                     entry.response_time = time.monotonic() - entry.send_time
                 entry.event.set()
+        if entry is None and packet.id != 0:
+            # Reader received a response whose pending entry was already
+            # popped -- almost certainly because the sender's
+            # event.wait() expired a few ms before the bytes arrived
+            # (host-side scheduling stall vs. real device timeout).
+            # This is the smoking gun for "mode B" timeouts; log it so
+            # we can correlate against the sender's TIMEOUT line.
+            log.warning(
+                "%s reader got UNMATCHED response id=%d (late after timeout?) %s",
+                self.desc, packet.id, self._packet_summary(packet),
+            )
         # Always emit so async listeners see every packet (including unsolicited)  
         # TODO: Consider separate signal for unsolicited packets vs responses to async commands      
         # self.signal_data_received.emit(self.desc, packet)
