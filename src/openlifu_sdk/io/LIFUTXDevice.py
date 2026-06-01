@@ -681,7 +681,8 @@ class TxDevice(OWComponent):
                         i2c_addr: int = 0x72,
                         dfu_wait_s: float = 5.0,
                         device_type: str = "transmitter",
-                        progress_callback=None) -> bool:
+                        progress_callback=None,
+                        enter_dfu_fn=None) -> bool:
         """Update firmware on a single module.
 
         Module 0 (USB master): host → USB DFU.
@@ -712,7 +713,7 @@ class TxDevice(OWComponent):
         mgr.update_module(
             module=module,
             package_file=package_file,
-            enter_dfu_fn=self.enter_dfu,
+            enter_dfu_fn=self.enter_dfu if enter_dfu_fn is None else enter_dfu_fn,
             vid=vid,
             pid=pid,
             libusb_dll=libusb_dll,

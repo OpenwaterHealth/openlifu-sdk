@@ -270,6 +270,7 @@ def main() -> None:
                 dfu_wait_s=args.dfu_wait,
                 device_type=args.device_type,
                 progress_callback=_progress,
+                enter_dfu_fn=(lambda *a, **k: None) if args.already_in_dfu else None,
             )
     except RuntimeError as e:
         print(f"\nERROR: Firmware update failed — {e}")
