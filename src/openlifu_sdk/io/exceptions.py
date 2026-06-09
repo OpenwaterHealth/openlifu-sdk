@@ -18,6 +18,7 @@ from .LIFUConfig import (
     LIFU_ERR_BAD_PAYLOAD_LENGTH,
     LIFU_ERR_DEVICE_NAK,
     LIFU_ERR_EMPTY_RESPONSE,
+    LIFU_ERR_HARDWARE_IN_USE,
     LIFU_ERR_HV_NOT_SETTLED,
     LIFU_ERR_MODULE_COUNT_MISMATCH,
     LIFU_ERR_NOT_CONNECTED,
@@ -54,6 +55,19 @@ class LIFUNotConnectedError(LIFUError):
     """Operation attempted on a device that is not currently connected."""
 
     default_code = LIFU_ERR_NOT_CONNECTED
+
+
+class LIFUHardwareInUseError(LIFUError):
+    """Another live process already owns the LIFU hardware interface."""
+
+    default_code = LIFU_ERR_HARDWARE_IN_USE
+
+    def __init__(self, message: str = "", *, pid: int | None = None, code: int | None = None):
+        self.pid = pid
+        if not message and pid is not None:
+            base = LIFU_ERROR_MESSAGES.get(self.default_code, "")
+            message = f"{base} (PID {pid})"
+        super().__init__(message, code=code)
 
 
 class LIFUCommunicationError(LIFUError):
@@ -100,6 +114,7 @@ class LIFUNoTriggerStatusError(LIFUError):
 __all__ = [
     "LIFUError",
     "LIFUNotConnectedError",
+    "LIFUHardwareInUseError",
     "LIFUCommunicationError",
     "LIFUDeviceError",
     "LIFUProtocolError",
@@ -111,6 +126,7 @@ __all__ = [
     "LIFU_ERR_BAD_PAYLOAD_LENGTH",
     "LIFU_ERR_DEVICE_NAK",
     "LIFU_ERR_EMPTY_RESPONSE",
+    "LIFU_ERR_HARDWARE_IN_USE",
     "LIFU_ERR_HV_NOT_SETTLED",
     "LIFU_ERR_MODULE_COUNT_MISMATCH",
     "LIFU_ERR_NOT_CONNECTED",

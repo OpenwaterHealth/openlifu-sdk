@@ -169,6 +169,7 @@ TEMPERATURE_DATA_LENGTH = 4  # temperature responses are 4 bytes (float32)
 LIFU_ERR_NOT_CONNECTED        = 1001  # serial port not open
 LIFU_ERR_SEND_FAILED          = 1002  # OS/serial error while transmitting
 LIFU_ERR_RESPONSE_TIMEOUT     = 1003  # no response received in time
+LIFU_ERR_HARDWARE_IN_USE      = 1004  # another live process owns the hardware interface
 
 # Device-reported
 LIFU_ERR_DEVICE_NAK           = 2001  # firmware returned OW_ERROR packet
@@ -189,6 +190,7 @@ LIFU_ERROR_MESSAGES: dict[int, str] = {
     LIFU_ERR_NOT_CONNECTED:        "Device is not connected",
     LIFU_ERR_SEND_FAILED:          "Failed to transmit packet to device",
     LIFU_ERR_RESPONSE_TIMEOUT:     "Timed out waiting for device response",
+    LIFU_ERR_HARDWARE_IN_USE:      "Hardware interface is already in use by another process",
     LIFU_ERR_DEVICE_NAK:           "Device returned an error response",
     LIFU_ERR_BAD_PAYLOAD_LENGTH:   "Device response payload has unexpected length",
     LIFU_ERR_BAD_PAYLOAD_FORMAT:   "Device response payload is malformed",

@@ -3,6 +3,8 @@ from __future__ import annotations
 import asyncio
 import importlib.metadata
 import logging
+import os
+import sys
 from enum import Enum
 from typing import Dict, List, Optional
 
@@ -17,7 +19,11 @@ from openlifu_sdk.io.LIFUConfig import (
     SETTLE_TIME_HV_OFF,
     SETTLE_TIME_HV_ON
 )
-from openlifu_sdk.io.exceptions import LIFUNoTriggerStatusError, LIFUSolutionError
+from openlifu_sdk.io.exceptions import (
+    LIFUHardwareInUseError,
+    LIFUNoTriggerStatusError,
+    LIFUSolutionError,
+)
 from openlifu_sdk.io.LIFUHVController import HVController
 from openlifu_sdk.io.LIFUTXDevice import TriggerModeOpts, TxDevice
 
@@ -64,6 +70,107 @@ class LIFUInterfaceStatus(Enum):
 
 logger = logging.getLogger(__name__)
 
+OPENLIFU_HW_INTERFACE_PID_ENV = "OPENLIFU_HW_INTERFACE_PID"
+
+
+def _pid_alive(pid: int) -> bool:
+    """Return True if a process with the given PID is currently running."""
+    if pid <= 0:
+        return False
+    if sys.platform == "win32":
+        import ctypes
+        from ctypes import wintypes
+
+        PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+        STILL_ACTIVE = 259
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+        if not handle:
+            return False
+        try:
+            exit_code = wintypes.DWORD()
+            if not kernel32.GetExitCodeProcess(handle, ctypes.byref(exit_code)):
+                return False
+            return exit_code.value == STILL_ACTIVE
+        finally:
+            kernel32.CloseHandle(handle)
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        # Process exists but is owned by another user
+        return True
+    return True
+
+
+# ---------------------------------------------------------------------------
+# Cross-process hardware-interface lock
+#
+# We need a value that any process on the machine (or for the user) can read
+# to discover whether another process is currently holding the LIFU hardware.
+# Per-process ``os.environ`` is not enough; on Windows we read/write the
+# *persistent* User environment variable directly via the registry, which is
+# visible to every process the user launches. On non-Windows platforms we
+# fall back to a PID file under the user's home directory, which serves the
+# same purpose.
+# ---------------------------------------------------------------------------
+
+def _hw_pid_lock_read() -> str:
+    """Return the raw value of the cross-process hardware-interface PID slot.
+
+    Empty string if it is not set / cannot be read.
+    """
+    if sys.platform == "win32":
+        try:
+            import winreg
+            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, "Environment", 0, winreg.KEY_READ) as key:
+                value, _ = winreg.QueryValueEx(key, OPENLIFU_HW_INTERFACE_PID_ENV)
+                return str(value).strip()
+        except FileNotFoundError:
+            return ""
+        except OSError as exc:
+            logger.debug("Could not read User env %s: %s", OPENLIFU_HW_INTERFACE_PID_ENV, exc)
+            return ""
+    path = _hw_pid_lock_file_path()
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            return fh.read().strip()
+    except FileNotFoundError:
+        return ""
+    except OSError as exc:
+        logger.debug("Could not read PID lock file %s: %s", path, exc)
+        return ""
+
+
+def _hw_pid_lock_write(value: str) -> None:
+    """Persist the hardware-interface PID slot. Empty string clears it."""
+    if sys.platform == "win32":
+        import winreg
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, "Environment", 0, winreg.KEY_SET_VALUE) as key:
+            winreg.SetValueEx(key, OPENLIFU_HW_INTERFACE_PID_ENV, 0, winreg.REG_SZ, value)
+        # Mirror to the current process so subsequent reads of os.environ in
+        # this process see the up-to-date value too.
+        os.environ[OPENLIFU_HW_INTERFACE_PID_ENV] = value
+        return
+    path = _hw_pid_lock_file_path()
+    if not value:
+        try:
+            os.remove(path)
+        except FileNotFoundError:
+            pass
+        os.environ[OPENLIFU_HW_INTERFACE_PID_ENV] = ""
+        return
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8") as fh:
+        fh.write(value)
+    os.environ[OPENLIFU_HW_INTERFACE_PID_ENV] = value
+
+
+def _hw_pid_lock_file_path() -> str:
+    """Path to the PID lock file used on non-Windows platforms."""
+    return os.path.join(os.path.expanduser("~"), ".openlifu", "hw_interface_pid")
+
 class LIFUInterface:
     hvcontroller: HVController = None
     txdevice: TxDevice = None
@@ -100,6 +207,9 @@ class LIFUInterface:
         self.hvcontroller = None
         self.status = LIFUInterfaceStatus.STATUS_SYS_OFF
         self._test_mode = TX_test_mode
+        self._owns_hw_pid_env = False
+
+        self._claim_hw_interface_pid()
 
         self.voltage_table = None
         self.sequence_time = None
@@ -488,12 +598,43 @@ class LIFUInterface:
         if self.hvcontroller:
             self.hvcontroller.stop()
             self.hvcontroller.close()
+        self._release_hw_interface_pid()
 
     def __enter__(self):
         return self
 
     def __exit__(self, exc_type, exc_value, traceback):
         self.close()
+
+    def _claim_hw_interface_pid(self) -> None:
+        """Register this process as the owner of the LIFU hardware interface.
+
+        Reads the cross-process ``OPENLIFU_HW_INTERFACE_PID`` slot (the User
+        environment variable on Windows, a PID file under the user's home
+        directory elsewhere). If it contains a live PID owned by a different
+        process, raises :class:`LIFUHardwareInUseError`. Otherwise overwrites
+        it with the current process's PID.
+        """
+        existing = _hw_pid_lock_read()
+        my_pid = os.getpid()
+        if existing:
+            try:
+                existing_pid = int(existing)
+            except ValueError:
+                existing_pid = 0
+            if existing_pid > 0 and existing_pid != my_pid and _pid_alive(existing_pid):
+                raise LIFUHardwareInUseError(pid=existing_pid)
+        _hw_pid_lock_write(str(my_pid))
+        self._owns_hw_pid_env = True
+
+    def _release_hw_interface_pid(self) -> None:
+        """Clear the hardware-interface PID slot if this process owns it."""
+        if not getattr(self, "_owns_hw_pid_env", False):
+            return
+        current = _hw_pid_lock_read()
+        if current == str(os.getpid()):
+            _hw_pid_lock_write("")
+        self._owns_hw_pid_env = False
 
     @staticmethod
     def get_sdk_version() -> str:
