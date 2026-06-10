@@ -26,13 +26,47 @@ import random
 import time
 from typing import List, Optional
 
-from PyQt6.QtCore import QObject, QTimer, pyqtSignal
+# Qt backend selection: prefer 3D Slicer's PythonQt-based ``qt`` module
+# when we're running inside Slicer, since Slicer's GUI event loop is Qt5
+# and Qt6 timers parented to that loop would never fire. Outside Slicer
+# (e.g. the openlifu desktop apps), fall back to PyQt6.
+import sys as _sys
+
+if "slicer" in _sys.modules:
+    try:
+        import qt as _slicer_qt  # type: ignore
+    except ImportError as _exc:  # pragma: no cover
+        raise ImportError(
+            "openlifu_sdk.ui.simulated_interface could not import 3D Slicer's "
+            "PythonQt 'qt' module despite running inside Slicer."
+        ) from _exc
+    QObject = _slicer_qt.QObject
+    QTimer = _slicer_qt.QTimer
+    pyqtSignal = _slicer_qt.Signal
+    _QT_BACKEND = "PythonQt"
+else:
+    try:
+        from PyQt6.QtCore import QObject, QTimer, pyqtSignal  # type: ignore
+        _QT_BACKEND = "PyQt6"
+    except ImportError:  # pragma: no cover - exercised only in Slicer
+        try:
+            import qt as _slicer_qt  # type: ignore
+        except ImportError as _exc:  # pragma: no cover - no Qt at all
+            raise ImportError(
+                "openlifu_sdk.ui.simulated_interface requires PyQt6 (install "
+                "with the 'ui' extra) or 3D Slicer's PythonQt 'qt' module."
+            ) from _exc
+        QObject = _slicer_qt.QObject
+        QTimer = _slicer_qt.QTimer
+        pyqtSignal = _slicer_qt.Signal
+        _QT_BACKEND = "PythonQt"
 
 from openlifu_sdk.io import LIFUInterfaceStatus
 from openlifu_sdk.io.signal import OWSignal
 from openlifu_sdk.ui.status_frame import format_status_frame as _format_status_frame
 
 logger = logging.getLogger(__name__)
+logger.debug("openlifu_sdk.ui.simulated_interface using Qt backend: %s", _QT_BACKEND)
 
 # k chosen so 45 V * 0.25 duty * 600 s -> 50 deg C
 TX_HEATING_K = 50.0 / (45.0 * 45.0 * 0.25 * 600.0)
@@ -223,6 +257,57 @@ class SimulatedTxDevice:
         except Exception:
             logger.warning("SimulatedTxDevice.write_config_json: invalid json; ignored")
         return LifuUserConfig(json_data=dict(self._user_configs[module]))
+
+    def apply_simulated_transducer(self, arr) -> None:
+        """Reconfigure the simulator to mimic a transducer (array).
+
+        ``arr`` is duck-typed against :class:`openlifu.xdc.TransducerArray`:
+        it must expose ``modules`` (a sequence) where each module exposes
+        ``id``, ``name``, ``frequency`` (Hz), and (optionally) an ``attrs``
+        mapping that may carry ``hwid``. The number of simulated TX modules
+        is rebuilt to match ``len(arr.modules)``, and each per-module
+        ``user_config`` is overwritten so that ``read_config(module=i)`` /
+        ``get_version`` / etc. return values consistent with the picked
+        transducer.
+        """
+        modules_list = list(getattr(arr, "modules", []) or [])
+        n = max(1, len(modules_list))
+        if n != self.num_modules:
+            self.num_modules = n
+            self._modules = [_ModuleThermal(i) for i in range(n)]
+            self._user_configs = [self._default_user_config(i) for i in range(n)]
+        for i, m in enumerate(modules_list):
+            cfg = self._user_configs[i]
+            freq_hz = float(getattr(m, "frequency", 400e3) or 400e3)
+            cfg["freq"] = int(round(freq_hz / 1000.0))
+            attrs = getattr(m, "attrs", None) or {}
+            hwid_str = attrs.get("hwid") if isinstance(attrs, dict) else None
+            if isinstance(hwid_str, str) and hwid_str:
+                cfg["hwid"] = hwid_str
+            mod_block = cfg.setdefault("module", {})
+            mod_id = getattr(m, "id", None)
+            mod_name = getattr(m, "name", None)
+            if mod_id:
+                mod_block["id"] = mod_id
+            if mod_name:
+                mod_block["name"] = mod_name
+            mod_block["frequency"] = freq_hz
+        # Stash array-level identity on module 0's ``device`` block so callers
+        # that read it back via ``read_config(0)`` (e.g. SlicerOpenLIFU's
+        # device-vs-session compatibility check) can recover the simulated
+        # transducer's id/name. ``to_device_config`` is the canonical
+        # serializer used by real hardware too.
+        to_device_config = getattr(arr, "to_device_config", None)
+        if callable(to_device_config):
+            try:
+                self._user_configs[0]["device"] = to_device_config()
+            except Exception:  # noqa: BLE001
+                logger.debug("apply_simulated_transducer: to_device_config() failed", exc_info=True)
+        else:
+            self._user_configs[0]["device"] = {
+                "id": getattr(arr, "id", None),
+                "name": getattr(arr, "name", None),
+            }
 
     def _normalize_train_interval(self):
         """Substitute pulse_train_interval=0 with pulse_count*pulse_interval."""
@@ -468,14 +553,19 @@ class _SimulatedRunEngine(QObject):
     to it. ``alive`` flips False when the run finishes, which the
     connector's polling sees via :meth:`SimulatedLIFUInterface.is_running`
     and uses to drive its own RUNNING -> READY transition.
-    """
 
-    finished = pyqtSignal()
+    Use :meth:`set_finished_callback` to be notified when the run
+    completes (we use a plain Python callable rather than a Qt signal
+    because this class is instantiated under either PyQt6 or Slicer's
+    PythonQt-based ``qt`` module, and class-level signal declarations
+    are not portable between the two backends).
+    """
 
     def __init__(self, txdevice: SimulatedTxDevice, hvcontroller: SimulatedHVController,
                  sequence: dict, pulse: dict, voltage: float,
                  trigger_mode: str = "sequence", parent=None):
         super().__init__(parent)
+        self._finished_cb: Optional[callable] = None
         self._tx = txdevice
         self._hv = hvcontroller
         self._voltage = float(voltage)
@@ -554,7 +644,13 @@ class _SimulatedRunEngine(QObject):
             status="RUNNING", mode=self._mode_label,
         )
         self._train_timer.start(period_ms)
-        self._heartbeat.start(HEARTBEAT_INTERVAL_MS)
+        # The heartbeat exists to carry temperature updates between
+        # long train ticks. When the train period is already <= the
+        # heartbeat interval, running both produces interleaved
+        # duplicate frames (the heartbeat re-emits the previous count
+        # right after a train tick has advanced it), so skip it.
+        if period_ms > HEARTBEAT_INTERVAL_MS:
+            self._heartbeat.start(HEARTBEAT_INTERVAL_MS)
 
     def stop(self):
         was_alive = self.alive
@@ -608,7 +704,15 @@ class _SimulatedRunEngine(QObject):
                 self._train_curr, self._train_total,
                 status="STOPPED", mode=self._mode_label,
             )
-            self.finished.emit()
+            if self._finished_cb is not None:
+                try:
+                    self._finished_cb()
+                except Exception:  # noqa: BLE001
+                    logger.exception("_SimulatedRunEngine finished callback raised")
+
+    def set_finished_callback(self, cb):
+        """Register a zero-arg callable to be invoked when the run completes."""
+        self._finished_cb = cb
 
     def _on_heartbeat(self):
         if not self.alive:
@@ -631,23 +735,35 @@ class _SimulatedRunEngine(QObject):
 class SimulatedLIFUInterface(QObject):
     """Drop-in fake for :class:`openlifu_sdk.LIFUInterface`."""
 
+    #: Class-level marker so callers can cheaply distinguish a simulated
+    #: interface from a real :class:`~openlifu_sdk.io.LIFUInterface`
+    #: without importing the simulated class itself.
+    is_simulated: bool = True
+
     def __init__(self, num_modules: int = 1,
+                 transducer=None,
                  voltage_table_selection: Optional[str] = None,
                  sequence_time_selection: Optional[str] = None,
                  duty_cycle_selection: Optional[str] = None,
                  **_unused):
+        # When a transducer (array) is supplied, derive num_modules from it
+        # so the TX device is built with the right module count up front.
+        if transducer is not None:
+            modules_attr = getattr(transducer, "modules", None)
+            if modules_attr is not None:
+                num_modules = max(1, len(list(modules_attr)))
         super().__init__()
         self.txdevice = SimulatedTxDevice(num_modules=num_modules)
         self.hvcontroller = SimulatedHVController()
         self.status = LIFUInterfaceStatus.STATUS_SYS_OFF
         self._engine: Optional[_SimulatedRunEngine] = None
-        # Mirror real interface's attributes so any external code that
-        # peeks at them sees something sensible.
         self.voltage_table_selection = voltage_table_selection
         self.sequence_time_selection = sequence_time_selection
         self.duty_cycle_selection = duty_cycle_selection
         self._last_solution_voltage = 0.0
         self._last_trigger_mode = "sequence"
+        if transducer is not None and getattr(transducer, "modules", None) is not None:
+            self.txdevice.apply_simulated_transducer(transducer)
 
     # ---- monitoring lifecycle -------------------------------------------
 

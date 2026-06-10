@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from asyncio import timeout
 import logging
 import struct
 import time
