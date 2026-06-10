@@ -85,6 +85,10 @@ def main() -> None:
         help="Target bootloader device type (transmitter or console). Default: transmitter"
     )
     p.add_argument(
+        "--already-in-dfu", action="store_true",
+        help="Assume the target is already in DFU mode and skip the enter-DFU step"
+    )
+    p.add_argument(
         "--yes", "-y", action="store_true",
         help="Skip the confirmation prompt"
     )
@@ -102,56 +106,65 @@ def main() -> None:
     else:
         print(f"  Interface     : I2C DFU via master"
               f"  (slave addr=0x{args.i2c_addr:02X})")
+    if args.already_in_dfu:
+        print("  DFU state     : already in DFU (skipping enter-DFU step)")
     print()
 
     # ------------------------------------------------------------------
     # Connect to LIFU device (select interface by device type)
     # ------------------------------------------------------------------
-    interface = LIFUInterface()
-    tx_connected, hv_connected = interface.is_device_connected()
-
-    # Determine which connection we require based on --device-type
-    if args.device_type == "console":
-        print("Connecting to LIFU console (HV controller)...")
-        required_connected = hv_connected
-        required_label = "HV controller"
+    interface = None
+    txdev = None
+    if args.module_id == 0 and args.already_in_dfu:
+        print("Skipping live-device connection for module 0 because DFU is already active.")
     else:
-        print("Connecting to LIFU transmitter device...")
-        required_connected = tx_connected
-        required_label = "TX device"
-
-    # If transmitter is expected but not present, attempt to enable 12V
-    if args.device_type == "transmitter" and not tx_connected and hv_connected:
-        print("  TX device not connected — enabling 12 V rail...")
-        interface.hvcontroller.turn_12v_on()
-        time.sleep(2)
-        interface.stop_monitoring()
-        del interface
-        time.sleep(3)
-        print("  Re-initialising LIFU interface...")
         interface = LIFUInterface()
         tx_connected, hv_connected = interface.is_device_connected()
-        required_connected = tx_connected
 
-    if not required_connected:
-        print(f"ERROR: {required_label} not connected. Cannot proceed.")
-        sys.exit(1)
+        # Determine which connection we require based on --device-type
+        if args.device_type == "console":
+            print("Connecting to LIFU console (HV controller)...")
+            required_connected = hv_connected
+            required_label = "HV controller"
+        else:
+            print("Connecting to LIFU transmitter device...")
+            required_connected = tx_connected
+            required_label = "TX device"
 
-    print(f"  {required_label} connected.")
+        # If transmitter is expected but not present, attempt to enable 12V
+        if args.device_type == "transmitter" and not tx_connected and hv_connected:
+            print("  TX device not connected — enabling 12 V rail...")
+            interface.hvcontroller.turn_12v_on()
+            time.sleep(2)
+            interface.stop_monitoring()
+            del interface
+            time.sleep(3)
+            print("  Re-initialising LIFU interface...")
+            interface = LIFUInterface()
+            tx_connected, hv_connected = interface.is_device_connected()
+            required_connected = tx_connected
 
-    # Select the device controller object to use for general commands.
-    # For console-targeted operations use the HV controller; for
-    # transmitter-targeted operations use the TX device.
-    if args.device_type == "console":
-        txdev = interface.hvcontroller
-    else:
-        txdev = interface.txdevice
+        if not required_connected:
+            print(f"ERROR: {required_label} not connected. Cannot proceed.")
+            sys.exit(1)
+
+        print(f"  {required_label} connected.")
+
+        # Select the device controller object to use for general commands.
+        # For console-targeted operations use the HV controller; for
+        # transmitter-targeted operations use the TX device.
+        if args.device_type == "console":
+            txdev = interface.hvcontroller
+        else:
+            txdev = interface.txdevice
 
     # ------------------------------------------------------------------
     # Verify target module is present (only for transmitter modules)
     # For console device type module must be 0 and we skip module_count.
     # ------------------------------------------------------------------
-    if args.device_type == "console":
+    if args.module_id == 0 and args.already_in_dfu:
+        print("\nTarget module 0 is already in DFU mode; skipping live module probe.")
+    elif args.device_type == "console":
         if args.module_id != 0:
             print("ERROR: console device type only supports module 0")
             sys.exit(2)
@@ -174,7 +187,10 @@ def main() -> None:
     # ------------------------------------------------------------------
     print(f"\nReading current firmware version for module {args.module_id}...")
     try:
-        if args.device_type == "console":
+        if args.module_id == 0 and args.already_in_dfu:
+            current_version = "unknown"
+            print("  Skipped current-version read because module 0 is already in DFU mode")
+        elif args.device_type == "console":
             current_version = txdev.get_version()
         else:
             current_version = txdev.get_version(module=args.module_id)
@@ -206,7 +222,19 @@ def main() -> None:
     # ------------------------------------------------------------------
     print(f"\nStarting firmware update for module {args.module_id}...")
     try:
-        if args.device_type == "console":
+        if args.module_id == 0 and args.already_in_dfu:
+            from openlifu_sdk.io.LIFUDFU import LIFUDFUManager
+
+            mgr = LIFUDFUManager(uart=None)
+            mgr.program_usb(
+                package_file=args.package_file,
+                vid=args.vid,
+                pid=args.pid,
+                libusb_dll=args.libusb_dll,
+                device_type=args.device_type,
+                progress_callback=_progress,
+            )
+        elif args.device_type == "console":
             # For console (module 0 USB DFU) use LIFUDFUManager with the
             # HV controller's enter_dfu function to trigger DFU on the
             # console device.
@@ -218,7 +246,7 @@ def main() -> None:
                 mgr.update_module(
                 module=args.module_id,
                 package_file=args.package_file,
-                enter_dfu_fn=interface.hvcontroller.enter_dfu,
+                enter_dfu_fn=(lambda *a, **k: None) if args.already_in_dfu else interface.hvcontroller.enter_dfu,
                 vid=args.vid,
                 pid=args.pid,
                 libusb_dll=args.libusb_dll,
@@ -242,6 +270,7 @@ def main() -> None:
                 dfu_wait_s=args.dfu_wait,
                 device_type=args.device_type,
                 progress_callback=_progress,
+                enter_dfu_fn=(lambda *a, **k: None) if args.already_in_dfu else None,
             )
     except RuntimeError as e:
         print(f"\nERROR: Firmware update failed — {e}")
