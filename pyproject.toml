@@ -49,6 +49,7 @@ dev = [
 ui = [
   "PyQt6>=6.5",
   "packaging>=21.0",
+  "requests>=2.25.0",
 ]
 
 
