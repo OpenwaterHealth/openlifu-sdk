@@ -33,6 +33,18 @@ CONSOLE_FIRMWARE_URL = "https://github.com/OpenwaterHealth/openlifu-console-fw"
 TRANSMITTER_FIRMWARE_URL = "https://github.com/OpenwaterHealth/openlifu-transmitter-fw"
 
 FIRMWARE_DIR_REL = '../firmware'
+
+
+class FirmwareNetworkError(RuntimeError):
+    """GitHub could not be reached for a firmware lookup or download.
+
+    Raised by the firmware-update helpers in this module so callers can
+    surface a clean "check your internet connection" message without
+    having to special-case the underlying ``requests``/``urllib3``
+    exception chain. Always raised with ``from None`` so the offending
+    DNS/socket traceback is suppressed.
+    """
+
 DOWNLOADED_FIRMWARE_DIR_REL = '../firmware/downloads'
 
 # Canonical bundled filenames (kept for backward compatibility).
@@ -172,8 +184,10 @@ def get_transmitter_firmware_version() -> str:
 def _check_latest_release_version(repo_url: str, current_version: str) -> str:
     """Return the newer of ``current_version`` and the latest GitHub release tag.
 
-    Network failures (offline, rate-limited, missing release) fall back
-    to ``current_version`` so callers can treat this as best-effort.
+    Raises :class:`FirmwareNetworkError` if GitHub is unreachable so
+    callers can distinguish "no newer version available" from "could
+    not check". HTTP non-200 responses (rate limits, missing release)
+    fall back to ``current_version`` and only log a warning.
     """
     import requests
 
@@ -181,8 +195,12 @@ def _check_latest_release_version(repo_url: str, current_version: str) -> str:
     try:
         response = requests.get(api_url, timeout=10)
     except requests.RequestException as e:
+        # Suppress the urllib3 -> requests chain so callers don't dump
+        # a 60-line socket traceback into the UI / logs.
         logger.warning("Could not reach %s: %s", api_url, e)
-        return current_version
+        raise FirmwareNetworkError(
+            f"Could not reach GitHub at {api_url}"
+        ) from None
     if response.status_code != 200:
         logger.warning("Latest-release lookup for %s returned HTTP %d",
                        repo_url, response.status_code)
@@ -262,7 +280,9 @@ def _download_artifact(
             r = requests.get(api_base + tag, timeout=10)
         except requests.RequestException as e:
             logger.warning("Release lookup %s%s failed: %s", api_base, tag, e)
-            return None
+            raise FirmwareNetworkError(
+                f"Could not reach GitHub at {api_base}{tag}"
+            ) from None
         if r.status_code == 200:
             release_json = r.json()
             break
@@ -297,7 +317,9 @@ def _download_artifact(
         logger.error("Download of %s failed: %s", download_url, e)
         if tmp_path is not None:
             tmp_path.unlink(missing_ok=True)
-        return None
+        raise FirmwareNetworkError(
+            f"Could not download firmware from {download_url}"
+        ) from None
 
     try:
         _get_firmware_version(tmp_path)
@@ -359,6 +381,7 @@ __all__ = [
     "CONSOLE_FIRMWARE_URL",
     "DOWNLOADED_FIRMWARE_DIR_REL",
     "FIRMWARE_DIR_REL",
+    "FirmwareNetworkError",
     "TRANSMITTER_FIRMWARE_BASENAME",
     "TRANSMITTER_FIRMWARE_FILENAME",
     "TRANSMITTER_FIRMWARE_URL",
