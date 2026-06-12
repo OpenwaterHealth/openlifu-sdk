@@ -390,6 +390,24 @@ print(f"\nRunning grouped profile/HV/trigger sequence once...")
 profile_sequence = [cfg["index"] for cfg in PROFILE_CONFIGS]
 print(f"  Sequence: {' -> '.join(map(str, profile_sequence))}")
 
+# Configure trigger once — delay profile switching does not change trigger timing.
+interface.txdevice.set_trigger(
+    pulse_interval=multi_sequence["pulse_interval"],
+    pulse_count=multi_sequence["pulse_count"],
+    pulse_train_interval=multi_sequence["pulse_train_interval"],
+    pulse_train_count=multi_sequence["pulse_train_count"],
+    trigger_mode="sequence",
+)
+trigger_readback = interface.txdevice.get_trigger_json()
+print(
+    "  Trigger configured: "
+    f"pi={multi_sequence['pulse_interval']:.6f}s "
+    f"pc={multi_sequence['pulse_count']} "
+    f"ti={multi_sequence['pulse_train_interval']:.3f}s "
+    f"tc={multi_sequence['pulse_train_count']} "
+    f"freq={trigger_readback.get('TriggerFrequencyHz')}Hz"
+)
+
 # For now, manually verify we can switch through each profile in the order
 # by reading active selectors before and after each write.
 active_trigger_time_s = 0.0
@@ -453,29 +471,12 @@ for cycle_idx in range(len(PROFILE_CONFIGS)):
         hv_readback = interface.hvcontroller.get_voltage()
         print(f"    HV readback: target={VOLTAGE:.1f}V measured={hv_readback:.2f}V")
 
-        # Apply profile-specific trigger parameters so oscilloscope output is
-        # uniquely identifiable for each grouped profile.
-        interface.txdevice.set_trigger(
-            pulse_interval=cfg["pulse_interval"],
-            pulse_count=cfg["pulse_count"],
-            pulse_train_interval=cfg["pulse_train_interval"],
-            pulse_train_count=cfg["pulse_train_count"],
-            trigger_mode="sequence",
-        )
-        trigger_readback = interface.txdevice.get_trigger_json()
-        print(
-            "    Trigger cfg/readback: "
-            f"pi={cfg['pulse_interval']:.6f}s pc={cfg['pulse_count']} "
-            f"ti={cfg['pulse_train_interval']:.3f}s tc={cfg['pulse_train_count']} "
-            f"freq={trigger_readback.get('TriggerFrequencyHz')}Hz"
-        )
-
-        # Run trigger while this profile+HV setting is active so output can be measured externally.
+        # Run trigger with delay profile active so output can be measured externally.
         interface.txdevice.start_trigger()
         time.sleep(TRIGGER_RUN_S)
         interface.txdevice.stop_trigger()
         active_trigger_time_s += TRIGGER_RUN_S
-        print("    Trigger run complete with profile/HV pair active")
+        print("    Trigger run complete with delay profile active")
     
     if verify_delay_profile_selected(interface, tx_id, expected_prof, f"cycle {cycle_idx}"):
         print(f"    ✓ Profile {expected_prof} verified")
