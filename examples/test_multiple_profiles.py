@@ -160,6 +160,20 @@ def verify_delay_profile_selected(interface, tx_id: int, expected_profile: int, 
     return True
 
 
+def verify_apodization_register(interface, tx_id: int, expected_value: int, stage: str) -> bool:
+    """Verify apodization register 0x1B matches expected value."""
+    apod_reg = interface.txdevice.read_register(tx_id, ADDRESS_APODIZATION)
+    if apod_reg != expected_value:
+        print(
+            f"  ✗ {stage}: Apodization mismatch: "
+            f"expected 0x{expected_value:08X}, got 0x{apod_reg:08X}"
+        )
+        return False
+
+    print(f"  ✓ {stage}: Apodization verified (0x{apod_reg:08X})")
+    return True
+
+
 def write_and_readback_all_registers(interface) -> bool:
     """Write all configured TX registers to hardware, read back, and print values."""
     print("\nProfile register targets before write:")
@@ -408,56 +422,65 @@ print(
     f"freq={trigger_readback.get('TriggerFrequencyHz')}Hz"
 )
 
-# For now, manually verify we can switch through each profile in the order
-# by reading active selectors before and after each write.
-active_trigger_time_s = 0.0
-for cycle_idx in range(len(PROFILE_CONFIGS)):
-    expected_prof = profile_sequence[(cycle_idx + 1) % len(profile_sequence)]
-    cfg = PROFILE_CONFIGS[expected_prof - 1]
-    print(f"  Cycle {cycle_idx}: Switching to next profile {expected_prof}")
-
-    # Get per-profile delay data (packed for write_block) and control regs
+# Preload all delay data + apodization for every profile once before switching.
+print("\nPreloading all profile delay/apodization data...")
+expected_apod_by_profile = {}
+expected_delay_sel_by_profile = {}
+for profile in profile_sequence:
     delay_data_list = interface.txdevice.tx_registers.get_delay_data_registers(
-        expected_prof, pack=True, pack_single=True
+        profile, pack=True, pack_single=True
     )
-    delay_ctrl_list = interface.txdevice.tx_registers.get_delay_control_registers(expected_prof)
+    delay_ctrl_list = interface.txdevice.tx_registers.get_delay_control_registers(profile)
     tx_delay_data = delay_data_list[tx_id]
     tx_ctrl = delay_ctrl_list[tx_id]
 
-    pre_delay_reg = interface.txdevice.read_register(tx_id, ADDRESS_DELAY_SEL)
-    pre_delay_profile = read_active_delay_profile(pre_delay_reg)
-    print(
-        "    Active before write: "
-        f"delay={pre_delay_profile}"
-    )
+    expected_apod_by_profile[profile] = tx_ctrl[ADDRESS_APODIZATION]
+    expected_delay_sel_by_profile[profile] = tx_ctrl[ADDRESS_DELAY_SEL]
 
-    # Write delay DATA registers for this profile (per-channel delays, profile-indexed slot)
-    print(f"    Writing delay data registers for profile {expected_prof}:")
+    print(f"  Preload profile {profile} delay data:")
     for start_addr, reg_values in sorted(tx_delay_data.items()):
         print(
-            f"      0x{start_addr:04X}..0x{start_addr + len(reg_values) - 1:04X} "
+            f"    0x{start_addr:04X}..0x{start_addr + len(reg_values) - 1:04X} "
             f"({len(reg_values)} regs)"
         )
         interface.txdevice.write_block(identifier=tx_id, start_address=start_addr, reg_values=reg_values)
 
-    # Write apodization (binary on/off per channel) for this profile
-    print(f"    Writing apodization: 0x{tx_ctrl[ADDRESS_APODIZATION]:08X}")
+    print(f"    Preload apodization: 0x{tx_ctrl[ADDRESS_APODIZATION]:08X}")
     interface.txdevice.write_register(tx_id, ADDRESS_APODIZATION, tx_ctrl[ADDRESS_APODIZATION])
 
-    # Write delay selector (tell chip which profile slot is active)
-    print(f"    Writing delay selector: 0x{tx_ctrl[ADDRESS_DELAY_SEL]:08X}")
-    interface.txdevice.write_register(tx_id, ADDRESS_DELAY_SEL, tx_ctrl[ADDRESS_DELAY_SEL])
+interface.txdevice.commit_profile_ram(tx_id)
+print("  ✓ Preload committed to profile RAM")
 
-    # Commit profile RAM to latch written delay data
-    interface.txdevice.commit_profile_ram(tx_id)
+# Force starting point after preload.
+interface.txdevice.write_register(tx_id, ADDRESS_DELAY_SEL, expected_delay_sel_by_profile[initial_profile])
+time.sleep(REG_PROPAGATION_DELAY_S)
+
+# Switch through each profile by changing selector only.
+active_trigger_time_s = 0.0
+for cycle_idx in range(len(PROFILE_CONFIGS)):
+    expected_prof = profile_sequence[(cycle_idx + 1) % len(profile_sequence)]
+    print(f"  Cycle {cycle_idx}: Switching to next profile {expected_prof}")
+
+    pre_delay_reg = interface.txdevice.read_register(tx_id, ADDRESS_DELAY_SEL)
+    pre_apod_reg = interface.txdevice.read_register(tx_id, ADDRESS_APODIZATION)
+    pre_delay_profile = read_active_delay_profile(pre_delay_reg)
+    print(
+        "    Active before write: "
+        f"delay={pre_delay_profile}, apod=0x{pre_apod_reg:08X}"
+    )
+
+    # Write delay selector (tell chip which profile slot is active)
+    print(f"    Writing delay selector: 0x{expected_delay_sel_by_profile[expected_prof]:08X}")
+    interface.txdevice.write_register(tx_id, ADDRESS_DELAY_SEL, expected_delay_sel_by_profile[expected_prof])
 
     time.sleep(REG_PROPAGATION_DELAY_S)
 
     post_delay_reg = interface.txdevice.read_register(tx_id, ADDRESS_DELAY_SEL)
+    post_apod_reg = interface.txdevice.read_register(tx_id, ADDRESS_APODIZATION)
     post_delay_profile = read_active_delay_profile(post_delay_reg)
     print(
         "    Active after write: "
-        f"delay={post_delay_profile}"
+        f"delay={post_delay_profile}, apod=0x{post_apod_reg:08X}"
     )
 
     if post_delay_profile == pre_delay_profile:
@@ -465,6 +488,15 @@ for cycle_idx in range(len(PROFILE_CONFIGS)):
         all_passed = False
     else:
         print("    ✓ Delay profile selector changed after write")
+
+    if post_apod_reg != expected_apod_by_profile[expected_prof]:
+        print(
+            "    ✗ Apodization register mismatch after switch: "
+            f"expected 0x{expected_apod_by_profile[expected_prof]:08X}, got 0x{post_apod_reg:08X}"
+        )
+        all_passed = False
+    else:
+        print("    ✓ Apodization register matches expected profile value")
 
     # Use one HV setpoint across all profiles and verify readback stability.
     if interface.hvcontroller is not None:
@@ -482,6 +514,9 @@ for cycle_idx in range(len(PROFILE_CONFIGS)):
         print(f"    ✓ Profile {expected_prof} verified")
     else:
         print(f"    ✗ Profile {expected_prof} NOT verified")
+        all_passed = False
+
+    if not verify_apodization_register(interface, tx_id, expected_apod_by_profile[expected_prof], f"cycle {cycle_idx}"):
         all_passed = False
 
 print("\n✓ Grouped profile cycle test completed")
