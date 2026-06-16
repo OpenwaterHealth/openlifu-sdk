@@ -42,3 +42,6 @@ htmlcov/
 
 # Hatch
 .hatch/
+
+#Downloaded Firmware
+src/openlifu_sdk/firmware/downloads
