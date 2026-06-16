@@ -405,20 +405,15 @@ class TxDevice(OWComponent):
     def get_tx_module_count(self) -> int:
         """Return the number of connected TX modules.
 
+        Thin alias for :meth:`get_module_count`, kept for backwards
+        compatibility. ``get_module_count`` includes a fallback to the older
+        ``OW_TX7332_DEVICE_COUNT`` command for legacy firmware.
+
         Raises:
             LIFUNotConnectedError, LIFUCommunicationError, LIFUDeviceError,
             LIFUProtocolError: If the payload length is invalid.
         """
-        r = self.send_checked(packet_type=OW_CONTROLLER, command=OW_CTRL_GET_MODULE_COUNT,
-                              addr=0, op="get_tx_module_count")
-        if r.data_len != 1:
-            raise LIFUProtocolError(
-                f"TX: get_tx_module_count payload length {r.data_len} != 1",
-                code=LIFU_ERR_BAD_PAYLOAD_LENGTH,
-            )
-        tx_module_count = r.data[0]
-        logger.debug("TX Module Count: %d", tx_module_count)
-        return tx_module_count
+        return self.get_module_count()
 
     def enum_tx7332_devices(self,
                             num_devices: int | None = None) -> int:
@@ -664,8 +659,13 @@ class TxDevice(OWComponent):
             LIFUNotConnectedError, LIFUCommunicationError, LIFUDeviceError,
             LIFUProtocolError: If the payload length is invalid.
         """
-        r = self.send_checked(packet_type=OW_CONTROLLER, command=OW_CTRL_GET_MODULE_COUNT,
-                              addr=0, op="get_module_count")
+        try:
+            r = self.send_checked(packet_type=OW_CONTROLLER, command=OW_CTRL_GET_MODULE_COUNT,
+                                addr=0, op="get_module_count")
+        except LIFUError:
+            r = self.send_checked(packet_type=OW_TX7332, command=OW_TX7332_DEVICE_COUNT,
+                                addr=0, op="get_device_count")
+
         if not r.data or len(r.data) < 1:
             raise LIFUProtocolError(
                 f"TX: get_module_count payload length {r.data_len} < 1",

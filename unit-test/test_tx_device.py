@@ -333,7 +333,7 @@ class TestTX7332Commands(unittest.TestCase):
         self.tx._uart = self.uart
         self.chip_id = 0   # TX7332 chip index 0
 
-    # --- OW_TX7332_DEVICE_COUNT ----------------------------------------
+    # --- OW_CTRL_GET_MODULE_COUNT (with OW_TX7332_DEVICE_COUNT fallback) ----
 
     def test_t01_get_tx_module_count_success(self):
         """get_tx_module_count(): firmware returns 1-byte count in data."""
