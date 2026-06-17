@@ -290,7 +290,6 @@ class LIFUInterface:
             evt_version = voltage_table.lower()
             if evt_version not in MAX_VOLTAGE_BY_DUTY_CYCLE_AND_SEQUENCE_TIME:
                 raise ValueError(f"Invalid voltage_table option '{voltage_table}'. Valid options are: {tuple(MAX_VOLTAGE_BY_DUTY_CYCLE_AND_SEQUENCE_TIME.keys())}")
-        print(evt_version)
         return MAX_VOLTAGE_BY_DUTY_CYCLE_AND_SEQUENCE_TIME[evt_version]
 
     def _load_voltage_table(self) -> None:
