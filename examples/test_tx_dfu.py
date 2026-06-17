@@ -54,12 +54,39 @@ version = interface.txdevice.get_version(module=MODULE_ID)
 print(f"Version: {version}")
 
 
+def _parse_fw_version(ver: str) -> tuple[int, int, int] | None:
+    """Parse a 'vX.Y.Z' (or 'X.Y.Z') firmware string into a tuple, or None."""
+    if not ver:
+        return None
+    parts = ver.lstrip("vV").split(".")
+    if len(parts) < 3:
+        return None
+    try:
+        return (int(parts[0]), int(parts[1]), int(parts[2]))
+    except ValueError:
+        return None
+
+
+# The reserved=0x77 flag triggers the legacy DFU pass-through path that
+# firmware <= 2.0.3 requires to enter DFU mode. Firmware 2.0.4+ ignores it
+# (and in some intermediate builds, sending it causes a NAK), so only set
+# it when we're talking to a known-old firmware. If the version is
+# unparseable we err on the side of NOT sending it (assume modern firmware).
+_LEGACY_DFU_MAX = (2, 0, 3)
+_parsed = _parse_fw_version(version)
+_dfu_reserved = 0x77 if (_parsed is not None and _parsed <= _LEGACY_DFU_MAX) else 0x00
+if _dfu_reserved:
+    print(f"Firmware {version} <= v2.0.3 detected; using legacy reserved=0x77 DFU flag.")
+else:
+    print(f"Firmware {version} > v2.0.3 (or unparseable); using reserved=0x00.")
+
+
 # Ask the user for confirmation
 user_input = input("Do you want to Enter DFU Mode? (y/n): ").strip().lower()
 
 if user_input == 'y':
     print("Enter DFU mode")
-    if interface.txdevice.enter_dfu(module=MODULE_ID, reserved=0x77):
+    if interface.txdevice.enter_dfu(module=MODULE_ID, reserved=_dfu_reserved):
         print("Successful.")
 
 elif user_input == 'n':
