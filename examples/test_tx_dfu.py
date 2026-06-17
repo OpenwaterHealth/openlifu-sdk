@@ -59,7 +59,7 @@ user_input = input("Do you want to Enter DFU Mode? (y/n): ").strip().lower()
 
 if user_input == 'y':
     print("Enter DFU mode")
-    if interface.txdevice.enter_dfu(module=MODULE_ID):
+    if interface.txdevice.enter_dfu(module=MODULE_ID, reserved=0x77):
         print("Successful.")
 
 elif user_input == 'n':

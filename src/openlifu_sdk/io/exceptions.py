@@ -77,9 +77,34 @@ class LIFUCommunicationError(LIFUError):
 
 
 class LIFUDeviceError(LIFUError):
-    """Device firmware returned an ``OW_ERROR`` packet."""
+    """Device firmware returned an ``OW_ERROR`` packet.
+
+    The optional ``packet`` attribute holds the raw OW_ERROR
+    :class:`OWUartPacket` reply when the exception originates from
+    :meth:`OWComponent.send_checked`. The ``device_error_code`` field
+    is the device-side error byte (carried in the OW_ERROR packet's
+    ``reserved`` slot) and ``device_error_data`` is any extra payload
+    bytes -- both ``None`` if the exception was constructed without a
+    packet.
+    """
 
     default_code = LIFU_ERR_DEVICE_NAK
+
+    def __init__(
+        self,
+        message: str = "",
+        *,
+        code: int | None = None,
+        packet: object | None = None,
+        device_error_code: int | None = None,
+        device_error_data: bytes | None = None,
+    ):
+        self.packet = packet
+        self.device_error_code = device_error_code
+        self.device_error_data = (
+            bytes(device_error_data) if device_error_data is not None else None
+        )
+        super().__init__(message, code=code)
 
 
 class LIFUProtocolError(LIFUError):
