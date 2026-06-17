@@ -267,10 +267,54 @@ class TxDevice(OWComponent):
         else:
             raise ValueError("Invalid trigger mode")
 
-        if pulse_train_interval > 0 and (pulse_train_interval < pulse_interval * pulse_count):
+        if pulse_train_count <= 1:
+            # Only one train will ever fire, so the inter-train spacing is
+            # functionally meaningless. Force it to a value derived from
+            # pulse_interval so the firmware compatibility shim below can
+            # bump it above the per-pulse period.
+            pulse_train_interval = pulse_interval
+        elif pulse_train_interval > 0 and (pulse_train_interval < pulse_interval * pulse_count):
             raise ValueError("Pulse train interval cannot be less than pulse interval * pulse count")
         elif pulse_train_interval == 0:
             pulse_train_interval = pulse_interval * pulse_count
+
+        # Firmware <= 2.0.3 compatibility shim.
+        #
+        # FW <= 2.0.3 rejects start_trigger with TRIGGER_STATUS_ERROR
+        # (surfaced as a LIFUDeviceError OW_ERROR NAK with no sub-code)
+        # whenever:
+        #     TriggerPulseTrainInterval > 0 AND
+        #     TriggerPulseTrainInterval <= triggerPeriodUsec
+        # where ``triggerPeriodUsec = 1_000_000 / TriggerFrequencyHz`` (the
+        # per-pulse period) and ``TriggerFrequencyHz`` is parsed as uint32
+        # (strtol, base 10) so fractional Hz get truncated. FW 2.0.7+ uses
+        # strict ``<`` and a pulse_count factor, so it always passes.
+        #
+        # When the train interval lands at or within rounding of the
+        # firmware per-pulse period we lengthen it to
+        # ``1 / (int(1/pulse_train_interval) - 1)`` -- effectively rounding
+        # the implied train frequency down by 1 Hz, which lengthens the
+        # interval just enough to clear the firmware integer period without
+        # changing pulse_interval (the user-meaningful sonication frequency).
+        train_us = int(round(pulse_train_interval * 1_000_000))
+        if train_us > 0 and pulse_interval > 0:
+            freq_int = int(1.0 / pulse_interval)
+            period_us = 1_000_000 // freq_int if freq_int > 0 else 0
+            if train_us <= period_us:
+                train_freq_int = int(1.0 / pulse_train_interval)
+                if train_freq_int > 1:
+                    new_train_s = 1.0 / (train_freq_int - 1)
+                else:
+                    new_train_s = pulse_train_interval + 1e-6
+                logger.debug(
+                    "FW <=2.0.3 compat: bumping pulse_train_interval from "
+                    "%s s (%s us) to %s s (%s us) so it exceeds the firmware "
+                    "per-pulse period (%s us).",
+                    pulse_train_interval, train_us,
+                    new_train_s, int(round(new_train_s * 1_000_000)),
+                    period_us,
+                )
+                pulse_train_interval = new_train_s
 
         logger.info(f"Setting trigger with parameters: "
                         f"pulse_interval={pulse_interval}, "

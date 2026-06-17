@@ -185,8 +185,65 @@ class OWComponent:
                     continue
                 raise last_timeout_exc
             if r.packet_type == OW_ERROR:
+                # Surface whatever diagnostic detail the device packed
+                # into the OW_ERROR reply so the failure isn't reduced
+                # to a bare "returned device error". The firmware uses
+                # the ``reserved`` byte as a sub-error code and may
+                # also stash a payload (often an ASCII reason string,
+                # sometimes packed struct bytes). Include both forms
+                # so the operator-facing popup carries enough context
+                # to triage the failure without a debug build.
+                #
+                # Attribute fetches are tolerant of mocks / partial
+                # packets used in tests -- only ints with sane values
+                # are formatted as hex, everything else is dropped.
+                def _as_int(value):
+                    if isinstance(value, bool):
+                        return None
+                    return value if isinstance(value, int) else None
+
+                def _as_bytes(value):
+                    if value is None:
+                        return b""
+                    try:
+                        return bytes(value)
+                    except TypeError:
+                        return b""
+
+                cmd_byte = _as_int(getattr(r, "command", None))
+                addr_byte = _as_int(getattr(r, "addr", None))
+                device_err_code = _as_int(getattr(r, "reserved", None))
+                payload = _as_bytes(getattr(r, "data", None))
+
+                detail_parts: list[str] = []
+                if cmd_byte is not None:
+                    detail_parts.append(f"cmd=0x{cmd_byte:02X}")
+                if addr_byte is not None:
+                    detail_parts.append(f"addr=0x{addr_byte:02X}")
+                if device_err_code is not None:
+                    detail_parts.append(f"device_err=0x{device_err_code:02X}")
+                if payload:
+                    payload_hex = payload.hex(" ")
+                    detail_parts.append(f"payload={payload_hex}")
+                    # Best-effort decode: most firmware error payloads
+                    # are short ASCII reason strings. Fall through
+                    # silently if it isn't decodable as printable text.
+                    try:
+                        text = payload.rstrip(b"\x00").decode("ascii")
+                    except UnicodeDecodeError:
+                        text = ""
+                    if text and all(c.isprintable() or c in "\r\n\t" for c in text):
+                        detail_parts.append(f'message="{text.strip()}"')
+
+                detail = " ".join(detail_parts)
+                msg = f"{self._uart.desc}: {label} returned device error"
+                if detail:
+                    msg = f"{msg} ({detail})"
                 raise LIFUDeviceError(
-                    f"{self._uart.desc}: {label} returned device error"
+                    msg,
+                    packet=r,
+                    device_error_code=device_err_code,
+                    device_error_data=payload or None,
                 )
             if attempt > 1:
                 # Make it visible WHEN slow responses are recovering --
@@ -302,13 +359,13 @@ class OWComponent:
         self.send_checked(OW_CMD_RESET, addr=module, op="soft_reset")
         return True
 
-    def enter_dfu(self, module: int = 0) -> bool:
+    def enter_dfu(self, module: int = 0, reserved: int = 0x00) -> bool:
         """Reboot the device into DFU mode.
 
         Raises:
             LIFUNotConnectedError, LIFUCommunicationError, LIFUDeviceError.
         """
-        self.send_checked(OW_CMD_DFU, addr=module, op="enter_dfu")
+        self.send_checked(OW_CMD_DFU, addr=module, op="enter_dfu", reserved=reserved)
         return True
 
     # ------------------------------------------------------------------

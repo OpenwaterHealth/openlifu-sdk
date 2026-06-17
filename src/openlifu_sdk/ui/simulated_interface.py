@@ -743,8 +743,6 @@ class SimulatedLIFUInterface(QObject):
     def __init__(self, num_modules: int = 1,
                  transducer=None,
                  voltage_table_selection: Optional[str] = None,
-                 sequence_time_selection: Optional[str] = None,
-                 duty_cycle_selection: Optional[str] = None,
                  **_unused):
         # When a transducer (array) is supplied, derive num_modules from it
         # so the TX device is built with the right module count up front.
@@ -758,8 +756,6 @@ class SimulatedLIFUInterface(QObject):
         self.status = LIFUInterfaceStatus.STATUS_SYS_OFF
         self._engine: Optional[_SimulatedRunEngine] = None
         self.voltage_table_selection = voltage_table_selection
-        self.sequence_time_selection = sequence_time_selection
-        self.duty_cycle_selection = duty_cycle_selection
         self._last_solution_voltage = 0.0
         self._last_trigger_mode = "sequence"
         if transducer is not None and getattr(transducer, "modules", None) is not None:

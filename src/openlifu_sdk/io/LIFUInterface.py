@@ -27,33 +27,79 @@ from openlifu_sdk.io.exceptions import (
 from openlifu_sdk.io.LIFUHVController import HVController
 from openlifu_sdk.io.LIFUTXDevice import TriggerModeOpts, TxDevice
 
-REF_MAX_SEQUENCE_TIMES = {
-    "default": [2*60, 5*60, 10*60],    # users to use default values
-    "stress_test": [60*60, 60*60, 60*60] # QA to use stress test values
-}
-
-REF_MAX_DUTY_CYCLES = {
-    "default": [0.05, 0.1, 0.2, 0.3, 0.4, 0.5],
-    "stress_test": [0.5, 0.5, 0.5, 0.5, 0.5, 0.5]
-}
-
+# Maximum-voltage lookup tables keyed by hardware/test profile.
+#
+# Each entry is a dict that fully describes its own anchor points and
+# voltage matrix:
+#
+#   - ``duty_cycles``     : list[float], one entry per row of ``voltages``.
+#                           Treated as "max duty cycle for this row" — the
+#                           lookup picks the first row whose limit >= the
+#                           sequence's duty cycle.
+#   - ``sequence_times``  : list[float] in seconds, one entry per column of
+#                           ``voltages``. Same semantics as ``duty_cycles``
+#                           but applied to total sequence duration.
+#   - ``voltages``        : 2D list of ints (rows × cols), giving the max
+#                           voltage allowed for that (duty_cycle, sequence_time)
+#                           cell.
+#
+# Different profiles may use entirely different anchor points (e.g. ``dvt``
+# is denser in duty cycle than ``evt2``/``evt0``); the lookup uses each
+# entry's own anchors, so no global anchor list is required.
 MAX_VOLTAGE_BY_DUTY_CYCLE_AND_SEQUENCE_TIME = {
-    "evt2": [
-        [45, 45, 45], # 0.05
-        [40, 40, 40], # 0.1
-        [40, 40, 35], # 0.2
-        [40, 35, 30], # 0.3
-        [35, 30, 25], # 0.4
-        [30, 25, 20] # 0.5
-    ],
-    "evt0": [
-        [65, 65, 65], # 0.05
-        [65, 65, 50], # 0.1
-        [50, 40, 35], # 0.2
-        [45, 35, 30], # 0.3
-        [35, 30, 25], # 0.4
-        [30, 25, 20] # 0.5
-    ],
+    "evt2": {
+        "duty_cycles": [0.05, 0.1, 0.2, 0.3, 0.4, 0.5],
+        "sequence_times": [2*60, 5*60, 10*60],
+        "voltages": [
+            [45, 45, 45], # 0.05
+            [40, 40, 40], # 0.1
+            [40, 40, 35], # 0.2
+            [40, 35, 30], # 0.3
+            [35, 30, 25], # 0.4
+            [30, 25, 20], # 0.5
+        ],
+    },
+    "evt0": {
+        "duty_cycles": [0.05, 0.1, 0.2, 0.3, 0.4, 0.5],
+        "sequence_times": [2*60, 5*60, 10*60],
+        "voltages": [
+            [65, 65, 65], # 0.05
+            [65, 65, 50], # 0.1
+            [50, 40, 35], # 0.2
+            [45, 35, 30], # 0.3
+            [35, 30, 25], # 0.4
+            [30, 25, 20], # 0.5
+        ],
+    },
+    "dvt": {
+        "duty_cycles": [0.05, 0.10, 0.15, 0.18, 0.22, 0.28, 0.35, 0.40, 0.45, 0.50],
+        "sequence_times": [10*60],
+        "voltages": [
+            [65], # 0.05
+            [60], # 0.10
+            [55], # 0.15
+            [50], # 0.18
+            [45], # 0.22
+            [40], # 0.28
+            [35], # 0.35
+            [30], # 0.40
+            [25], # 0.45
+            [20], # 0.50
+        ],
+    },
+    # QA / stress-test profiles. Single-cell tables that effectively disable
+    # the duty-cycle / duration ramp-down: any sequence at or below the listed
+    # caps is allowed at the listed voltage.
+    "stress_test_evt0": {
+        "duty_cycles": [0.5],
+        "sequence_times": [60*60],
+        "voltages": [[65]],
+    },
+    "stress_test_evt2": {
+        "duty_cycles": [0.5],
+        "sequence_times": [60*60],
+        "voltages": [[45]],
+    },
 }
 
 class LIFUInterfaceStatus(Enum):
@@ -186,9 +232,7 @@ class LIFUInterface:
                  run_async: bool = False,
                  ext_power_supply: bool = False,
                  module_invert: bool | List[bool] = False,
-                 voltage_table_selection: Optional[str] = None,
-                 sequence_time_selection: Optional[str] = None,
-                 duty_cycle_selection: Optional[str] = None) -> None:
+                 voltage_table_selection: Optional[str] = None) -> None:
         """
         Initialize the LIFUInterface with given parameters and store them in the class.
 
@@ -215,8 +259,6 @@ class LIFUInterface:
         self.sequence_time = None
         self.duty_cycles = None
         self.voltage_table_selection = voltage_table_selection
-        self.sequence_time_selection = sequence_time_selection
-        self.duty_cycle_selection = duty_cycle_selection
 
         # Create a TXDevice instance as part of the interface
         self.txdevice = TxDevice(vid=vid, pid=tx_pid, baudrate=baudrate, timeout=timeout, test_mode=TX_test_mode, module_invert=module_invert)
@@ -235,35 +277,28 @@ class LIFUInterface:
                 self.hvcontroller.connect()
 
     # Temporary fix for hardware variations between EVT0 and EVT2
-    def _resolve_voltage_chart_evt_version(self, voltage_table: str) -> list[list[int]]:
+    def _resolve_voltage_chart(self, voltage_table: Optional[str]) -> dict:
+        """Return the voltage-table entry (``duty_cycles`` / ``sequence_times`` / ``voltages``)
+        for the requested profile.
+
+        If *voltage_table* is ``None``, the profile is inferred from the connected
+        HV controller's reported version.
+        """
         if voltage_table is None:
-            evt_version = "evt0" if self.hvcontroller.get_version().startswith("v1.1") else "evt2"
+            evt_version = "evt0" if self.hvcontroller.get_version().startswith("v1.1") else "dvt"
         else:
             evt_version = voltage_table.lower()
             if evt_version not in MAX_VOLTAGE_BY_DUTY_CYCLE_AND_SEQUENCE_TIME:
                 raise ValueError(f"Invalid voltage_table option '{voltage_table}'. Valid options are: {tuple(MAX_VOLTAGE_BY_DUTY_CYCLE_AND_SEQUENCE_TIME.keys())}")
-
         return MAX_VOLTAGE_BY_DUTY_CYCLE_AND_SEQUENCE_TIME[evt_version]
 
-    # Restrict sequence time options for users vs QA
-    def _resolve_max_sequence_time_set(self, sequence_time: str) -> list[int]:
-        if sequence_time is None:
-            return REF_MAX_SEQUENCE_TIMES["default"]
-        else:
-            sequence_time = sequence_time.lower()
-            if sequence_time not in REF_MAX_SEQUENCE_TIMES:
-                raise ValueError(f"Invalid sequence_time option '{sequence_time}'. Valid options are: {tuple(REF_MAX_SEQUENCE_TIMES.keys())}")
-            return REF_MAX_SEQUENCE_TIMES[sequence_time]
-
-    # Restrict duty cycle options for users vs QA
-    def _resolve_duty_cycle_set(self, duty_cycle: str) -> list[float]:
-        if duty_cycle is None:
-            return REF_MAX_DUTY_CYCLES["default"]
-        else:
-            duty_cycle = duty_cycle.lower()
-            if duty_cycle not in REF_MAX_DUTY_CYCLES:
-                raise ValueError(f"Invalid duty_cycle option '{duty_cycle}'. Valid options are: {tuple(REF_MAX_DUTY_CYCLES.keys())}")
-            return REF_MAX_DUTY_CYCLES[duty_cycle]
+    def _load_voltage_table(self) -> None:
+        """Populate ``self.voltage_table`` / ``self.duty_cycles`` / ``self.sequence_time``
+        from the currently selected profile."""
+        entry = self._resolve_voltage_chart(self.voltage_table_selection)
+        self.duty_cycles = entry["duty_cycles"]
+        self.sequence_time = entry["sequence_times"]
+        self.voltage_table = entry["voltages"]
 
     async def start_monitoring(self, interval: int = 1) -> None:
         """Start monitoring for USB device connections."""
@@ -344,10 +379,7 @@ class LIFUInterface:
         Raises:
             LIFUSolutionError: If the solution exceeds any safety limit.
         """
-
-        self.voltage_table = self._resolve_voltage_chart_evt_version(self.voltage_table_selection)
-        self.sequence_time = self._resolve_max_sequence_time_set(self.sequence_time_selection)
-        self.duty_cycles = self._resolve_duty_cycle_set(self.duty_cycle_selection)
+        self._load_voltage_table()
         sequence_duty_cycle = self.get_sequence_duty_cycle(solution)
         duty_cycles_limits = np.array(self.duty_cycles)
         if sequence_duty_cycle > duty_cycles_limits.max():
