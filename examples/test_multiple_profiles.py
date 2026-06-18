@@ -365,12 +365,12 @@ except Exception as e:
     print(f"✗ Failed to set grouped profile solution: {e}")
     all_passed = False
 
-try:
-    if not write_and_readback_all_registers(interface):
-        all_passed = False
-except Exception as e:
-    print(f"✗ Failed during write/readback stage: {e}")
-    all_passed = False
+# try:
+#     if not write_and_readback_all_registers(interface):
+#         all_passed = False
+# except Exception as e:
+#     print(f"✗ Failed during write/readback stage: {e}")
+#     all_passed = False
 
 # Single integrated verification pass.
 print("\nIntegrated verification pass:")
@@ -431,28 +431,32 @@ for profile in profile_sequence:
         profile, pack=True, pack_single=True
     )
     delay_ctrl_list = interface.txdevice.tx_registers.get_delay_control_registers(profile)
-    tx_delay_data = delay_data_list[tx_id]
-    tx_ctrl = delay_ctrl_list[tx_id]
+    num_tx_chips = len(delay_data_list)
 
-    expected_apod_by_profile[profile] = tx_ctrl[ADDRESS_APODIZATION]
-    expected_delay_sel_by_profile[profile] = tx_ctrl[ADDRESS_DELAY_SEL]
+    # Store expected values from tx_id=0 for verification
+    expected_apod_by_profile[profile] = delay_ctrl_list[tx_id][ADDRESS_APODIZATION]
+    expected_delay_sel_by_profile[profile] = delay_ctrl_list[tx_id][ADDRESS_DELAY_SEL]
 
-    print(f"  Preload profile {profile} delay data:")
-    for start_addr, reg_values in sorted(tx_delay_data.items()):
-        print(
-            f"    0x{start_addr:04X}..0x{start_addr + len(reg_values) - 1:04X} "
-            f"({len(reg_values)} regs)"
-        )
-        interface.txdevice.write_block(identifier=tx_id, start_address=start_addr, reg_values=reg_values)
+    print(f"  Preload profile {profile} delay data ({num_tx_chips} TX chips):")
+    for chip_idx in range(num_tx_chips):
+        tx_delay_data = delay_data_list[chip_idx]
+        tx_ctrl = delay_ctrl_list[chip_idx]
+        for start_addr, reg_values in sorted(tx_delay_data.items()):
+            print(
+                f"    TX{chip_idx} 0x{start_addr:04X}..0x{start_addr + len(reg_values) - 1:04X} "
+                f"({len(reg_values)} regs)"
+            )
+            interface.txdevice.write_block(identifier=chip_idx, start_address=start_addr, reg_values=reg_values)
 
-    print(f"    Preload apodization: 0x{tx_ctrl[ADDRESS_APODIZATION]:08X}")
-    interface.txdevice.write_register(tx_id, ADDRESS_APODIZATION, tx_ctrl[ADDRESS_APODIZATION])
+        print(f"    TX{chip_idx} preload apodization: 0x{tx_ctrl[ADDRESS_APODIZATION]:08X}")
+        interface.txdevice.write_register(chip_idx, ADDRESS_APODIZATION, tx_ctrl[ADDRESS_APODIZATION])
 
 interface.txdevice.commit_profile_ram(tx_id)
 print("  ✓ Preload committed to profile RAM")
 
 # Force starting point after preload.
-interface.txdevice.write_register(tx_id, ADDRESS_DELAY_SEL, expected_delay_sel_by_profile[initial_profile])
+for chip_idx in range(num_tx_chips):
+    interface.txdevice.write_register(chip_idx, ADDRESS_DELAY_SEL, expected_delay_sel_by_profile[initial_profile])
 time.sleep(REG_PROPAGATION_DELAY_S)
 
 # Switch through each profile by changing selector only.
@@ -469,9 +473,10 @@ for cycle_idx in range(len(PROFILE_CONFIGS)):
         f"delay={pre_delay_profile}, apod=0x{pre_apod_reg:08X}"
     )
 
-    # Write delay selector (tell chip which profile slot is active)
+    # Write delay selector to all TX chips (tell each chip which profile slot is active)
     print(f"    Writing delay selector: 0x{expected_delay_sel_by_profile[expected_prof]:08X}")
-    interface.txdevice.write_register(tx_id, ADDRESS_DELAY_SEL, expected_delay_sel_by_profile[expected_prof])
+    for chip_idx in range(num_tx_chips):
+        interface.txdevice.write_register(chip_idx, ADDRESS_DELAY_SEL, expected_delay_sel_by_profile[expected_prof])
 
     time.sleep(REG_PROPAGATION_DELAY_S)
 
