@@ -49,6 +49,10 @@ TRIGGER_RUN_S = 0.40
 MAX_ACTIVE_TRIGGER_TIME_S = 10.0
 MAX_REGISTER_READ_COUNT = 62  # Device/API read_block limit
 
+# Debug aid: keep all channels enabled on every profile to isolate
+# physical output issues from apodization masking behavior.
+FORCE_ALL_CHANNELS_ON = False
+
 # HV validation for grouped profile/trigger verification
 # VOLTAGE = 20.0
 # HV_SETTLE_RANGE_V = 2.0
@@ -307,21 +311,25 @@ for cfg in PROFILE_CONFIGS:
         delays = np.zeros(CHANNEL_COUNT)
     multi_delays.append(delays)
     
-    # Apodizations: vary by profile for distinction
-    # Profile 1: uniform (all 1.0)
-    # Profile 2: ramped (0.5 -> 1.0)
-    # Profile 3: windowed (1.0 in center, taper edges)
-    # Profile 4: inverted (opposite of profile 3)                                  
-    # if cfg["index"] == 1:
-    #     apod = np.ones(CHANNEL_COUNT)
-    # elif cfg["index"] == 2:
-    #     apod = np.linspace(0.5, 1.0, CHANNEL_COUNT)
-    # elif cfg["index"] == 3:
-    #     apod = np.hanning(CHANNEL_COUNT)
-    # else:  # cfg["index"] == 4
-    #     apod = 1.0 - np.hanning(CHANNEL_COUNT)
+    # Apodization is provided as logical 0.0/1.0 values at script level.
+    # Register-level active-low inversion happens in SDK/firmware mapping.
+    apod = np.zeros(CHANNEL_COUNT, dtype=float)
 
-    apod = np.ones(CHANNEL_COUNT)
+    if FORCE_ALL_CHANNELS_ON:
+        apod[:] = 1.0
+    elif cfg["index"] == 1:
+        # Profile 1: all channels enabled.
+        apod[:] = 1.0
+    elif cfg["index"] == 2:
+        # Profile 2: channels 1-32 on, channels 33-64 off.
+        apod[: CHANNEL_COUNT // 2] = 1.0
+    elif cfg["index"] == 3:
+        # Profile 3: channels 1-32 off, channels 33-64 on.
+        apod[CHANNEL_COUNT // 2 :] = 1.0
+    else:  # cfg["index"] == 4
+        # Profile 4: all channels enabled.
+        apod[:] = 1.0
+
     multi_apods.append(apod)
     
     # Pulse config: single dict shared across all
