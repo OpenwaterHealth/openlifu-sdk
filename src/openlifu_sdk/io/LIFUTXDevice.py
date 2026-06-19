@@ -131,6 +131,8 @@ from openlifu_sdk.io.LIFUConfig import (
     NODE_MODE_APP,
     NODE_MODE_BOOTLOADER,
     NODE_MODE_UNKNOWN,
+    OW_CTRL_GET_PROFILE,
+    OW_CTRL_SET_PROFILE,
     OW_CTRL_SET_PROFILE_CYCLE,
     OW_CMD_GET_TEMP,
     OW_CMD_HWID,
@@ -419,6 +421,46 @@ class TxDevice(OWComponent):
             "profile_index": trigger_json["ProfileIndex"],
             "profile_increment": bool(trigger_json["ProfileIncrement"]),
         }
+
+    def set_profile(self, profile: int, identifier: int | None = None) -> bool:
+        """Set active TX profile via MCU controller command.
+
+        This routes profile switching through firmware (OW_CTRL_SET_PROFILE),
+        allowing MCU-side profile bookkeeping (including apodization handling)
+        instead of direct host register writes.
+        """
+        if profile not in VALID_DELAY_PROFILES:
+            raise ValueError(f"Invalid profile {profile}. Expected 1-16.")
+
+        payload = struct.pack('<B', profile)
+        tx_ids = self._iter_target_tx_ids(identifier)
+        for tx_id in tx_ids:
+            self.send_checked(
+                packet_type=OW_CONTROLLER,
+                command=OW_CTRL_SET_PROFILE,
+                addr=tx_id,
+                data=payload,
+                op=f"set_profile[{tx_id}]",
+            )
+        return True
+
+    def get_profile(self, identifier: int) -> int:
+        """Read active TX profile via MCU controller command."""
+        if identifier < 0:
+            raise ValueError("TX chip identifier must be >= 0")
+
+        r = self.send_checked(
+            packet_type=OW_CONTROLLER,
+            command=OW_CTRL_GET_PROFILE,
+            addr=identifier,
+            op=f"get_profile[{identifier}]",
+        )
+        if r.data_len < 1 or not r.data:
+            raise LIFUProtocolError(
+                f"TX: get_profile payload too short ({r.data_len} < 1)",
+                code=LIFU_ERR_BAD_PAYLOAD_LENGTH,
+            )
+        return int(r.data[0])
 
     def start_trigger(self) -> bool:
         """Start the software trigger on the TX device.
