@@ -46,7 +46,7 @@ REGISTER_0X18_READ_COMPARE_MASK = 0x07FFFFFF  # Ignore bits 31-27 on read per da
 # Short timing for integrated verification (keep total active trigger time < 10s)
 REG_PROPAGATION_DELAY_S = 0.025
 TRIGGER_RUN_S = 0.40
-MAX_ACTIVE_TRIGGER_TIME_S = 10.0
+MAX_ACTIVE_TRIGGER_TIME_S = 60.0
 MAX_REGISTER_READ_COUNT = 62  # Device/API read_block limit
 
 # Debug aid: keep all channels enabled on every profile to isolate
@@ -397,6 +397,9 @@ else:
     hv_baseline = interface.hvcontroller.get_voltage()
     print(f"  HV baseline set/readback: target={VOLTAGE:.1f}V measured={hv_baseline:.2f}V")
 
+
+num_tx_devices = interface.txdevice.enum_tx7332_devices()
+
 # Verify that initial profile is active (first configured profile)
 initial_profile = 1
 print(f"\nVerifying initial active profile: {initial_profile}")
@@ -467,9 +470,10 @@ for chip_idx in range(num_tx_chips):
     interface.txdevice.write_register(chip_idx, ADDRESS_DELAY_SEL, expected_delay_sel_by_profile[initial_profile])
 time.sleep(REG_PROPAGATION_DELAY_S)
 
-# Switch through each profile by changing selector only.
+# Switch through each profile by changing selector only, repeating the sequence 10 times.
+SEQUENCE_REPEAT_COUNT = 10
 active_trigger_time_s = 0.0
-for cycle_idx in range(len(PROFILE_CONFIGS)):
+for cycle_idx in range(len(PROFILE_CONFIGS) * SEQUENCE_REPEAT_COUNT):
     expected_prof = profile_sequence[(cycle_idx + 1) % len(profile_sequence)]
     print(f"  Cycle {cycle_idx}: Switching to next profile {expected_prof}")
 
