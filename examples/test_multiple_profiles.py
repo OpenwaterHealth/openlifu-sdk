@@ -21,9 +21,6 @@ import time
 
 from openlifu_sdk import LIFUInterface
 from openlifu_sdk.io.LIFUTXDevice import (
-    # Tx7332DelayProfile,
-    # Tx7332PulseProfile,
-    # TxDeviceRegisters,
     ADDRESS_DELAY_SEL,
     ADDRESS_APODIZATION,
 )
@@ -52,49 +49,6 @@ MAX_REGISTER_READ_COUNT = 62  # Device/API read_block limit
 # Debug aid: keep all channels enabled on every profile to isolate
 # physical output issues from apodization masking behavior.
 FORCE_ALL_CHANNELS_ON = False
-
-# HV validation for grouped profile/trigger verification
-# VOLTAGE = 20.0
-# HV_SETTLE_RANGE_V = 2.0
-# HV_SETTLE_TIME_S = 0.2
-# HV_SETTLE_TIMEOUT_S = 10.0
-
-# Watertank-inspired profile sequence configurations for fast QA.
-# Reference point from test_watertank.py:
-# - duration_msec = 5
-# - interval_msec = 100
-# Here we keep a ~5 ms burst window per profile but vary PRF/count/train interval
-# so each profile is easy to differentiate on an oscilloscope.
-# PROFILE_CONFIGS = [
-#     {
-#         "index": 1,
-#         "pulse_interval": 0.0020,
-#         "pulse_count": 3,
-#         "pulse_train_interval": 0.120,
-#         "pulse_train_count": 2,
-#     },
-#     {
-#         "index": 2,
-#         "pulse_interval": 0.0010,
-#         "pulse_count": 5,
-#         "pulse_train_interval": 0.090,
-#         "pulse_train_count": 2,
-#     },
-#     {
-#         "index": 3,
-#         "pulse_interval": 0.0005,
-#         "pulse_count": 10,
-#         "pulse_train_interval": 0.060,
-#         "pulse_train_count": 2,
-#     },
-#     {
-#         "index": 4,
-#         "pulse_interval": 0.00025,
-#         "pulse_count": 20,
-#         "pulse_train_interval": 0.040,
-#         "pulse_train_count": 2,
-#     },
-# ]
 
 PROFILE_CONFIGS = [
     {
@@ -147,35 +101,62 @@ def read_active_delay_profile(delay_select_reg: int) -> int:
     return profile_field + 1  # Convert 0-based to 1-based
 
 
-def verify_delay_profile_selected(interface, tx_id: int, expected_profile: int, stage: str) -> bool:
+def verify_delay_profile_selected(interface, expected_profile: int, stage: str, num_tx_devices: int) -> list[int]:
+    """Read delay profile on all chips and verify they match.
+
+    Returns list of per-chip delay profile values.
+    Raises RuntimeError if chip values do not match each other.
     """
-    Verify that expected delay profile (1-16) is currently selected on the chip.
-    Reads delay selector register and validates active delay profile.
-    """
-    delay_reg  = interface.txdevice.read_register(tx_id, ADDRESS_DELAY_SEL)
+    delay_profiles = []
+    for chip_idx in range(num_tx_devices):
+        delay_reg = interface.txdevice.read_register(chip_idx, ADDRESS_DELAY_SEL)
+        delay_profiles.append(read_active_delay_profile(delay_reg))
 
-    delay_profile = read_active_delay_profile(delay_reg)
-
-    if delay_profile != expected_profile:
-        print(f"  ✗ {stage}: Delay profile mismatch: expected {expected_profile}, got {delay_profile}")
-        return False
-
-    print(f"  ✓ {stage}: Delay profile {expected_profile} verified (delay={delay_profile})")
-    return True
-
-
-def verify_apodization_register(interface, tx_id: int, expected_value: int, stage: str) -> bool:
-    """Verify apodization register 0x1B matches expected value."""
-    apod_reg = interface.txdevice.read_register(tx_id, ADDRESS_APODIZATION)
-    if apod_reg != expected_value:
-        print(
-            f"  ✗ {stage}: Apodization mismatch: "
-            f"expected 0x{expected_value:08X}, got 0x{apod_reg:08X}"
+    if any(v != delay_profiles[0] for v in delay_profiles[1:]):
+        raise RuntimeError(
+            f"{stage}: chip delay profile mismatch across chips: {delay_profiles}"
         )
-        return False
 
-    print(f"  ✓ {stage}: Apodization verified (0x{apod_reg:08X})")
-    return True
+    if delay_profiles[0] != expected_profile:
+        print(
+            f"  [FAIL] {stage}: Delay profile mismatch: "
+            f"expected {expected_profile}, got {delay_profiles}"
+        )
+    else:
+        print(
+            f"  [OK] {stage}: Delay profile {expected_profile} verified "
+            f"(delay={delay_profiles})"
+        )
+    return delay_profiles
+
+
+def verify_apodization_register(interface, expected_value: int, stage: str, num_tx_devices: int) -> list[int]:
+    """Read apodization register on all chips and verify they match.
+
+    Returns list of per-chip apodization values.
+    Raises RuntimeError if chip values do not match each other.
+    """
+    apod_values = []
+    for chip_idx in range(num_tx_devices):
+        apod_values.append(interface.txdevice.read_register(chip_idx, ADDRESS_APODIZATION))
+
+    if any(v != apod_values[0] for v in apod_values[1:]):
+        raise RuntimeError(
+            f"{stage}: chip apodization mismatch across chips: "
+            f"{[f'0x{v:08X}' for v in apod_values]}"
+        )
+
+    if apod_values[0] != expected_value:
+        print(
+            f"  [FAIL] {stage}: Apodization mismatch: "
+            f"expected 0x{expected_value:08X}, got {[f'0x{v:08X}' for v in apod_values]}"
+        )
+    else:
+        print(
+            f"  [OK] {stage}: Apodization verified "
+            f"({[f'0x{v:08X}' for v in apod_values]})"
+        )
+    return apod_values
 
 
 def write_and_readback_all_registers(interface) -> bool:
@@ -209,9 +190,9 @@ def write_and_readback_all_registers(interface) -> bool:
 
     print("\nWriting all configured TX registers to hardware...")
     if not interface.txdevice.apply_all_registers():
-        print("✗ Failed to write all registers to hardware")
+        print("[FAIL] Failed to write all registers to hardware")
         return False
-    print("✓ Register write complete")
+    print("[OK] Register write complete")
 
     print("\nReading back all configured TX registers from chip(s)...")
     packed_registers = interface.txdevice.tx_registers.get_registers(
@@ -240,7 +221,7 @@ def write_and_readback_all_registers(interface) -> bool:
 
             if read_vals is None:
                 print(
-                    f"    ✗ 0x{start_addr:04X}..0x{start_addr + len(expected_vals) - 1:04X} read failed"
+                    f"    [FAIL] 0x{start_addr:04X}..0x{start_addr + len(expected_vals) - 1:04X} read failed"
                 )
                 readback_ok = False
                 continue
@@ -257,26 +238,25 @@ def write_and_readback_all_registers(interface) -> bool:
                 if actual_cmp != expected_cmp:
                     if addr == 0x0018:
                         print(
-                            "      ✗ mismatch expected "
+                            "      [FAIL] mismatch expected "
                             f"0x{expected:08X} (masked=0x{expected_cmp:08X})"
                         )
                     else:
-                        print(f"      ✗ mismatch expected 0x{expected:08X}")
+                        print(f"      [FAIL] mismatch expected 0x{expected:08X}")
                     readback_ok = False
 
     if readback_ok:
-        print("✓ Register readback complete: all values match configured data")
+        print("[OK] Register readback complete: all values match configured data")
     else:
-        print("✗ Register readback complete: mismatches detected")
+        print("[FAIL] Register readback complete: mismatches detected")
 
     return readback_ok
 
 print("=" * SEPARATOR_LINE_WIDTH)
-print("TX7332 PROFILE QA TEST")
+print("TX7332 MULTIPLE PROFILE AND APODIZATIONS QA TEST")
 print("=" * SEPARATOR_LINE_WIDTH)
 print(f"Frequency: {FIXED_FREQUENCY_HZ:.0f} kHz")
-print("Single integrated grouped-profile verification (profile + HV + trigger)")
-print(f"Testing {len(PROFILE_CONFIGS)} profiles with short sequence timing\n")
+print(f"Testing {len(PROFILE_CONFIGS)} profiles\n")
 
 for cfg in PROFILE_CONFIGS:
     validate_profile_timing(cfg)
@@ -288,15 +268,11 @@ if not interface.hvcontroller.get_12v_status():
     time.sleep(2)
 
 
-tx_id = 0  # Assume single TX device for now, once 1 is working make sure multiple work
+tx_id = 0  # Representative chip index for summary readouts.
 all_passed = True
 
-print("\n" + "=" * SEPARATOR_LINE_WIDTH)
-print("INTEGRATED GROUPED VERIFICATION")
-print("-" * SEPARATOR_LINE_WIDTH)
-
 # Build multi-profile solution
-print("\nBuilding multi-profile solution with grouped packages...")
+print("\nBuilding multiple profiles...")
 
 # Build delays and apodizations for all profiles
 multi_delays = []
@@ -321,11 +297,13 @@ for cfg in PROFILE_CONFIGS:
         # Profile 1: all channels enabled.
         apod[:] = 1.0
     elif cfg["index"] == 2:
-        # Profile 2: channels 1-32 on, channels 33-64 off.
-        apod[: CHANNEL_COUNT // 2] = 1.0
+        # Profile 2: alternating channels on across full aperture.
+        # This keeps chip-0 and chip-1 masks identical.
+        apod[0::2] = 1.0
     elif cfg["index"] == 3:
-        # Profile 3: channels 1-32 off, channels 33-64 on.
-        apod[CHANNEL_COUNT // 2 :] = 1.0
+        # Profile 3: inverse alternating channels on across full aperture.
+        # This keeps chip-0 and chip-1 masks identical.
+        apod[1::2] = 1.0
     else:  # cfg["index"] == 4
         # Profile 4: all channels enabled.
         apod[:] = 1.0
@@ -353,7 +331,7 @@ multi_sequence = {
 }
 
 print(f"  Profiles configured: {len(PROFILE_CONFIGS)}")
-print(f"  Sequence: {multi_sequence}")
+# print(f"  Profiles pulse configurations: {multi_pulse_configs}")
 
 try:
     # Call set_solution; firmware will step through configured profiles in order.
@@ -367,55 +345,66 @@ try:
         profile_index=1,
         profile_increment=True,
     )
-    print("✓ Grouped profile packages sent to firmware")
+    print("[OK] Grouped profile packages sent to firmware")
     
 except Exception as e:
-    print(f"✗ Failed to set grouped profile solution: {e}")
+    print(f"[FAIL] Failed to set grouped profile solution: {e}")
     all_passed = False
 
 # try:
 #     if not write_and_readback_all_registers(interface):
 #         all_passed = False
 # except Exception as e:
-#     print(f"✗ Failed during write/readback stage: {e}")
+#     print(f"[FAIL] Failed during write/readback stage: {e}")
 #     all_passed = False
 
 # Single integrated verification pass.
-print("\nIntegrated verification pass:")
-print("-" * SEPARATOR_LINE_WIDTH)
+# print("\nIntegrated verification pass:")
+# print("-" * SEPARATOR_LINE_WIDTH)
 
 # HV setup for measured output changes during trigger execution.
 if interface.hvcontroller is None:
-    print("  ✗ HV controller not available; cannot validate HV-coupled trigger output changes")
+    print("  [FAIL] HV controller not available; cannot validate HV-coupled trigger output changes")
     all_passed = False
 else:
-    print("  Initializing HV rail for Phase 5...")
+    print("  Turning on HV...")
     interface.hvcontroller.turn_12v_on()
     interface.hvcontroller.turn_hv_on()
     interface.hvcontroller.set_voltage(VOLTAGE)
     interface.hvcontroller.wait_for_settle()
     hv_baseline = interface.hvcontroller.get_voltage()
-    print(f"  HV baseline set/readback: target={VOLTAGE:.1f}V measured={hv_baseline:.2f}V")
+    print(f"  HV readback: target={VOLTAGE:.1f}V measured={hv_baseline:.2f}V")
 
 
-num_tx_devices = interface.txdevice.enum_tx7332_devices()
+if interface.txdevice.tx_registers is None:
+    num_tx_devices = interface.txdevice.enum_tx7332_devices()
+else:
+    num_tx_devices = interface.txdevice.tx_registers.num_transmitters
+print(f"num_tx_devices={num_tx_devices}")
 
 # Verify that initial profile is active (first configured profile)
 initial_profile = 1
 print(f"\nVerifying initial active profile: {initial_profile}")
 
-if not verify_delay_profile_selected(interface, tx_id, initial_profile, "grouped package init"):
+init_delay_profiles = verify_delay_profile_selected(
+    interface,
+    initial_profile,
+    "grouped package init",
+    num_tx_devices,
+)
+print(f"  Initial per-chip delay profiles: {init_delay_profiles}")
+if init_delay_profiles[0] != initial_profile:
     all_passed = False
 
-# Verify apodization was applied (this would require reading apod register from TX7332)
-print(f"  Apodization data for profile {initial_profile} stored in firmware MCU")
+# # Verify apodization was applied (this would require reading apod register from TX7332)
+# print(f"  Apodization data for profile {initial_profile} stored in firmware MCU")
 
 # Walk the grouped set once and verify each profile+HV+trigger combination.
 print(f"\nRunning grouped profile/HV/trigger sequence once...")
 profile_sequence = [cfg["index"] for cfg in PROFILE_CONFIGS]
 print(f"  Sequence: {' -> '.join(map(str, profile_sequence))}")
 
-# Configure trigger once — delay profile switching does not change trigger timing.
+# Configure trigger once - delay profile switching does not change trigger timing.
 interface.txdevice.set_trigger(
     pulse_interval=multi_sequence["pulse_interval"],
     pulse_count=multi_sequence["pulse_count"],
@@ -442,11 +431,18 @@ for profile in profile_sequence:
         profile, pack=True, pack_single=True
     )
     delay_ctrl_list = interface.txdevice.tx_registers.get_delay_control_registers(profile)
-    num_tx_chips = len(delay_data_list)
+    num_tx_chips = num_tx_devices
+    if len(delay_data_list) != num_tx_chips or len(delay_ctrl_list) != num_tx_chips:
+        print(
+            "  [FAIL] Enumerated TX chip count does not match register data: "
+            f"enum={num_tx_chips}, delay_data={len(delay_data_list)}, delay_ctrl={len(delay_ctrl_list)}"
+        )
+        all_passed = False
+        break
 
-    # Store expected values from tx_id=0 for verification
-    expected_apod_by_profile[profile] = delay_ctrl_list[tx_id][ADDRESS_APODIZATION]
-    expected_delay_sel_by_profile[profile] = delay_ctrl_list[tx_id][ADDRESS_DELAY_SEL]
+    # Store expected value from first chip and enforce both chips match.
+    expected_apod_by_profile[profile] = delay_ctrl_list[0][ADDRESS_APODIZATION]
+    expected_delay_sel_by_profile[profile] = delay_ctrl_list[0][ADDRESS_DELAY_SEL]
 
     print(f"  Preload profile {profile} delay data ({num_tx_chips} TX chips):")
     for chip_idx in range(num_tx_chips):
@@ -462,12 +458,13 @@ for profile in profile_sequence:
         print(f"    TX{chip_idx} preload apodization: 0x{tx_ctrl[ADDRESS_APODIZATION]:08X}")
         interface.txdevice.write_register(chip_idx, ADDRESS_APODIZATION, tx_ctrl[ADDRESS_APODIZATION])
 
-interface.txdevice.commit_profile_ram(tx_id)
-print("  ✓ Preload committed to profile RAM")
+for chip_idx in range(num_tx_devices):
+    interface.txdevice.commit_profile_ram(chip_idx)
+print("  [OK] Preload committed to profile RAM for all chips")
 
 # Force starting point after preload.
-for chip_idx in range(num_tx_chips):
-    interface.txdevice.write_register(chip_idx, ADDRESS_DELAY_SEL, expected_delay_sel_by_profile[initial_profile])
+for chip_idx in range(num_tx_devices):
+        interface.txdevice.write_register(chip_idx, ADDRESS_DELAY_SEL, expected_delay_sel_by_profile[initial_profile])
 time.sleep(REG_PROPAGATION_DELAY_S)
 
 # Switch through each profile by changing selector only, repeating the sequence 10 times.
@@ -486,8 +483,11 @@ for cycle_idx in range(len(PROFILE_CONFIGS) * SEQUENCE_REPEAT_COUNT):
     )
 
     # Write delay selector to all TX chips (tell each chip which profile slot is active)
-    print(f"    Writing delay selector: 0x{expected_delay_sel_by_profile[expected_prof]:08X}")
-    for chip_idx in range(num_tx_chips):
+    for chip_idx in range(num_tx_devices):
+        print(
+            f"    Writing delay selector TX{chip_idx}: "
+            f"0x{expected_delay_sel_by_profile[expected_prof]:08X}"
+        )
         interface.txdevice.write_register(chip_idx, ADDRESS_DELAY_SEL, expected_delay_sel_by_profile[expected_prof])
 
     time.sleep(REG_PROPAGATION_DELAY_S)
@@ -501,19 +501,19 @@ for cycle_idx in range(len(PROFILE_CONFIGS) * SEQUENCE_REPEAT_COUNT):
     )
 
     if post_delay_profile == pre_delay_profile:
-        print("    ✗ Delay profile selector did not change after write")
+        print("    [FAIL] Delay profile selector did not change after write")
         all_passed = False
     else:
-        print("    ✓ Delay profile selector changed after write")
+        print("    [OK] Delay profile selector changed after write")
 
     if post_apod_reg != expected_apod_by_profile[expected_prof]:
         print(
-            "    ✗ Apodization register mismatch after switch: "
+            f"    [FAIL] Apodization register mismatch after switch (chip {tx_id}): "
             f"expected 0x{expected_apod_by_profile[expected_prof]:08X}, got 0x{post_apod_reg:08X}"
         )
         all_passed = False
     else:
-        print("    ✓ Apodization register matches expected profile value")
+        print(f"    [OK] Apodization register matches expected profile value (chip {tx_id})")
 
     # Use one HV setpoint across all profiles and verify readback stability.
     if interface.hvcontroller is not None:
@@ -527,28 +527,31 @@ for cycle_idx in range(len(PROFILE_CONFIGS) * SEQUENCE_REPEAT_COUNT):
         active_trigger_time_s += TRIGGER_RUN_S
         print("    Trigger run complete with delay profile active")
     
-    if verify_delay_profile_selected(interface, tx_id, expected_prof, f"cycle {cycle_idx}"):
-        print(f"    ✓ Profile {expected_prof} verified")
-    else:
-        print(f"    ✗ Profile {expected_prof} NOT verified")
+    delay_profiles = verify_delay_profile_selected(interface, expected_prof, f"cycle {cycle_idx}", num_tx_devices)
+    print(f"    Cycle {cycle_idx} per-chip delay profiles: {delay_profiles}")
+    if delay_profiles[0] != expected_prof:
         all_passed = False
 
-    if not verify_apodization_register(interface, tx_id, expected_apod_by_profile[expected_prof], f"cycle {cycle_idx}"):
+    apod_values = verify_apodization_register(
+        interface, expected_apod_by_profile[expected_prof], f"cycle {cycle_idx}", num_tx_devices
+    )
+    print(f"    Cycle {cycle_idx} per-chip apodization: {[f'0x{v:08X}' for v in apod_values]}")
+    if apod_values[0] != expected_apod_by_profile[expected_prof]:
         all_passed = False
 
-print("\n✓ Grouped profile cycle test completed")
+print("\n[OK] Grouped profile cycle test completed")
 print("  (Firmware auto-cycling verified by manual profile selection)")
 print(f"  Total active trigger time: {active_trigger_time_s:.2f}s")
 
 if active_trigger_time_s >= MAX_ACTIVE_TRIGGER_TIME_S:
     print(
-        f"  ✗ Active trigger time exceeds limit: "
+        f"  [FAIL] Active trigger time exceeds limit: "
         f"{active_trigger_time_s:.2f}s >= {MAX_ACTIVE_TRIGGER_TIME_S:.2f}s"
     )
     all_passed = False
 else:
     print(
-        f"  ✓ Active trigger time within limit: "
+        f"  [OK] Active trigger time within limit: "
         f"{active_trigger_time_s:.2f}s < {MAX_ACTIVE_TRIGGER_TIME_S:.2f}s"
     )
 
