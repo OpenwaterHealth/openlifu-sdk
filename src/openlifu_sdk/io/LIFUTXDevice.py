@@ -79,7 +79,8 @@ for row, channels in enumerate(DELAY_ORDER_REVERSED):
     for i, channel in enumerate(channels):
         DELAY_CHANNEL_MAP[channel] = {'row': row, 'lsb': 16*(1-i)}
 DELAY_PROFILE_OFFSET = 16
-VALID_DELAY_PROFILES = list(range(1, 17))
+VALID_PULSE_PROFILES = list(range(0, 17))
+VALID_DELAY_PROFILES = list(range(0, 17))
 DELAY_WIDTH = 13
 APODIZATION_CHANNEL_ORDER = [17, 19, 21, 23, 25, 27, 29, 31, 18, 20, 22, 24, 26, 28, 30, 32, 1, 3, 5, 7, 9, 11, 13, 15, 2, 4, 6, 8, 10, 12, 14, 16]
 APODIZATION_CHANNEL_ORDER_REVERSED = [33 - c for c in APODIZATION_CHANNEL_ORDER]
@@ -88,6 +89,9 @@ PATTERN_PROFILE_OFFSET = 4
 NUM_PATTERN_PROFILES = 32
 VALID_PATTERN_PROFILES = list(range(1, NUM_PATTERN_PROFILES+1))
 PATTERN_PROFILE_SELECT_MASK = 0x3F
+BF_PROF_SEL_G1_SHIFT = 28  # Bits 28-31 for G1 delay profile selector
+BF_PROF_SEL_G2_SHIFT = 12  # Bits 12-15 for G2 delay profile selector
+BF_PROF_SEL_FIELD_MASK = 0x0F  # 4-bit profile field (0-15 for profiles 1-16)
 MAX_PATTERN_PERIODS = 16
 PATTERN_PERIOD_ORDER = [[1, 2, 3, 4],
                  [5, 6, 7, 8],
@@ -131,8 +135,10 @@ from openlifu_sdk.io.LIFUConfig import (
     NODE_MODE_APP,
     NODE_MODE_BOOTLOADER,
     NODE_MODE_UNKNOWN,
-    OW_CTRL_GET_PROFILE,
-    OW_CTRL_SET_PROFILE,
+    OW_CTRL_GET_PATTERN_PROFILE,
+    OW_CTRL_SET_PATTERN_PROFILE,
+    OW_CTRL_SET_DELAY_PROFILE,
+    OW_CTRL_GET_DELAY_PROFILE,
     OW_CTRL_SET_PROFILE_CYCLE,
     OW_CMD_GET_TEMP,
     OW_CMD_HWID,
@@ -422,45 +428,94 @@ class TxDevice(OWComponent):
             "profile_increment": bool(trigger_json["ProfileIncrement"]),
         }
 
-    def set_profile(self, profile: int, identifier: int | None = None) -> bool:
+    # my changes
+    def set_pattern_profile(self, profile: int, identifier: int | None = None) -> bool:
         """Set active TX profile via MCU controller command.
 
-        This routes profile switching through firmware (OW_CTRL_SET_PROFILE),
+        This routes profile switching through firmware (OW_CTRL_SET_PATTERN_PROFILE), 
         allowing MCU-side profile bookkeeping (including apodization handling)
         instead of direct host register writes.
         """
-        if profile not in VALID_DELAY_PROFILES:
+        if profile not in VALID_PULSE_PROFILES:
             raise ValueError(f"Invalid profile {profile}. Expected 1-16.")
 
         payload = struct.pack('<B', profile)
         tx_ids = self._iter_target_tx_ids(identifier)
+
+        # Verify both chips on the module are set
         for tx_id in tx_ids:
-            self.send_checked(
+            r = self.send_checked(
                 packet_type=OW_CONTROLLER,
-                command=OW_CTRL_SET_PROFILE,
+                command=OW_CTRL_SET_PATTERN_PROFILE,
                 addr=tx_id,
                 data=payload,
                 op=f"set_profile[{tx_id}]",
             )
         return True
 
-    def get_profile(self, identifier: int) -> int:
-        """Read active TX profile via MCU controller command."""
-        if identifier < 0:
+    # my changes
+    def get_pattern_profile(self, identifier: int | None = None) -> int:
+        """Read active TX pattern profile via MCU controller command."""
+        if identifier is not None and identifier < 0:
             raise ValueError("TX chip identifier must be >= 0")
 
-        r = self.send_checked(
-            packet_type=OW_CONTROLLER,
-            command=OW_CTRL_GET_PROFILE,
-            addr=identifier,
-            op=f"get_profile[{identifier}]",
-        )
+        tx_ids = self._iter_target_tx_ids(identifier)
+        for tx_id in tx_ids:
+            r = self.send_checked(
+                packet_type=OW_CONTROLLER,
+                command=OW_CTRL_GET_PATTERN_PROFILE,
+                addr=tx_id,
+                op=f"get_pattern_profile[{tx_id}]",
+            )
         if r.data_len < 1 or not r.data:
             raise LIFUProtocolError(
-                f"TX: get_profile payload too short ({r.data_len} < 1)",
+                f"TX: get_pulse_profile payload too short ({r.data_len} < 1)",
                 code=LIFU_ERR_BAD_PAYLOAD_LENGTH,
             )
         return int(r.data[0])
+    
+    def set_delay_profile(self, profile: int, identifier: int | None = None) -> bool:
+        """Set active TX delay profile via MCU controller command.
+
+        This routes delay profile switching through firmware (OW_CTRL_SET_DELAY_PROFILE),
+        allowing MCU-side profile bookkeeping instead of direct host register writes.
+        """
+        if profile not in VALID_DELAY_PROFILES:
+            raise ValueError(f"Invalid delay profile {profile}. Expected 1-16.")
+
+        payload = struct.pack('<B', profile)
+        tx_ids = self._iter_target_tx_ids(identifier)
+        for tx_id in tx_ids:
+            self.send_checked(
+                packet_type=OW_CONTROLLER,
+                command=OW_CTRL_SET_DELAY_PROFILE,
+                addr=tx_id,
+                data=payload,
+                op=f"set_delay_profile[{tx_id}]",
+            )
+        return True
+    
+    def get_delay_profile(self, identifier: int | None = None) -> int:
+        """Read active TX delay profile via MCU controller command."""
+        if identifier is not None and identifier < 0:
+            raise ValueError("TX chip identifier must be >= 0")
+
+        tx_ids = self._iter_target_tx_ids(identifier)
+        for tx_id in tx_ids:
+            r = self.send_checked(
+                packet_type=OW_CONTROLLER,
+                command=OW_CTRL_GET_DELAY_PROFILE,
+                addr=tx_id,
+                op=f"get_delay_profile[{tx_id}]",
+            )
+        if r.data_len < 1 or not r.data:
+            raise LIFUProtocolError(
+                f"TX: get_delay_profile payload too short ({r.data_len} < 1)",
+                code=LIFU_ERR_BAD_PAYLOAD_LENGTH,
+            )
+        return int(r.data[0])
+    
+
 
     def start_trigger(self) -> bool:
         """Start the software trigger on the TX device.
@@ -1999,3 +2054,56 @@ class TxDeviceRegisters:
         if profile is None:
             profile = self.active_profile
         return [tx.get_pulse_data_registers(profile, pack=pack, pack_single=pack_single) for tx in self.transmitters]
+
+    # def get_active_delay_profile(self, chip_id: int=0) -> int:
+    #     """
+    #     Get the currently active delay profile
+
+    #     :param chip_id: ID of the chip to query
+    #     :return: Active delay profile number
+    #     """
+
+    #     delay_reg = self.txdevice.read_register(chip_id, ADDRESS_DELAY_SEL)  # Trigger a read to update the active delay profile
+    #     active_profile_g1 = (delay_reg >> BF_PROF_SEL_G1_SHIFT) & BF_PROF_SEL_FIELD_MASK
+
+
+    #     return active_profile + 1  # Convert 0-based to 1-based
+
+    def get_active_delay_profile(self, chip_id: int=0) -> int:
+        """
+        Get the currently active delay profile from the register model.
+        Ensures both Group 1 and Group 2 are utilizing the same profile.
+
+        :param chip_id: ID of the chip to query
+        :return: Active delay profile number (1-based, 1 to 16)
+        """
+        if chip_id < 0 or chip_id >= len(self.transmitters):
+            raise ValueError(f"Invalid chip_id {chip_id}. Must be 0-{len(self.transmitters) - 1}.")
+
+        delay_reg = self.transmitters[chip_id].get_delay_control_registers()[ADDRESS_DELAY_SEL]
+
+        print(f"Reading delay control register for chip {chip_id}: {delay_reg:#010x}")
+        
+        active_profile_g1 = (delay_reg >> BF_PROF_SEL_G1_SHIFT) & BF_PROF_SEL_FIELD_MASK # Extract Group 1 (Bits 31-28)
+        active_profile_g2 = (delay_reg >> BF_PROF_SEL_G2_SHIFT) & BF_PROF_SEL_FIELD_MASK # Extract Group 2 (Bits 15-12)
+        
+        # Hardware sanity check: Ensure the whole chip is on the same delay profile
+        if active_profile_g1 != active_profile_g2:
+            raise ValueError(
+                f"Desynchronized profiles on chip {chip_id}! "
+                f"G1 is using Profile {active_profile_g1 + 1}, but G2 is using Profile {active_profile_g2 + 1}."
+            )
+            
+        # Return 1-based index
+        return active_profile_g1 + 1
+
+    # def get_active_pattern_profile(self, chip_id: int=0) -> int:
+    #     """
+    #     Get the currently active pattern profile from the device.
+
+    #     :param chip_id: ID of the chip to query
+    #     :return: Active pattern profile number (1-based, 1 to 16)
+    #     """
+    #     pattern_reg = self.txdevice.read_register(chip_id, ADDRESS_PATTERN_SEL)
+    #     active_profile = (pattern_reg >> BF_PROF_SEL_PATTERN_SHIFT) & BF_PROF_SEL_FIELD_MASK
+    #     return active_profile + 1  # Convert 0-based to 1-based
