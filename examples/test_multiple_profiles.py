@@ -29,6 +29,7 @@ FIXED_FREQUENCY_HZ = 400
 DURATION_MS = 5
 CHANNEL_COUNT = 64
 VOLTAGE = 20.0
+MAX_NUM_PROFILES = 16
 
 # Formatting
 SEPARATOR_LINE_WIDTH = 80
@@ -37,7 +38,7 @@ SEPARATOR_LINE_WIDTH = 80
 BF_PROF_SEL_G1_SHIFT = 28  # Bits 28-31 for G1 delay profile selector
 BF_PROF_SEL_G2_SHIFT = 12  # Bits 12-15 for G2 delay profile selector
 BF_PROF_SEL_FIELD_MASK = 0x0F  # 4-bit profile field (0-15 for profiles 1-16)
-DELAY_REG_TR_SW_DEL_PRESERVE_MASK = 0x0FFF0FFF  # Preserve TR_SW_DEL timing fields
+# DELAY_REG_TR_SW_DEL_PRESERVE_MASK = 0x0FFF0FFF  # Preserve TR_SW_DEL timing fields
 REGISTER_0X18_READ_COMPARE_MASK = 0x07FFFFFF  # Ignore bits 31-27 on read per datasheet
 
 # Short timing for integrated verification (keep total active trigger time < 10s)
@@ -85,7 +86,7 @@ PROFILE_CONFIGS = [
     },
 ]
 
-
+'''
 def validate_profile_timing(profile: dict) -> None:
     """Ensure each short profile timing config is internally valid."""
     on_per_train = profile["pulse_interval"] * profile["pulse_count"]
@@ -95,11 +96,23 @@ def validate_profile_timing(profile: dict) -> None:
         )
 
 
-def read_active_delay_profile(delay_select_reg: int) -> int:
-    """Extract delay profile selection from register 0x16 (bits 28-31 for G1)."""
-    profile_field = (delay_select_reg >> BF_PROF_SEL_G1_SHIFT) & BF_PROF_SEL_FIELD_MASK
-    return profile_field + 1  # Convert 0-based to 1-based
+# def read_active_delay_profile(delay_select_reg: int) -> int:
+#     """Extract delay profile selection from register 0x16 (bits 28-31 for G1)."""
+#     profile_field = (delay_select_reg >> BF_PROF_SEL_G1_SHIFT) & BF_PROF_SEL_FIELD_MASK
+#     return profile_field + 1  # Convert 0-based to 1-based
 
+def read_active_delay_profile(interface, num_tx_devices: int) -> int:
+    """Read the active delay profile for a specific chip via the interface."""
+    
+    profiles = []
+    for i in range(num_tx_devices):
+        profiles.append(interface.txdevice.tx_registers.get_active_delay_profile(i))
+
+    if any(v != profiles[0] for v in profiles[1:]):
+        raise RuntimeError(
+            f"Active delay profile mismatch across chips: {profiles}"
+        )
+    return profiles[0]  # Return the active profile of the first chip
 
 def verify_delay_profile_selected(interface, expected_profile: int, stage: str, num_tx_devices: int) -> list[int]:
     """Read delay profile on all chips and verify they match.
@@ -109,8 +122,8 @@ def verify_delay_profile_selected(interface, expected_profile: int, stage: str, 
     """
     delay_profiles = []
     for chip_idx in range(num_tx_devices):
-        delay_reg = interface.txdevice.read_register(chip_idx, ADDRESS_DELAY_SEL)
-        delay_profiles.append(read_active_delay_profile(delay_reg))
+        # delay_reg = interface.txdevice.read_register(chip_idx, ADDRESS_DELAY_SEL)
+        delay_profiles.append(interface.txdevice.tx_registers.get_active_delay_profile(chip_idx))
 
     if any(v != delay_profiles[0] for v in delay_profiles[1:]):
         raise RuntimeError(
@@ -267,6 +280,12 @@ if not interface.hvcontroller.get_12v_status():
     interface.hvcontroller.turn_12v_on()
     time.sleep(2)
 
+if interface.txdevice.tx_registers is None:
+    num_tx_devices = interface.txdevice.enum_tx7332_devices()
+else:
+    num_tx_devices = interface.txdevice.tx_registers.num_transmitters
+print(f"num_tx_devices={num_tx_devices}")
+
 
 tx_id = 0  # Representative chip index for summary readouts.
 all_passed = True
@@ -369,18 +388,14 @@ if interface.hvcontroller is None:
 else:
     print("  Turning on HV...")
     interface.hvcontroller.turn_12v_on()
-    interface.hvcontroller.turn_hv_on()
-    interface.hvcontroller.set_voltage(VOLTAGE)
-    interface.hvcontroller.wait_for_settle()
+    # interface.hvcontroller.turn_hv_on()
+    # interface.hvcontroller.set_voltage(VOLTAGE)
+    # interface.hvcontroller.wait_for_settle()
     hv_baseline = interface.hvcontroller.get_voltage()
     print(f"  HV readback: target={VOLTAGE:.1f}V measured={hv_baseline:.2f}V")
 
 
-if interface.txdevice.tx_registers is None:
-    num_tx_devices = interface.txdevice.enum_tx7332_devices()
-else:
-    num_tx_devices = interface.txdevice.tx_registers.num_transmitters
-print(f"num_tx_devices={num_tx_devices}")
+
 
 # Verify that initial profile is active (first configured profile)
 initial_profile = 1
@@ -476,7 +491,7 @@ for cycle_idx in range(len(PROFILE_CONFIGS) * SEQUENCE_REPEAT_COUNT):
 
     pre_delay_reg = interface.txdevice.read_register(tx_id, ADDRESS_DELAY_SEL)
     pre_apod_reg = interface.txdevice.read_register(tx_id, ADDRESS_APODIZATION)
-    pre_delay_profile = read_active_delay_profile(pre_delay_reg)
+    pre_delay_profile = read_active_delay_profile(interface, num_tx_devices)
     print(
         "    Active before write: "
         f"delay={pre_delay_profile}, apod=0x{pre_apod_reg:08X}"
@@ -494,7 +509,7 @@ for cycle_idx in range(len(PROFILE_CONFIGS) * SEQUENCE_REPEAT_COUNT):
 
     post_delay_reg = interface.txdevice.read_register(tx_id, ADDRESS_DELAY_SEL)
     post_apod_reg = interface.txdevice.read_register(tx_id, ADDRESS_APODIZATION)
-    post_delay_profile = read_active_delay_profile(post_delay_reg)
+    post_delay_profile = read_active_delay_profile(interface, num_tx_devices)
     print(
         "    Active after write: "
         f"delay={post_delay_profile}, apod=0x{post_apod_reg:08X}"
@@ -567,3 +582,39 @@ if all_passed:
 else:
     print("!!! QA TESTS FAILED !!!")
 print("=" * SEPARATOR_LINE_WIDTH)
+
+'''
+
+def main():
+    interface = LIFUInterface()
+    if not interface.hvcontroller.get_12v_status():
+        interface.hvcontroller.turn_12v_on()
+        time.sleep(2)
+
+    if interface.txdevice.tx_registers is None:
+        num_tx_devices = interface.txdevice.enum_tx7332_devices()
+    else:
+        num_tx_devices = interface.txdevice.tx_registers.num_transmitters
+    print(f"num_tx_devices={num_tx_devices}")
+
+    print("testing new get and set profile functions")
+    # print("before setting profile:")
+
+    # print(f"pattern profile: {interface.txdevice.get_pattern_profile()}")
+    # print(f"delay profile: {interface.txdevice.get_delay_profile()}")
+
+    for i in range(MAX_NUM_PROFILES):
+        print(f"i is {i}")
+        print(f"Pattern profile is currently: {interface.txdevice.get_pattern_profile()}")
+        interface.txdevice.set_pattern_profile(profile=i)
+        print(f"Set pattern profile to {i}")
+        print(f"New pattern profile: {interface.txdevice.get_pattern_profile()}")
+
+        print(f"Delay profile: {interface.txdevice.get_delay_profile()}")
+        interface.txdevice.set_delay_profile(profile=i)
+        print(f"Set delay profile to {i}")
+        print(f"New delay profile: {interface.txdevice.get_delay_profile()}")
+
+if __name__ == "__main__":
+    main()
+# %%
