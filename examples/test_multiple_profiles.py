@@ -45,6 +45,51 @@ REGISTER_0X18_READ_COMPARE_MASK = 0x07FFFFFF  # Ignore bits 31-27 on read per da
 REG_PROPAGATION_DELAY_S = 0.025
 TRIGGER_RUN_S = 0.40
 MAX_ACTIVE_TRIGGER_TIME_S = 60.0
+
+def get_profile_delay_sequence(profile_number: int) -> np.ndarray:
+    """Return the profile delay sequence from the commented multi-profile section.
+
+    Profiles 2 and 4: all channels delayed by 100 us.
+    Profiles 1 and 3: all channels set to 0 us.
+    """
+    if profile_number in (2, 4):
+        return np.full((1, CHANNEL_COUNT), 100e-6, dtype=float)
+    return np.zeros((1, CHANNEL_COUNT), dtype=float)
+
+
+def read_profile_delays_all_chips(interface: LIFUInterface,
+                                  profile_number: int,
+                                  num_tx_devices: int) -> np.ndarray:
+    """Read and concatenate delay profile values from all TX chips (64 channels total)."""
+    all_delays = []
+    for i in range(num_tx_devices):
+        result = interface.txdevice.read_delay_profile_value(
+            profile_number=profile_number,
+            identifier=i,
+            units="s",
+        )
+        print(f"delay profile readback for tx={i}, profile={profile_number}")
+        print(f"  raw_registers[0:4]={result['raw_registers'][:4]}")
+        print(f"  delays ({len(result['delays'])} channels)={result['delays']}")
+        all_delays.extend(result["delays"])
+    # for chip_idx in range(num_tx_devices):
+    #     result = interface.txdevice.read_delay_profile_value(
+    #         profile_number=profile_number,
+    #         identifier=chip_idx,
+    #         units="s",
+    #     )
+    #     print(f"delay profile readback for tx={chip_idx}, profile={profile_number}")
+    #     print(f"  raw_registers[0:4]={result['raw_registers'][:4]}")
+    #     print(f"  delays ({len(result['delays'])} channels)={result['delays']}")
+    #     all_delays.extend(result["delays"])
+    return np.array(all_delays, dtype=float)
+
+
+def quantize_delays_to_device(delays_seconds: np.ndarray, bf_clk_hz: float) -> np.ndarray:
+    """Match device packing behavior: integer ticks via truncation to floor."""
+    return np.floor(delays_seconds * bf_clk_hz) / bf_clk_hz
+
+
 MAX_REGISTER_READ_COUNT = 62  # Device/API read_block limit
 
 # Debug aid: keep all channels enabled on every profile to isolate
@@ -586,34 +631,177 @@ print("=" * SEPARATOR_LINE_WIDTH)
 '''
 
 def main():
+    # Create the hardware interface used by this short readback test.
     interface = LIFUInterface()
+    # Ensure 12V rail is on before programming profiles.
     if not interface.hvcontroller.get_12v_status():
+        # Enable the 12V rail when it is currently off.
         interface.hvcontroller.turn_12v_on()
+        # Allow hardware power rail to settle.
         time.sleep(2)
 
+    # Enumerate TX chips if not already enumerated in this session.
     if interface.txdevice.tx_registers is None:
+        # Query hardware and create register model.
         num_tx_devices = interface.txdevice.enum_tx7332_devices()
     else:
+        # Reuse previously discovered device count.
         num_tx_devices = interface.txdevice.tx_registers.num_transmitters
+    # Print detected device count for visibility.
     print(f"num_tx_devices={num_tx_devices}")
 
     print("testing new get and set profile functions")
+
     # print("before setting profile:")
 
     # print(f"pattern profile: {interface.txdevice.get_pattern_profile()}")
     # print(f"delay profile: {interface.txdevice.get_delay_profile()}")
+    '''
+        for i in range(MAX_NUM_PROFILES):
+            print(f"i is {i}")
+            print(f"Pattern profile is currently: {interface.txdevice.get_pattern_profile()}")
+            interface.txdevice.set_pattern_profile(profile=i)
+            print(f"Set pattern profile to {i}")
+            print(f"New pattern profile: {interface.txdevice.get_pattern_profile()}")
 
-    for i in range(MAX_NUM_PROFILES):
-        print(f"i is {i}")
-        print(f"Pattern profile is currently: {interface.txdevice.get_pattern_profile()}")
-        interface.txdevice.set_pattern_profile(profile=i)
-        print(f"Set pattern profile to {i}")
-        print(f"New pattern profile: {interface.txdevice.get_pattern_profile()}")
+            print(f"Delay profile: {interface.txdevice.get_delay_profile()}")
+            interface.txdevice.set_delay_profile(profile=i)
+            print(f"Set delay profile to {i}")
+            print(f"New delay profile: {interface.txdevice.get_delay_profile()}")
+    '''
+    # Build a pulse configuration for set_solution.
+    pulse = {
+        # Set pulse frequency in Hz.
+        "frequency": FIXED_FREQUENCY_HZ * 1e3,
+        # Set pulse duration in seconds.
+        "duration": DURATION_MS * 1e-3,
+        # Use full-scale amplitude.
+        "amplitude": 1.0,
+    }
+    # Program and verify exactly 4 profiles, matching the commented test section.
+    profile_numbers = [1, 2, 3, 4]
+    # Build one delay row per profile.
+    delay_rows = [get_profile_delay_sequence(profile_number).reshape(-1)
+                  for profile_number in profile_numbers]
+    delays = np.array(delay_rows, dtype=float)
 
-        print(f"Delay profile: {interface.txdevice.get_delay_profile()}")
-        interface.txdevice.set_delay_profile(profile=i)
-        print(f"Set delay profile to {i}")
-        print(f"New delay profile: {interface.txdevice.get_delay_profile()}")
+    print("delays to be written:")
+    for idx, profile_number in enumerate(profile_numbers):
+        print(f"  profile {profile_number}: first 8 channels={delays[idx][:8]}")
+
+    # Build one apodization row per profile (all channels enabled).
+    apodizations = np.ones((len(profile_numbers), CHANNEL_COUNT), dtype=float)
+    # Build a minimal trigger sequence dictionary required by set_solution.
+    sequence = {
+        # Time between pulses in seconds.
+        "pulse_interval": 0.1,
+        # Number of pulses per train.
+        "pulse_count": 10,
+        # Time between pulse trains in seconds.
+        "pulse_train_interval": 1.0,
+        # Number of pulse trains.
+        "pulse_train_count": 1,
+    }
+
+    # Program all 4 profiles through set_solution.
+    interface.txdevice.set_solution(
+        # Provide pulse configuration.
+        pulse=pulse,
+        # Provide delay table.
+        delays=delays,
+        # Provide apodization table.
+        apodizations=apodizations,
+        # Provide trigger sequence.
+        sequence=sequence,
+        # Use sequence trigger mode.
+        trigger_mode="sequence",
+        # Activate profile 1 after programming.
+        profile_index=1,
+        # Enable increment so firmware can cycle profiles in order.
+        profile_increment=True,
+        # Explicit execution order for this 4-profile test.
+        execution_order=profile_numbers,
+    )
+
+    # Commit profile RAM and apply all registers (matching commented section).
+    interface.txdevice.commit_profile_ram()
+    interface.txdevice.apply_all_registers()
+    time.sleep(0.025)
+
+    # Pre-compute delay selector register values for each profile.
+    delay_sel_by_profile = {}
+    for profile_number in profile_numbers:
+        interface.txdevice.tx_registers.activate_delay_profile(profile_number)
+        delay_ctrl_list = interface.txdevice.tx_registers.get_delay_control_registers()
+        delay_sel_by_profile[profile_number] = delay_ctrl_list[0][ADDRESS_DELAY_SEL]
+
+    interface.hvcontroller.set_voltage(VOLTAGE)
+    interface.hvcontroller.turn_hv_on()
+
+    while True:
+        for profile_number in profile_numbers:
+            # Write delay selector register directly to all TX devices (matching commented section).
+            # for chip_idx in range(num_tx_devices):
+            #     interface.txdevice.write_register(chip_idx, ADDRESS_DELAY_SEL, delay_sel_by_profile[profile_number])
+            print("Current selected delay profile:", interface.txdevice.get_delay_profile())
+            print("Setting delay profile to:", profile_number)
+            interface.txdevice.set_delay_profile(profile=profile_number)
+            print("New selected delay profile:", interface.txdevice.get_delay_profile())
+            
+            time.sleep(0.025)
+            interface.txdevice.start_trigger()
+            time.sleep(0.1)
+            print(f"Profile {profile_number} triggered")
+            time.sleep(1)
+            interface.txdevice.stop_trigger()
+
+
+    print("\n[OK] 4-profile test complete. Oscilloscope should show delay variations:")
+    print("  Profiles 1, 3: 0 delay")
+    print("  Profiles 2, 4: 100 us delay")
+
+    bf_clk_hz = interface.txdevice.tx_registers.bf_clk
+    tick_s = 1.0 / bf_clk_hz
+
+    # Read back and verify each of the 4 profiles independently.
+    for idx, profile_number in enumerate(profile_numbers):
+        print(f"\nDelay profile readback for profile {profile_number}:")
+        readback_delays = read_profile_delays_all_chips(
+            interface=interface,
+            profile_number=profile_number,
+            num_tx_devices=num_tx_devices,
+        )
+        written_delays = delays[idx]
+        expected_quantized = quantize_delays_to_device(written_delays, bf_clk_hz)
+
+        if readback_delays.size != CHANNEL_COUNT:
+            raise RuntimeError(
+                f"Profile {profile_number}: expected {CHANNEL_COUNT} readback delays, got {readback_delays.size}"
+            )
+
+        abs_err = np.abs(readback_delays - expected_quantized)
+        max_err = float(np.max(abs_err))
+        max_err_idx = int(np.argmax(abs_err))
+
+        print("full 64-channel compare (quantized):")
+        print(f"  bf_clk_hz={bf_clk_hz}")
+        print(f"  tick_s={tick_s:.3e}")
+        print(f"  max_abs_error={max_err:.3e} at channel={max_err_idx + 1}")
+
+        if np.any(abs_err > (tick_s + 1e-15)):
+            mismatches = np.where(abs_err > (tick_s + 1e-15))[0]
+            print(f"  [FAIL] profile {profile_number} mismatch count={len(mismatches)}")
+            for ch_idx in mismatches[:10]:
+                print(
+                    f"    ch{ch_idx + 1}: written={written_delays[ch_idx]:.9e}, "
+                    f"expected_quantized={expected_quantized[ch_idx]:.9e}, "
+                    f"read={readback_delays[ch_idx]:.9e}, err={abs_err[ch_idx]:.3e}"
+                )
+            raise RuntimeError(
+                f"Profile {profile_number}: delay readback mismatch exceeds one BF clock tick"
+            )
+
+        print(f"  [OK] profile {profile_number}: all 64 delays match quantized expected values")
 
 if __name__ == "__main__":
     main()

@@ -474,26 +474,26 @@ class TxDevice(OWComponent):
             )
         return int(r.data[0])
     
-    def set_delay_profile(self, profile: int, identifier: int | None = None) -> bool:
-        """Set active TX delay profile via MCU controller command.
+    # def set_delay_profile(self, profile: int, identifier: int | None = None) -> bool:
+    #     """Set active TX delay profile via MCU controller command.
 
-        This routes delay profile switching through firmware (OW_CTRL_SET_DELAY_PROFILE),
-        allowing MCU-side profile bookkeeping instead of direct host register writes.
-        """
-        if profile not in VALID_DELAY_PROFILES:
-            raise ValueError(f"Invalid delay profile {profile}. Expected 1-16.")
+    #     This routes delay profile switching through firmware (OW_CTRL_SET_DELAY_PROFILE),
+    #     allowing MCU-side profile bookkeeping instead of direct host register writes.
+    #     """
+    #     if profile not in VALID_DELAY_PROFILES:
+    #         raise ValueError(f"Invalid delay profile {profile}. Expected 1-16.")
 
-        payload = struct.pack('<B', profile)
-        tx_ids = self._iter_target_tx_ids(identifier)
-        for tx_id in tx_ids:
-            self.send_checked(
-                packet_type=OW_CONTROLLER,
-                command=OW_CTRL_SET_DELAY_PROFILE,
-                addr=tx_id,
-                data=payload,
-                op=f"set_delay_profile[{tx_id}]",
-            )
-        return True
+    #     payload = struct.pack('<B', profile)
+    #     tx_ids = self._iter_target_tx_ids(identifier)
+    #     for tx_id in tx_ids:
+    #         self.send_checked(
+    #             packet_type=OW_CONTROLLER,
+    #             command=OW_CTRL_SET_DELAY_PROFILE,
+    #             addr=tx_id,
+    #             data=payload,
+    #             op=f"set_delay_profile[{tx_id}]",
+    #         )
+    #     return True
     
     def get_delay_profile(self, identifier: int | None = None) -> int:
         """Read active TX delay profile via MCU controller command."""
@@ -750,7 +750,7 @@ class TxDevice(OWComponent):
             self.write_register(tx_id, ADDRESS_GLOBAL_CONTROL, 0x00000008)
         return True
 
-    def set_delay_profile_select(self,
+    def set_delay_profile(self,
                                  profile: int,
                                  identifier: int | None = None,
                                  tr_sw_del_g1: int | None = None,
@@ -888,6 +888,97 @@ class TxDevice(OWComponent):
         logger.debug("read_block: %d regs from 0x%04X on chip %d", count, start_address, identifier)
         return values
 
+    def _validate_delay_profile_number(self, profile_number: int) -> None:
+        # Ensure the profile index is an integer-like positive value.
+        if not isinstance(profile_number, int):
+            # Raise a clear error for non-integer inputs.
+            raise ValueError(f"profile_number must be an int, got {type(profile_number).__name__}")
+        # Enforce TX7332 delay profile range (1-16).
+        if profile_number < 1 or profile_number > 16:
+            # Raise a clear error when the profile is out of range.
+            raise ValueError(f"profile_number must be in 1-16, got {profile_number}")
+
+    def _get_delay_profile_start_address(self, profile_number: int) -> int:
+        # Validate profile number before computing the address.
+        self._validate_delay_profile_number(profile_number)
+        # Return the first register for the selected delay profile block.
+        return ADDRESSES_DELAY_DATA[0] + ((profile_number - 1) * DELAY_PROFILE_OFFSET)
+
+    def _decode_delay_profile_register_values(self,
+                                              profile_number: int,
+                                              register_values: List[int],
+                                              units: str = "s") -> List[float]:
+        # Validate profile number to keep mapping logic predictable.
+        self._validate_delay_profile_number(profile_number)
+        # Validate register block size for one delay profile.
+        if len(register_values) != DELAY_PROFILE_OFFSET:
+            # Raise a clear error when the block size is unexpected.
+            raise ValueError(f"Expected {DELAY_PROFILE_OFFSET} delay registers, got {len(register_values)}")
+        # Select BF clock from configured register model when available.
+        bf_clk_hz = self.tx_registers.bf_clk if self.tx_registers is not None else DEFAULT_CLK_FREQ
+        # Compute the profile block base address for register indexing.
+        profile_start = self._get_delay_profile_start_address(profile_number)
+        # Pre-allocate output delays (32 channels per TX chip).
+        delays = [0.0] * NUM_CHANNELS
+        # Walk channel order expected by the public API.
+        for channel in range(1, NUM_CHANNELS + 1):
+            # Resolve register address and bit offset for this channel/profile.
+            address, lsb = get_delay_location(channel, profile_number)
+            # Convert absolute register address to block-local index.
+            block_index = address - profile_start
+            # Read raw packed register value for this channel's row.
+            packed_register = register_values[block_index]
+            # Extract this channel's delay field in BF clock ticks.
+            delay_ticks = get_register_value(packed_register, lsb=lsb, width=DELAY_WIDTH)
+            # Convert ticks -> seconds.
+            delay_seconds = delay_ticks / bf_clk_hz
+            # Convert seconds -> requested output units.
+            delay_in_units = delay_seconds * getunitconversion("s", units)
+            # Store decoded value in channel-ordered output list.
+            delays[channel - 1] = delay_in_units
+        # Return decoded channel delay values.
+        return delays
+
+    def read_delay_profile_value(self,
+                                 profile_number: int,
+                                 identifier: int = 0,
+                                 units: str = "s") -> Dict[str, object]:
+        """Read one delay profile block from device RAM and decode channel delay values.
+
+        Args:
+            profile_number: Delay profile index to read (1-16).
+            identifier: TX chip index to read from.
+            units: Output units for delay values (default seconds).
+
+        Returns:
+            Dict with profile number, chip id, start address, raw registers, and decoded delays.
+        """
+        # Ensure TX identifier is non-negative before issuing device command.
+        if identifier < 0:
+            # Raise a clear error for invalid chip ids.
+            raise ValueError("TX chip identifier must be >= 0")
+        # Validate profile range before address computation.
+        self._validate_delay_profile_number(profile_number)
+        # Compute start address for the selected delay profile block.
+        start_address = self._get_delay_profile_start_address(profile_number)
+        # Read the full 16-register delay block from hardware.
+        raw_registers = self.read_block(identifier=identifier,
+                                        start_address=start_address,
+                                        count=DELAY_PROFILE_OFFSET)
+        # Decode the block into channel-ordered delay values.
+        decoded_delays = self._decode_delay_profile_register_values(profile_number=profile_number,
+                                                                    register_values=raw_registers,
+                                                                    units=units)
+        # Return a readable payload that includes both raw and decoded values.
+        return {
+            "profile_number": profile_number,
+            "identifier": identifier,
+            "start_address": start_address,
+            "raw_registers": raw_registers,
+            "delays": decoded_delays,
+            "units": units,
+        }
+
     def set_solution(self,
                      pulse: Dict | List[Dict],
                      delays: np.ndarray,
@@ -983,6 +1074,8 @@ class TxDevice(OWComponent):
         n_required_devices = int(n_elements / NUM_CHANNELS)
         # enum_tx7332_devices raises LIFUError on mismatch
         self.enum_tx7332_devices(num_devices=n_required_devices)
+
+        print("delays after reshape:", delays)
 
         for profile in range(n):
             pulse_cfg = pulse_profiles[profile]
