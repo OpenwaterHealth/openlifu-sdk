@@ -731,7 +731,7 @@ def main():
     # Pre-compute delay selector register values for each profile.
     delay_sel_by_profile = {}
     for profile_number in profile_numbers:
-        interface.txdevice.tx_registers.activate_delay_profile(profile_number)
+        interface.txdevice.tx_registers.activate_delay_profile(profile_number) # this doesn't do anything??
         delay_ctrl_list = interface.txdevice.tx_registers.get_delay_control_registers()
         delay_sel_by_profile[profile_number] = delay_ctrl_list[0][ADDRESS_DELAY_SEL]
 
