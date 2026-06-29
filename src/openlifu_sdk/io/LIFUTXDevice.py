@@ -164,6 +164,7 @@ from openlifu_sdk.io.LIFUConfig import (
     OW_TX7332_VWREG,
     OW_TX7332_WBLOCK,
     OW_TX7332_WREG,
+    OW_TX7332_SET_DELAY_PROFILE,
     OW_VID,
     TRIGGER_MODE_CONTINUOUS,
     TRIGGER_MODE_SEQUENCE,
@@ -473,29 +474,8 @@ class TxDevice(OWComponent):
                 code=LIFU_ERR_BAD_PAYLOAD_LENGTH,
             )
         return int(r.data[0])
-    
-    # def set_delay_profile(self, profile: int, identifier: int | None = None) -> bool:
-    #     """Set active TX delay profile via MCU controller command.
 
-    #     This routes delay profile switching through firmware (OW_CTRL_SET_DELAY_PROFILE),
-    #     allowing MCU-side profile bookkeeping instead of direct host register writes.
-    #     """
-    #     if profile not in VALID_DELAY_PROFILES:
-    #         raise ValueError(f"Invalid delay profile {profile}. Expected 1-16.")
-
-    #     payload = struct.pack('<B', profile)
-    #     tx_ids = self._iter_target_tx_ids(identifier)
-    #     for tx_id in tx_ids:
-    #         self.send_checked(
-    #             packet_type=OW_CONTROLLER,
-    #             command=OW_CTRL_SET_DELAY_PROFILE,
-    #             addr=tx_id,
-    #             data=payload,
-    #             op=f"set_delay_profile[{tx_id}]",
-    #         )
-    #     return True
-    
-    def get_delay_profile(self, identifier: int | None = None) -> int:
+    def get_delay_profile(self, identifier: int | None = 0) -> int:
         """Read active TX delay profile from TX7332 register 0x16.
 
         Mirrors ``set_delay_profile`` by reading the same selector fields
@@ -504,31 +484,39 @@ class TxDevice(OWComponent):
         if identifier is not None and identifier < 0:
             raise ValueError("TX chip identifier must be >= 0")
 
-        tx_ids = self._iter_target_tx_ids(identifier)
-        active_profile: int | None = None
-        for tx_id in tx_ids:
-            reg = self.read_register(tx_id, ADDRESS_DELAY_SEL)
-            profile_g1 = get_register_value(reg, lsb=BF_PROF_SEL_G1_SHIFT, width=4) + 1
-            profile_g2 = get_register_value(reg, lsb=BF_PROF_SEL_G2_SHIFT, width=4) + 1
+        # tx_ids = self._iter_target_tx_ids(identifier)
+        # active_profile: int | None = None
+        # for tx_id in tx_ids:
+        r = self.send_checked(
+            packet_type=OW_CONTROLLER,
+            command=OW_CTRL_GET_DELAY_PROFILE,
+            addr=identifier,
+            op=f"get_delay_profile[{identifier}]",
+        )
+        if r.data_len < 1 or not r.data:
+            raise LIFUProtocolError(
+                f"TX: get_delay_profile payload too short ({r.data_len} < 1)",
+                code=LIFU_ERR_BAD_PAYLOAD_LENGTH,
+            )
+        profile = int(r.data[0])
+        if profile < 1 or profile > 16:
+            raise LIFUProtocolError(
+                f"TX: get_delay_profile payload out of range ({profile})",
+                code=LIFU_ERR_BAD_PAYLOAD_FORMAT,
+            )
 
-            if profile_g1 != profile_g2:
-                raise ValueError(
-                    f"Desynchronized delay profile selectors on TX chip {tx_id}: "
-                    f"G1={profile_g1}, G2={profile_g2}"
-                )
+            # if active_profile is None:
+            #     active_profile = int(profile_g1)
+            # elif active_profile != int(profile_g1):
+            #     raise ValueError(
+            #         "Delay profile mismatch across selected TX chips: "
+            #         f"expected {active_profile}, got {profile_g1} on chip {tx_id}"
+            #     )
 
-            if active_profile is None:
-                active_profile = int(profile_g1)
-            elif active_profile != int(profile_g1):
-                raise ValueError(
-                    "Delay profile mismatch across selected TX chips: "
-                    f"expected {active_profile}, got {profile_g1} on chip {tx_id}"
-                )
-
-        if active_profile is None:
+        if profile is None:
             raise ValueError("No TX chips selected to read delay profile")
 
-        return active_profile
+        return profile
     
 
 
@@ -765,29 +753,26 @@ class TxDevice(OWComponent):
             self.write_register(tx_id, ADDRESS_GLOBAL_CONTROL, 0x00000008)
         return True
 
-    def set_delay_profile(self,
-                                 profile: int,
-                                 identifier: int | None = None,
-                                 tr_sw_del_g1: int | None = None,
-                                 tr_sw_del_g2: int | None = None) -> bool:
-        """Select active delay profile (1-16) by writing TX7332 register 0x16.
+    def set_delay_profile(self, profile: int, identifier: int | None = 0) -> bool:
+        """Set active TX delay profile via MCU controller command.
 
-        For raster hot-path updates, this performs one register write per selected chip.
+        This routes delay profile switching through firmware (OW_CTRL_SET_DELAY_PROFILE),
+        allowing MCU-side profile bookkeeping and apodization handling.
         """
         if profile not in VALID_DELAY_PROFILES:
             raise ValueError(f"Invalid delay profile {profile}. Expected 1-16.")
-        profile_sel = profile - 1
 
-        tx_ids = self._iter_target_tx_ids(identifier)
-        for tx_id in tx_ids:
-            reg = self.read_register(tx_id, ADDRESS_DELAY_SEL)
-            if tr_sw_del_g1 is not None:
-                reg = set_register_value(reg, tr_sw_del_g1, lsb=16, width=12)
-            if tr_sw_del_g2 is not None:
-                reg = set_register_value(reg, tr_sw_del_g2, lsb=0, width=12)
-            reg = set_register_value(reg, profile_sel, lsb=28, width=4)
-            reg = set_register_value(reg, profile_sel, lsb=12, width=4)
-            self.write_register(tx_id, ADDRESS_DELAY_SEL, reg)
+        payload = struct.pack('<B', profile)
+        # tx_ids = self._iter_target_tx_ids(identifier)
+        # for tx_id in tx_ids:
+        # print("tx_id: ", tx_id)
+        self.send_checked(
+            packet_type=OW_CONTROLLER,
+            command=OW_CTRL_SET_DELAY_PROFILE,
+            addr=identifier,
+            data=payload,
+            op=f"set_delay_profile[{identifier}]",
+            )
         return True
 
     def set_pattern_profile_select(self,
