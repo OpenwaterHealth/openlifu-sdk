@@ -690,7 +690,22 @@ def main():
         print(f"  profile {profile_number}: first 8 channels={delays[idx][:8]}")
 
     # Build one apodization row per profile (all channels enabled).
-    apodizations = np.ones((len(profile_numbers), CHANNEL_COUNT), dtype=float)
+    apodizations = []
+
+
+    # make every other profile have alternating channels on/off for testing
+    for cfg in PROFILE_CONFIGS:
+        profile = cfg["index"]
+        if profile % 2 == 0:
+            apod = np.zeros(CHANNEL_COUNT, dtype=float)
+        else:
+            apod = np.ones(CHANNEL_COUNT, dtype=float)
+        apodizations.append(apod)
+
+    print("apodizations to be written:")
+    for idx, profile_number in enumerate(profile_numbers):
+        print(f"  profile {profile_number}: first 8 channels={apodizations[idx][:8]}")
+
     # Build a minimal trigger sequence dictionary required by set_solution.
     sequence = {
         # Time between pulses in seconds.
@@ -704,6 +719,7 @@ def main():
     }
 
     # Program all 4 profiles through set_solution.
+
     interface.txdevice.set_solution(
         # Provide pulse configuration.
         pulse=pulse,
