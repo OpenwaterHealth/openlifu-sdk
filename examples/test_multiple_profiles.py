@@ -20,41 +20,24 @@ import numpy as np
 import time
 
 from openlifu_sdk import LIFUInterface
-from openlifu_sdk.io.LIFUTXDevice import (
-    ADDRESS_DELAY_SEL,
-    ADDRESS_APODIZATION,
-)
 
 FIXED_FREQUENCY_HZ = 400
 DURATION_MS = 5
 CHANNEL_COUNT = 64
 VOLTAGE = 20.0
-MAX_NUM_PROFILES = 16
 
-# Formatting
-SEPARATOR_LINE_WIDTH = 80
-
-# TX7332 Register field definitions
-BF_PROF_SEL_G1_SHIFT = 28  # Bits 28-31 for G1 delay profile selector
-BF_PROF_SEL_G2_SHIFT = 12  # Bits 12-15 for G2 delay profile selector
-BF_PROF_SEL_FIELD_MASK = 0x0F  # 4-bit profile field (0-15 for profiles 1-16)
-# DELAY_REG_TR_SW_DEL_PRESERVE_MASK = 0x0FFF0FFF  # Preserve TR_SW_DEL timing fields
-REGISTER_0X18_READ_COMPARE_MASK = 0x07FFFFFF  # Ignore bits 31-27 on read per datasheet
-
-# Short timing for integrated verification (keep total active trigger time < 10s)
-REG_PROPAGATION_DELAY_S = 0.025
-TRIGGER_RUN_S = 0.40
-MAX_ACTIVE_TRIGGER_TIME_S = 60.0
+PROFILE_DELAY_DISPLACEMENT_US = 10.0  # Delay step between profiles for test verification
 
 def get_profile_delay_sequence(profile_number: int) -> np.ndarray:
-    """Return the profile delay sequence from the commented multi-profile section.
+    """Return the profile delay sequence with PROFILE_DELAY_DISPLACEMENT_US us step per profile.
 
-    Profiles 2 and 4: all channels delayed by 100 us.
-    Profiles 1 and 3: all channels set to 0 us.
+    Profile 1: 0 us
+    Profile 2: 10 us
+    Profile 3: 20 us
+    Profile 4: 30 us
     """
-    if profile_number in (2, 4):
-        return np.full((1, CHANNEL_COUNT), 100e-6, dtype=float)
-    return np.zeros((1, CHANNEL_COUNT), dtype=float)
+    delay_us = (profile_number - 1) * PROFILE_DELAY_DISPLACEMENT_US
+    return np.full((1, CHANNEL_COUNT), delay_us * 1e-6, dtype=float)
 
 
 def read_profile_delays_all_chips(interface: LIFUInterface,
@@ -90,11 +73,12 @@ def quantize_delays_to_device(delays_seconds: np.ndarray, bf_clk_hz: float) -> n
     return np.floor(delays_seconds * bf_clk_hz) / bf_clk_hz
 
 
-MAX_REGISTER_READ_COUNT = 62  # Device/API read_block limit
-
 # Debug aid: keep all channels enabled on every profile to isolate
 # physical output issues from apodization masking behavior.
 FORCE_ALL_CHANNELS_ON = False
+
+# Temporary test switch: bypass profile-varying apodizations.
+BYPASS_APODIZATIONS = True
 
 PROFILE_CONFIGS = [
     {
@@ -123,6 +107,14 @@ PROFILE_CONFIGS = [
     },
     {
         "index": 4,
+        "duration_ms": 20,
+        "pulse_interval": 0.1,
+        "pulse_count": 10,
+        "pulse_train_interval": 1,
+        "pulse_train_count": 1,
+    },
+    {
+        "index": 5,
         "duration_ms": 20,
         "pulse_interval": 0.1,
         "pulse_count": 10,
@@ -656,19 +648,19 @@ def main():
 
     # print(f"pattern profile: {interface.txdevice.get_pattern_profile()}")
     # print(f"delay profile: {interface.txdevice.get_delay_profile()}")
-    '''
-        for i in range(MAX_NUM_PROFILES):
-            print(f"i is {i}")
-            print(f"Pattern profile is currently: {interface.txdevice.get_pattern_profile()}")
-            interface.txdevice.set_pattern_profile(profile=i)
-            print(f"Set pattern profile to {i}")
-            print(f"New pattern profile: {interface.txdevice.get_pattern_profile()}")
+    
+        # for i in range(MAX_NUM_PROFILES):
+        #     print(f"i is {i}")
+        #     print(f"Pattern profile is currently: {interface.txdevice.get_pattern_profile()}")
+        #     interface.txdevice.set_pattern_profile(profile=i)
+        #     print(f"Set pattern profile to {i}")
+        #     print(f"New pattern profile: {interface.txdevice.get_pattern_profile()}")
 
-            print(f"Delay profile: {interface.txdevice.get_delay_profile()}")
-            interface.txdevice.set_delay_profile(profile=i)
-            print(f"Set delay profile to {i}")
-            print(f"New delay profile: {interface.txdevice.get_delay_profile()}")
-    '''
+        #     print(f"Delay profile: {interface.txdevice.get_delay_profile()}")
+        #     interface.txdevice.set_delay_profile(profile=i)
+        #     print(f"Set delay profile to {i}")
+        #     print(f"New delay profile: {interface.txdevice.get_delay_profile()}")
+    
     # Build a pulse configuration for set_solution.
     pulse = {
         # Set pulse frequency in Hz.
@@ -679,7 +671,7 @@ def main():
         "amplitude": 1.0,
     }
     # Program and verify exactly 4 profiles, matching the commented test section.
-    profile_numbers = [1, 2, 3, 4]
+    profile_numbers = [1, 2, 3, 4, 5]
     # Build one delay row per profile.
     delay_rows = [get_profile_delay_sequence(profile_number).reshape(-1)
                   for profile_number in profile_numbers]
@@ -689,14 +681,17 @@ def main():
     for idx, profile_number in enumerate(profile_numbers):
         print(f"  profile {profile_number}: first 8 channels={delays[idx][:8]}")
 
-    # Build one apodization row per profile (all channels enabled).
+    # Build one apodization row per profile.
     apodizations = []
-
 
     # make every other profile have alternating channels on/off for testing
     for cfg in PROFILE_CONFIGS:
         profile = cfg["index"]
-        if profile % 2 == 0:
+        if BYPASS_APODIZATIONS:
+            apod = np.ones(CHANNEL_COUNT, dtype=float)
+        elif FORCE_ALL_CHANNELS_ON:
+            apod = np.ones(CHANNEL_COUNT, dtype=float)
+        elif profile % 2 == 0:
             apod = np.zeros(CHANNEL_COUNT, dtype=float)
         else:
             apod = np.ones(CHANNEL_COUNT, dtype=float)
@@ -718,7 +713,12 @@ def main():
         "pulse_train_count": 1,
     }
 
-    # Program all 4 profiles through set_solution.
+    # Program and run one explicit execution order for oscilloscope verification.
+    execution_order = [1, 2, 3, 4, 5, 4, 3, 2, 1]
+
+    interface.hvcontroller.set_voltage(VOLTAGE)
+
+    print(f"running execution_order={execution_order}")
 
     interface.txdevice.set_solution(
         # Provide pulse configuration.
@@ -735,8 +735,8 @@ def main():
         profile_index=1,
         # Enable increment so firmware can cycle profiles in order.
         profile_increment=True,
-        # Explicit execution order for this 4-profile test.
-        execution_order=profile_numbers,
+        # Explicit execution order for this test pass.
+        execution_order=execution_order,
     )
 
     # Commit profile RAM and apply all registers (matching commented section).
@@ -744,40 +744,23 @@ def main():
     interface.txdevice.apply_all_registers()
     time.sleep(0.025)
 
-    # Pre-compute delay selector register values for each profile.
-    delay_sel_by_profile = {}
-    for profile_number in profile_numbers:
-        interface.txdevice.tx_registers.activate_delay_profile(profile_number) # this doesn't do anything??
-        delay_ctrl_list = interface.txdevice.tx_registers.get_delay_control_registers()
-        delay_sel_by_profile[profile_number] = delay_ctrl_list[0][ADDRESS_DELAY_SEL]
+    read_stored_delay_values(
+        interface=interface,
+        profile_numbers=profile_numbers,
+        num_tx_devices=num_tx_devices,
+        delays=delays,
+    )
 
-    interface.hvcontroller.set_voltage(VOLTAGE)
-    interface.hvcontroller.turn_hv_on()
+    interface.start_sonication()
 
-    while True:
-        for profile_number in profile_numbers:
-            # Write delay selector register directly to all TX devices (matching commented section).
-            # for chip_idx in range(num_tx_devices):
-            #     interface.txdevice.write_register(chip_idx, ADDRESS_DELAY_SEL, delay_sel_by_profile[profile_number])
-            print("Current selected delay profile:", interface.txdevice.get_delay_profile())
-            print("Setting delay profile to:", profile_number)
-            interface.txdevice.set_delay_profile(profile=profile_number)
-            print("New selected delay profile:", interface.txdevice.get_delay_profile())
-            
-            time.sleep(0.025)
-            interface.txdevice.start_trigger()
-            time.sleep(0.1)
-            print(f"Profile {profile_number} triggered")
-            time.sleep(1)
-            interface.txdevice.stop_trigger()
-
-
-    print("\n[OK] 4-profile test complete. Oscilloscope should show delay variations:")
-    print("  Profiles 1, 3: 0 delay")
-    print("  Profiles 2, 4: 100 us delay")
-
+def read_stored_delay_values(interface: LIFUInterface,
+                             profile_numbers: list[int],
+                             num_tx_devices: int,
+                             delays: np.ndarray) -> np.ndarray:
+    # Implement the function to read stored delay values from the device
     bf_clk_hz = interface.txdevice.tx_registers.bf_clk
     tick_s = 1.0 / bf_clk_hz
+    all_readback_delays = []
 
     # Read back and verify each of the 4 profiles independently.
     for idx, profile_number in enumerate(profile_numbers):
@@ -818,6 +801,10 @@ def main():
             )
 
         print(f"  [OK] profile {profile_number}: all 64 delays match quantized expected values")
+
+        all_readback_delays.append(readback_delays)
+
+    return np.array(all_readback_delays, dtype=float)
 
 if __name__ == "__main__":
     main()
