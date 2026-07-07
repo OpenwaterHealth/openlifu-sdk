@@ -485,6 +485,7 @@ class LIFUInterface:
             profile_index=profile_index,
             profile_increment=profile_increment,
             trigger_mode=trigger_mode,
+            pulse_profile_map=solution.get('pulse_profile_map'),
         )
         self.set_status(LIFUInterfaceStatus.STATUS_READY)
 
