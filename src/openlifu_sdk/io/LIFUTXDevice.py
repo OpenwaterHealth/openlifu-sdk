@@ -987,41 +987,47 @@ class TxDevice(OWComponent):
                      trigger_mode: TriggerModeOpts = "sequence",
                      profile_index: int = 1,
                      profile_increment: bool = True,
-                     execution_order: List[int] | None = None) -> bool:
+                     execution_order: List[int] | None = None,
+                     pulse_profile_map: Dict[int, int] | None = None) -> bool:
         """Program the TX device with the supplied beamforming solution.
 
         For multi-profile solutions, row ``i`` of ``delays`` and ``apodizations``
-        is grouped with profile ``i+1``. ``pulse`` may be a single dict (shared
-        across all profiles) or a list of dicts (one per profile row).
+        is grouped with delay profile ``i+1``. Pulse profiles are decoupled from
+        delay profiles: ``pulse`` may be a single dict (one shared pulse profile)
+        or a list of dicts (one per unique pulse profile).
+
+        ``pulse_profile_map`` controls which pulse profile each delay profile uses.
+        When ``pulse`` is a single dict and no map is provided, all delay profiles
+        share pulse profile 1.  When ``pulse`` is a list of N dicts and no map is
+        provided, a 1:1 mapping is used (backward compatible).
 
         Grouped Profile Package System:
         ================================
-        Each profile i (1-16) is bundled with:
-          - Pulse configuration (frequency, cycles, duty cycle)
-          - Delay profile (register 0x16 selector + delay values)
-          - Apodization configuration (register 0x1B + apodization values)
-
-        This bundle is sent as an atomic unit to the firmware, allowing the MCU
-        to cache all profile configurations and apply them coherently during
-        runtime profile switching.
+        Each delay profile i (1-16) is bundled with:
+          - A pulse profile (possibly shared across delay profiles)
+          - Delay values (register 0x16 selector + delay RAM)
+          - Apodization configuration (register 0x1B)
 
         Profile Execution Order:
         ========================
         If execution_order is provided (e.g., [1, 2, 3, 1, 2, 3]), the firmware
-        will automatically cycle through these profiles on each trigger sequence
-        completion. The apodization for the active profile is automatically applied
-        alongside the delay/pattern selectors.
+        will automatically cycle through these delay profiles on each trigger
+        sequence completion.
 
         Args:
-            pulse:              Dict or List[Dict] of pulse configs (frequency, duration, amplitude)
-            delays:             np.ndarray of shape (N, 64) for N profiles
-            apodizations:       np.ndarray of shape (N, 64) for N profiles
-            sequence:           Dict with trigger timing (pulse_interval, pulse_count, etc.)
-            trigger_mode:       "sequence", "continuous", or "single"
-            profile_index:      Initial active profile (1-16)
-            profile_increment:  Whether firmware auto-increments profile on sequence end
-            execution_order:    List[int] of profile indices to cycle (e.g., [1,2,3,1,2,3])
-                               If None, defaults to [1, 2, ..., N]
+            pulse:              Dict (single shared pulse config) or List[Dict]
+                                (one per unique pulse profile).
+            delays:             np.ndarray of shape (N, 64) for N delay profiles.
+            apodizations:       np.ndarray of shape (N, 64) for N delay profiles.
+            sequence:           Dict with trigger timing (pulse_interval, pulse_count, etc.).
+            trigger_mode:       "sequence", "continuous", or "single".
+            profile_index:      Initial active delay profile (1-16).
+            profile_increment:  Whether firmware auto-increments profile on sequence end.
+            execution_order:    List[int] of delay profile indices to cycle.
+                               If None, defaults to [1, 2, ..., N].
+            pulse_profile_map:  Optional dict mapping delay profile index (1-based) to
+                               pulse profile index (1-based).  When None, derived from
+                               the ``pulse`` argument type.
 
         Raises:
             ValueError: If the inputs are malformed or execution_order is invalid.
@@ -1047,12 +1053,35 @@ class TxDevice(OWComponent):
         if n > len(VALID_DELAY_PROFILES):
             raise ValueError(f"Too many profile rows ({n}). Max supported is {len(VALID_DELAY_PROFILES)}")
 
+        # ========== PULSE PROFILE CONFIGURATION ==========
+        # pulse_configs: list of unique pulse config dicts, indexed 0-based.
         if isinstance(pulse, list):
-            if len(pulse) != n:
-                raise ValueError("When pulse is a list, it must contain one entry per profile row")
-            pulse_profiles = pulse
+            pulse_configs = pulse
         else:
-            pulse_profiles = [pulse] * n
+            pulse_configs = [pulse]
+        num_pulse_profiles = len(pulse_configs)
+
+        # Build pulse_profile_map: delay profile index (1-based) -> pulse profile index (1-based)
+        if pulse_profile_map is None:
+            if num_pulse_profiles == 1:
+                # Single pulse config: all delay profiles share pulse profile 1.
+                pulse_profile_map = {i + 1: 1 for i in range(n)}
+            else:
+                if num_pulse_profiles != n:
+                    raise ValueError(
+                        f"When pulse is a list without pulse_profile_map, "
+                        f"it must have one entry per delay profile row ({n}), got {num_pulse_profiles}"
+                    )
+                pulse_profile_map = {i + 1: i + 1 for i in range(n)}
+        else:
+            for dp_idx, pp_idx in pulse_profile_map.items():
+                if dp_idx < 1 or dp_idx > n:
+                    raise ValueError(f"pulse_profile_map key {dp_idx} out of range 1-{n}")
+                if pp_idx < 1 or pp_idx > num_pulse_profiles:
+                    raise ValueError(f"pulse_profile_map value {pp_idx} out of range 1-{num_pulse_profiles}")
+            for i in range(1, n + 1):
+                if i not in pulse_profile_map:
+                    raise ValueError(f"pulse_profile_map missing mapping for delay profile {i}")
 
         # ========== SET EXECUTION ORDER ==========
         # If not provided, create sequential order: [1, 2, ..., n]
@@ -1075,33 +1104,50 @@ class TxDevice(OWComponent):
         # enum_tx7332_devices raises LIFUError on mismatch
         self.enum_tx7332_devices(num_devices=n_required_devices)
 
-        print("delays after reshape:", delays)
+        # print("delays after reshape:", delays)
 
-        for profile in range(n):
-            pulse_cfg = pulse_profiles[profile]
-            duty_cycle = DEFAULT_PATTERN_DUTY_CYCLE * max(apodizations[profile, :]) * pulse_cfg["amplitude"]
+        # Pre-compute duty cycle per mapped pulse config: use max apodization
+        # across all delay profiles sharing the same pulse config.
+        _duty_cycle_by_pulse = {}
+        for pidx in set(pulse_profile_map.values()):
+            pulse_cfg = pulse_configs[pidx - 1]
+            mapped_dps = [k for k, v in pulse_profile_map.items() if v == pidx]
+            max_apod = max(max(apodizations[dp - 1, :]) for dp in mapped_dps)
+            _duty_cycle_by_pulse[pidx] = DEFAULT_PATTERN_DUTY_CYCLE * max_apod * pulse_cfg["amplitude"]
+
+        # Create one pulse profile per delay profile slot.
+        # The TX7332 firmware cycles PATTERN_SEL in lockstep with DELAY_SEL,
+        # so every delay profile slot must have valid pattern RAM data.
+        # When multiple delay profiles share the same pulse config, the
+        # pattern data is replicated across their slots.
+        for dp in range(n):
+            pidx = pulse_profile_map[dp + 1]
+            pulse_cfg = pulse_configs[pidx - 1]
             pulse_profile = Tx7332PulseProfile(
-                profile=profile+1,
+                profile=dp + 1,
                 frequency=pulse_cfg["frequency"],
                 cycles=int(pulse_cfg["duration"] * pulse_cfg["frequency"]),
-                duty_cycle=duty_cycle
+                duty_cycle=_duty_cycle_by_pulse[pidx],
             )
             self.tx_registers.add_pulse_profile(pulse_profile)
+
+        # Create all delay profiles (one per row).
+        for dp in range(n):
             delay_profile = Tx7332DelayProfile(
-                profile=profile+1,
-                delays=delays[profile, :],
-                apodizations=apodizations[profile, :]
+                profile=dp + 1,
+                delays=delays[dp, :],
+                apodizations=apodizations[dp, :],
             )
             self.tx_registers.add_delay_profile(delay_profile)
 
         if profile_index not in self.tx_registers.configured_delay_profiles():
             raise ValueError(
                 f"profile_index={profile_index} is not configured. "
-                f"Configured profiles: {self.tx_registers.configured_delay_profiles()}"
+                f"Configured delay profiles: {self.tx_registers.configured_delay_profiles()}"
             )
         if profile_index not in self.tx_registers.configured_pulse_profiles():
             raise ValueError(
-                f"profile_index={profile_index} is not configured. "
+                f"pulse profile {profile_index} is not configured. "
                 f"Configured pulse profiles: {self.tx_registers.configured_pulse_profiles()}"
             )
 
@@ -1131,16 +1177,16 @@ class TxDevice(OWComponent):
 
             # Write grouped control registers once so firmware runtime has all
             # profile apodization/control combinations available from host writes.
+            # Firmware expects delay profile N and pattern profile N to match.
             for profile in self.tx_registers.configured_delay_profiles():
                 delay_groups = self._runtime_profile_groups[profile]["delay_control"]
                 pulse_groups = self._runtime_profile_groups[profile]["pulse_control"]
                 for txi, regs in enumerate(delay_groups):
                     self.write_register(txi, ADDRESS_DELAY_SEL, regs[ADDRESS_DELAY_SEL])
                     self.write_register(txi, ADDRESS_APODIZATION, regs[ADDRESS_APODIZATION])
-                    # Keep grouped profile writes semantically aligned: profile N uses
-                    # pattern selector N (1-based), matching firmware GET/SET profile logic.
-                    self.write_register(txi, ADDRESS_PATTERN_SEL_G1, profile & PATTERN_PROFILE_SELECT_MASK)
-                    self.write_register(txi, ADDRESS_PATTERN_SEL_G2, profile & PATTERN_PROFILE_SELECT_MASK)
+                    # TX7332 pattern selector is 0-based.
+                    self.write_register(txi, ADDRESS_PATTERN_SEL_G1, (profile - 1) & PATTERN_PROFILE_SELECT_MASK)
+                    self.write_register(txi, ADDRESS_PATTERN_SEL_G2, (profile - 1) & PATTERN_PROFILE_SELECT_MASK)
 
             # Restore selected active profile group for immediate triggering.
             active_delay_groups = self.tx_registers.get_delay_control_registers(profile_index)
@@ -1148,8 +1194,8 @@ class TxDevice(OWComponent):
             for txi, regs in enumerate(active_delay_groups):
                 self.write_register(txi, ADDRESS_DELAY_SEL, regs[ADDRESS_DELAY_SEL])
                 self.write_register(txi, ADDRESS_APODIZATION, regs[ADDRESS_APODIZATION])
-                self.write_register(txi, ADDRESS_PATTERN_SEL_G1, profile_index & PATTERN_PROFILE_SELECT_MASK)
-                self.write_register(txi, ADDRESS_PATTERN_SEL_G2, profile_index & PATTERN_PROFILE_SELECT_MASK)
+                self.write_register(txi, ADDRESS_PATTERN_SEL_G1, (profile_index - 1) & PATTERN_PROFILE_SELECT_MASK)
+                self.write_register(txi, ADDRESS_PATTERN_SEL_G2, (profile_index - 1) & PATTERN_PROFILE_SELECT_MASK)
 
             # ========== SEND GROUPED PROFILE PACKAGE TO FIRMWARE ==========
             # For multi-profile solutions, communicate the execution_order and all
@@ -1205,6 +1251,8 @@ class TxDevice(OWComponent):
             f"Sending grouped profile cycle: {n_profiles} profiles, "
             f"execution_order={execution_order}, payload_size={len(payload)} bytes"
         )
+
+        # print("payload bytes:", list(payload))  # Debug print of payload content
 
         # Send via controller command packet. This is a required part of
         # grouped multi-profile operation and must succeed.
