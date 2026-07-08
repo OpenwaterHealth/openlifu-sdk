@@ -1198,64 +1198,67 @@ class TxDevice(OWComponent):
                 self.write_register(txi, ADDRESS_PATTERN_SEL_G2, (profile_index - 1) & PATTERN_PROFILE_SELECT_MASK)
 
             # ========== SEND GROUPED PROFILE PACKAGE TO FIRMWARE ==========
-            # For multi-profile solutions, communicate the execution_order and all
-            # profile apodization data to the firmware so it can auto-cycle and apply
-            # correct apodization per profile.
-            self._send_grouped_profile_cycle(execution_order, apodizations)
+            # For multi-profile solutions, send execution_order and pre-computed
+            # apodization register values so firmware can auto-cycle profiles.
+            # Build per-chip apod registers for each profile from the already-computed groups.
+            apod_reg_values = []  # List of lists: [profile][chip] = uint32 register value
+            for profile in sorted(self._runtime_profile_groups.keys()):
+                delay_control = self._runtime_profile_groups[profile]["delay_control"]
+                chip_regs = [regs[ADDRESS_APODIZATION] for regs in delay_control]
+                apod_reg_values.append(chip_regs)
+            self._send_grouped_profile_cycle(execution_order, apod_reg_values)
 
         return True
 
-    def _send_grouped_profile_cycle(self, execution_order: List[int], apodizations: np.ndarray) -> bool:
-        """Send grouped profile cycle command and apodization data to firmware.
+    def _send_grouped_profile_cycle(self, execution_order: List[int], apod_reg_values: List[List[int]]) -> bool:
+        """Send grouped profile cycle command with pre-computed apodization registers.
 
-        This command instructs the firmware to:
-          1. Store the execution_order list (which profiles to cycle through)
-          2. Store apodization data for each profile
-          3. On trigger sequence completion, auto-advance to the next profile
-             in the execution_order and apply the correct apodization
+        The SDK pre-computes the TX7332 apodization register values (including the
+        TX7332 channel-to-bit mapping) and sends the uint32 register values directly.
+        The firmware stores and writes them as-is during profile cycling — no mapping
+        logic needed on the MCU.
 
         Protocol:
-          Packet format: [command] [data_len] [profile_count] [apod_count] [execution_order...] [apod_data...]
-          - profile_count: Number of configured profiles (1-16)
-          - apod_count: Apodization vector length (typically 64)
-          - execution_order: Array of profile indices to cycle through
-          - apod_data: Concatenated apodization vectors, one per profile
+          Packet format: [n_profiles] [n_chips] [exec_order_len] [execution_order...]
+                         [profile_0_chip_0_reg:4B LE] [profile_0_chip_1_reg:4B LE] ...
+          - n_profiles: Number of configured profiles (1-16)
+          - n_chips: Number of TX chips (typically 2)
+          - exec_order_len: Length of execution order array
+          - execution_order: Array of 1-based profile indices to cycle through
+          - apod registers: Pre-computed uint32 apodization register per chip per profile (LE)
+
+        Args:
+            execution_order: List of 1-based profile indices to cycle through.
+            apod_reg_values: List of lists — apod_reg_values[profile][chip] = uint32 register value.
         """
         if not hasattr(self, 'uart') or self.uart is None:
             raise ValueError("UART not initialized for grouped profile cycle setup")
 
-        n_profiles = apodizations.shape[0]
-        n_channels = apodizations.shape[1]
+        n_profiles = len(apod_reg_values)
+        n_chips = len(apod_reg_values[0]) if n_profiles > 0 else 0
 
-        # Build payload: [profile_count] [apod_count] [exec_order...] [apod_data...]
         payload = bytearray()
 
-        # Header: number of profiles and apodization channels
-        payload.append(n_profiles)  # 1 byte: profile count
-        payload.append(n_channels)  # 1 byte: apodization channels (typically 64)
-        payload.append(len(execution_order))  # 1 byte: execution order length
+        # Header
+        payload.append(n_profiles)
+        payload.append(n_chips)
+        payload.append(len(execution_order))
 
         # Execution order indices (1-based profile numbers)
         for profile_idx in execution_order:
             payload.append(profile_idx & 0xFF)
 
-        # Apodization data: for each profile, pack all apodization values as 8-bit scaled integers
+        # Pre-computed apodization registers: uint32 little-endian per chip per profile
         for profile_idx in range(n_profiles):
-            apod_row = apodizations[profile_idx, :]
-            # Scale to 0-255 range based on max value in profile
-            max_apod = np.max(apod_row) if np.max(apod_row) > 0 else 1.0
-            scaled_apod = (apod_row / max_apod * 255).astype(np.uint8)
-            payload.extend(scaled_apod.tolist())
-            
+            for chip_idx in range(n_chips):
+                reg_val = apod_reg_values[profile_idx][chip_idx] & 0xFFFFFFFF
+                payload.extend(reg_val.to_bytes(4, byteorder='little'))
+
         logger.info(
-            f"Sending grouped profile cycle: {n_profiles} profiles, "
+            f"Sending grouped profile cycle: {n_profiles} profiles, {n_chips} chips, "
             f"execution_order={execution_order}, payload_size={len(payload)} bytes"
         )
 
-        # print("payload bytes:", list(payload))  # Debug print of payload content
-
-        # Send via controller command packet. This is a required part of
-        # grouped multi-profile operation and must succeed.
         self.send_checked(
             packet_type=OW_CONTROLLER,
             command=OW_CTRL_SET_PROFILE_CYCLE,
