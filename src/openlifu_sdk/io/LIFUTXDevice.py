@@ -120,6 +120,11 @@ from openlifu_sdk.io.LIFUConfig import (
     OW_CMD_ECHO,
     OW_CMD_GET_AMBIENT,
     OW_CTRL_GET_MODULE_COUNT,
+    OW_CTRL_GET_MODULE_MODE,
+    OW_CTRL_ENUMERATE,
+    NODE_MODE_APP,
+    NODE_MODE_BOOTLOADER,
+    NODE_MODE_UNKNOWN,
     OW_CMD_GET_TEMP,
     OW_CMD_HWID,
     OW_CMD_PING,
@@ -718,7 +723,90 @@ class TxDevice(OWComponent):
         count = r.data[0]
         logger.debug("Detected %d module(s)", count)
         return count
-        
+
+    def enumerate_modules(self) -> int:
+        """Re-run the master's robust enumeration (Phase 2).
+
+        The master broadcasts OW_CMD_CLEAR_CONFIG down the one-wire chain (so every
+        node — application or bootloader — drops any stale I2C address), waits for
+        the chain to re-ready, then re-runs the discovery walk assigning fresh
+        addresses 0x20, 0x21, .... Each node reports whether it is running the
+        application or is stuck in the bootloader.
+
+        Use this after forcing one or more slaves into DFU so they pick up unique
+        addresses instead of all colliding at 0x72.
+
+        Returns:
+            int: the new module count (including the master).
+        """
+        # The master runs the discovery walk synchronously before replying; each hop
+        # can incur one-wire timeouts (up to ~0.5 s). Allow generous headroom so a
+        # slow-but-successful walk is not reported as a transport timeout.
+        #
+        # retries=0 is important: a retry would send a SECOND enumerate while the
+        # master is still processing the first (the walk is long), overlapping two
+        # re-enumerations and corrupting the master's state. One shot only.
+        r = self.send_checked(packet_type=OW_CONTROLLER, command=OW_CTRL_ENUMERATE,
+                              addr=0, op="enumerate_modules", timeout=30.0, retries=0)
+        if not r.data or len(r.data) < 1:
+            raise LIFUProtocolError(
+                f"TX: enumerate_modules payload length {r.data_len} < 1",
+                code=LIFU_ERR_BAD_PAYLOAD_LENGTH,
+            )
+        count = r.data[0]
+        logger.debug("Re-enumeration detected %d module(s)", count)
+        return count
+
+    def get_module_mode(self, module: int) -> int:
+        """Return a module's operating mode: NODE_MODE_APP or NODE_MODE_BOOTLOADER.
+
+        The mode is recorded by the master during discovery (Phase 2). Module 0
+        (the master) is always NODE_MODE_APP. A bootloader-mode module listens for
+        I2C DFU at its assigned address (see :meth:`get_module_i2c_addr`).
+
+        Args:
+            module: module index (0 = master, 1.. = slaves).
+
+        Returns:
+            int: one of NODE_MODE_APP / NODE_MODE_BOOTLOADER / NODE_MODE_UNKNOWN.
+        """
+        r = self.send_checked(packet_type=OW_CONTROLLER, command=OW_CTRL_GET_MODULE_MODE,
+                              addr=module, op="get_module_mode")
+        if not r.data or len(r.data) < 1:
+            raise LIFUProtocolError(
+                f"TX: get_module_mode payload length {r.data_len} < 1",
+                code=LIFU_ERR_BAD_PAYLOAD_LENGTH,
+            )
+        return r.data[0]
+
+    def get_module_i2c_addr(self, module: int) -> int:
+        """Return the assigned 7-bit I2C address for a slave module index.
+
+        Slaves are enumerated sequentially from 0x20 (module 1 -> 0x20, module 2 ->
+        0x21, ...). This mirrors BASE_I2C_ADDRESS in the firmware. Module 0 (the
+        master) has no slave-bus address; 0 is returned.
+        """
+        if module <= 0:
+            return 0
+        return 0x20 + (module - 1)
+
+    def scan_module_modes(self) -> list[dict]:
+        """Return a per-module summary of index, mode and I2C address.
+
+        Convenience wrapper around get_module_count + get_module_mode, e.g.::
+
+            [{"module": 0, "mode": NODE_MODE_APP,        "i2c_addr": 0x00},
+             {"module": 1, "mode": NODE_MODE_BOOTLOADER, "i2c_addr": 0x20}, ...]
+        """
+        out = []
+        for m in range(self.get_module_count()):
+            try:
+                mode = self.get_module_mode(m)
+            except LIFUError:
+                mode = NODE_MODE_UNKNOWN
+            out.append({"module": m, "mode": mode, "i2c_addr": self.get_module_i2c_addr(m)})
+        return out
+
     def update_firmware(self, module: int, package_file: str,
                         vid: int = 0x0483, pid: int = 0xDF11,
                         libusb_dll: str | None = None,

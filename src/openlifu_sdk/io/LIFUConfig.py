@@ -40,10 +40,16 @@ OW_CMD_GET_TEMP = 0x06
 OW_CMD_GET_AMBIENT = 0x07
 OW_CMD_ASYNC = 0x09
 OW_CMD_USR_CFG = 0x0A
+OW_CMD_CLEAR_CONFIG = 0x0B  # Phase 2: chain broadcast to drop stale I2C addresses
 OW_CMD_DISCOVERY = 0x0C
 OW_CMD_DFU = 0x0D
 OW_CMD_NOP = 0x0E
 OW_CMD_RESET = 0x0F
+
+# Node operating mode reported by OW_CTRL_GET_MODULE_MODE / discovery (Phase 2)
+NODE_MODE_UNKNOWN = 0x00
+NODE_MODE_APP = 0x01          # module is running application firmware
+NODE_MODE_BOOTLOADER = 0x02   # module is in the secure bootloader (I2C DFU)
 
 # Controller Commands
 OW_CTRL_SET_SWTRIG = 0x13
@@ -52,6 +58,8 @@ OW_CTRL_START_SWTRIG = 0x15
 OW_CTRL_STOP_SWTRIG = 0x16
 OW_CTRL_STATUS_SWTRIG = 0x17
 OW_CTRL_GET_MODULE_COUNT = 0x1A
+OW_CTRL_GET_MODULE_MODE = 0x1B  # Phase 2: per-module NodeMode (app vs bootloader)
+OW_CTRL_ENUMERATE = 0x1C        # Phase 2: re-run clear-config + discovery walk
 
 # TX7332 Commands
 OW_TX7332_STATUS = 0x20
@@ -107,6 +115,7 @@ TX7332_COMMANDS = {
 CONTROLLER_COMMANDS = {
     OW_CTRL_SET_SWTRIG, OW_CTRL_GET_SWTRIG, OW_CTRL_START_SWTRIG,
     OW_CTRL_STOP_SWTRIG, OW_CTRL_STATUS_SWTRIG, OW_CTRL_GET_MODULE_COUNT,
+    OW_CTRL_GET_MODULE_MODE, OW_CTRL_ENUMERATE,
 }
 
 POWER_COMMANDS = {
