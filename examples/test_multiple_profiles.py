@@ -57,9 +57,9 @@ DEFAULT_DURATION_S = 5e-3
 SONICATION_DURATION_S: dict[str, float] = {
     "TC1": 10.0,
     "TC2": 10.0,
-    "TC3": 10.0,
-    "TC4": 10.0,
-    "TC5": 10.0,
+    "TC3": 120.0,
+    "TC4": 20.0,
+    "TC5": 30.0,
     "TC6": 120.0,
 }
 
@@ -177,13 +177,19 @@ def make_default_pulse() -> dict:
 
 def make_default_sequence() -> dict:
     """Standard trigger sequence used across tests."""
-    return {
-        "pulse_interval": 0.1,
-        "pulse_count": 10,
-        "pulse_train_interval": 1.0,
-        "pulse_train_count": 1,
-    }
+    # return {
+    #     "pulse_interval": 0.5,
+    #     "pulse_count": 20,
+    #     "pulse_train_interval": 0,
+    #     "pulse_train_count": 3,
+    # }
 
+    return {
+        "pulse_interval": .1,
+        "pulse_count": 16,
+        "pulse_train_interval": 0,
+        "pulse_train_count": 5,
+    }
 
 # ---------------------------------------------------------------------------
 # Register readback and verification
@@ -525,6 +531,7 @@ def test_multi_profile_shared_pulse(
     pulse = make_default_pulse()
     sequence = make_default_sequence()
     execution_order = list(profile_numbers)
+    # execution_order = [1,4,1,4,2,3,2,3]
 
     interface.txdevice.set_solution(
         pulse=pulse,
@@ -727,6 +734,8 @@ def main() -> None:
         ("TC5", test_max_profiles),
         ("TC6", test_single_channel_scan),
     ]
+
+    test_multi_profile_shared_pulse(interface, num_tx)
 
     results: dict[str, str] = {}
     for name, test_fn in tests:
