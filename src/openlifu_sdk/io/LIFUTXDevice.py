@@ -85,6 +85,9 @@ DELAY_WIDTH = 13
 APODIZATION_CHANNEL_ORDER = [17, 19, 21, 23, 25, 27, 29, 31, 18, 20, 22, 24, 26, 28, 30, 32, 1, 3, 5, 7, 9, 11, 13, 15, 2, 4, 6, 8, 10, 12, 14, 16]
 APODIZATION_CHANNEL_ORDER_REVERSED = [33 - c for c in APODIZATION_CHANNEL_ORDER]
 DEFAULT_PATTERN_DUTY_CYCLE = 0.66
+# Minimum inter-pulse dead time (seconds) required for SPI profile switching.
+# Must match MIN_PROFILE_SWITCH_US in firmware trigger.h (200 µs).
+MIN_PROFILE_SWITCH_INTERVAL = 200e-6
 PATTERN_PROFILE_OFFSET = 4
 NUM_PATTERN_PROFILES = 32
 VALID_PATTERN_PROFILES = list(range(1, NUM_PATTERN_PROFILES+1))
@@ -1096,7 +1099,30 @@ class TxDevice(OWComponent):
         for idx in execution_order:
             if not isinstance(idx, int) or idx < 1 or idx > n:
                 raise ValueError(f"execution_order contains invalid profile index {idx}. Must be in 1-{n}")
-        
+
+        # ========== PULSE-LEVEL PROFILE SWITCHING INTERLOCKS ==========
+        # Firmware switches profiles between pulses. Validate constraints:
+        # 1. pulse_count must be divisible by len(execution_order)
+        # 2. Inter-pulse dead time must exceed SPI write duration
+        if n > 1:
+            pulse_count = sequence["pulse_count"]
+            n_exec = len(execution_order)
+            if pulse_count % n_exec != 0:
+                raise ValueError(
+                    f"pulse_count ({pulse_count}) must be divisible by the number of "
+                    f"profiles in execution_order ({n_exec}). "
+                    f"Each profile gets pulse_count/n_profiles = {pulse_count}/{n_exec} consecutive pulses."
+                )
+            pulse_interval = sequence["pulse_interval"]
+            pulse_width_s = sequence.get("pulse_width", DEFAULT_PULSE_WIDTH_US) * 1e-6
+            dead_time = pulse_interval - pulse_width_s
+            if dead_time < MIN_PROFILE_SWITCH_INTERVAL:
+                raise ValueError(
+                    f"Inter-pulse dead time ({dead_time*1e6:.0f} µs) is less than the minimum "
+                    f"required for profile switching ({MIN_PROFILE_SWITCH_INTERVAL*1e6:.0f} µs). "
+                    f"Increase pulse_interval or decrease pulse_width."
+                )
+
         logger.info(f"Grouped profile package system: {n} profiles, execution_order={execution_order}")
 
         n_elements = delays.shape[1]
