@@ -86,8 +86,9 @@ APODIZATION_CHANNEL_ORDER = [17, 19, 21, 23, 25, 27, 29, 31, 18, 20, 22, 24, 26,
 APODIZATION_CHANNEL_ORDER_REVERSED = [33 - c for c in APODIZATION_CHANNEL_ORDER]
 DEFAULT_PATTERN_DUTY_CYCLE = 0.66
 # Minimum inter-pulse dead time (seconds) required for SPI profile switching.
-# Must match MIN_PROFILE_SWITCH_US in firmware trigger.h (200 µs).
-MIN_PROFILE_SWITCH_INTERVAL = 200e-6
+# Must match MIN_PROFILE_SWITCH_US in firmware trigger.h (1000 µs).
+# Measured: ~460 µs at SPI prescaler /4 (12 MHz). Using 1 ms for safety margin.
+MIN_PROFILE_SWITCH_INTERVAL = 1000e-6
 PATTERN_PROFILE_OFFSET = 4
 NUM_PATTERN_PROFILES = 32
 VALID_PATTERN_PROFILES = list(range(1, NUM_PATTERN_PROFILES+1))
