@@ -71,7 +71,13 @@ openlifu_sdk = [
 
 
 [tool.setuptools_scm]
-# Uses tags like v1.2.3 or 1.2.3  ->  1.2.3
-tag_regex = "^(?:pre-)?v?(?P<version>\\d+\\.\\d+\\.\\d+)$"
+# The version comes from the git tag, verbatim. Accepts release and
+# pre-release tags with optional pre-/v prefixes, e.g.:
+#   1.2.3  v1.2.3  pre-v1.2.3  2.0.15-rc.0  2.0.15rc0  1.2.3.post1
+# The captured part is normalized per PEP 440 (2.0.15-rc.0 -> 2.0.15rc0).
+tag_regex = "^(?:pre-)?v?(?P<version>\\d+\\.\\d+\\.\\d+(?:[-._]?(?:rc|a|b|c|alpha|beta|post|dev)[-._]?\\d*)?)$"
 version_scheme = "no-guess-dev"
 local_scheme = "no-local-version"
+# Bake the resolved version into the package so openlifu_sdk.__version__
+# always matches the wheel that was actually imported.
+version_file = "src/openlifu_sdk/_version.py"

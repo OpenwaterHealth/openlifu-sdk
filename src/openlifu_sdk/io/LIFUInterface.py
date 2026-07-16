@@ -669,4 +669,12 @@ class LIFUInterface:
 
     @staticmethod
     def get_sdk_version() -> str:
-        return importlib.metadata.version("openlifu-sdk")
+        # Report the version of the module actually imported (baked from the
+        # git tag at build time), not whichever dist-info importlib finds
+        # first -- the two can disagree when a stale install lingers on the
+        # path. Runtime import avoids a circular import at module load.
+        import openlifu_sdk
+
+        return getattr(
+            openlifu_sdk, "__version__", None
+        ) or importlib.metadata.version("openlifu-sdk")
