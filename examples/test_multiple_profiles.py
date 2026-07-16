@@ -27,6 +27,8 @@ Test cases:
     TC4: Apodization register verification per profile.
     TC5: Maximum 16 delay profiles.
     TC6: Single-channel scan for oscilloscope verification.
+    TC7: Host-side validation rejects invalid configurations.
+    TC8: Non-sequential, repeated execution_order cycling.
 """
 
 from __future__ import annotations
@@ -39,6 +41,7 @@ from typing import Sequence
 import numpy as np
 
 from openlifu_sdk import LIFUInterface
+from openlifu_sdk.io.LIFUTXDevice import MIN_PROFILE_SWITCH_INTERVAL
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -52,16 +55,9 @@ VOLTAGE = 20.0
 DEFAULT_FREQUENCY_HZ = 400e3
 DEFAULT_DURATION_S = 5e-3
 
-# Sonication duration per test case (seconds). Longer for tests with more
-# profiles so the oscilloscope operator has time to observe cycling.
-SONICATION_DURATION_S: dict[str, float] = {
-    "TC1": 10.0,
-    "TC2": 10.0,
-    "TC3": 120.0,
-    "TC4": 20.0,
-    "TC5": 30.0,
-    "TC6": 120.0,
-}
+# Extra wall-clock margin (seconds) on top of the computed sequence duration,
+# covering start/stop command latency and per-train firmware ISR overhead.
+SONICATION_MARGIN_S = 0.0
 
 # Pattern RAM layout.
 PATTERN_DATA_START = 0x120
@@ -177,15 +173,8 @@ def make_default_pulse() -> dict:
 
 def make_default_sequence() -> dict:
     """Standard trigger sequence used across tests."""
-    # return {
-    #     "pulse_interval": 0.5,
-    #     "pulse_count": 20,
-    #     "pulse_train_interval": 0,
-    #     "pulse_train_count": 3,
-    # }
-
     return {
-        "pulse_interval": .1,
+        "pulse_interval": 0.1,
         "pulse_count": 16,
         "pulse_train_interval": 0,
         "pulse_train_count": 5,
@@ -401,22 +390,59 @@ def _setup_hardware(interface: LIFUInterface) -> int:
 
 def _print_header(name: str) -> None:
     """Print a test case header."""
-    print(f"\n{'=' * 60}")
+    print(f"\n{'=' * 80}")
     print(f"  {name}")
-    print(f"{'=' * 60}")
+    print(f"{'=' * 80}")
+
+
+def compute_sonication_duration(sequence: dict) -> float:
+    """Compute the wall-clock duration of one full trigger sequence.
+
+    Mirrors the SDK/firmware timing model: trains repeat every
+    ``pulse_train_interval`` (auto-filled by ``set_trigger`` to the train
+    duration plus MIN_PROFILE_SWITCH_INTERVAL when 0), and the sequence ends
+    when the last train's pulses complete.
+
+    Args:
+        sequence: Trigger sequence dict with pulse_interval, pulse_count,
+            pulse_train_interval, and pulse_train_count.
+
+    Returns:
+        Expected sequence duration in seconds (no margin).
+    """
+    pulse_interval = sequence["pulse_interval"]
+    pulse_count = sequence["pulse_count"]
+    train_count = sequence["pulse_train_count"]
+    train_interval = sequence["pulse_train_interval"]
+
+    train_duration = pulse_interval * pulse_count
+    if train_count <= 1:
+        return train_duration
+
+    if train_interval == 0:
+        # Back-to-back trains: set_trigger() auto-fills the interval with the
+        # train duration plus the TIM1/TIM2 race-margin.
+        train_interval = train_duration + MIN_PROFILE_SWITCH_INTERVAL
+
+    return (train_count - 1) * train_interval + train_duration
 
 
 def _run_sonication(
     interface: LIFUInterface,
-    tc_name: str,
+    sequence: dict,
     description: str,
 ) -> None:
-    """Start sonication, wait for the configured duration, then stop."""
-    duration = SONICATION_DURATION_S.get(tc_name, 5.0)
+    """Start sonication, wait for the sequence to complete, then stop.
+
+    The wait time is derived from the sequence's own pulse parameters via
+    compute_sonication_duration(), plus a fixed safety margin.
+    """
+    duration = compute_sonication_duration(sequence)
     print(f"\n  Sonication: {description}")
-    print(f"  Duration: {duration}s — observe on oscilloscope.")
+    print(f"  Sequence duration: {duration:.2f}s "
+          f"(+{SONICATION_MARGIN_S:.1f}s margin) — observe on oscilloscope.")
     interface.start_sonication()
-    time.sleep(duration)
+    time.sleep(duration + SONICATION_MARGIN_S)
     interface.stop_sonication()
     print("  Sonication stopped.")
 
@@ -432,10 +458,10 @@ def test_single_profile_backward_compat(
 ) -> bool:
     """TC1: Single delay profile, no execution_order (backward compatible).
 
-    Verifies the n=1 path that existing callers (burn_in_test, single_pulse,
-    Slicer app) rely on. No grouped profile cycle is sent to firmware.
+    Verifies the n=1 path that existing callers (example scripts, Slicer) rely on. 
+    No grouped profile cycle is sent to firmware.
     """
-    _print_header("TC1: Single profile - backward compatible (all channels on)")
+    _print_header("TC1: Single profile - backwards compatibility (all channels on)")
 
     delays = generate_per_channel_delays(profile_number=1).reshape(1, -1)
     apodizations = make_all_on_apodizations(num_profiles=1)
@@ -463,7 +489,7 @@ def test_single_profile_backward_compat(
     passed &= verify_pattern_ram(interface, [1], num_tx)
 
     if passed:
-        _run_sonication(interface, "TC1", "1 profile, all 64 channels on")
+        _run_sonication(interface, sequence, "1 profile, all 64 channels on")
 
     return passed
 
@@ -504,7 +530,7 @@ def test_single_profile_with_execution_order(
     passed &= verify_apodization_register(interface, 1, num_tx)
 
     if passed:
-        _run_sonication(interface, "TC2", "1 profile with execution_order=[1]")
+        _run_sonication(interface, sequence, "1 profile with execution_order=[1]")
 
     return passed
 
@@ -531,7 +557,6 @@ def test_multi_profile_shared_pulse(
     pulse = make_default_pulse()
     sequence = make_default_sequence()
     execution_order = list(profile_numbers)
-    # execution_order = [1,4,1,4,2,3,2,3]
 
     interface.txdevice.set_solution(
         pulse=pulse,
@@ -555,7 +580,7 @@ def test_multi_profile_shared_pulse(
     passed &= verify_pattern_ram(interface, profile_numbers, num_tx)
 
     if passed:
-        _run_sonication(interface, "TC3", "4 profiles cycling, all channels on")
+        _run_sonication(interface, sequence, "4 profiles cycling, all channels on")
 
     return passed
 
@@ -597,12 +622,12 @@ def test_apodization_per_profile(
     print("  Delay verification:")
     passed &= verify_delays(interface, profile_numbers, delays, num_tx)
     print("  Apodization register for active profile (profile 1):")
-    print(f"    Expected enabled channels: 0-15")
+    print("    Expected enabled channels: 0-15")
     passed &= verify_apodization_register(interface, 1, num_tx)
 
     if passed:
         _run_sonication(
-            interface, "TC4",
+            interface, sequence,
             "4 profiles cycling, 16-channel blocks (ch0-15, 16-31, 32-47, 48-63)",
         )
 
@@ -621,9 +646,10 @@ def test_single_channel_scan(
 
     Channels tested: 1, 2, 63, 64.
     """
-    _print_header("TC6: Single-channel scan - 8 profiles, one channel each")
-
     scan_channels = [1, 2, 63, 64]
+    _print_header(
+        f"TC6: Single-channel scan - {len(scan_channels)} profiles, one channel each"
+    )
     num_profiles = len(scan_channels)
     profile_numbers = list(range(1, num_profiles + 1))
 
@@ -660,8 +686,8 @@ def test_single_channel_scan(
 
     if passed:
         _run_sonication(
-            interface, "TC6",
-            f"8 profiles cycling, one channel each: {scan_channels}",
+            interface, sequence,
+            f"{num_profiles} profiles cycling, only one channel active on each: {scan_channels}",
         )
 
     return passed
@@ -708,7 +734,148 @@ def test_max_profiles(
     passed &= verify_pattern_ram(interface, profile_numbers, num_tx)
 
     if passed:
-        _run_sonication(interface, "TC5", "16 profiles cycling, all channels on")
+        _run_sonication(interface, sequence, "16 profiles cycling, all channels on")
+
+    return passed
+
+
+def test_execution_order_cycling(
+    interface: LIFUInterface,
+    num_tx: int,
+) -> bool:
+    """TC7: Non-sequential, repeated execution_order.
+
+    Uses execution_order=[1, 4, 1, 4, 2, 3, 2, 3] over 4 delay profiles so
+    the firmware's pulses-per-entry grouping (pulse_count / len(order)) and
+    the order wraparound are exercised with repeated and out-of-order
+    entries. Each profile enables a distinct 16-channel block so the order
+    is visible on an oscilloscope.
+
+    After the sequence completes, the last executed entry must remain
+    active: the firmware applies the next entry after each group's final
+    pulse but never after the sequence's last pulse, and the profile reset
+    at train boundaries only occurs between trains.
+    """
+    execution_order = [1, 4, 1, 4, 2, 3, 2, 3]
+    num_profiles = 4
+    profile_numbers = list(range(1, num_profiles + 1))
+
+    sequence = make_default_sequence()
+    pulses_per_entry = sequence["pulse_count"] // len(execution_order)
+    _print_header(
+        f"TC7: Execution order cycling - order={execution_order}, "
+        f"{pulses_per_entry} pulse(s) per entry"
+    )
+
+    delays = np.array([
+        generate_per_channel_delays(p) for p in profile_numbers
+    ])
+    apodizations = make_block_apodizations(num_profiles)
+    pulse = make_default_pulse()
+
+    interface.txdevice.set_solution(
+        pulse=pulse,
+        delays=delays,
+        apodizations=apodizations,
+        sequence=sequence,
+        trigger_mode="sequence",
+        profile_index=1,
+        profile_increment=True,
+        execution_order=execution_order,
+    )
+
+    passed = True
+    print("  Delay verification:")
+    passed &= verify_delays(interface, profile_numbers, delays, num_tx)
+    print("  Control register verification (active profile = 1):")
+    passed &= verify_control_registers(interface, 1, num_tx)
+
+    if not passed:
+        return False
+
+    _run_sonication(
+        interface, sequence,
+        f"order {execution_order}, {pulses_per_entry} pulse(s) per entry, "
+        f"16-channel block per profile",
+    )
+
+    # Post-run: the last execution_order entry must still be selected.
+    expected_final = execution_order[-1]
+    final_profile = interface.txdevice.get_delay_profile()
+    if final_profile == expected_final:
+        print(f"  [OK] final active delay profile = {final_profile} "
+              f"(last execution_order entry)")
+    else:
+        print(f"  [FAIL] final active delay profile = {final_profile}, "
+              f"expected {expected_final} (last execution_order entry)")
+        passed = False
+
+    print(f"  Apodization register after run (expect profile {expected_final}'s block):")
+    passed &= verify_apodization_register(interface, expected_final, num_tx)
+
+    return passed
+
+
+def test_validation_errors(
+    interface: LIFUInterface,
+    num_tx: int,
+) -> bool:
+    """TC8: set_solution rejects invalid multi-profile configurations.
+
+    Exercises host-side validation only; every case must raise ValueError
+    before any register is written, so no sonication is run.
+    """
+    _print_header("TC8: Validation errors (host-side, no sonication)")
+
+    delays = np.array([generate_per_channel_delays(p) for p in (1, 2, 3)])
+    apodizations = make_all_on_apodizations(3)
+    pulse = make_default_pulse()
+
+    cases = [
+        (
+            "pulse_count not divisible by len(execution_order)",
+            {"sequence": {"pulse_interval": 0.1, "pulse_count": 10,
+                          "pulse_train_interval": 0, "pulse_train_count": 1}},
+        ),
+        (
+            "execution_order index out of range",
+            {"sequence": make_default_sequence(), "execution_order": [1, 2, 4]},
+        ),
+        (
+            "inter-pulse dead time below profile-switch minimum",
+            {"sequence": {"pulse_interval": 0.0005, "pulse_count": 15,
+                          "pulse_train_interval": 0, "pulse_train_count": 1}},
+        ),
+        (
+            "mismatched delays/apodizations rows",
+            {"sequence": make_default_sequence(),
+             "apodizations": make_all_on_apodizations(2)},
+        ),
+        (
+            "pulse list length != profile rows without pulse_profile_map",
+            {"sequence": make_default_sequence(),
+             "pulse": [make_default_pulse(), make_default_pulse()]},
+        ),
+    ]
+
+    passed = True
+    for description, overrides in cases:
+        kwargs = {
+            "pulse": pulse,
+            "delays": delays,
+            "apodizations": apodizations,
+            "trigger_mode": "sequence",
+            "profile_index": 1,
+            "profile_increment": False,
+        }
+        kwargs.update(overrides)
+        try:
+            interface.txdevice.set_solution(**kwargs)
+        except ValueError as exc:
+            print(f"  [OK] {description}: raised ValueError ({exc})")
+        else:
+            print(f"  [FAIL] {description}: no ValueError raised")
+            passed = False
 
     return passed
 
@@ -733,26 +900,29 @@ def main() -> None:
         ("TC4", test_apodization_per_profile),
         ("TC5", test_max_profiles),
         ("TC6", test_single_channel_scan),
+        ("TC7", test_execution_order_cycling),
+        ("TC8", test_validation_errors),
     ]
 
-    test_multi_profile_shared_pulse(interface, num_tx)
-
     results: dict[str, str] = {}
-    for name, test_fn in tests:
-        try:
-            passed = test_fn(interface, num_tx)
-            results[name] = "PASS" if passed else "FAIL"
-        except Exception:
-            traceback.print_exc()
-            results[name] = "ERROR"
+    try:
+        for name, test_fn in tests:
+            try:
+                passed = test_fn(interface, num_tx)
+                results[name] = "PASS" if passed else "FAIL"
+            except Exception:
+                traceback.print_exc()
+                results[name] = "ERROR"
+    finally:
+        # Never leave the array sonicating if a test dies mid-run.
+        interface.stop_sonication(turn_hv_off=False)
 
     # Summary.
     print(f"\n{'=' * 60}")
     print("  TEST SUMMARY")
     print(f"{'=' * 60}")
     for name, result in results.items():
-        marker = "PASS" if result == "PASS" else "FAIL"
-        print(f"  [{marker}] {name}: {result}")
+        print(f"  [{result}] {name}")
 
     total = len(results)
     passed_count = sum(1 for r in results.values() if r == "PASS")
