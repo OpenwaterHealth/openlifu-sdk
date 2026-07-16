@@ -10,7 +10,6 @@ from openlifu_sdk.io.LIFUConfig import (
     GLOBAL_COMMANDS,
     LIFU_ERR_BAD_PAYLOAD_LENGTH,
     OW_CONSOLE_PID,
-    OW_ERROR,
     OW_POWER,
     OW_POWER_12V_OFF,
     OW_POWER_12V_ON,

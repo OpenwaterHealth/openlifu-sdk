@@ -4,16 +4,14 @@ import json
 import logging
 import re
 import struct
-import time
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Annotated, Dict, List, Literal, Optional
+from typing import TYPE_CHECKING, Annotated, Dict, List, Literal
 
 import numpy as np
 
 from openlifu_sdk.io.component import OWComponent, register_command_packet_types
 from openlifu_sdk.util.annotations import OpenLIFUFieldData
 from openlifu_sdk.util.units import getunitconversion
-from openlifu_sdk.util.hwid import format_hwid
 
 DEFAULT_NUM_TRANSMITTERS = 2
 TRANSMITTERS_PER_MODULE = 2
@@ -106,7 +104,7 @@ TriggerModeOpts = Literal['sequence', 'continuous','single']
 DEFAULT_PULSE_WIDTH_US = 20
 TEMPERATURE_DATA_LENGTH = 4
 
-from openlifu_sdk.io.LIFUConfig import (
+from openlifu_sdk.io.LIFUConfig import (  # noqa: E402 -- protocol constants above are needed before this import block
     CONTROLLER_COMMANDS,
     DEFAULT_TIMEOUT,
     GLOBAL_COMMANDS,
@@ -114,30 +112,18 @@ from openlifu_sdk.io.LIFUConfig import (
     LIFU_ERR_BAD_PAYLOAD_LENGTH,
     LIFU_ERR_EMPTY_RESPONSE,
     LIFU_ERR_MODULE_COUNT_MISMATCH,
-    OW_CMD,
     OW_CMD_ASYNC,
-    OW_CMD_DFU,
-    OW_CMD_ECHO,
     OW_CMD_GET_AMBIENT,
     OW_CTRL_GET_MODULE_COUNT,
     OW_CTRL_GET_MODULE_MODE,
     OW_CTRL_ENUMERATE,
-    NODE_MODE_APP,
-    NODE_MODE_BOOTLOADER,
     NODE_MODE_UNKNOWN,
     OW_CMD_GET_TEMP,
-    OW_CMD_HWID,
-    OW_CMD_PING,
-    OW_CMD_RESET,
-    OW_CMD_TOGGLE_LED,
-    OW_CMD_USR_CFG,
-    OW_CMD_VERSION,
     OW_CONTROLLER,
     OW_CTRL_GET_SWTRIG,
     OW_CTRL_SET_SWTRIG,
     OW_CTRL_START_SWTRIG,
     OW_CTRL_STOP_SWTRIG,
-    OW_ERROR,
     OW_TRANSMITTER_PID,
     OW_TX7332,
     OW_TX7332_DEMO,
@@ -145,18 +131,16 @@ from openlifu_sdk.io.LIFUConfig import (
     OW_TX7332_ENUM,
     OW_TX7332_RREG,
     OW_TX7332_RBLOCK,
-    OW_TX7332_VWBLOCK,
-    OW_TX7332_VWREG,
     OW_TX7332_WBLOCK,
     OW_TX7332_WREG,
     OW_VID,
     TRIGGER_MODE_CONTINUOUS,
     TRIGGER_MODE_SEQUENCE,
     TRIGGER_MODE_SINGLE,
-    HW_ID_DATA_LENGTH,
     TX7332_COMMANDS
 )
-from openlifu_sdk.io.exceptions import LIFUError, LIFUProtocolError
+from openlifu_sdk.io.LIFUConfig import HW_ID_DATA_LENGTH as HW_ID_DATA_LENGTH  # noqa: E402 -- re-exported; unit tests import it from this module
+from openlifu_sdk.io.exceptions import LIFUError, LIFUProtocolError  # noqa: E402
 
 if TYPE_CHECKING:
     pass
@@ -661,8 +645,8 @@ class TxDevice(OWComponent):
 
         if n > 1:
             # Buffer the pulse and delay profiles in the microcontroller(s), so that they can be used to switch profiles on trigger detection
-            delay_control_registers = {profile: self.tx_registers.get_delay_control_registers(profile) for profile in self.tx_registers.configured_delay_profiles()}
-            pulse_control_registers = {profile: self.tx_registers.get_pulse_control_registers(profile) for profile in self.tx_registers.configured_pulse_profiles()}
+            delay_control_registers = {profile: self.tx_registers.get_delay_control_registers(profile) for profile in self.tx_registers.configured_delay_profiles()}  # noqa: F841 -- consumed by the profile-buffering feature in development on a branch
+            pulse_control_registers = {profile: self.tx_registers.get_pulse_control_registers(profile) for profile in self.tx_registers.configured_pulse_profiles()}  # noqa: F841 -- consumed by the profile-buffering feature in development on a branch
 
         return True
 
@@ -1235,7 +1219,6 @@ class Tx7332Registers:
             y = pattern['y']*int(cycles+1)
             y = y[:(16*elastic_repeat)]
             y = y + ([0]*pulse_profile.tail_count)
-            t = np.arange(len(y))*(1/clk_n)
             elastic_mode = 1
             if elastic_repeat > MAX_ELASTIC_REPEAT:
                 raise ValueError("Pattern duration too long for elastic repeat")

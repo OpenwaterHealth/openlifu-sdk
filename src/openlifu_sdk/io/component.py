@@ -87,9 +87,6 @@ class OWComponent:
 
     def connect(self) -> bool:
         return self._uart.connect()
-    
-    def is_connected(self) -> bool:
-        return self._uart.is_connected
 
     def disconnect(self):
         self._uart.disconnect()
