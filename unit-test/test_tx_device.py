@@ -262,19 +262,15 @@ class TestTxDeviceUnit(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.tx.set_trigger(pulse_interval=0.1, trigger_mode="invalid")
 
-    def test_23b_set_trigger_single_train_lengthens_train_interval(self):
-        """set_trigger() lengthens TriggerPulseTrainInterval when
-        pulse_train_count<=1 so it clears the firmware per-pulse period.
+    def test_23b_set_trigger_single_train_sets_train_duration(self):
+        """set_trigger() sets TriggerPulseTrainInterval to the train duration
+        when pulse_train_count<=1.
 
-        For single-train operation the inter-train spacing is meaningless,
-        but firmware <= 2.0.3 still NAKs start_trigger when
-        TriggerPulseTrainInterval > 0 AND <= triggerPeriodUsec, and that
-        firmware parses TriggerFrequencyHz as uint32 (strtol base 10) so
-        fractional Hz get truncated. To make ``train_us > period_us``
-        without changing the user-visible sonication frequency, the SDK
-        copies pulse_interval into pulse_train_interval and then lengthens
-        the train interval to ``1 / (int(1/burst) - 1)`` (equivalent to
-        rounding the implied train frequency down by 1 Hz).
+        For single-train operation the inter-train spacing is meaningless, but
+        the firmware still validates TriggerPulseTrainInterval >= period *
+        pulse_count on every start. The SDK sets it to
+        ``pulse_interval * pulse_count + MIN_PROFILE_SWITCH_INTERVAL`` so the
+        check passes regardless of pulse_count.
         """
         response = {"TriggerFrequencyHz": 50.0, "TriggerMode": TRIGGER_MODE_SEQUENCE}
         self.uart.send_packet.return_value = _make_packet(json.dumps(response).encode())
@@ -283,19 +279,19 @@ class TestTxDeviceUnit(unittest.TestCase):
         sent_json = json.loads(self.uart.send_packet.call_args.kwargs["data"].decode())
         # pulse_interval (frequency) is preserved.
         self.assertEqual(int(sent_json["TriggerFrequencyHz"]), 50)
-        # train_us = int(1/49 * 1e6) = 20408 us (> period 20000 us)
-        self.assertEqual(int(sent_json["TriggerPulseTrainInterval"]), 20408)
+        # 0.02 s * 1 pulse + 1 ms margin = 21000 us.
+        self.assertEqual(int(sent_json["TriggerPulseTrainInterval"]), 21000)
 
-        # Same outcome when caller explicitly passes a nonzero interval.
+        # A larger pulse_count scales the interval with the train duration.
         self.uart.send_packet.reset_mock()
         self.uart.send_packet.return_value = _make_packet(json.dumps(response).encode())
-        self.tx.set_trigger(pulse_interval=0.02, pulse_count=1, pulse_width=20,
+        self.tx.set_trigger(pulse_interval=0.02, pulse_count=100, pulse_width=20,
                             pulse_train_interval=1.0, pulse_train_count=1,
                             trigger_mode="continuous")
         sent_json = json.loads(self.uart.send_packet.call_args.kwargs["data"].decode())
-        # train_count<=1 ignores the explicit interval and uses pulse_interval instead.
+        # train_count<=1 ignores the explicit interval; 0.02 s * 100 + 1 ms = 2001000 us.
         self.assertEqual(int(sent_json["TriggerFrequencyHz"]), 50)
-        self.assertEqual(int(sent_json["TriggerPulseTrainInterval"]), 20408)
+        self.assertEqual(int(sent_json["TriggerPulseTrainInterval"]), 2001000)
 
     def test_23c_set_trigger_multi_train_lengthens_train_interval(self):
         """set_trigger() lengthens TriggerPulseTrainInterval for the

@@ -290,10 +290,11 @@ class TxDevice(OWComponent):
 
         if pulse_train_count <= 1:
             # Only one train will ever fire, so the inter-train spacing is
-            # functionally meaningless. Force it to a value derived from
-            # pulse_interval so the firmware compatibility shim below can
-            # bump it above the per-pulse period.
-            pulse_train_interval = pulse_interval
+            # functionally meaningless -- but the firmware still validates
+            # train_interval >= period * pulse_count on every start. Set it to
+            # the full train duration plus margin (same as the interval==0
+            # case) so single-train configs pass regardless of pulse_count.
+            pulse_train_interval = pulse_interval * pulse_count + MIN_PROFILE_SWITCH_INTERVAL
         elif pulse_train_interval > 0 and (pulse_train_interval < pulse_interval * pulse_count):
             raise ValueError("Pulse train interval cannot be less than pulse interval * pulse count")
         elif pulse_train_interval == 0:

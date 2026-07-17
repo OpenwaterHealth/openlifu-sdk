@@ -49,7 +49,7 @@ from openlifu_sdk.io.LIFUTXDevice import MIN_PROFILE_SWITCH_INTERVAL
 
 CHANNEL_COUNT = 64
 CHANNELS_PER_CHIP = 32
-VOLTAGE = 20.0
+VOLTAGE = 65.0
 
 # Channels enabled per profile by make_block_apodizations().
 APOD_BLOCK_SIZE = 16
@@ -59,7 +59,7 @@ RAIL_12V_SETTLE_S = 2.0
 
 # Default pulse parameters shared by all tests.
 DEFAULT_FREQUENCY_HZ = 400e3
-DEFAULT_DURATION_S = 5e-3
+DEFAULT_DURATION_S = 2e-3
 
 # Extra wall-clock margin (seconds) on top of the computed sequence duration,
 # covering start/stop command latency and per-train firmware ISR overhead.
