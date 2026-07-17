@@ -51,6 +51,12 @@ CHANNEL_COUNT = 64
 CHANNELS_PER_CHIP = 32
 VOLTAGE = 20.0
 
+# Channels enabled per profile by make_block_apodizations().
+APOD_BLOCK_SIZE = 16
+
+# Wait after enabling the 12 V rail before talking to the TX chips.
+RAIL_12V_SETTLE_S = 2.0
+
 # Default pulse parameters shared by all tests.
 DEFAULT_FREQUENCY_HZ = 400e3
 DEFAULT_DURATION_S = 5e-3
@@ -125,8 +131,8 @@ def make_block_apodizations(
     """
     apodizations = np.zeros((num_profiles, channel_count), dtype=float)
     for k in range(num_profiles):
-        start = (16 * k) % channel_count
-        apodizations[k, start:start + 16] = 1.0
+        start = (APOD_BLOCK_SIZE * k) % channel_count
+        apodizations[k, start:start + APOD_BLOCK_SIZE] = 1.0
     return apodizations
 
 
@@ -377,7 +383,7 @@ def _setup_hardware(interface: LIFUInterface) -> int:
     """Ensure 12 V rail and TX enumeration are ready. Returns num_tx."""
     if not interface.hvcontroller.get_12v_status():
         interface.hvcontroller.turn_12v_on()
-        time.sleep(2)
+        time.sleep(RAIL_12V_SETTLE_S)
 
     if interface.txdevice.tx_registers is None:
         num_tx = interface.txdevice.enum_tx7332_devices()

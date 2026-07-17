@@ -309,7 +309,8 @@ class TestTxDeviceUnit(unittest.TestCase):
                             trigger_mode="sequence")
         sent_json = json.loads(self.uart.send_packet.call_args.kwargs["data"].decode())
         self.assertEqual(int(sent_json["TriggerFrequencyHz"]), 50)
-        self.assertEqual(int(sent_json["TriggerPulseTrainInterval"]), 20408)
+        # Auto-fill: train duration (20000 us) + 1 ms TIM1/TIM2 race margin.
+        self.assertEqual(int(sent_json["TriggerPulseTrainInterval"]), 21000)
 
         # Explicit interval equal to pulse_interval * pulse_count: same fix.
         self.uart.send_packet.reset_mock()
@@ -331,8 +332,8 @@ class TestTxDeviceUnit(unittest.TestCase):
                             pulse_train_interval=0.0, pulse_train_count=3,
                             trigger_mode="sequence")
         sent_json = json.loads(self.uart.send_packet.call_args.kwargs["data"].decode())
-        # pulse_interval (0.02 s) * pulse_count (4) = 0.08 s -> 80000 us
-        self.assertEqual(sent_json["TriggerPulseTrainInterval"], 80000)
+        # pulse_interval (0.02 s) * pulse_count (4) + 1 ms race margin -> 81000 us
+        self.assertEqual(sent_json["TriggerPulseTrainInterval"], 81000)
         self.assertEqual(int(sent_json["TriggerFrequencyHz"]), 50)
 
     # --- start / stop trigger -----------------------------------------------

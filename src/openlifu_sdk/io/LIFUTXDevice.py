@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import json
 import logging
-import math
 import re
 import struct
 import time
@@ -11,7 +10,6 @@ from typing import TYPE_CHECKING, Annotated, Dict, List, Literal, Optional
 
 import numpy as np
 
-from openlifu_sdk.io.LIFUUserConfig import LifuUserConfig
 from openlifu_sdk.io.component import OWComponent, register_command_packet_types
 from openlifu_sdk.util.annotations import OpenLIFUFieldData
 from openlifu_sdk.util.units import getunitconversion
@@ -35,6 +33,7 @@ ADDRESS_PATTERN_SEL_G1 = 0x1F
 ADDRESS_TRSW = 0x1A
 ADDRESS_APODIZATION = 0x1B
 ADDRESS_GLOBAL_CONTROL = 0x00
+GLOBAL_CONTROL_LOAD_PROFILE = 0x08  # Self-clearing LOAD_PROF bit in register 0x00.
 ADDRESSES_GLOBAL = [ADDRESS_GLOBAL_MODE,
                     ADDRESS_STANDBY,
                     ADDRESS_DYNPWR_2,
@@ -79,8 +78,8 @@ for row, channels in enumerate(DELAY_ORDER_REVERSED):
     for i, channel in enumerate(channels):
         DELAY_CHANNEL_MAP[channel] = {'row': row, 'lsb': 16*(1-i)}
 DELAY_PROFILE_OFFSET = 16
-VALID_PULSE_PROFILES = list(range(0, 17))
-VALID_DELAY_PROFILES = list(range(0, 17))
+VALID_PULSE_PROFILES = list(range(1, 17))
+VALID_DELAY_PROFILES = list(range(1, 17))
 DELAY_WIDTH = 13
 APODIZATION_CHANNEL_ORDER = [17, 19, 21, 23, 25, 27, 29, 31, 18, 20, 22, 24, 26, 28, 30, 32, 1, 3, 5, 7, 9, 11, 13, 15, 2, 4, 6, 8, 10, 12, 14, 16]
 APODIZATION_CHANNEL_ORDER_REVERSED = [33 - c for c in APODIZATION_CHANNEL_ORDER]
@@ -130,8 +129,6 @@ from openlifu_sdk.io.LIFUConfig import (
     OW_CMD_ASYNC,
     OW_CMD_DFU,
     OW_CMD_ECHO,
-    OW_CMD_FLASH_WRITE,
-    OW_CMD_FLASH_READ,
     OW_CMD_GET_AMBIENT,
     OW_CTRL_GET_MODULE_COUNT,
     OW_CTRL_GET_MODULE_MODE,
@@ -168,7 +165,6 @@ from openlifu_sdk.io.LIFUConfig import (
     OW_TX7332_VWREG,
     OW_TX7332_WBLOCK,
     OW_TX7332_WREG,
-    OW_TX7332_SET_DELAY_PROFILE,
     OW_VID,
     TRIGGER_MODE_CONTINUOUS,
     TRIGGER_MODE_SEQUENCE,
@@ -301,7 +297,11 @@ class TxDevice(OWComponent):
         elif pulse_train_interval > 0 and (pulse_train_interval < pulse_interval * pulse_count):
             raise ValueError("Pulse train interval cannot be less than pulse interval * pulse count")
         elif pulse_train_interval == 0:
-            pulse_train_interval = pulse_interval * pulse_count
+            # Back-to-back trains: pad the train duration with a safety margin.
+            # If the interval exactly equals the train duration, the firmware
+            # TIM2 (train) expiry races the final TIM1 pulse and the trigger
+            # output becomes unstable.
+            pulse_train_interval = pulse_interval * pulse_count + MIN_PROFILE_SWITCH_INTERVAL
 
         # Firmware <= 2.0.3 compatibility shim.
         #
@@ -433,64 +433,97 @@ class TxDevice(OWComponent):
             "profile_increment": bool(trigger_json["ProfileIncrement"]),
         }
 
-    # my changes
     def set_pattern_profile(self, profile: int, identifier: int | None = None) -> bool:
-        """Set active TX profile via MCU controller command.
+        """Set the active TX pattern profile via MCU controller command.
 
-        This routes profile switching through firmware (OW_CTRL_SET_PATTERN_PROFILE), 
-        allowing MCU-side profile bookkeeping (including apodization handling)
-        instead of direct host register writes.
+        Routes profile switching through firmware (OW_CTRL_SET_PATTERN_PROFILE)
+        so the MCU can keep its profile bookkeeping (including apodization
+        handling) consistent, instead of direct host register writes.
+
+        Args:
+            profile: Pattern profile to activate (1-16).
+            identifier: TX chip index, or None to apply to every chip.
+
+        Raises:
+            ValueError: If profile is out of range.
+            LIFUNotConnectedError, LIFUCommunicationError, LIFUDeviceError:
+                On device-communication failure.
         """
         if profile not in VALID_PULSE_PROFILES:
             raise ValueError(f"Invalid profile {profile}. Expected 1-16.")
 
         payload = struct.pack('<B', profile)
-        tx_ids = self._iter_target_tx_ids(identifier)
-
-        # Verify both chips on the module are set
-        for tx_id in tx_ids:
-            r = self.send_checked(
+        for tx_id in self._resolve_tx_ids(identifier):
+            self.send_checked(
                 packet_type=OW_CONTROLLER,
                 command=OW_CTRL_SET_PATTERN_PROFILE,
                 addr=tx_id,
                 data=payload,
-                op=f"set_profile[{tx_id}]",
+                op=f"set_pattern_profile[{tx_id}]",
             )
         return True
 
-    # my changes
     def get_pattern_profile(self, identifier: int | None = None) -> int:
-        """Read active TX pattern profile via MCU controller command."""
+        """Read the active TX pattern profile via MCU controller command.
+
+        Args:
+            identifier: TX chip index, or None to read every chip and require
+                that all chips report the same profile.
+
+        Returns:
+            Active pattern profile (1-16).
+
+        Raises:
+            ValueError: If identifier is negative.
+            LIFUProtocolError: If a payload is malformed or chips disagree.
+        """
         if identifier is not None and identifier < 0:
             raise ValueError("TX chip identifier must be >= 0")
 
-        tx_ids = self._iter_target_tx_ids(identifier)
-        for tx_id in tx_ids:
+        profile: int | None = None
+        for tx_id in self._resolve_tx_ids(identifier):
             r = self.send_checked(
                 packet_type=OW_CONTROLLER,
                 command=OW_CTRL_GET_PATTERN_PROFILE,
                 addr=tx_id,
                 op=f"get_pattern_profile[{tx_id}]",
             )
-        if r.data_len < 1 or not r.data:
-            raise LIFUProtocolError(
-                f"TX: get_pulse_profile payload too short ({r.data_len} < 1)",
-                code=LIFU_ERR_BAD_PAYLOAD_LENGTH,
-            )
-        return int(r.data[0])
+            if r.data_len < 1 or not r.data:
+                raise LIFUProtocolError(
+                    f"TX: get_pattern_profile payload too short ({r.data_len} < 1)",
+                    code=LIFU_ERR_BAD_PAYLOAD_LENGTH,
+                )
+            chip_profile = int(r.data[0])
+            if profile is None:
+                profile = chip_profile
+            elif profile != chip_profile:
+                raise LIFUProtocolError(
+                    f"TX: pattern profile mismatch across chips ({profile} != {chip_profile})",
+                    code=LIFU_ERR_BAD_PAYLOAD_FORMAT,
+                )
+        if profile is None:
+            raise ValueError("No TX chips selected to read pattern profile")
+        return profile
 
-    def get_delay_profile(self, identifier: int | None = 0) -> int:
-        """Read active TX delay profile from TX7332 register 0x16.
+    def get_delay_profile(self, identifier: int = 0) -> int:
+        """Read the active TX delay profile via MCU controller command.
 
         Mirrors ``set_delay_profile`` by reading the same selector fields
-        (G1/G2) used for direct register-based profile switching.
+        (G1/G2) used for register-based profile switching.
+
+        Args:
+            identifier: TX chip index to read from.
+
+        Returns:
+            Active delay profile (1-16).
+
+        Raises:
+            ValueError: If identifier is negative.
+            LIFUProtocolError: If the payload is malformed or out of range.
         """
-        if identifier is not None and identifier < 0:
+        if identifier < 0:
             raise ValueError("TX chip identifier must be >= 0")
 
-        # tx_ids = self._iter_target_tx_ids(identifier)
-        # active_profile: int | None = None
-        # for tx_id in tx_ids:
         r = self.send_checked(
             packet_type=OW_CONTROLLER,
             command=OW_CTRL_GET_DELAY_PROFILE,
@@ -503,26 +536,12 @@ class TxDevice(OWComponent):
                 code=LIFU_ERR_BAD_PAYLOAD_LENGTH,
             )
         profile = int(r.data[0])
-        if profile < 1 or profile > 16:
+        if profile not in VALID_DELAY_PROFILES:
             raise LIFUProtocolError(
                 f"TX: get_delay_profile payload out of range ({profile})",
                 code=LIFU_ERR_BAD_PAYLOAD_FORMAT,
             )
-
-            # if active_profile is None:
-            #     active_profile = int(profile_g1)
-            # elif active_profile != int(profile_g1):
-            #     raise ValueError(
-            #         "Delay profile mismatch across selected TX chips: "
-            #         f"expected {active_profile}, got {profile_g1} on chip {tx_id}"
-            #     )
-
-        if profile is None:
-            raise ValueError("No TX chips selected to read delay profile")
-
         return profile
-    
-
 
     def start_trigger(self) -> bool:
         """Start the software trigger on the TX device.
@@ -689,94 +708,51 @@ class TxDevice(OWComponent):
         logger.debug("write_block: %d regs from 0x%04X on chip %d", len(reg_values), start_address, identifier)
         return True
 
-    def _iter_tx_ids(self) -> List[int]:
-        if self.tx_registers is None:
-            raise ValueError("TX devices not enumerated. Call enum_tx7332_devices() first.")
-        return list(range(self.tx_registers.num_transmitters))
-
-    def _iter_target_tx_ids(self, identifier: int | None = None) -> List[int]:
+    def _resolve_tx_ids(self, identifier: int | None = None) -> List[int]:
+        """Resolve an optional chip identifier to the chip indices to act on: all chips when None, else just that one."""
         if identifier is None:
-            return self._iter_tx_ids()
+            if self.tx_registers is None:
+                raise ValueError("TX devices not enumerated. Call enum_tx7332_devices() first.")
+            return list(range(self.tx_registers.num_transmitters))
         if identifier < 0:
             raise ValueError("TX chip identifier must be >= 0")
         return [identifier]
 
-    def _build_pattern_mode_register(self,
-                                     tx_start_del: int,
-                                     tx_bf_mode: bool = True,
-                                     tr_sw_del_mode: bool = True,
-                                     template: int | None = None) -> int:
-        reg = 0 if template is None else int(template)
-        reg = set_register_value(reg, 1 if tx_bf_mode else 0, lsb=0, width=1)
-        reg = set_register_value(reg, 1 if tr_sw_del_mode else 0, lsb=1, width=1)
-        reg = set_register_value(reg, tx_start_del, lsb=18, width=9)
-        return reg
-
-    @staticmethod
-    def min_tx_start_delay(bf_clk_hz: float = 200e6, tr_off_time_s: float = 2e-6) -> int:
-        required_cycles = tr_off_time_s * bf_clk_hz
-        # Enforce (8 * TX_START_DEL + 121) > required_cycles.
-        tx_start_del = math.ceil((required_cycles - 120.0) / 8.0)
-        return max(0, tx_start_del)
-
-    def init_onchip_raster_mode(self,
-                                tx_start_del: int | None = None,
-                                bf_clk_hz: float = 200e6,
-                                tr_sw_del_mode: bool = True,
-                                identifier: int | None = None) -> bool:
-        """Initialize TX7332 register set for on-chip beamforming profile RAM use.
-
-        This applies the datasheet-safe bring-up register sequence:
-        1) zero profile-1 delays (0x20-0x2F)
-        2) set profile-1 pattern to Hi-Z terminator (0x120 = 0x78)
-        3) enable on-chip mode in 0x18
-        """
-        if tx_start_del is None:
-            tx_start_del = self.min_tx_start_delay(bf_clk_hz=bf_clk_hz)
-
-        tx_ids = self._iter_target_tx_ids(identifier)
-        for tx_id in tx_ids:
-            self.write_block(tx_id, 0x20, [0x00000000] * 16)
-            self.write_register(tx_id, 0x120, 0x00000078)
-            reg_mode = self._build_pattern_mode_register(
-                tx_start_del=tx_start_del,
-                tx_bf_mode=True,
-                tr_sw_del_mode=tr_sw_del_mode,
-                template=0,
-            )
-            self.write_register(tx_id, ADDRESS_PATTERN_MODE, reg_mode)
-
-        # Wait >=200 BF_CLK cycles before profile RAM programming.
-        time.sleep(max(200.0 / bf_clk_hz, 0.0))
-        return True
-
     def commit_profile_ram(self, identifier: int | None = None) -> bool:
-        """Commit profile RAM writes by pulsing LOAD_PROF (0x00 bit 3)."""
-        tx_ids = self._iter_target_tx_ids(identifier)
+        """Commit profile RAM writes by pulsing the self-clearing LOAD_PROF bit."""
+        tx_ids = self._resolve_tx_ids(identifier)
         for tx_id in tx_ids:
-            self.write_register(tx_id, ADDRESS_GLOBAL_CONTROL, 0x00000008)
+            self.write_register(tx_id, ADDRESS_GLOBAL_CONTROL, GLOBAL_CONTROL_LOAD_PROFILE)
         return True
 
-    def set_delay_profile(self, profile: int, identifier: int | None = 0) -> bool:
-        """Set active TX delay profile via MCU controller command.
+    def set_delay_profile(self, profile: int, identifier: int = 0) -> bool:
+        """Set the active TX delay profile via MCU controller command.
 
-        This routes delay profile switching through firmware (OW_CTRL_SET_DELAY_PROFILE),
-        allowing MCU-side profile bookkeeping and apodization handling.
+        Routes delay profile switching through firmware (OW_CTRL_SET_DELAY_PROFILE),
+        allowing MCU-side profile bookkeeping and apodization handling. Note the
+        firmware applies the profile to every TX chip on the module regardless
+        of ``identifier``.
+
+        Args:
+            profile: Delay profile to activate (1-16).
+            identifier: TX chip index used for addressing/validation.
+
+        Raises:
+            ValueError: If profile is out of range.
+            LIFUNotConnectedError, LIFUCommunicationError, LIFUDeviceError:
+                On device-communication failure.
         """
         if profile not in VALID_DELAY_PROFILES:
             raise ValueError(f"Invalid delay profile {profile}. Expected 1-16.")
 
         payload = struct.pack('<B', profile)
-        # tx_ids = self._iter_target_tx_ids(identifier)
-        # for tx_id in tx_ids:
-        # print("tx_id: ", tx_id)
         self.send_checked(
             packet_type=OW_CONTROLLER,
             command=OW_CTRL_SET_DELAY_PROFILE,
             addr=identifier,
             data=payload,
             op=f"set_delay_profile[{identifier}]",
-            )
+        )
         return True
 
     def set_pattern_profile_select(self,
@@ -787,85 +763,11 @@ class TxDevice(OWComponent):
             raise ValueError(f"Invalid pattern profile {profile}. Expected 1-32.")
         profile_sel = profile - 1
 
-        tx_ids = self._iter_target_tx_ids(identifier)
+        tx_ids = self._resolve_tx_ids(identifier)
         for tx_id in tx_ids:
             self.write_register(tx_id, ADDRESS_PATTERN_SEL_G1, profile_sel)
             self.write_register(tx_id, ADDRESS_PATTERN_SEL_G2, profile_sel)
         return True
-    
-    def flash_write(self, data: None, module:int=0) -> bool:
-        """
-        Write the current configuration to flash memory on the TX device.
-
-        Returns:
-            bool: True if the write operation was successful, False otherwise.
-
-        Raises:
-            ValueError: If the UART is not connected.
-            Exception: If an error occurs while writing to flash.
-        """
-        try:
-            if self.uart.demo_mode:
-                return True
-
-            if not self.uart.is_connected():
-                raise ValueError("TX Device not connected")
-
-            r = self.uart.send_packet(id=None,
-                                      packetType=OW_CONTROLLER,
-                                      command=OW_CMD_FLASH_WRITE,
-                                      addr=module,
-                                      data=data)
-            self.uart.clear_buffer()
-            # r.print_packet()
-            if r.packet_type == OW_ERROR:
-                logger.error("Error writing to flash for device")
-                return False
-            else:
-                return True
-        except ValueError as v:
-            logger.error("ValueError: %s", v)
-            raise  # Re-raise the exception for the caller to handle
-        except Exception as e:
-            logger.error("Unexpected error during process: %s", e)
-            raise  # Re-raise the exception for the caller to handle
-
-    def flash_read(self, module:int=0) -> Dict:
-        """
-        Write the current configuration to flash memory on the TX device.
-
-        Returns:
-            Dict: The data read from flash memory.
-
-        Raises:
-            ValueError: If the UART is not connected.
-            Exception: If an error occurs while reading from flash.
-        """
-        try:
-            if self.uart.demo_mode:
-                return {}
-
-            if not self.uart.is_connected():
-                raise ValueError("TX Device not connected")
-
-            r = self.uart.send_packet(id=None,
-                                      packetType=OW_CONTROLLER,
-                                      command=OW_CMD_FLASH_READ,
-                                      addr=module)
-            self.uart.clear_buffer()
-            # r.print_packet()
-            if r.packet_type == OW_ERROR:
-                logger.error("Error reading flash for device")
-                return False
-            else:
-                return r.data
-        except ValueError as v:
-            logger.error("ValueError: %s", v)
-            raise  # Re-raise the exception for the caller to handle
-
-        except Exception as e:
-            logger.error("Unexpected error during process: %s", e)
-            raise  # Re-raise the exception for the caller to handle
 
     def read_block(self, identifier: int, start_address: int, count: int) -> list[int]:
         """Read a contiguous block of TX7332 registers.
@@ -893,54 +795,33 @@ class TxDevice(OWComponent):
         return values
 
     def _validate_delay_profile_number(self, profile_number: int) -> None:
-        # Ensure the profile index is an integer-like positive value.
         if not isinstance(profile_number, int):
-            # Raise a clear error for non-integer inputs.
             raise ValueError(f"profile_number must be an int, got {type(profile_number).__name__}")
-        # Enforce TX7332 delay profile range (1-16).
-        if profile_number < 1 or profile_number > 16:
-            # Raise a clear error when the profile is out of range.
+        if profile_number not in VALID_DELAY_PROFILES:
             raise ValueError(f"profile_number must be in 1-16, got {profile_number}")
 
     def _get_delay_profile_start_address(self, profile_number: int) -> int:
-        # Validate profile number before computing the address.
+        """Return the first register address of the selected delay profile block."""
         self._validate_delay_profile_number(profile_number)
-        # Return the first register for the selected delay profile block.
         return ADDRESSES_DELAY_DATA[0] + ((profile_number - 1) * DELAY_PROFILE_OFFSET)
 
     def _decode_delay_profile_register_values(self,
                                               profile_number: int,
                                               register_values: List[int],
                                               units: str = "s") -> List[float]:
-        # Validate profile number to keep mapping logic predictable.
+        """Decode one delay profile register block into per-channel delay values."""
         self._validate_delay_profile_number(profile_number)
-        # Validate register block size for one delay profile.
         if len(register_values) != DELAY_PROFILE_OFFSET:
-            # Raise a clear error when the block size is unexpected.
             raise ValueError(f"Expected {DELAY_PROFILE_OFFSET} delay registers, got {len(register_values)}")
-        # Select BF clock from configured register model when available.
+
         bf_clk_hz = self.tx_registers.bf_clk if self.tx_registers is not None else DEFAULT_CLK_FREQ
-        # Compute the profile block base address for register indexing.
         profile_start = self._get_delay_profile_start_address(profile_number)
-        # Pre-allocate output delays (32 channels per TX chip).
         delays = [0.0] * NUM_CHANNELS
-        # Walk channel order expected by the public API.
         for channel in range(1, NUM_CHANNELS + 1):
-            # Resolve register address and bit offset for this channel/profile.
             address, lsb = get_delay_location(channel, profile_number)
-            # Convert absolute register address to block-local index.
-            block_index = address - profile_start
-            # Read raw packed register value for this channel's row.
-            packed_register = register_values[block_index]
-            # Extract this channel's delay field in BF clock ticks.
+            packed_register = register_values[address - profile_start]
             delay_ticks = get_register_value(packed_register, lsb=lsb, width=DELAY_WIDTH)
-            # Convert ticks -> seconds.
-            delay_seconds = delay_ticks / bf_clk_hz
-            # Convert seconds -> requested output units.
-            delay_in_units = delay_seconds * getunitconversion("s", units)
-            # Store decoded value in channel-ordered output list.
-            delays[channel - 1] = delay_in_units
-        # Return decoded channel delay values.
+            delays[channel - 1] = (delay_ticks / bf_clk_hz) * getunitconversion("s", units)
         return delays
 
     def read_delay_profile_value(self,
@@ -957,23 +838,17 @@ class TxDevice(OWComponent):
         Returns:
             Dict with profile number, chip id, start address, raw registers, and decoded delays.
         """
-        # Ensure TX identifier is non-negative before issuing device command.
         if identifier < 0:
-            # Raise a clear error for invalid chip ids.
             raise ValueError("TX chip identifier must be >= 0")
-        # Validate profile range before address computation.
         self._validate_delay_profile_number(profile_number)
-        # Compute start address for the selected delay profile block.
+
         start_address = self._get_delay_profile_start_address(profile_number)
-        # Read the full 16-register delay block from hardware.
         raw_registers = self.read_block(identifier=identifier,
                                         start_address=start_address,
                                         count=DELAY_PROFILE_OFFSET)
-        # Decode the block into channel-ordered delay values.
         decoded_delays = self._decode_delay_profile_register_values(profile_number=profile_number,
                                                                     register_values=raw_registers,
                                                                     units=units)
-        # Return a readable payload that includes both raw and decoded values.
         return {
             "profile_number": profile_number,
             "identifier": identifier,
@@ -1005,18 +880,14 @@ class TxDevice(OWComponent):
         share pulse profile 1.  When ``pulse`` is a list of N dicts and no map is
         provided, a 1:1 mapping is used (backward compatible).
 
-        Grouped Profile Package System:
-        ================================
-        Each delay profile i (1-16) is bundled with:
-          - A pulse profile (possibly shared across delay profiles)
-          - Delay values (register 0x16 selector + delay RAM)
-          - Apodization configuration (register 0x1B)
+        Each delay profile i (1-16) is bundled as a group with a pulse profile
+        (possibly shared across delay profiles), delay values (register 0x16
+        selector + delay RAM), and an apodization configuration (register 0x1B).
 
-        Profile Execution Order:
-        ========================
-        If execution_order is provided (e.g., [1, 2, 3, 1, 2, 3]), the firmware
-        will automatically cycle through these delay profiles on each trigger
-        sequence completion.
+        For multi-profile solutions the firmware cycles through
+        ``execution_order`` at pulse boundaries: each entry gets
+        ``pulse_count / len(execution_order)`` consecutive pulses, and the
+        order restarts at the beginning of every pulse train.
 
         Args:
             pulse:              Dict (single shared pulse config) or List[Dict]
@@ -1037,7 +908,7 @@ class TxDevice(OWComponent):
             ValueError: If the inputs are malformed or execution_order is invalid.
             LIFUError: On any device-communication failure.
         """
-        # ========== VALIDATE AND NORMALIZE INPUTS ==========
+        # Validate and normalize inputs.
         delays = np.array(delays)
         if delays.ndim == 1:
             delays = delays.reshape(1, -1)
@@ -1057,7 +928,6 @@ class TxDevice(OWComponent):
         if n > len(VALID_DELAY_PROFILES):
             raise ValueError(f"Too many profile rows ({n}). Max supported is {len(VALID_DELAY_PROFILES)}")
 
-        # ========== PULSE PROFILE CONFIGURATION ==========
         # pulse_configs: list of unique pulse config dicts, indexed 0-based.
         if isinstance(pulse, list):
             pulse_configs = pulse
@@ -1087,12 +957,10 @@ class TxDevice(OWComponent):
                 if i not in pulse_profile_map:
                     raise ValueError(f"pulse_profile_map missing mapping for delay profile {i}")
 
-        # ========== SET EXECUTION ORDER ==========
-        # If not provided, create sequential order: [1, 2, ..., n]
+        # Default to sequential execution order: [1, 2, ..., n].
         if execution_order is None:
             execution_order = list(range(1, n + 1))
-        
-        # Validate execution_order
+
         if not isinstance(execution_order, list):
             raise ValueError("execution_order must be a list of profile indices")
         if len(execution_order) == 0:
@@ -1101,10 +969,11 @@ class TxDevice(OWComponent):
             if not isinstance(idx, int) or idx < 1 or idx > n:
                 raise ValueError(f"execution_order contains invalid profile index {idx}. Must be in 1-{n}")
 
-        # ========== PULSE-LEVEL PROFILE SWITCHING INTERLOCKS ==========
-        # Firmware switches profiles between pulses. Validate constraints:
-        # 1. pulse_count must be divisible by len(execution_order)
-        # 2. Inter-pulse dead time must exceed SPI write duration
+        # Pulse-level profile switching interlocks: firmware switches profiles
+        # between pulses, so pulse_count must be divisible by the execution
+        # order length, and the acoustic burst must end before the dead-time
+        # window at the end of each trigger period where the firmware performs
+        # the profile-switch SPI writes.
         if n > 1:
             pulse_count = sequence["pulse_count"]
             n_exec = len(execution_order)
@@ -1115,13 +984,15 @@ class TxDevice(OWComponent):
                     f"Each profile gets pulse_count/n_profiles = {pulse_count}/{n_exec} consecutive pulses."
                 )
             pulse_interval = sequence["pulse_interval"]
-            pulse_width_s = sequence.get("pulse_width", DEFAULT_PULSE_WIDTH_US) * 1e-6
-            dead_time = pulse_interval - pulse_width_s
+            max_burst_s = max(cfg["duration"] for cfg in pulse_configs)
+            dead_time = pulse_interval - max_burst_s
             if dead_time < MIN_PROFILE_SWITCH_INTERVAL:
                 raise ValueError(
-                    f"Inter-pulse dead time ({dead_time*1e6:.0f} µs) is less than the minimum "
-                    f"required for profile switching ({MIN_PROFILE_SWITCH_INTERVAL*1e6:.0f} µs). "
-                    f"Increase pulse_interval or decrease pulse_width."
+                    f"pulse_interval ({pulse_interval * 1e3:.1f} ms) must exceed the pulse "
+                    f"duration ({max_burst_s * 1e3:.1f} ms) by at least "
+                    f"{MIN_PROFILE_SWITCH_INTERVAL * 1e6:.0f} µs so the firmware can switch "
+                    f"profiles after the burst ends. Increase pulse_interval or shorten "
+                    f"the pulse duration."
                 )
 
         logger.info(f"Grouped profile package system: {n} profiles, execution_order={execution_order}")
@@ -1131,16 +1002,14 @@ class TxDevice(OWComponent):
         # enum_tx7332_devices raises LIFUError on mismatch
         self.enum_tx7332_devices(num_devices=n_required_devices)
 
-        # print("delays after reshape:", delays)
-
         # Pre-compute duty cycle per mapped pulse config: use max apodization
         # across all delay profiles sharing the same pulse config.
-        _duty_cycle_by_pulse = {}
+        duty_cycle_by_pulse = {}
         for pidx in set(pulse_profile_map.values()):
             pulse_cfg = pulse_configs[pidx - 1]
             mapped_dps = [k for k, v in pulse_profile_map.items() if v == pidx]
             max_apod = max(max(apodizations[dp - 1, :]) for dp in mapped_dps)
-            _duty_cycle_by_pulse[pidx] = DEFAULT_PATTERN_DUTY_CYCLE * max_apod * pulse_cfg["amplitude"]
+            duty_cycle_by_pulse[pidx] = DEFAULT_PATTERN_DUTY_CYCLE * max_apod * pulse_cfg["amplitude"]
 
         # Create one pulse profile per delay profile slot.
         # The TX7332 firmware cycles PATTERN_SEL in lockstep with DELAY_SEL,
@@ -1154,7 +1023,7 @@ class TxDevice(OWComponent):
                 profile=dp + 1,
                 frequency=pulse_cfg["frequency"],
                 cycles=int(pulse_cfg["duration"] * pulse_cfg["frequency"]),
-                duty_cycle=_duty_cycle_by_pulse[pidx],
+                duty_cycle=duty_cycle_by_pulse[pidx],
             )
             self.tx_registers.add_pulse_profile(pulse_profile)
 
@@ -1193,46 +1062,22 @@ class TxDevice(OWComponent):
         self.apply_all_registers()
 
         if n > 1:
-            # Keep grouped runtime control registers (delay+pattern+apodization)
-            # so profile i can be restored as a unit during runtime switching.
-            self._runtime_profile_groups = {}
-            for profile in self.tx_registers.configured_delay_profiles():
-                self._runtime_profile_groups[profile] = {
-                    "delay_control": self.tx_registers.get_delay_control_registers(profile),
-                    "pulse_control": self.tx_registers.get_pulse_control_registers(profile),
-                }
-
-            # Write grouped control registers once so firmware runtime has all
-            # profile apodization/control combinations available from host writes.
-            # Firmware expects delay profile N and pattern profile N to match.
-            for profile in self.tx_registers.configured_delay_profiles():
-                delay_groups = self._runtime_profile_groups[profile]["delay_control"]
-                pulse_groups = self._runtime_profile_groups[profile]["pulse_control"]
-                for txi, regs in enumerate(delay_groups):
-                    self.write_register(txi, ADDRESS_DELAY_SEL, regs[ADDRESS_DELAY_SEL])
-                    self.write_register(txi, ADDRESS_APODIZATION, regs[ADDRESS_APODIZATION])
-                    # TX7332 pattern selector is 0-based.
-                    self.write_register(txi, ADDRESS_PATTERN_SEL_G1, (profile - 1) & PATTERN_PROFILE_SELECT_MASK)
-                    self.write_register(txi, ADDRESS_PATTERN_SEL_G2, (profile - 1) & PATTERN_PROFILE_SELECT_MASK)
-
-            # Restore selected active profile group for immediate triggering.
+            # Make the selected profile active for the first trigger: delay
+            # selector, apodization, and (0-based) pattern selector as a unit.
             active_delay_groups = self.tx_registers.get_delay_control_registers(profile_index)
-            active_pulse_groups = self.tx_registers.get_pulse_control_registers(profile_index)
             for txi, regs in enumerate(active_delay_groups):
                 self.write_register(txi, ADDRESS_DELAY_SEL, regs[ADDRESS_DELAY_SEL])
                 self.write_register(txi, ADDRESS_APODIZATION, regs[ADDRESS_APODIZATION])
                 self.write_register(txi, ADDRESS_PATTERN_SEL_G1, (profile_index - 1) & PATTERN_PROFILE_SELECT_MASK)
                 self.write_register(txi, ADDRESS_PATTERN_SEL_G2, (profile_index - 1) & PATTERN_PROFILE_SELECT_MASK)
 
-            # ========== SEND GROUPED PROFILE PACKAGE TO FIRMWARE ==========
-            # For multi-profile solutions, send execution_order and pre-computed
-            # apodization register values so firmware can auto-cycle profiles.
-            # Build per-chip apod registers for each profile from the already-computed groups.
-            apod_reg_values = []  # List of lists: [profile][chip] = uint32 register value
-            for profile in sorted(self._runtime_profile_groups.keys()):
-                delay_control = self._runtime_profile_groups[profile]["delay_control"]
-                chip_regs = [regs[ADDRESS_APODIZATION] for regs in delay_control]
-                apod_reg_values.append(chip_regs)
+            # Send execution_order plus the pre-computed per-chip apodization
+            # register of each profile so firmware can auto-cycle profiles at
+            # pulse boundaries: apod_reg_values[profile - 1][chip] = uint32.
+            apod_reg_values = []
+            for profile in sorted(self.tx_registers.configured_delay_profiles()):
+                delay_control = self.tx_registers.get_delay_control_registers(profile)
+                apod_reg_values.append([regs[ADDRESS_APODIZATION] for regs in delay_control])
             self._send_grouped_profile_cycle(execution_order, apod_reg_values)
 
         return True
@@ -1279,7 +1124,7 @@ class TxDevice(OWComponent):
         for profile_idx in range(n_profiles):
             for chip_idx in range(n_chips):
                 reg_val = apod_reg_values[profile_idx][chip_idx] & 0xFFFFFFFF
-                payload.extend(reg_val.to_bytes(4, byteorder='little'))
+                payload.extend(reg_val.to_bytes(REGISTER_BYTES, byteorder='little'))
 
         logger.info(
             f"Sending grouped profile cycle: {n_profiles} profiles, {n_chips} chips, "
@@ -1298,6 +1143,10 @@ class TxDevice(OWComponent):
 
     def apply_all_registers(self, load_profile: bool = True) -> bool:
         """Flush all configured TX7332 registers to the device.
+
+        Args:
+            load_profile: When True, pulse LOAD_PROF afterwards so the chips
+                latch the freshly written profile RAM.
 
         Raises:
             LIFUNotConnectedError, LIFUCommunicationError, LIFUDeviceError.
@@ -2226,24 +2075,10 @@ class TxDeviceRegisters:
             profile = self.active_profile
         return [tx.get_pulse_data_registers(profile, pack=pack, pack_single=pack_single) for tx in self.transmitters]
 
-    # def get_active_delay_profile(self, chip_id: int=0) -> int:
-    #     """
-    #     Get the currently active delay profile
-
-    #     :param chip_id: ID of the chip to query
-    #     :return: Active delay profile number
-    #     """
-
-    #     delay_reg = self.txdevice.read_register(chip_id, ADDRESS_DELAY_SEL)  # Trigger a read to update the active delay profile
-    #     active_profile_g1 = (delay_reg >> BF_PROF_SEL_G1_SHIFT) & BF_PROF_SEL_FIELD_MASK
-
-
-    #     return active_profile + 1  # Convert 0-based to 1-based
-
-    def get_active_delay_profile(self, chip_id: int=0) -> int:
+    def get_active_delay_profile(self, chip_id: int = 0) -> int:
         """
         Get the currently active delay profile from the register model.
-        Ensures both Group 1 and Group 2 are utilizing the same profile.
+        Ensures both Group 1 and Group 2 are using the same profile.
 
         :param chip_id: ID of the chip to query
         :return: Active delay profile number (1-based, 1 to 16)
@@ -2252,29 +2087,14 @@ class TxDeviceRegisters:
             raise ValueError(f"Invalid chip_id {chip_id}. Must be 0-{len(self.transmitters) - 1}.")
 
         delay_reg = self.transmitters[chip_id].get_delay_control_registers()[ADDRESS_DELAY_SEL]
+        active_profile_g1 = (delay_reg >> BF_PROF_SEL_G1_SHIFT) & BF_PROF_SEL_FIELD_MASK
+        active_profile_g2 = (delay_reg >> BF_PROF_SEL_G2_SHIFT) & BF_PROF_SEL_FIELD_MASK
 
-        print(f"Reading delay control register for chip {chip_id}: {delay_reg:#010x}")
-        
-        active_profile_g1 = (delay_reg >> BF_PROF_SEL_G1_SHIFT) & BF_PROF_SEL_FIELD_MASK # Extract Group 1 (Bits 31-28)
-        active_profile_g2 = (delay_reg >> BF_PROF_SEL_G2_SHIFT) & BF_PROF_SEL_FIELD_MASK # Extract Group 2 (Bits 15-12)
-        
-        # Hardware sanity check: Ensure the whole chip is on the same delay profile
+        # Sanity check: ensure the whole chip is on the same delay profile.
         if active_profile_g1 != active_profile_g2:
             raise ValueError(
                 f"Desynchronized profiles on chip {chip_id}! "
                 f"G1 is using Profile {active_profile_g1 + 1}, but G2 is using Profile {active_profile_g2 + 1}."
             )
-            
-        # Return 1-based index
+
         return active_profile_g1 + 1
-
-    # def get_active_pattern_profile(self, chip_id: int=0) -> int:
-    #     """
-    #     Get the currently active pattern profile from the device.
-
-    #     :param chip_id: ID of the chip to query
-    #     :return: Active pattern profile number (1-based, 1 to 16)
-    #     """
-    #     pattern_reg = self.txdevice.read_register(chip_id, ADDRESS_PATTERN_SEL)
-    #     active_profile = (pattern_reg >> BF_PROF_SEL_PATTERN_SHIFT) & BF_PROF_SEL_FIELD_MASK
-    #     return active_profile + 1  # Convert 0-based to 1-based
