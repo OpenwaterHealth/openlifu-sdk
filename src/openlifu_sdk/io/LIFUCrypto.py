@@ -53,7 +53,14 @@ import struct
 from dataclasses import dataclass
 from pathlib import Path
 
-from openlifu_sdk.io.exceptions import LIFUError
+# Base class for LIFUCryptoError. Guarded so this module stays usable as a
+# standalone signer with only `cryptography` installed (e.g. CI signing),
+# without pulling in the full SDK (numpy/pandas/...). Inside the SDK the real
+# LIFUError base is used so `except LIFUError` still catches crypto errors.
+try:
+    from openlifu_sdk.io.exceptions import LIFUError as _LIFUCryptoErrorBase
+except Exception:  # pragma: no cover - standalone/minimal environment
+    _LIFUCryptoErrorBase = Exception
 
 try:
     from cryptography.hazmat.primitives import hashes, serialization
@@ -68,7 +75,7 @@ except ImportError:  # pragma: no cover - depends on environment
     _HAVE_CRYPTOGRAPHY = False
 
 
-class LIFUCryptoError(LIFUError):
+class LIFUCryptoError(_LIFUCryptoErrorBase):
     """Firmware signing / validation failure (bad keys, malformed image)."""
 
 

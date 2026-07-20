@@ -356,14 +356,40 @@ class OWComponent:
         self.send_checked(OW_CMD_RESET, addr=module, op="soft_reset")
         return True
 
+    # Hidden switch: OW_CMD_DFU reserved byte that forces the STM32 ROM
+    # (system-memory) DFU loader regardless of which bootloader is installed.
+    # Used to reflash the bootloader itself on beta units. Once units are
+    # locked down (RDP/FDA), the bootloader region can no longer be erased
+    # and this flag has no effect.
+    DFU_FORCE_STM32_ROM = 0x77
+
     def enter_dfu(self, module: int = 0, reserved: int = 0x00) -> bool:
         """Reboot the device into DFU mode.
+
+        With the default *reserved* the device enters whichever DFU its
+        installed bootloader provides (STM32 ROM for no-bootloader units,
+        the legacy or secure bootloader otherwise). Pass
+        ``reserved=OWComponent.DFU_FORCE_STM32_ROM`` (or use
+        :meth:`enter_stm32_rom_dfu`) to force the STM32 ROM DFU loader.
 
         Raises:
             LIFUNotConnectedError, LIFUCommunicationError, LIFUDeviceError.
         """
         self.send_checked(OW_CMD_DFU, addr=module, op="enter_dfu", reserved=reserved)
         return True
+
+    def enter_stm32_rom_dfu(self, module: int = 0) -> bool:
+        """Reboot into the STM32 ROM (system-memory) DFU loader via the hidden
+        force switch, regardless of the installed bootloader.
+
+        This is the entry point for bootloader migration/replacement: the ROM
+        loader can write the whole flash, including the bootloader region.
+        Only effective on unlocked (beta) units.
+
+        Raises:
+            LIFUNotConnectedError, LIFUCommunicationError, LIFUDeviceError.
+        """
+        return self.enter_dfu(module=module, reserved=self.DFU_FORCE_STM32_ROM)
 
     # ------------------------------------------------------------------
     # User configuration helpers
