@@ -37,7 +37,6 @@ def progress(written: int, total: int, label: str) -> None:
     print(f"\r  {label}: {written:,}/{total:,} bytes ({pct}%)", end="", flush=True)
 
 mgr = LIFUDFUManager()
-enter_dfu_fn = None
 
 if not args.already_in_dfu:
     print("Connecting to the console...")
@@ -48,12 +47,25 @@ if not args.already_in_dfu:
               "(e.g. after a rejected image), rerun with --already-in-dfu.")
         sys.exit(1)
     interface.hvcontroller.ping()
-    enter_dfu_fn = interface.hvcontroller.enter_dfu
+    print("Entering DFU mode...")
+    interface.hvcontroller.enter_dfu()
+    time.sleep(2)
+
+print("Waiting for the DFU bootloader...")
+bl_version = mgr.get_console_bootloader_version()
+print(f"Bootloader version : {bl_version}")
+
+installed = mgr.get_console_installed_version()
+if installed is not None:
+    from openlifu_sdk.io.LIFUCrypto import decode_fw_version
+    print(f"Installed firmware : {installed} (semver {decode_fw_version(installed)})")
+else:
+    print("Installed firmware : none (slot empty or invalidated)")
 
 try:
     mgr.update_console(
         args.image,
-        enter_dfu_fn=enter_dfu_fn,
+        enter_dfu_fn=None,          # already in DFU at this point
         keys_dir=args.keys,
         force=args.force,
         progress_callback=progress,

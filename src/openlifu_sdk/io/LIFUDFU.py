@@ -742,6 +742,21 @@ class LIFUDFUManager:
 
     # --- console (SBSFU signed image) path ---
 
+    def get_console_bootloader_version(self, vid: int = 0x0483, pid: int = 0xDF11,
+                                       libusb_dll: str | None = None,
+                                       timeout_s: float = 30.0) -> str:
+        """Wait for the console DFU device to enumerate (up to *timeout_s*)
+        and return its bootloader version string (the bootloader's git
+        describe, read from the DFU virtual version address).
+
+        Raises:
+            RuntimeError: Device did not enumerate within the timeout.
+        """
+        return self._wait_for_usb_dfu(
+            vid=vid, pid=pid, libusb_dll=libusb_dll,
+            timeout_s=timeout_s, device_profile=CONSOLE_PROFILE,
+        )
+
     def get_console_installed_version(self, vid: int = 0x0483, pid: int = 0xDF11,
                                       libusb_dll: str | None = None) -> int | None:
         """Read the FwVersion of the image currently installed in the console's
@@ -838,7 +853,7 @@ class LIFUDFUManager:
                        libusb_dll: str | None = None,
                        dfu_wait_s: float = 2.0,
                        dfu_enum_timeout_s: float = 30.0,
-                       progress_callback: Callable | None = None) -> None:
+                       progress_callback: Callable | None = None) -> str:
         """High-level console firmware update.
 
         Optionally calls *enter_dfu_fn()* (e.g. ``interface.hvcontroller.
@@ -846,6 +861,9 @@ class LIFUDFUManager:
         waits for the DFU device to enumerate, then runs
         :meth:`program_console` with its pre-erase validation and
         anti-downgrade checks.
+
+        Returns:
+            The console bootloader's version string.
         """
         if enter_dfu_fn is not None:
             logger.info("Requesting console DFU mode...")
@@ -853,9 +871,9 @@ class LIFUDFUManager:
             if dfu_wait_s > 0:
                 time.sleep(dfu_wait_s)
 
-        bl_version = self._wait_for_usb_dfu(
+        bl_version = self.get_console_bootloader_version(
             vid=vid, pid=pid, libusb_dll=libusb_dll,
-            timeout_s=dfu_enum_timeout_s, device_profile=CONSOLE_PROFILE,
+            timeout_s=dfu_enum_timeout_s,
         )
         logger.info("Console bootloader version: %s", bl_version)
 
@@ -864,6 +882,7 @@ class LIFUDFUManager:
             vid=vid, pid=pid, libusb_dll=libusb_dll,
             progress_callback=progress_callback,
         )
+        return bl_version
 
     def program_i2c(self, package_file: str,
                     i2c_addr: int = I2C_DFU_SLAVE_ADDR,
