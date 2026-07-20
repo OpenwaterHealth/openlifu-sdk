@@ -36,6 +36,9 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+crypto = [
+  "cryptography==46.0.5",
+]
 test = [
   "pytest>=6",
   "pytest-cov>=3",
@@ -45,6 +48,7 @@ dev = [
   "pytest>=6",
   "pytest-cov>=3",
   "pytest-mock",
+  "cryptography==46.0.5",
 ]
 ui = [
   "PyQt6==6.11.0",

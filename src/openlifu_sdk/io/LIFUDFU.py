@@ -1,11 +1,14 @@
-"""LIFU Transmitter Firmware Update (DFU) support.
+"""LIFU Firmware Update (DFU) support — transmitter and console.
 
 Provides:
   - :func:`stm32_crc32`          — STM32-compatible CRC32
-  - :func:`parse_signed_package` — parse/validate a signed firmware package
-  - :class:`STM32USBDFU`         — USB DFU client (PyUSB, for module 0)
+  - :func:`parse_signed_package` — parse/validate a transmitter 'PGK1' package
+  - :class:`STM32USBDFU`         — USB DFU client (PyUSB; erase/write/read/version)
   - :class:`STM32I2CDFUviaMaster`— I2C DFU via OW UART master passthrough (modules 1+)
-  - :class:`LIFUDFUManager`      — high-level firmware update orchestration
+  - :class:`LIFUDFUManager`      — high-level firmware update orchestration:
+      * transmitter modules: :meth:`LIFUDFUManager.update_module` (PGK1 packages)
+      * console: :meth:`LIFUDFUManager.update_console` (SBSFU signed images from
+        LIFUCrypto, with pre-erase validation and anti-downgrade checks)
 """
 
 from __future__ import annotations
@@ -129,11 +132,15 @@ TRANSMITTER_PROFILE = DeviceProfile(
 CONSOLE_PROFILE = DeviceProfile(
     name="console",
     transfer_size=1024,
-    version_read_len=32,
+    version_read_len=64,            # matches DFU_VERSION_READ_LEN in usbd_dfu_if.c
     program_alignment_bytes=4,
-    app_default_address=None,
+    app_default_address=0x08010000,  # SBSFU active slot (console memory_map.h)
     reset_virt_addr=0xFFFFFF08,
 )
+
+# Console SBSFU active slot: the signed image (320 B header + app @ +0x400)
+# is written here; the bootloader verifies and launches it after manifest.
+CONSOLE_SLOT_BASE = 0x08010000
 
 # OW_I2C_PASSTHRU sub-commands (must match firmware if_commands.c handler)
 _PASSTHRU_WRITE       = 0x00   # write only
@@ -428,6 +435,28 @@ class STM32USBDFU:
         self.abort()
         return raw.rstrip(b"\x00").decode("ascii", errors="replace")
 
+    def read_memory(self, address: int, length: int) -> bytes:
+        """Read *length* bytes from target memory via DFU UPLOAD.
+
+        The bootloader's read window applies (the console rejects reads
+        outside the application slot).
+        """
+        self._recover_idle()
+        self._set_address(address)
+        self.abort()   # back to dfuIDLE so UPLOAD starts at block 2
+
+        out = bytearray()
+        block = 2
+        while len(out) < length:
+            want = min(self.transfer_size, length - len(out))
+            chunk = self._ctrl_in(self.DFU_UPLOAD, block, want)
+            if not chunk:
+                break
+            out += chunk
+            block += 1
+        self.abort()
+        return bytes(out[:length])
+
     def write_memory(self, address: int, data: bytes,
                      page_erase: bool = True,
                      progress_callback: Callable | None = None) -> None:
@@ -656,7 +685,9 @@ class LIFUDFUManager:
         )
     """
 
-    def __init__(self, uart: "LIFUUart"):
+    def __init__(self, uart: "LIFUUart | None" = None):
+        """*uart* is only needed for the I2C passthrough paths (transmitter
+        modules 1+); USB-only use (console, transmitter module 0) may omit it."""
         self._uart = uart
 
     # --- per-transport helpers ---
@@ -708,6 +739,131 @@ class LIFUDFUManager:
             logger.info("USB DFU: sending manifest...")
             dfu.manifest()
         logger.info("USB DFU: programming complete.")
+
+    # --- console (SBSFU signed image) path ---
+
+    def get_console_installed_version(self, vid: int = 0x0483, pid: int = 0xDF11,
+                                      libusb_dll: str | None = None) -> int | None:
+        """Read the FwVersion of the image currently installed in the console's
+        active slot, or None if the slot holds no valid SBSFU header.
+
+        The console must be in USB DFU mode.
+        """
+        from openlifu_sdk.io import LIFUCrypto
+
+        with STM32USBDFU(vid=vid, pid=pid, libusb_dll=libusb_dll,
+                         device_profile=CONSOLE_PROFILE) as dfu:
+            hdr_bytes = dfu.read_memory(CONSOLE_SLOT_BASE,
+                                        LIFUCrypto.HEADER_TOTAL_LEN)
+        try:
+            header = LIFUCrypto.FirmwareHeader.from_bytes(hdr_bytes)
+        except LIFUCrypto.LIFUCryptoError:
+            return None
+        if header.magic != LIFUCrypto.SFU_MAGIC:
+            return None
+        return header.fw_version
+
+    def program_console(self, signed_image: str,
+                        keys_dir: str | None = None,
+                        force: bool = False,
+                        vid: int = 0x0483, pid: int = 0xDF11,
+                        libusb_dll: str | None = None,
+                        progress_callback: Callable | None = None) -> None:
+        """Program a console SBSFU signed image (from LIFUCrypto / the
+        bootloader signing tools) into the active slot via USB DFU.
+
+        Pre-flight checks run BEFORE any flash erase, so a rejected image
+        leaves the installed firmware untouched (unlike naive erase-first
+        flashers, which strand the board with an empty slot when the
+        bootloader's anti-rollback refuses the new image at boot):
+
+          1. The image is validated locally (structure, sizes, SHA-256 tag;
+             plus the ECDSA signature when *keys_dir* is given).
+          2. The installed slot header is read back over DFU and a version
+             DOWNGRADE is refused unless *force* is set. Note this compares
+             against the installed image only - the bootloader's persistent
+             anti-rollback floor is not DFU-readable and remains the final
+             authority at boot.
+
+        The console must already be in USB DFU mode.
+
+        Raises:
+            ValueError: Image invalid, or downgrade without *force*.
+            RuntimeError: DFU device/communication problems.
+        """
+        from openlifu_sdk.io import LIFUCrypto
+
+        image = Path(signed_image).read_bytes()
+
+        report = LIFUCrypto.validate_signed_image(image, keys_dir=keys_dir)
+        if not (report.ok or (keys_dir is None and report.structural_ok)):
+            raise ValueError(
+                f"Refusing to flash invalid image {signed_image}:\n"
+                + report.describe()
+            )
+        new_version = report.header.fw_version
+        logger.info("Console image: version %d (%s), %d bytes",
+                    new_version, report.header.fw_version_str, len(image))
+
+        installed = self.get_console_installed_version(
+            vid=vid, pid=pid, libusb_dll=libusb_dll)
+        if installed is not None:
+            logger.info("Installed image: version %d (%s)",
+                        installed, LIFUCrypto.decode_fw_version(installed))
+            if new_version < installed and not force:
+                raise ValueError(
+                    f"Downgrade refused before erase: image version {new_version} "
+                    f"({report.header.fw_version_str}) is below the installed "
+                    f"version {installed} "
+                    f"({LIFUCrypto.decode_fw_version(installed)}). "
+                    "Pass force=True to flash anyway (the bootloader's "
+                    "anti-rollback floor may still reject it at boot, leaving "
+                    "the slot empty)."
+                )
+
+        with STM32USBDFU(vid=vid, pid=pid, libusb_dll=libusb_dll,
+                         device_profile=CONSOLE_PROFILE) as dfu:
+            dfu.write_memory(CONSOLE_SLOT_BASE, image, page_erase=True,
+                             progress_callback=progress_callback)
+            logger.info("Console DFU: sending manifest (device will reset "
+                        "and the bootloader will verify the image)...")
+            dfu.manifest()
+        logger.info("Console DFU: programming complete.")
+
+    def update_console(self, signed_image: str,
+                       enter_dfu_fn: Callable | None = None,
+                       keys_dir: str | None = None,
+                       force: bool = False,
+                       vid: int = 0x0483, pid: int = 0xDF11,
+                       libusb_dll: str | None = None,
+                       dfu_wait_s: float = 2.0,
+                       dfu_enum_timeout_s: float = 30.0,
+                       progress_callback: Callable | None = None) -> None:
+        """High-level console firmware update.
+
+        Optionally calls *enter_dfu_fn()* (e.g. ``interface.hvcontroller.
+        enter_dfu``) to reboot the running application into the bootloader,
+        waits for the DFU device to enumerate, then runs
+        :meth:`program_console` with its pre-erase validation and
+        anti-downgrade checks.
+        """
+        if enter_dfu_fn is not None:
+            logger.info("Requesting console DFU mode...")
+            enter_dfu_fn()
+            if dfu_wait_s > 0:
+                time.sleep(dfu_wait_s)
+
+        bl_version = self._wait_for_usb_dfu(
+            vid=vid, pid=pid, libusb_dll=libusb_dll,
+            timeout_s=dfu_enum_timeout_s, device_profile=CONSOLE_PROFILE,
+        )
+        logger.info("Console bootloader version: %s", bl_version)
+
+        self.program_console(
+            signed_image, keys_dir=keys_dir, force=force,
+            vid=vid, pid=pid, libusb_dll=libusb_dll,
+            progress_callback=progress_callback,
+        )
 
     def program_i2c(self, package_file: str,
                     i2c_addr: int = I2C_DFU_SLAVE_ADDR,
