@@ -28,7 +28,16 @@ from openlifu_sdk.io.LIFUConfig import (
     OW_POWER_SET_FAN,
     OW_POWER_SET_HV,
     OW_POWER_SET_RGB,
+    OW_POWER_SET_RGB_FX,
     OW_POWER_VMON,
+    OW_RGB_CYCLE_MAX_COLORS,
+    OW_RGB_FX_BREATHE,
+    OW_RGB_FX_CYCLE,
+    OW_RGB_FX_FADE,
+    OW_RGB_FX_FLASH,
+    OW_RGB_FX_RAINBOW,
+    OW_RGB_FX_SOLID,
+    OW_RGB_FX_STOP,
     OW_VID,
     POWER_COMMANDS,
 )
@@ -317,7 +326,7 @@ class HVController(OWComponent):
         return r.data[0]
 
     def set_rgb_led(self, rgb_state: int) -> bool:
-        """Set the RGB LED state (0 = OFF, 1 = RED, 2 = BLUE, 3 = GREEN).
+        """Set the RGB LED state (0 = OFF, 1 = RED, 2 = GREEN, 3 = BLUE).
 
         Raises:
             ValueError: If *rgb_state* is out of range.
@@ -325,7 +334,7 @@ class HVController(OWComponent):
         """
         if rgb_state not in (0, 1, 2, 3):
             raise ValueError(
-                "Invalid RGB state. Must be 0 (OFF), 1 (RED), 2 (BLUE), or 3 (GREEN)"
+                "Invalid RGB state. Must be 0 (OFF), 1 (RED), 2 (GREEN), or 3 (BLUE)"
             )
         self.send_checked(packet_type=OW_POWER, command=OW_POWER_SET_RGB,
                           reserved=rgb_state, op="set_rgb_led")
@@ -334,12 +343,125 @@ class HVController(OWComponent):
     def get_rgb_led(self) -> int:
         """Read the RGB LED state.
 
+        Note: reflects the last basic set_rgb_led() state only; rgb_* effect
+        methods do not change it.
+
         Raises:
             LIFUNotConnectedError, LIFUCommunicationError, LIFUDeviceError.
         """
         r = self.send_checked(packet_type=OW_POWER, command=OW_POWER_GET_RGB,
                               op="get_rgb_led")
         return r.reserved
+
+    # ------------------------------------------------------------------
+    # RGB effects (OW_POWER_SET_RGB_FX). The console drives the LED with a
+    # DMA-based 24-bit color engine; these commands select an animation that
+    # then runs entirely on the device. Basic set_rgb_led() remains valid
+    # and cancels any running effect.
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _check_rgb(r: int, g: int, b: int, period_ms: int) -> None:
+        for name, v in (("r", r), ("g", g), ("b", b)):
+            if not 0 <= v <= 255:
+                raise ValueError(f"Invalid {name} value {v}. Must be 0-255")
+        if not 0 <= period_ms <= 0xFFFF:
+            raise ValueError(f"Invalid period {period_ms}. Must be 0-65535 ms")
+
+    def _send_rgb_fx(self, fx: int, r: int = 0, g: int = 0, b: int = 0,
+                     period_ms: int = 0, extra: bytes = b"", op: str = "rgb_fx") -> bool:
+        payload = bytearray(struct.pack("<BBBBH", fx, r, g, b, period_ms)) + extra
+        self.send_checked(packet_type=OW_POWER, command=OW_POWER_SET_RGB_FX,
+                          data=payload, op=op)
+        return True
+
+    def set_rgb_color(self, r: int, g: int, b: int) -> bool:
+        """Set a static 24-bit LED color, cancelling any running effect.
+
+        Raises:
+            ValueError: If a channel value is out of range.
+            LIFUNotConnectedError, LIFUCommunicationError, LIFUDeviceError.
+        """
+        self._check_rgb(r, g, b, 0)
+        return self._send_rgb_fx(OW_RGB_FX_SOLID, r, g, b, op="set_rgb_color")
+
+    def rgb_fade_to(self, r: int, g: int, b: int, duration_ms: int = 1000) -> bool:
+        """Fade smoothly from the current color to (r, g, b) over duration_ms,
+        then hold. Fading to (0, 0, 0) is a smooth off.
+
+        Raises:
+            ValueError: If a parameter is out of range.
+            LIFUNotConnectedError, LIFUCommunicationError, LIFUDeviceError.
+        """
+        self._check_rgb(r, g, b, duration_ms)
+        return self._send_rgb_fx(OW_RGB_FX_FADE, r, g, b, duration_ms,
+                                 op="rgb_fade_to")
+
+    def rgb_breathe(self, r: int, g: int, b: int, period_ms: int = 3000) -> bool:
+        """Breathe the given color: brightness ramps 0 -> full -> 0 every
+        period_ms, repeating until another command.
+
+        Raises:
+            ValueError: If a parameter is out of range.
+            LIFUNotConnectedError, LIFUCommunicationError, LIFUDeviceError.
+        """
+        self._check_rgb(r, g, b, period_ms)
+        return self._send_rgb_fx(OW_RGB_FX_BREATHE, r, g, b, period_ms,
+                                 op="rgb_breathe")
+
+    def rgb_rainbow(self, period_ms: int = 4000) -> bool:
+        """Sweep the full hue wheel, one revolution every period_ms, repeating.
+
+        Raises:
+            ValueError: If *period_ms* is out of range.
+            LIFUNotConnectedError, LIFUCommunicationError, LIFUDeviceError.
+        """
+        self._check_rgb(0, 0, 0, period_ms)
+        return self._send_rgb_fx(OW_RGB_FX_RAINBOW, period_ms=period_ms,
+                                 op="rgb_rainbow")
+
+    def rgb_flash(self, r: int, g: int, b: int, period_ms: int = 1000) -> bool:
+        """Flash the given color: 50% on/off blink with a full cycle of
+        period_ms (e.g. 1000 = 0.5 s on, 0.5 s off), repeating.
+
+        Raises:
+            ValueError: If a parameter is out of range.
+            LIFUNotConnectedError, LIFUCommunicationError, LIFUDeviceError.
+        """
+        self._check_rgb(r, g, b, period_ms)
+        return self._send_rgb_fx(OW_RGB_FX_FLASH, r, g, b, period_ms,
+                                 op="rgb_flash")
+
+    def rgb_color_cycle(self, colors: list[tuple[int, int, int]],
+                        dwell_ms: int = 1000) -> bool:
+        """Step through a list of colors, showing each for dwell_ms, repeating.
+
+        Args:
+            colors: 1 to 8 (r, g, b) tuples.
+            dwell_ms: Time each color is shown, in milliseconds.
+
+        Raises:
+            ValueError: If the color list or a value is out of range.
+            LIFUNotConnectedError, LIFUCommunicationError, LIFUDeviceError.
+        """
+        if not 1 <= len(colors) <= OW_RGB_CYCLE_MAX_COLORS:
+            raise ValueError(
+                f"Invalid color list. Must contain 1-{OW_RGB_CYCLE_MAX_COLORS} colors"
+            )
+        for color in colors:
+            self._check_rgb(*color, dwell_ms)
+        first = colors[0]
+        extra = b"".join(struct.pack("<BBB", *c) for c in colors[1:])
+        return self._send_rgb_fx(OW_RGB_FX_CYCLE, first[0], first[1], first[2],
+                                 dwell_ms, extra=extra, op="rgb_color_cycle")
+
+    def rgb_effect_stop(self) -> bool:
+        """Cancel any running effect; the LED holds its current color.
+
+        Raises:
+            LIFUNotConnectedError, LIFUCommunicationError, LIFUDeviceError.
+        """
+        return self._send_rgb_fx(OW_RGB_FX_STOP, op="rgb_effect_stop")
 
     def get_vmon_values(self) -> list[dict]:
         """Retrieve the voltage-monitor readings.
