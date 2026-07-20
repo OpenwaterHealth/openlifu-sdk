@@ -17,6 +17,13 @@ send_checked
 # with per-step error reporting; length from step count, not nesting.
 update_module
 
+# Legacy->secure bootloader migration orchestration (io/LIFUDFU.py) — the
+# sequential legacy-DFU steps (write updater+metadata, reset, wait for the
+# secure BL, flash the signed app) with per-step error reporting, kept inline
+# to preserve the ordering; length from step count + docstring, not nesting
+# (CCN 10).
+migrate_console_legacy
+
 # Trigger configuration (io/LIFUTXDevice.py) — validates and packs the full
 # trigger parameter set in one place to keep the JSON payload atomic.
 set_trigger
