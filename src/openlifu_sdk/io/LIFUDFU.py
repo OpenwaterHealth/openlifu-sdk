@@ -179,6 +179,17 @@ def find_stm32_programmer_cli() -> str | None:
     return None
 
 
+def bundled_updater_path() -> Path:
+    """Path to the RAM-resident legacy-migration updater shipped with the SDK
+    (``firmware/updater.bin``).
+
+    This is the one-time, keyless self-updater used by
+    :meth:`LIFUDFUManager.migrate_console_legacy`. It needs no signing key: the
+    legacy bootloader authenticates it with an HMAC "trust tag" that the SDK
+    computes from the updater bytes at run time (``build_legacy_metadata``)."""
+    return Path(__file__).parent.parent / "firmware" / "updater.bin"
+
+
 def split_console_flash_image(image: bytes) -> tuple[bytes, bytes]:
     """Split a combined full-flash console image (bootloader + signed app,
     starting at 0x08000000) into ``(bootloader_bytes, signed_app_bytes)``.
@@ -1317,7 +1328,8 @@ class LIFUDFUManager:
             progress_callback=progress_callback,
         )
 
-    def migrate_console_legacy(self, updater_bin: str, signed_app: str,
+    def migrate_console_legacy(self, signed_app: str,
+                               updater_bin: str | None = None,
                                enter_dfu_fn: Callable | None = None,
                                keys_dir: str | None = None,
                                vid: int = 0x0483, pid: int = 0xDF11,
@@ -1343,12 +1355,17 @@ class LIFUDFUManager:
           4. Flash the signed app over the secure DFU (program_console).
 
         Args:
-            updater_bin: The console-legacy-updater binary (embeds the new
-                secure bootloader; links at 0x08008000).
             signed_app: SBSFU signed application image.
+            updater_bin: The console-legacy-updater binary (embeds the new
+                secure bootloader; links at 0x08008000). Defaults to the
+                updater bundled with the SDK (``bundled_updater_path()``) - the
+                one-time, keyless self-updater; pass a path only to override it.
             enter_dfu_fn: Callable that reboots the running app into DFU, e.g.
                 ``interface.hvcontroller.enter_dfu``.
-            keys_dir: Optional keys dir to validate the signed app.
+            keys_dir: Optional keys dir to validate the signed app's ECDSA
+                signature before flashing. The migration needs no signing key:
+                the updater is authenticated by an HMAC trust tag (computed
+                here), and the secure bootloader re-verifies the app at boot.
 
         Raises:
             ValueError: Invalid signed app or updater.
@@ -1359,7 +1376,10 @@ class LIFUDFUManager:
         """
         from openlifu_sdk.io import LIFUCrypto
 
-        updater = Path(updater_bin).read_bytes()
+        updater_path = Path(updater_bin) if updater_bin else bundled_updater_path()
+        if not updater_path.is_file():
+            raise ValueError(f"Updater not found: {updater_path}")
+        updater = updater_path.read_bytes()
         app_image = Path(signed_app).read_bytes()
         report = LIFUCrypto.validate_signed_image(app_image, keys_dir=keys_dir)
         if not (report.ok or (keys_dir is None and report.structural_ok)):
