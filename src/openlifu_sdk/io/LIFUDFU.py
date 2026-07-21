@@ -1268,6 +1268,23 @@ class LIFUDFUManager:
 
     # --- transmitter (secure bootloader, SBSFU signed image) path ---
 
+    def get_transmitter_bootloader_version(self, vid: int = 0x0483,
+                                           pid: int = 0xDF11,
+                                           libusb_dll: str | None = None,
+                                           timeout_s: float = 30.0) -> str:
+        """Wait for the transmitter DFU device to enumerate (up to
+        *timeout_s*) and return its bootloader version string (the
+        bootloader's git describe, read from the DFU virtual version
+        address).
+
+        Raises:
+            RuntimeError: Device did not enumerate within the timeout.
+        """
+        return self._wait_for_usb_dfu(
+            vid=vid, pid=pid, libusb_dll=libusb_dll,
+            timeout_s=timeout_s, device_profile=TRANSMITTER_PROFILE,
+        )
+
     def get_transmitter_installed_version(self, vid: int = 0x0483,
                                           pid: int = 0xDF11,
                                           libusb_dll: str | None = None

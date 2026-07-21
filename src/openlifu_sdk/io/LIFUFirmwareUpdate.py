@@ -46,16 +46,18 @@ erasable.
 from __future__ import annotations
 
 import logging
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
 
 from openlifu_sdk.io.LIFUDFU import (
+    CONSOLE_PROFILE,
     DFU_KIND_LEGACY,
     DFU_KIND_ROM,
     DFU_KIND_SECURE,
     LIFUDFUManager,
-    bundled_updater_path,
+    TRANSMITTER_PROFILE,
     infer_console_bootloader_from_app_version,
 )
 
@@ -95,6 +97,8 @@ class UpdateResult:
     action: str            # "migrate-rom" | "migrate-legacy" | "app-update"
     summary: str           # human-readable one-liner
     reboot_required: bool  # True if a power-cycle is needed to run the app
+    bl_version: str | None = None  # bootloader version string (DFU virtual
+                                   # version address), when the path read it
 
 
 class LIFUFirmwareUpdate:
@@ -161,6 +165,43 @@ class LIFUFirmwareUpdate:
         return mapping[kind], "dfu"
 
     # ------------------------------------------------------------------
+    # Bootloader (DFU) version
+    # ------------------------------------------------------------------
+
+    def get_bootloader_version(self) -> str:
+        """Read the console bootloader's version string (its git describe,
+        served over DFU at the virtual version address).
+
+        If the unit is already in DFU, the version is read directly. If the
+        application is running, the unit is rebooted into DFU, the version is
+        read, and the bootloader is asked to reset back into the application
+        via its virtual reset address (bootloaders without the reset hook —
+        open-lifu-console-bl <= 1.0.2 — stay in DFU until a power-cycle).
+
+        Raises:
+            RuntimeError: State undetectable, or the DFU device did not
+                enumerate.
+        """
+        cohort, source = self.detect_cohort()
+        if cohort == COHORT_NONE:
+            raise RuntimeError(
+                "unit has no bootloader (STM32 ROM DFU) — there is no "
+                "bootloader version to read")
+        in_dfu = source == "dfu"
+        if not in_dfu:
+            logger.info("Entering DFU to read the bootloader version...")
+            self._enter_dfu()
+            time.sleep(2.0)
+        try:
+            return self._mgr.get_console_bootloader_version(
+                vid=self.vid, pid=self.pid, libusb_dll=self.libusb_dll)
+        finally:
+            if not in_dfu:
+                self._mgr.abort_dfu(vid=self.vid, pid=self.pid,
+                                    libusb_dll=self.libusb_dll,
+                                    profile=CONSOLE_PROFILE)
+
+    # ------------------------------------------------------------------
     # Update
     # ------------------------------------------------------------------
 
@@ -216,13 +257,14 @@ class LIFUFirmwareUpdate:
                                 "bootloader (RAM updater).", reboot_required=True)
 
         if cohort == COHORT_SECURE:
-            self._mgr.update_console(
+            bl_version = self._mgr.update_console(
                 app, enter_dfu_fn=None if in_dfu else self._enter_dfu,
                 keys_dir=self.keys_dir, force=force, vid=self.vid, pid=self.pid,
                 libusb_dll=self.libusb_dll, progress_callback=progress_callback)
             return UpdateResult(cohort, "app-update",
                                 "Updated the application on the secure "
-                                "bootloader.", reboot_required=True)
+                                "bootloader.", reboot_required=True,
+                                bl_version=bl_version)
 
         raise RuntimeError(f"unhandled cohort: {cohort}")
 
@@ -311,6 +353,36 @@ class LIFUTransmitterFirmwareUpdate:
         logger.info("Detected secure-bootloader DFU %s", dfu_ver)
         return COHORT_SECURE, "dfu"
 
+    def get_bootloader_version(self) -> str:
+        """Read the transmitter bootloader's version string (its git
+        describe, served over DFU at the virtual version address).
+
+        If the unit is already in DFU, the version is read directly. If the
+        application is running, the unit is rebooted into DFU, the version is
+        read, and the bootloader is asked to reset back into the application
+        via its virtual reset address (bootloaders without the reset hook —
+        open-lifu-transmitter-bl <= 1.0.1-rc.1 — stay in DFU until a
+        power-cycle).
+
+        Raises:
+            RuntimeError: No responding application and no secure-bootloader
+                DFU present, or the DFU device did not enumerate.
+        """
+        _state, source = self.detect()
+        in_dfu = source == "dfu"
+        if not in_dfu:
+            logger.info("Entering DFU to read the bootloader version...")
+            self._enter_dfu()
+            time.sleep(2.0)
+        try:
+            return self._mgr.get_transmitter_bootloader_version(
+                vid=self.vid, pid=self.pid, libusb_dll=self.libusb_dll)
+        finally:
+            if not in_dfu:
+                self._mgr.abort_dfu(vid=self.vid, pid=self.pid,
+                                    libusb_dll=self.libusb_dll,
+                                    profile=TRANSMITTER_PROFILE)
+
     def update(self, *, signed_app: str | None = None, force: bool = False,
                progress_callback: Callable | None = None) -> UpdateResult:
         """Update the transmitter application over standard USB DFU.
@@ -333,13 +405,14 @@ class LIFUTransmitterFirmwareUpdate:
         app = str(signed_app) if signed_app else str(bundled_transmitter_signed_app())
         in_dfu = source == "dfu"
 
-        self._mgr.update_transmitter(
+        bl_version = self._mgr.update_transmitter(
             app, enter_dfu_fn=None if in_dfu else self._enter_dfu,
             keys_dir=self.keys_dir, force=force, vid=self.vid, pid=self.pid,
             libusb_dll=self.libusb_dll, progress_callback=progress_callback)
         return UpdateResult(state, "app-update",
                             "Updated the transmitter application on the "
-                            "secure bootloader.", reboot_required=True)
+                            "secure bootloader.", reboot_required=True,
+                            bl_version=bl_version)
 
     def _require_tx(self):
         if self.tx is None:
@@ -370,6 +443,13 @@ def main(argv: list[str] | None = None) -> int:
                         help="Which unit to update (default: console).")
     parser.add_argument("--detect", action="store_true",
                         help="Report the detected state and exit — no flashing.")
+    parser.add_argument("--bl-version", action="store_true",
+                        help="Report the bootloader (DFU) version and exit — "
+                             "no flashing. If the app is running, the unit "
+                             "round-trips through DFU and resets back into "
+                             "the app (needs a bootloader with the reset "
+                             "hook; older ones stay in DFU until "
+                             "power-cycle).")
     parser.add_argument("--production",
                         help="Console only: override the combined bootloader+app image.")
     parser.add_argument("--app", help="Override the signed app image.")
@@ -422,6 +502,13 @@ def main(argv: list[str] | None = None) -> int:
         print(f"Transmitter state: {state} (from {source})")
         if args.detect:
             return 0
+        if args.bl_version:
+            try:
+                print(f"Bootloader version: {fw.get_bootloader_version()}")
+            except RuntimeError as e:
+                print(f"Could not read bootloader version: {e}")
+                return 1
+            return 0
         if not confirm(state):
             print("Aborted.")
             return 1
@@ -432,6 +519,8 @@ def main(argv: list[str] | None = None) -> int:
             print(f"\nUPDATE FAILED: {e}")
             return 1
         print(f"\n{result.summary}")
+        if result.bl_version:
+            print(f"Bootloader version: {result.bl_version}")
         if result.reboot_required:
             print("Power-cycle the transmitter to boot the new application.")
         return 0
@@ -452,6 +541,13 @@ def main(argv: list[str] | None = None) -> int:
     print(f"Console state: {cohort} (from {source})")
     if args.detect:
         return 0
+    if args.bl_version:
+        try:
+            print(f"Bootloader version: {fw.get_bootloader_version()}")
+        except RuntimeError as e:
+            print(f"Could not read bootloader version: {e}")
+            return 1
+        return 0
 
     if not confirm(cohort):
         print("Aborted.")
@@ -465,6 +561,8 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     print(f"\n{result.summary}")
+    if result.bl_version:
+        print(f"Bootloader version: {result.bl_version}")
     if result.reboot_required:
         print("Power-cycle the console to boot the new application.")
     return 0
