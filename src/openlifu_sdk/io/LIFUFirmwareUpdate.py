@@ -429,6 +429,104 @@ class LIFUTransmitterFirmwareUpdate:
 # CLI:  python -m openlifu_sdk.io.LIFUFirmwareUpdate [options]
 # ---------------------------------------------------------------------------
 
+def _progress(written: int, total: int, label: str) -> None:
+    pct = 100 * written // total if total else 100
+    print(f"\r  {label}: {written:,}/{total:,} ({pct}%)", end="", flush=True)
+
+
+def _confirm(label: str, yes: bool) -> bool:
+    if yes:
+        return True
+    try:
+        resp = input(f"Proceed with the update for '{label}'? [y/N] ").strip().lower()
+    except EOFError:
+        resp = ""
+    return resp in ("y", "yes")
+
+
+def _run_update_flow(fw: Any, label: str, detect_fn: Callable,
+                     update_fn: Callable, args: Any) -> int:
+    """Shared CLI flow for both devices: detect the unit's state, service the
+    query-only flags (--detect / --bl-version), then confirm and update."""
+    try:
+        state, source = detect_fn()
+    except RuntimeError as e:
+        print(f"Could not determine {label} state: {e}")
+        return 1
+    print(f"{label.capitalize()} state: {state} (from {source})")
+    if args.detect:
+        return 0
+    if args.bl_version:
+        try:
+            print(f"Bootloader version: {fw.get_bootloader_version()}")
+        except RuntimeError as e:
+            print(f"Could not read bootloader version: {e}")
+            return 1
+        return 0
+
+    if not _confirm(state, args.yes):
+        print("Aborted.")
+        return 1
+
+    try:
+        result = update_fn()
+    except (ValueError, RuntimeError) as e:
+        print(f"\nUPDATE FAILED: {e}")
+        return 1
+
+    print(f"\n{result.summary}")
+    if result.bl_version:
+        print(f"Bootloader version: {result.bl_version}")
+    if result.reboot_required:
+        print(f"Power-cycle the {label} to boot the new application.")
+    return 0
+
+
+def _run_transmitter(args: Any) -> int:
+    from openlifu_sdk.io.LIFUInterface import LIFUInterface
+
+    # A running app is preferred (it lets us trigger DFU entry), but a unit
+    # already sitting in the secure bootloader's DFU works too.
+    tx = None
+    try:
+        interface = LIFUInterface(TX_test_mode=False)
+        tx_connected, _hv = interface.is_device_connected()
+        if tx_connected:
+            interface.txdevice.ping()
+            tx = interface.txdevice
+    except Exception as e:
+        logger.info("Transmitter app connection failed (%s); the unit "
+                    "must already be in USB DFU mode", e)
+    if tx is None:
+        print("Transmitter app not connected — checking for a unit "
+              "already in USB DFU mode.")
+
+    fw = LIFUTransmitterFirmwareUpdate(tx=tx, keys_dir=args.keys)
+    return _run_update_flow(
+        fw, "transmitter", fw.detect,
+        lambda: fw.update(signed_app=args.app, force=args.force,
+                          progress_callback=_progress),
+        args)
+
+
+def _run_console(args: Any) -> int:
+    from openlifu_sdk.io.LIFUInterface import LIFUInterface
+
+    interface = LIFUInterface(TX_test_mode=False)
+    _tx, hv = interface.is_device_connected()
+    if not hv:
+        print("Console not connected.")
+        return 1
+    interface.hvcontroller.ping()
+
+    fw = LIFUFirmwareUpdate(hv=interface.hvcontroller, keys_dir=args.keys)
+    return _run_update_flow(
+        fw, "console", fw.detect_cohort,
+        lambda: fw.update(production_image=args.production, signed_app=args.app,
+                          force=args.force, progress_callback=_progress),
+        args)
+
+
 def main(argv: list[str] | None = None) -> int:
     import argparse
 
@@ -461,111 +559,9 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     logging.basicConfig(level=logging.INFO, format="%(message)s")
-    from openlifu_sdk.io.LIFUInterface import LIFUInterface
-
-    def confirm(label: str) -> bool:
-        if args.yes:
-            return True
-        try:
-            resp = input(f"Proceed with the update for '{label}'? [y/N] ").strip().lower()
-        except EOFError:
-            resp = ""
-        return resp in ("y", "yes")
-
-    def progress(w: int, t: int, label: str) -> None:
-        pct = 100 * w // t if t else 100
-        print(f"\r  {label}: {w:,}/{t:,} ({pct}%)", end="", flush=True)
-
     if args.device == "transmitter":
-        # A running app is preferred (it lets us trigger DFU entry), but a
-        # unit already sitting in the secure bootloader's DFU works too.
-        tx = None
-        try:
-            interface = LIFUInterface(TX_test_mode=False)
-            tx_connected, _hv = interface.is_device_connected()
-            if tx_connected:
-                interface.txdevice.ping()
-                tx = interface.txdevice
-        except Exception as e:
-            logger.info("Transmitter app connection failed (%s); the unit "
-                        "must already be in USB DFU mode", e)
-        if tx is None:
-            print("Transmitter app not connected — checking for a unit "
-                  "already in USB DFU mode.")
-
-        fw = LIFUTransmitterFirmwareUpdate(tx=tx, keys_dir=args.keys)
-        try:
-            state, source = fw.detect()
-        except RuntimeError as e:
-            print(f"Could not determine transmitter state: {e}")
-            return 1
-        print(f"Transmitter state: {state} (from {source})")
-        if args.detect:
-            return 0
-        if args.bl_version:
-            try:
-                print(f"Bootloader version: {fw.get_bootloader_version()}")
-            except RuntimeError as e:
-                print(f"Could not read bootloader version: {e}")
-                return 1
-            return 0
-        if not confirm(state):
-            print("Aborted.")
-            return 1
-        try:
-            result = fw.update(signed_app=args.app, force=args.force,
-                               progress_callback=progress)
-        except (ValueError, RuntimeError) as e:
-            print(f"\nUPDATE FAILED: {e}")
-            return 1
-        print(f"\n{result.summary}")
-        if result.bl_version:
-            print(f"Bootloader version: {result.bl_version}")
-        if result.reboot_required:
-            print("Power-cycle the transmitter to boot the new application.")
-        return 0
-
-    interface = LIFUInterface(TX_test_mode=False)
-    _tx, hv = interface.is_device_connected()
-    if not hv:
-        print("Console not connected.")
-        return 1
-    interface.hvcontroller.ping()
-
-    fw = LIFUFirmwareUpdate(hv=interface.hvcontroller, keys_dir=args.keys)
-    try:
-        cohort, source = fw.detect_cohort()
-    except RuntimeError as e:
-        print(f"Could not determine console state: {e}")
-        return 1
-    print(f"Console state: {cohort} (from {source})")
-    if args.detect:
-        return 0
-    if args.bl_version:
-        try:
-            print(f"Bootloader version: {fw.get_bootloader_version()}")
-        except RuntimeError as e:
-            print(f"Could not read bootloader version: {e}")
-            return 1
-        return 0
-
-    if not confirm(cohort):
-        print("Aborted.")
-        return 1
-
-    try:
-        result = fw.update(production_image=args.production, signed_app=args.app,
-                           force=args.force, progress_callback=progress)
-    except (ValueError, RuntimeError) as e:
-        print(f"\nUPDATE FAILED: {e}")
-        return 1
-
-    print(f"\n{result.summary}")
-    if result.bl_version:
-        print(f"Bootloader version: {result.bl_version}")
-    if result.reboot_required:
-        print("Power-cycle the console to boot the new application.")
-    return 0
+        return _run_transmitter(args)
+    return _run_console(args)
 
 
 if __name__ == "__main__":
