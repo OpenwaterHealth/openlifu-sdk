@@ -6,7 +6,11 @@ Provides:
   - :class:`STM32USBDFU`         — USB DFU client (PyUSB; erase/write/read/version)
   - :class:`STM32I2CDFUviaMaster`— I2C DFU via OW UART master passthrough (modules 1+)
   - :class:`LIFUDFUManager`      — high-level firmware update orchestration:
-      * transmitter modules: :meth:`LIFUDFUManager.update_module` (PGK1 packages)
+      * transmitter modules: :meth:`LIFUDFUManager.update_module` — module 0
+        accepts both SBSFU signed images ('SFU1', secure bootloader) and legacy
+        PGK1 packages (auto-detected by magic); modules 1+ use I2C passthrough
+      * transmitter (secure bootloader, USB): :meth:`LIFUDFUManager.update_transmitter`
+        (SBSFU signed image, with pre-erase validation and anti-downgrade checks)
       * console: :meth:`LIFUDFUManager.update_console` (SBSFU signed images from
         LIFUCrypto, with pre-erase validation and anti-downgrade checks)
 """
@@ -141,6 +145,10 @@ CONSOLE_PROFILE = DeviceProfile(
 # Console SBSFU active slot: the signed image (320 B header + app @ +0x400)
 # is written here; the bootloader verifies and launches it after manifest.
 CONSOLE_SLOT_BASE = 0x08010000
+
+# Transmitter SBSFU active slot (open-lifu-transmitter-bl memory_map.h): same
+# layout as the console — the signed image is written whole to the slot base.
+TRANSMITTER_SLOT_BASE = 0x08010000
 
 # Console flash base — where the bootloader itself lives. Writable only from
 # the STM32 ROM DFU (full-flash access); the legacy and secure bootloaders
@@ -938,12 +946,34 @@ class LIFUDFUManager:
                     libusb_dll: str | None = None,
                     device_type: str = "transmitter",
                     progress_callback: Callable | None = None) -> None:
-        """Program a signed package to module 0 via USB DFU.
+        """Program a signed firmware file to module 0 via USB DFU.
+
+        The file format is auto-detected by magic:
+          - ``SFU1`` — SBSFU signed image (secure bootloader): written whole to
+            the active slot with pre-erase validation and anti-downgrade checks.
+          - otherwise — legacy ``PGK1`` package (fw + metadata page), for units
+            still on the legacy non-secure bootloader.
 
         The module must already be in DFU bootloader mode.
         """
+        if device_type not in ("transmitter", "console"):
+            raise ValueError(
+                f"Unknown device_type {device_type!r}; expected 'transmitter' or 'console'."
+            )
+        profile = TRANSMITTER_PROFILE if device_type == "transmitter" else CONSOLE_PROFILE
+
         with open(package_file, "rb") as f:
             pkg_blob = f.read()
+
+        if pkg_blob[:4] == b"SFU1":
+            slot_base = (TRANSMITTER_SLOT_BASE if device_type == "transmitter"
+                         else CONSOLE_SLOT_BASE)
+            self._program_slot_image(
+                package_file, profile, slot_base, device_type.capitalize(),
+                vid=vid, pid=pid, libusb_dll=libusb_dll,
+                progress_callback=progress_callback)
+            return
+
         pkg = parse_signed_package(pkg_blob)
 
         logger.info(
@@ -951,11 +981,6 @@ class LIFUDFUManager:
             len(pkg["fw"]), pkg["fw_address"],
             len(pkg["meta"]), pkg["meta_address"],
         )
-        if device_type not in ("transmitter", "console"):
-            raise ValueError(
-                f"Unknown device_type {device_type!r}; expected 'transmitter' or 'console'."
-            )
-        profile = TRANSMITTER_PROFILE if device_type == "transmitter" else CONSOLE_PROFILE
         with STM32USBDFU(vid=vid, pid=pid, libusb_dll=libusb_dll,
                          device_profile=profile) as dfu:
             dfu.write_memory(
@@ -1062,18 +1087,20 @@ class LIFUDFUManager:
             timeout_s=timeout_s, device_profile=CONSOLE_PROFILE,
         )
 
-    def get_console_installed_version(self, vid: int = 0x0483, pid: int = 0xDF11,
-                                      libusb_dll: str | None = None) -> int | None:
-        """Read the FwVersion of the image currently installed in the console's
-        active slot, or None if the slot holds no valid SBSFU header.
+    def _get_installed_slot_version(self, profile: "DeviceProfile",
+                                    slot_base: int,
+                                    vid: int = 0x0483, pid: int = 0xDF11,
+                                    libusb_dll: str | None = None) -> int | None:
+        """Read the FwVersion of the image installed in the SBSFU active slot
+        at *slot_base*, or None if the slot holds no valid SBSFU header.
 
-        The console must be in USB DFU mode.
+        The unit must be in USB DFU mode.
         """
         from openlifu_sdk.io import LIFUCrypto
 
         with STM32USBDFU(vid=vid, pid=pid, libusb_dll=libusb_dll,
-                         device_profile=CONSOLE_PROFILE) as dfu:
-            hdr_bytes = dfu.read_memory(CONSOLE_SLOT_BASE,
+                         device_profile=profile) as dfu:
+            hdr_bytes = dfu.read_memory(slot_base,
                                         LIFUCrypto.HEADER_TOTAL_LEN)
         try:
             header = LIFUCrypto.FirmwareHeader.from_bytes(hdr_bytes)
@@ -1083,14 +1110,16 @@ class LIFUDFUManager:
             return None
         return header.fw_version
 
-    def program_console(self, signed_image: str,
-                        keys_dir: str | None = None,
-                        force: bool = False,
-                        vid: int = 0x0483, pid: int = 0xDF11,
-                        libusb_dll: str | None = None,
-                        progress_callback: Callable | None = None) -> None:
-        """Program a console SBSFU signed image (from LIFUCrypto / the
-        bootloader signing tools) into the active slot via USB DFU.
+    def _program_slot_image(self, signed_image: str,
+                            profile: "DeviceProfile", slot_base: int,
+                            label: str,
+                            keys_dir: str | None = None,
+                            force: bool = False,
+                            vid: int = 0x0483, pid: int = 0xDF11,
+                            libusb_dll: str | None = None,
+                            progress_callback: Callable | None = None) -> None:
+        """Program an SBSFU signed image (from LIFUCrypto / the bootloader
+        signing tools) into the active slot at *slot_base* via USB DFU.
 
         Pre-flight checks run BEFORE any flash erase, so a rejected image
         leaves the installed firmware untouched (unlike naive erase-first
@@ -1105,7 +1134,7 @@ class LIFUDFUManager:
              anti-rollback floor is not DFU-readable and remains the final
              authority at boot.
 
-        The console must already be in USB DFU mode.
+        The unit must already be in USB DFU mode.
 
         Raises:
             ValueError: Image invalid, or downgrade without *force*.
@@ -1122,11 +1151,11 @@ class LIFUDFUManager:
                 + report.describe()
             )
         new_version = report.header.fw_version
-        logger.info("Console image: version %d (%s), %d bytes",
+        logger.info("%s image: version %d (%s), %d bytes", label,
                     new_version, report.header.fw_version_str, len(image))
 
-        installed = self.get_console_installed_version(
-            vid=vid, pid=pid, libusb_dll=libusb_dll)
+        installed = self._get_installed_slot_version(
+            profile, slot_base, vid=vid, pid=pid, libusb_dll=libusb_dll)
         if installed is not None:
             logger.info("Installed image: version %d (%s)",
                         installed, LIFUCrypto.decode_fw_version(installed))
@@ -1142,13 +1171,44 @@ class LIFUDFUManager:
                 )
 
         with STM32USBDFU(vid=vid, pid=pid, libusb_dll=libusb_dll,
-                         device_profile=CONSOLE_PROFILE) as dfu:
-            dfu.write_memory(CONSOLE_SLOT_BASE, image, page_erase=True,
+                         device_profile=profile) as dfu:
+            dfu.write_memory(slot_base, image, page_erase=True,
                              progress_callback=progress_callback)
-            logger.info("Console DFU: sending manifest (device will reset "
-                        "and the bootloader will verify the image)...")
+            logger.info("%s DFU: sending manifest (device will reset "
+                        "and the bootloader will verify the image)...", label)
             dfu.manifest()
-        logger.info("Console DFU: programming complete.")
+        logger.info("%s DFU: programming complete.", label)
+
+    def get_console_installed_version(self, vid: int = 0x0483, pid: int = 0xDF11,
+                                      libusb_dll: str | None = None) -> int | None:
+        """Read the FwVersion of the image currently installed in the console's
+        active slot, or None if the slot holds no valid SBSFU header.
+
+        The console must be in USB DFU mode.
+        """
+        return self._get_installed_slot_version(
+            CONSOLE_PROFILE, CONSOLE_SLOT_BASE,
+            vid=vid, pid=pid, libusb_dll=libusb_dll)
+
+    def program_console(self, signed_image: str,
+                        keys_dir: str | None = None,
+                        force: bool = False,
+                        vid: int = 0x0483, pid: int = 0xDF11,
+                        libusb_dll: str | None = None,
+                        progress_callback: Callable | None = None) -> None:
+        """Program a console SBSFU signed image into the active slot via USB
+        DFU, with pre-erase validation and anti-downgrade checks (see
+        :meth:`_program_slot_image`). The console must already be in USB DFU
+        mode.
+
+        Raises:
+            ValueError: Image invalid, or downgrade without *force*.
+            RuntimeError: DFU device/communication problems.
+        """
+        self._program_slot_image(
+            signed_image, CONSOLE_PROFILE, CONSOLE_SLOT_BASE, "Console",
+            keys_dir=keys_dir, force=force, vid=vid, pid=pid,
+            libusb_dll=libusb_dll, progress_callback=progress_callback)
 
     def update_console(self, signed_image: str,
                        enter_dfu_fn: Callable | None = None,
@@ -1167,6 +1227,12 @@ class LIFUDFUManager:
         :meth:`program_console` with its pre-erase validation and
         anti-downgrade checks.
 
+        Clean abort: if the pre-flight checks refuse the image (bad image or
+        downgrade) nothing was erased, and — when this call put the unit into
+        DFU itself — the bootloader is asked to reset via its virtual reset
+        address so the installed application boots again. Bootloaders without
+        the reset hook stay in DFU until a power-cycle (best effort).
+
         Returns:
             The console bootloader's version string.
         """
@@ -1182,12 +1248,142 @@ class LIFUDFUManager:
         )
         logger.info("Console bootloader version: %s", bl_version)
 
-        self.program_console(
-            signed_image, keys_dir=keys_dir, force=force,
-            vid=vid, pid=pid, libusb_dll=libusb_dll,
-            progress_callback=progress_callback,
-        )
+        try:
+            self.program_console(
+                signed_image, keys_dir=keys_dir, force=force,
+                vid=vid, pid=pid, libusb_dll=libusb_dll,
+                progress_callback=progress_callback,
+            )
+        except ValueError:
+            # Pre-flight refusal: no erase happened, the installed image is
+            # intact. If we entered DFU ourselves, boot the app back up rather
+            # than stranding the unit in DFU. (A mid-write RuntimeError is NOT
+            # handled here on purpose — the slot may be partially written, so
+            # the unit stays in DFU ready for a retry.)
+            if enter_dfu_fn is not None:
+                self.abort_dfu(vid=vid, pid=pid, libusb_dll=libusb_dll,
+                               profile=CONSOLE_PROFILE)
+            raise
         return bl_version
+
+    # --- transmitter (secure bootloader, SBSFU signed image) path ---
+
+    def get_transmitter_installed_version(self, vid: int = 0x0483,
+                                          pid: int = 0xDF11,
+                                          libusb_dll: str | None = None
+                                          ) -> int | None:
+        """Read the FwVersion of the image currently installed in the
+        transmitter's active slot, or None if the slot holds no valid SBSFU
+        header.
+
+        The transmitter must be in USB DFU mode (secure bootloader).
+        """
+        return self._get_installed_slot_version(
+            TRANSMITTER_PROFILE, TRANSMITTER_SLOT_BASE,
+            vid=vid, pid=pid, libusb_dll=libusb_dll)
+
+    def program_transmitter(self, signed_image: str,
+                            keys_dir: str | None = None,
+                            force: bool = False,
+                            vid: int = 0x0483, pid: int = 0xDF11,
+                            libusb_dll: str | None = None,
+                            progress_callback: Callable | None = None) -> None:
+        """Program a transmitter SBSFU signed image into the active slot via
+        USB DFU, with pre-erase validation and anti-downgrade checks (see
+        :meth:`_program_slot_image`). The transmitter must already be in USB
+        DFU mode (secure bootloader).
+
+        Raises:
+            ValueError: Image invalid, or downgrade without *force*.
+            RuntimeError: DFU device/communication problems.
+        """
+        self._program_slot_image(
+            signed_image, TRANSMITTER_PROFILE, TRANSMITTER_SLOT_BASE,
+            "Transmitter", keys_dir=keys_dir, force=force, vid=vid, pid=pid,
+            libusb_dll=libusb_dll, progress_callback=progress_callback)
+
+    def update_transmitter(self, signed_image: str,
+                           enter_dfu_fn: Callable | None = None,
+                           keys_dir: str | None = None,
+                           force: bool = False,
+                           vid: int = 0x0483, pid: int = 0xDF11,
+                           libusb_dll: str | None = None,
+                           dfu_wait_s: float = 2.0,
+                           dfu_enum_timeout_s: float = 30.0,
+                           progress_callback: Callable | None = None) -> str:
+        """High-level transmitter firmware update over standard USB DFU
+        (module 0, secure bootloader).
+
+        Optionally calls *enter_dfu_fn()* (e.g. ``lambda:
+        interface.txdevice.enter_dfu(module=0)``) to reboot the running
+        application into the bootloader, waits for the SECURE bootloader's
+        DFU to enumerate (a legacy or ROM DFU environment is refused — this
+        path writes an SFU1 signed image, which only the secure bootloader
+        accepts), then runs :meth:`program_transmitter` with its pre-erase
+        validation and anti-downgrade checks.
+
+        Clean abort: if the pre-flight checks refuse the image (bad image or
+        downgrade) nothing was erased, and — when this call put the unit into
+        DFU itself — the bootloader is asked to reset via its virtual reset
+        address so the installed application boots again. Bootloaders without
+        the reset hook stay in DFU until a power-cycle (best effort).
+
+        Returns:
+            The transmitter bootloader's version string.
+        """
+        if enter_dfu_fn is not None:
+            logger.info("Requesting transmitter DFU mode...")
+            enter_dfu_fn()
+            if dfu_wait_s > 0:
+                time.sleep(dfu_wait_s)
+
+        bl_version = self._wait_for_dfu_kind(
+            DFU_KIND_SECURE, vid=vid, pid=pid, libusb_dll=libusb_dll,
+            timeout_s=dfu_enum_timeout_s,
+        )
+        logger.info("Transmitter secure bootloader version: %s", bl_version)
+
+        try:
+            self.program_transmitter(
+                signed_image, keys_dir=keys_dir, force=force,
+                vid=vid, pid=pid, libusb_dll=libusb_dll,
+                progress_callback=progress_callback,
+            )
+        except ValueError:
+            # Pre-flight refusal: no erase happened, the installed image is
+            # intact. If we entered DFU ourselves, boot the app back up rather
+            # than stranding the unit in DFU. (A mid-write RuntimeError is NOT
+            # handled here on purpose — the slot may be partially written, so
+            # the unit stays in DFU ready for a retry.)
+            if enter_dfu_fn is not None:
+                self.abort_dfu(vid=vid, pid=pid, libusb_dll=libusb_dll)
+            raise
+        return bl_version
+
+    def abort_dfu(self, vid: int = 0x0483, pid: int = 0xDF11,
+                  libusb_dll: str | None = None,
+                  profile: "DeviceProfile | None" = None) -> None:
+        """Best-effort: reset a unit out of USB DFU mode via the bootloader's
+        virtual reset address (a DNLOAD to ``0xFFFFFF08``), so the bootloader
+        re-verifies the slot and boots the installed application.
+
+        Requires a bootloader with the reset hook (open-lifu-transmitter-bl >
+        1.0.1-rc.1, open-lifu-console-bl > 1.0.2); older bootloaders reject
+        the write and remain in DFU until a power-cycle. Never raises.
+
+        Args:
+            profile: Device profile (defaults to the transmitter's).
+        """
+        try:
+            with STM32USBDFU(vid=vid, pid=pid, libusb_dll=libusb_dll,
+                             device_profile=profile or TRANSMITTER_PROFILE) as dfu:
+                dfu.trigger_reset()
+            logger.info(
+                "DFU abort reset sent — the bootloader re-verifies the slot "
+                "and boots the app (bootloaders without the reset hook stay "
+                "in DFU until power-cycle)")
+        except Exception as e:
+            logger.warning("DFU abort reset failed: %s", e)
 
     def migrate_console_rom_dfu(self, bootloader_bin: str, signed_app: str,
                                 keys_dir: str | None = None,

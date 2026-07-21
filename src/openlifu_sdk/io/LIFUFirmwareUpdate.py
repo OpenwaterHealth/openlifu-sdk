@@ -1,6 +1,8 @@
-"""High-level console firmware update — one entry point for all three cases.
+"""High-level firmware update for the console and the transmitter.
 
-A console unit is in one of three states, each needing a different update path:
+**Console** (:class:`LIFUFirmwareUpdate`) — one entry point for all three
+cases. A console unit is in one of three states, each needing a different
+update path:
 
   - **no bootloader** (app < 1.2.0)     → migrate to the secure bootloader via
     the STM32 ROM DFU (write the combined bootloader+app image).
@@ -25,8 +27,20 @@ Typical use::
     result = fw.update()          # detect + update; uses bundled images
     print(result.summary)
 
-NOTE: the migration paths are for unlocked (beta) units only; after RDP/FDA
-lockdown the force-ROM-DFU switch is inert and the bootloader is not erasable.
+**Transmitter** (:class:`LIFUTransmitterFirmwareUpdate`) — standard USB DFU
+update of the module 0 (USB master) application on the secure bootloader
+(open-lifu-transmitter-bl). The signed app is written to the active slot and
+verified by the bootloader at boot; no signing keys are needed. Legacy
+(non-secure bootloader) units and I2C slave-module updates are not covered
+here — use ``TxDevice.update_firmware`` for those::
+
+    fw = LIFUTransmitterFirmwareUpdate(tx=interface.txdevice)
+    result = fw.update()          # uses the bundled signed transmitter app
+    print(result.summary)
+
+NOTE: the console migration paths are for unlocked (beta) units only; after
+RDP/FDA lockdown the force-ROM-DFU switch is inert and the bootloader is not
+erasable.
 """
 
 from __future__ import annotations
@@ -65,6 +79,12 @@ def bundled_signed_app() -> Path:
     """Signed console app image bundled with the SDK (legacy migration and
     secure app update source)."""
     return _FW_DIR / "openlifu-console-fw-signed.bin"
+
+
+def bundled_transmitter_signed_app() -> Path:
+    """Signed transmitter app image bundled with the SDK (secure app update
+    source for the transmitter's USB DFU path)."""
+    return _FW_DIR / "openlifu-transmitter-fw-signed.bin"
 
 
 @dataclass
@@ -224,6 +244,114 @@ class LIFUFirmwareUpdate:
         self._require_hv().enter_stm32_rom_dfu()
 
 
+class LIFUTransmitterFirmwareUpdate:
+    """Transmitter firmware updater — standard USB DFU on the secure bootloader.
+
+    Covers the module 0 (USB master) update path for units running the secure
+    bootloader (open-lifu-transmitter-bl): reboot the running application into
+    DFU, write the SBSFU signed image to the active slot with pre-erase
+    validation and anti-downgrade checks, and let the bootloader verify it at
+    boot. Needs no signing keys; an optional *keys_dir* only adds an ECDSA
+    signature pre-check before flashing.
+
+    Not covered here (yet): migration of legacy (non-secure bootloader) units,
+    and I2C slave-module updates — use ``TxDevice.update_firmware`` for those.
+
+    Args:
+        tx: A connected ``TxDevice`` (e.g. ``interface.txdevice``) used to read
+            the running app version and to trigger DFU entry. May be omitted
+            only if the unit is already in USB DFU mode.
+        keys_dir: Optional keys directory to ECDSA-validate the signed app
+            before flashing. Not required.
+        libusb_dll: Optional explicit libusb-1.0 DLL path (Windows).
+    """
+
+    def __init__(self, tx: Any = None, keys_dir: str | None = None,
+                 libusb_dll: str | None = None,
+                 vid: int = 0x0483, pid: int = 0xDF11):
+        self.tx = tx
+        self.keys_dir = keys_dir
+        self.libusb_dll = libusb_dll
+        self.vid = vid
+        self.pid = pid
+        self._mgr = LIFUDFUManager()
+
+    def detect(self) -> tuple[str, str]:
+        """Determine how the unit will be updated.
+
+        Returns ``(state, source)`` where state is ``COHORT_SECURE`` and
+        source is ``"app"`` (application responding; DFU entry will be
+        triggered) or ``"dfu"`` (the unit is already in the secure
+        bootloader's USB DFU).
+
+        Raises:
+            RuntimeError: No responding application and no secure-bootloader
+                DFU device present (a legacy or ROM DFU environment is
+                refused — this path only writes SFU1 signed images).
+        """
+        if self.tx is not None:
+            try:
+                ver = str(self.tx.get_version())
+                logger.info("Detected transmitter app version %s", ver)
+                return COHORT_SECURE, "app"
+            except Exception as e:
+                logger.info("Transmitter app version read failed (%s); "
+                            "checking DFU state", e)
+
+        # detect_console_dfu_kind reads only the generic USB product string /
+        # DFU version, so it identifies the transmitter environments too.
+        kind, dfu_ver = self._mgr.detect_console_dfu_kind(
+            vid=self.vid, pid=self.pid, libusb_dll=self.libusb_dll)
+        if kind != DFU_KIND_SECURE:
+            raise RuntimeError(
+                f"Transmitter is not in the secure bootloader's DFU (found "
+                f"{kind!r}). This path only supports the secure bootloader; "
+                "connect the running app, or use TxDevice.update_firmware for "
+                "legacy units.")
+        logger.info("Detected secure-bootloader DFU %s", dfu_ver)
+        return COHORT_SECURE, "dfu"
+
+    def update(self, *, signed_app: str | None = None, force: bool = False,
+               progress_callback: Callable | None = None) -> UpdateResult:
+        """Update the transmitter application over standard USB DFU.
+
+        Args:
+            signed_app: Override the signed app image. Defaults to the bundled
+                signed transmitter app.
+            force: Flash even if the image version is below the installed one
+                (still subject to the bootloader's anti-rollback floor at
+                boot).
+
+        Returns:
+            :class:`UpdateResult`.
+
+        Raises:
+            ValueError: Bad image / downgrade refused.
+            RuntimeError: Wrong DFU environment, or a write/verify failure.
+        """
+        state, source = self.detect()
+        app = str(signed_app) if signed_app else str(bundled_transmitter_signed_app())
+        in_dfu = source == "dfu"
+
+        self._mgr.update_transmitter(
+            app, enter_dfu_fn=None if in_dfu else self._enter_dfu,
+            keys_dir=self.keys_dir, force=force, vid=self.vid, pid=self.pid,
+            libusb_dll=self.libusb_dll, progress_callback=progress_callback)
+        return UpdateResult(state, "app-update",
+                            "Updated the transmitter application on the "
+                            "secure bootloader.", reboot_required=True)
+
+    def _require_tx(self):
+        if self.tx is None:
+            raise RuntimeError(
+                "a TxDevice is required to trigger DFU entry (or put the "
+                "unit in DFU first and re-run)")
+        return self.tx
+
+    def _enter_dfu(self) -> None:
+        self._require_tx().enter_dfu(module=0)
+
+
 # ---------------------------------------------------------------------------
 # CLI:  python -m openlifu_sdk.io.LIFUFirmwareUpdate [options]
 # ---------------------------------------------------------------------------
@@ -233,12 +361,17 @@ def main(argv: list[str] | None = None) -> int:
 
     parser = argparse.ArgumentParser(
         prog="python -m openlifu_sdk.io.LIFUFirmwareUpdate",
-        description="Detect the console's state and update its firmware "
-                    "(no-bootloader / legacy / secure). Uses the SDK-bundled "
-                    "images and needs no signing keys.")
+        description="Detect the unit's state and update its firmware. "
+                    "Console: no-bootloader / legacy / secure paths. "
+                    "Transmitter: standard USB DFU on the secure bootloader. "
+                    "Uses the SDK-bundled images and needs no signing keys.")
+    parser.add_argument("--device", choices=("console", "transmitter"),
+                        default="console",
+                        help="Which unit to update (default: console).")
     parser.add_argument("--detect", action="store_true",
                         help="Report the detected state and exit — no flashing.")
-    parser.add_argument("--production", help="Override the combined bootloader+app image.")
+    parser.add_argument("--production",
+                        help="Console only: override the combined bootloader+app image.")
     parser.add_argument("--app", help="Override the signed app image.")
     parser.add_argument("--keys", help="Optional keys dir to pre-validate the app signature.")
     parser.add_argument("--force", action="store_true",
@@ -249,6 +382,59 @@ def main(argv: list[str] | None = None) -> int:
 
     logging.basicConfig(level=logging.INFO, format="%(message)s")
     from openlifu_sdk.io.LIFUInterface import LIFUInterface
+
+    def confirm(label: str) -> bool:
+        if args.yes:
+            return True
+        try:
+            resp = input(f"Proceed with the update for '{label}'? [y/N] ").strip().lower()
+        except EOFError:
+            resp = ""
+        return resp in ("y", "yes")
+
+    def progress(w: int, t: int, label: str) -> None:
+        pct = 100 * w // t if t else 100
+        print(f"\r  {label}: {w:,}/{t:,} ({pct}%)", end="", flush=True)
+
+    if args.device == "transmitter":
+        # A running app is preferred (it lets us trigger DFU entry), but a
+        # unit already sitting in the secure bootloader's DFU works too.
+        tx = None
+        try:
+            interface = LIFUInterface(TX_test_mode=False)
+            tx_connected, _hv = interface.is_device_connected()
+            if tx_connected:
+                interface.txdevice.ping()
+                tx = interface.txdevice
+        except Exception as e:
+            logger.info("Transmitter app connection failed (%s); the unit "
+                        "must already be in USB DFU mode", e)
+        if tx is None:
+            print("Transmitter app not connected — checking for a unit "
+                  "already in USB DFU mode.")
+
+        fw = LIFUTransmitterFirmwareUpdate(tx=tx, keys_dir=args.keys)
+        try:
+            state, source = fw.detect()
+        except RuntimeError as e:
+            print(f"Could not determine transmitter state: {e}")
+            return 1
+        print(f"Transmitter state: {state} (from {source})")
+        if args.detect:
+            return 0
+        if not confirm(state):
+            print("Aborted.")
+            return 1
+        try:
+            result = fw.update(signed_app=args.app, force=args.force,
+                               progress_callback=progress)
+        except (ValueError, RuntimeError) as e:
+            print(f"\nUPDATE FAILED: {e}")
+            return 1
+        print(f"\n{result.summary}")
+        if result.reboot_required:
+            print("Power-cycle the transmitter to boot the new application.")
+        return 0
 
     interface = LIFUInterface(TX_test_mode=False)
     _tx, hv = interface.is_device_connected()
@@ -267,18 +453,9 @@ def main(argv: list[str] | None = None) -> int:
     if args.detect:
         return 0
 
-    if not args.yes:
-        try:
-            resp = input(f"Proceed with the update for '{cohort}'? [y/N] ").strip().lower()
-        except EOFError:
-            resp = ""
-        if resp not in ("y", "yes"):
-            print("Aborted.")
-            return 1
-
-    def progress(w: int, t: int, label: str) -> None:
-        pct = 100 * w // t if t else 100
-        print(f"\r  {label}: {w:,}/{t:,} ({pct}%)", end="", flush=True)
+    if not confirm(cohort):
+        print("Aborted.")
+        return 1
 
     try:
         result = fw.update(production_image=args.production, signed_app=args.app,
