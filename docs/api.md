@@ -10,8 +10,9 @@ Core package (entry points):
 I/O modules (in `openlifu_sdk.io`):
 
 - `LIFUUart` — low-level USB/serial transport wrapper and monitor.
-- `LIFUHVController` — HV/console interface (power, voltage, telemetry). See [LIFUHVController API](api/LIFUHVController.md).
-- `LIFUDFU` — firmware DFU helpers and managers (USB DFU, I2C DFU). See [LIFUDFU API](api/LIFUDFU.md).
+- `LIFUHVController` — HV/console interface (power, voltage, telemetry, RGB LED and effects). See [LIFUHVController API](api/LIFUHVController.md).
+- `LIFUDFU` — firmware DFU helpers and managers (USB/I2C DFU, console updates and bootloader migration). See [LIFUDFU API](api/LIFUDFU.md).
+- `LIFUCrypto` — SBSFU firmware image signing, validation and inspection; owns the FwVersion encoding. See [LIFUCrypto API](api/LIFUCrypto.md).
 - `LIFUConfig`, `LIFUUserConfig` — configuration helpers for device registers and user settings.
 
 Utility modules (in `openlifu_sdk.util`):
