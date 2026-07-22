@@ -150,6 +150,18 @@ CONSOLE_SLOT_BASE = 0x08010000
 # layout as the console — the signed image is written whole to the slot base.
 TRANSMITTER_SLOT_BASE = 0x08010000
 
+# Transmitter anti-rollback floor log (open-lifu-transmitter-bl memory_map.h,
+# MEM_ANTIROLLBACK_BASE / anti_rollback.c AR_PAGE_BASE): flash page 126, one
+# 2 KB page. It sits OUTSIDE the DFU-writable window and OUTSIDE the production
+# image extent, so a normal update — or even a full-image ROM-DFU migration
+# that only erases the image's pages — leaves it untouched. A unit that latched
+# a floor under the OLD decimal MMmmpp scheme (e.g. 2.0.8 -> 20008) therefore
+# keeps rejecting new bitfield-scheme images (2.0.8 -> 4104, which is < 20008)
+# forever. The migration path erases this page explicitly (only reachable via
+# the STM32 ROM loader, which has full-flash access) so the floor truly resets.
+TRANSMITTER_ANTIROLLBACK_BASE = 0x0803F000
+TRANSMITTER_ANTIROLLBACK_SIZE = 0x800
+
 # Console flash base — where the bootloader itself lives. Writable only from
 # the STM32 ROM DFU (full-flash access); the legacy and secure bootloaders
 # both refuse writes to their own region.
@@ -257,6 +269,14 @@ LEGACY_META_VERSION   = 3
 LEGACY_META_FLAG_SIG_REQUIRED = 0x0001
 LEGACY_META_KEY_ID    = 1
 
+# Transmitter legacy bootloader (openlifu-transmitter-bl, STM32L443): SAME WFM1
+# metadata format and trust HMAC key as the console legacy BL, but different
+# addresses (memory_map.h) — metadata @ 0x0800F800, app @ 0x08010000, and a
+# larger app slot (190 KB). Confirmed against bl_trust.c firmware_metadata_valid.
+TX_LEGACY_META_ADDRESS = 0x0800F800
+TX_LEGACY_APP_ADDRESS  = 0x08010000
+TX_LEGACY_APP_MAX_SIZE = 190 * 1024
+
 # Trust HMAC key embedded in the legacy bootloader (main.c:58, key_id 1).
 LEGACY_TRUST_HMAC_KEY = bytes([
     0x17, 0xB2, 0x05, 0x19, 0x59, 0x0C, 0xFD, 0x78,
@@ -272,12 +292,15 @@ _LEGACY_META_WITHOUT_CRC = "<IHHIIII64s32s"  # + trust_tag (120 bytes)
 def build_legacy_metadata(app_bytes: bytes,
                           trust_key: bytes = LEGACY_TRUST_HMAC_KEY,
                           fw_address: int = LEGACY_APP_ADDRESS,
-                          key_id: int = LEGACY_META_KEY_ID) -> bytes:
+                          key_id: int = LEGACY_META_KEY_ID,
+                          max_size: int = LEGACY_APP_MAX_SIZE) -> bytes:
     """Build a legacy-bootloader metadata block (124 bytes) that authenticates
     *app_bytes* via the HMAC trust tag.
 
-    The block is written to ``LEGACY_META_ADDRESS`` (0x08007800) while the app
-    goes to ``fw_address`` (0x08008000). Mirrors ``build_metadata_blob`` in the
+    The block is written to the legacy metadata address while the app goes to
+    ``fw_address``. Console defaults (fw_address 0x08008000, max 94 KB); pass
+    the transmitter values (``TX_LEGACY_APP_ADDRESS``, ``TX_LEGACY_APP_MAX_SIZE``)
+    for a transmitter legacy image. Mirrors ``build_metadata_blob`` in the
     legacy repo's ``test/dfu-test.py`` (trust-tag path, zero signature).
 
     Raises:
@@ -288,9 +311,9 @@ def build_legacy_metadata(app_bytes: bytes,
 
     if len(trust_key) != 32:
         raise ValueError(f"trust key must be 32 bytes, got {len(trust_key)}")
-    if not 0 < len(app_bytes) <= LEGACY_APP_MAX_SIZE:
+    if not 0 < len(app_bytes) <= max_size:
         raise ValueError(
-            f"app is {len(app_bytes)} bytes; legacy slot max is {LEGACY_APP_MAX_SIZE}")
+            f"app is {len(app_bytes)} bytes; legacy slot max is {max_size}")
 
     fw_len = len(app_bytes)
     fw_crc = stm32_crc32(app_bytes)
@@ -1647,17 +1670,30 @@ class LIFUDFUManager:
         # - no STM32CubeProgrammer dependency. The driver honors the DfuSe
         # bwPollTimeout windows, addresses every block individually, pads
         # writes to 8 bytes (AN2606 L43x/44x V9.1 erratum), verifies by full
-        # read-back, and finally leaves DFU so the secure bootloader boots
-        # the app without a power-cycle. Erase covers the pages the image
-        # occupies; the anti-rollback log page starts blank-or-garbage either
-        # way and anti_rollback.c provisions it on first use.
+        # read-back.
+        #
+        # CRITICAL: also erase the anti-rollback floor page. The image's own
+        # per-page erase only covers the pages it occupies (0x08000000 ..
+        # ~0x08020D80); the floor log at 0x0803F000 lies beyond that, so a
+        # migrating unit that carried a stale OLD-SCHEME floor (decimal 2.0.8 =
+        # 20008) would keep it and then REJECT the freshly written bitfield app
+        # (2.0.8 = 4104 < 20008) at boot — the exact "update runs but won't
+        # boot" failure. The ROM loader can erase this page (full-flash
+        # access); the secure bootloader cannot. leave=False so we can erase
+        # the floor before manifesting/booting.
         from openlifu_sdk.io.STM32DFU import STM32DFU
         logger.info("Writing the production image with the pure-Python ROM "
                     "DFU driver...")
         with STM32DFU(vid=vid, pid=pid, libusb_dll=libusb_dll,
                       page_size=2048) as rom:
-            rom.flash(image, address=0x08000000,
+            rom.flash(image, address=0x08000000, leave=False,
                       progress_callback=progress_callback)
+            logger.info("Erasing the anti-rollback floor page (0x%08X) so the "
+                        "migration resets any stale (old-scheme) floor...",
+                        TRANSMITTER_ANTIROLLBACK_BASE)
+            rom.erase_pages(TRANSMITTER_ANTIROLLBACK_BASE,
+                            TRANSMITTER_ANTIROLLBACK_SIZE)
+            rom.leave(0x08000000)
 
         logger.info("Full-image migration complete - the device left DFU; "
                     "the secure bootloader verifies and launches the app.")
@@ -2148,6 +2184,115 @@ class LIFUDFUManager:
         logger.info("I2C DFU: sending manifest...")
         dfu.manifest()
         logger.info("I2C DFU: programming complete.")
+
+    def program_transmitter_slave_i2c(self, signed_image: str, i2c_addr: int,
+                                      keys_dir: str | None = None,
+                                      progress_callback: Callable | None = None
+                                      ) -> str:
+        """Program a SECURE-bootloader slave transmitter over I2C passthrough.
+
+        The slave must already be in its bootloader's I2C DFU mode at
+        *i2c_addr* (the master's discovery walk assigns 0x20 to module 1,
+        0x21 to module 2, ...). Unlike :meth:`program_i2c` (legacy PGK1 +
+        metadata page), the secure bootloader takes the SFU1 signed image
+        written WHOLE to the active slot and verifies its signature at boot.
+
+        The image is validated (structure + SHA-256; plus ECDSA when
+        *keys_dir* is given) BEFORE the mass-erase, so a rejected image never
+        wipes the slave's installed firmware. Then: mass-erase the app slot,
+        write the image, manifest, reset.
+
+        Requires a master UART (``LIFUDFUManager(uart=txdevice.uart)``).
+
+        Returns the slave bootloader's version string.
+
+        Raises:
+            ValueError: Image invalid.
+            RuntimeError: No UART, or an I2C DFU communication/flash failure.
+        """
+        from openlifu_sdk.io import LIFUCrypto
+
+        if self._uart is None:
+            raise RuntimeError(
+                "I2C slave programming needs the master UART — construct "
+                "LIFUDFUManager(uart=txdevice.uart).")
+
+        image = Path(signed_image).read_bytes()
+        report = LIFUCrypto.validate_signed_image(image, keys_dir=keys_dir)
+        if not (report.ok or (keys_dir is None and report.structural_ok)):
+            raise ValueError(
+                f"Refusing to flash invalid image {signed_image}:\n"
+                + report.describe())
+        logger.info("Slave I2C image: version %d (%s), %d bytes",
+                    report.header.fw_version, report.header.fw_version_str,
+                    len(image))
+
+        dfu = STM32I2CDFUviaMaster(uart=self._uart, i2c_addr=i2c_addr)
+        bl_version = dfu.get_version()
+        logger.info("Slave bootloader @ 0x%02X: %s", i2c_addr, bl_version)
+        logger.info("I2C DFU: mass-erasing the slave application slot...")
+        dfu.mass_erase()
+        dfu.write_memory(TRANSMITTER_SLOT_BASE, image,
+                         progress_callback=progress_callback)
+        logger.info("I2C DFU: sending manifest...")
+        dfu.manifest()
+        logger.info("I2C DFU: resetting the slave (secure BL verifies the "
+                    "signature and launches the app)...")
+        dfu.reset()
+        return bl_version
+
+    def program_transmitter_slave_legacy_i2c(self, updater_bin: str,
+                                             i2c_addr: int,
+                                             progress_callback: Callable | None = None
+                                             ) -> str:
+        """Write the legacy->secure UPDATER (+ its WFM1 metadata) to a
+        LEGACY-bootloader slave over I2C, then reset it so the legacy BL boots
+        the updater and it swaps in the secure bootloader.
+
+        The slave must already be in the LEGACY bootloader's I2C DFU at
+        *i2c_addr*. Sequence (legacy write window = metadata page + app
+        region): mass-erase the app region, erase the metadata page, write the
+        updater to 0x08010000, write the HMAC-tagged metadata to 0x0800F800,
+        manifest, reset. The updater then does the irreversible bootloader
+        swap on its own (see transmitter-legacy-updater).
+
+        Returns the legacy bootloader's version string.
+
+        Raises:
+            ValueError: Updater too large for the legacy slot.
+            RuntimeError: No UART, or an I2C DFU communication/flash failure.
+        """
+        if self._uart is None:
+            raise RuntimeError(
+                "I2C slave programming needs the master UART — construct "
+                "LIFUDFUManager(uart=txdevice.uart).")
+
+        updater = Path(updater_bin).read_bytes()
+        metadata = build_legacy_metadata(
+            updater, fw_address=TX_LEGACY_APP_ADDRESS,
+            max_size=TX_LEGACY_APP_MAX_SIZE)
+        logger.info("Legacy migration: updater %d B -> 0x%08X, metadata %d B "
+                    "-> 0x%08X", len(updater), TX_LEGACY_APP_ADDRESS,
+                    len(metadata), TX_LEGACY_META_ADDRESS)
+
+        dfu = STM32I2CDFUviaMaster(uart=self._uart, i2c_addr=i2c_addr)
+        bl_version = dfu.get_version()
+        logger.info("Legacy slave bootloader @ 0x%02X: %s", i2c_addr, bl_version)
+        logger.info("I2C DFU: mass-erasing the app region...")
+        dfu.mass_erase()
+        logger.info("I2C DFU: erasing the metadata page @ 0x%08X...",
+                    TX_LEGACY_META_ADDRESS)
+        dfu.erase_page(TX_LEGACY_META_ADDRESS)
+        dfu.write_memory(TX_LEGACY_APP_ADDRESS, updater,
+                         progress_callback=progress_callback)
+        logger.info("I2C DFU: writing the WFM1 metadata...")
+        dfu.write_memory(TX_LEGACY_META_ADDRESS, metadata)
+        logger.info("I2C DFU: sending manifest...")
+        dfu.manifest()
+        logger.info("I2C DFU: resetting the slave (legacy BL boots the updater, "
+                    "which swaps in the secure bootloader)...")
+        dfu.reset()
+        return bl_version
 
     def _wait_for_usb_dfu(self, vid: int, pid: int, libusb_dll: str | None,
                            timeout_s: float = 30.0, poll_interval_s: float = 1.0,

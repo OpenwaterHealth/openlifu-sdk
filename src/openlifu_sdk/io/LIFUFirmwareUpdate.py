@@ -101,6 +101,13 @@ def bundled_transmitter_production_image() -> Path:
     return _FW_DIR / "openlifu-transmitter-fw-production.bin"
 
 
+def bundled_transmitter_legacy_updater() -> Path:
+    """The legacy->secure bootloader updater bundled with the SDK (source for
+    migrating a LEGACY-bootloader transmitter slave over I2C — the updater
+    swaps in the secure bootloader; see transmitter-legacy-updater)."""
+    return _FW_DIR / "openlifu-transmitter-legacy-updater.bin"
+
+
 @dataclass
 class UpdateResult:
     """Outcome of an update run."""
@@ -350,11 +357,13 @@ class LIFUTransmitterFirmwareUpdate:
         bootloader + signed-app production image at the flash base
         (beta/unlocked units only).
 
+    Slave modules (index >= 1) are updated over I2C through the master with
+    :meth:`update_slave` — the master puts the slave into its bootloader's
+    I2C DFU, assigns it an address, and the signed app is streamed over the
+    master's I2C passthrough (current/secure bootloader only).
+
     Needs no signing keys; an optional *keys_dir* only adds an ECDSA
     signature pre-check before flashing.
-
-    Not covered here: I2C slave-module updates — use
-    ``TxDevice.update_firmware`` for those.
 
     Args:
         tx: A connected ``TxDevice`` (e.g. ``interface.txdevice``) used to read
@@ -540,6 +549,198 @@ class LIFUTransmitterFirmwareUpdate:
                             "secure bootloader.", reboot_required=True,
                             bl_version=bl_version)
 
+    def slave_module_version(self, module: int) -> tuple[str, int]:
+        """Return ``(app_version, mode)`` for a slave module as the master
+        currently sees it (re-enumerates first so the report is fresh)."""
+        from openlifu_sdk.io.LIFUConfig import NODE_MODE_UNKNOWN
+        tx = self._require_tx()
+        tx.enumerate_modules()
+        try:
+            mode = tx.get_module_mode(module)
+        except Exception:
+            mode = NODE_MODE_UNKNOWN
+        try:
+            ver = str(tx.get_version(module=module))
+        except Exception:
+            ver = ""
+        return ver, mode
+
+    def update_slave(self, module: int, *, signed_app: str | None = None,
+                     legacy: bool | None = None, updater_bin: str | None = None,
+                     dfu_wait_s: float = 6.0,
+                     progress_callback: Callable | None = None) -> UpdateResult:
+        """Update a SLAVE transmitter module (index >= 1) over I2C, through
+        the master. The master brokers everything on the one-wire + I2C buses.
+
+        Two paths, chosen by the slave's bootloader generation:
+
+          - **secure** (app >= 2.0.8): stream the SFU1 signed app to the
+            slave's secure bootloader over I2C.
+          - **legacy** (app <= 2.0.7): first migrate the slave to the secure
+            bootloader over I2C (write the legacy->secure updater + its WFM1
+            metadata; the legacy BL boots the updater, which swaps in the
+            secure bootloader), THEN flash the SFU1 signed app.
+
+        Args:
+            module: slave module index (>= 1). Module 0 is the USB master —
+                use :meth:`update`.
+            signed_app: signed app image; defaults to the bundled signed app.
+            legacy: force the legacy-migration path (True) or the secure path
+                (False); ``None`` auto-detects from the slave's app version.
+            updater_bin: override the legacy->secure updater; defaults to the
+                bundled one.
+            dfu_wait_s: seconds to wait for a slave BL to come up on I2C.
+
+        Raises:
+            ValueError: module < 1, or a bad image.
+            RuntimeError: master can't see/reach the module, DFU entry failed,
+                or an I2C programming failure.
+        """
+        tx = self._require_tx()
+        if module < 1:
+            raise ValueError(
+                "update_slave targets slave modules (>= 1); use update() for "
+                "the master (module 0).")
+
+        if legacy is None:
+            try:
+                ver = str(tx.get_version(module=module))
+            except Exception as e:
+                raise RuntimeError(
+                    f"could not read slave {module} version to choose the "
+                    f"update path ({e}); pass legacy=True or legacy=False.")
+            legacy = (infer_transmitter_bootloader_from_app_version(ver)
+                      == COHORT_NONE)
+            logger.info("Slave %d app %s -> %s bootloader", module, ver,
+                        "legacy" if legacy else "secure")
+
+        if legacy:
+            return self._update_slave_legacy(module, signed_app, updater_bin,
+                                             dfu_wait_s, progress_callback)
+        return self._update_slave_secure(module, signed_app, dfu_wait_s,
+                                         progress_callback)
+
+    def _slave_enter_dfu(self, module: int, dfu_wait_s: float) -> int:
+        """Confirm the master sees *module*, put it into its bootloader's I2C
+        DFU, re-enumerate, and return its assigned I2C address. Raises if the
+        module isn't seen or didn't enter DFU."""
+        from openlifu_sdk.io.LIFUConfig import NODE_MODE_BOOTLOADER
+        tx = self._require_tx()
+        count = tx.get_module_count()
+        logger.info("Master enumerates %d module(s)", count)
+        if module >= count:
+            raise RuntimeError(
+                f"master does not see module {module} (only {count} "
+                "enumerated). Ensure the slave is powered and on the one-wire "
+                "chain, then reset the master.")
+        logger.info("Requesting DFU on slave module %d...", module)
+        tx.enter_dfu(module=module)
+        logger.info("Waiting %.0fs for the slave bootloader to start I2C DFU...",
+                    dfu_wait_s)
+        time.sleep(dfu_wait_s)
+        tx.enumerate_modules()
+        mode = tx.get_module_mode(module)
+        if mode != NODE_MODE_BOOTLOADER:
+            raise RuntimeError(
+                f"module {module} reports mode {mode}, expected BOOTLOADER "
+                f"({NODE_MODE_BOOTLOADER}) — the slave did not enter DFU.")
+        addr = tx.get_module_i2c_addr(module)
+        logger.info("Slave module %d is in bootloader DFU at I2C 0x%02X",
+                    module, addr)
+        return addr
+
+    def _slave_wait_bootloader(self, module: int, timeout_s: float) -> int:
+        """Poll (re-enumerating) until *module* is back in bootloader I2C DFU,
+        returning its I2C address. Used after the legacy updater's BL swap +
+        reset, where the slave reboots twice before the secure BL DFU appears."""
+        from openlifu_sdk.io.LIFUConfig import NODE_MODE_BOOTLOADER
+        tx = self._require_tx()
+        deadline = time.monotonic() + timeout_s
+        last = None
+        while time.monotonic() < deadline:
+            try:
+                tx.enumerate_modules()
+                mode = tx.get_module_mode(module)
+                last = mode
+                if mode == NODE_MODE_BOOTLOADER:
+                    return tx.get_module_i2c_addr(module)
+            except Exception as e:
+                last = str(e)
+            time.sleep(3.0)
+        raise RuntimeError(
+            f"slave {module} did not return to bootloader DFU within "
+            f"{timeout_s:.0f}s (last seen: {last!r}) — the migration may have "
+            "failed; recover via SWD.")
+
+    def _slave_post_boot_version(self, module: int, dfu_wait_s: float) -> str:
+        """Wait for the slave app to boot and read its version back (best
+        effort)."""
+        tx = self._require_tx()
+        logger.info("Waiting %.0fs for the slave app to boot...", dfu_wait_s)
+        time.sleep(dfu_wait_s)
+        try:
+            tx.enumerate_modules()
+            ver = str(tx.get_version(module=module))
+            logger.info("Slave module %d app version: %s", module, ver)
+            return ver
+        except Exception as e:
+            logger.warning("Slave %d post-update version read failed (%s) — "
+                           "it may still be verifying/booting", module, e)
+            return ""
+
+    def _update_slave_secure(self, module: int, signed_app: str | None,
+                             dfu_wait_s: float,
+                             progress_callback: Callable | None) -> UpdateResult:
+        tx = self._require_tx()
+        app = str(signed_app) if signed_app else str(bundled_transmitter_signed_app())
+        i2c_addr = self._slave_enter_dfu(module, dfu_wait_s)
+        mgr = LIFUDFUManager(uart=tx.uart)
+        bl_version = mgr.program_transmitter_slave_i2c(
+            app, i2c_addr=i2c_addr, keys_dir=self.keys_dir,
+            progress_callback=progress_callback)
+        app_version = self._slave_post_boot_version(module, dfu_wait_s)
+        summary = (f"Updated slave transmitter module {module} over I2C"
+                   + (f" (now {app_version})" if app_version else "."))
+        return UpdateResult(COHORT_SECURE, "app-update-i2c", summary,
+                            reboot_required=False, bl_version=bl_version)
+
+    def _update_slave_legacy(self, module: int, signed_app: str | None,
+                             updater_bin: str | None, dfu_wait_s: float,
+                             progress_callback: Callable | None) -> UpdateResult:
+        tx = self._require_tx()
+        app = str(signed_app) if signed_app else str(bundled_transmitter_signed_app())
+        updater = (str(updater_bin) if updater_bin
+                   else str(bundled_transmitter_legacy_updater()))
+        mgr = LIFUDFUManager(uart=tx.uart)
+
+        # Phase 1: write the updater + WFM1 metadata over the LEGACY I2C DFU;
+        # the reset boots the updater, which swaps in the secure bootloader.
+        logger.info("Slave %d: migrating legacy -> secure bootloader over I2C",
+                    module)
+        legacy_addr = self._slave_enter_dfu(module, dfu_wait_s)
+        legacy_bl = mgr.program_transmitter_slave_legacy_i2c(
+            updater, i2c_addr=legacy_addr, progress_callback=progress_callback)
+        logger.info("Legacy slave BL was %s; updater written.", legacy_bl)
+
+        # Phase 2: wait for the updater to run + the secure BL DFU to come up.
+        logger.info("Waiting for the updater to swap the bootloader and the "
+                    "secure bootloader DFU to appear...")
+        secure_addr = self._slave_wait_bootloader(module, timeout_s=45.0)
+        logger.info("Secure bootloader DFU is up (slave %d @ I2C 0x%02X); "
+                    "flashing the signed app...", module, secure_addr)
+
+        # Phase 3: flash the SFU1 signed app over the SECURE I2C DFU.
+        secure_bl = mgr.program_transmitter_slave_i2c(
+            app, i2c_addr=secure_addr, keys_dir=self.keys_dir,
+            progress_callback=progress_callback)
+
+        app_version = self._slave_post_boot_version(module, dfu_wait_s)
+        summary = (f"Migrated slave transmitter module {module} to the secure "
+                   f"bootloader over I2C and flashed the app"
+                   + (f" (now {app_version})" if app_version else "."))
+        return UpdateResult(COHORT_SECURE, "migrate-legacy-i2c", summary,
+                            reboot_required=False, bl_version=secure_bl)
+
     def _require_tx(self):
         if self.tx is None:
             raise RuntimeError(
@@ -634,6 +835,8 @@ def _run_transmitter(args: Any) -> int:
               "already in USB DFU mode.")
 
     fw = LIFUTransmitterFirmwareUpdate(tx=tx, keys_dir=args.keys)
+    if args.module and args.module > 0:
+        return _run_transmitter_slave(fw, args)
     return _run_update_flow(
         fw, "transmitter", fw.detect,
         lambda: fw.update(signed_app=args.app,
@@ -641,6 +844,36 @@ def _run_transmitter(args: Any) -> int:
                           force_production=args.force_production,
                           progress_callback=_progress),
         args)
+
+
+def _run_transmitter_slave(fw: Any, args: Any) -> int:
+    """CLI flow for updating a SLAVE transmitter module (>= 1) over I2C."""
+    module = args.module
+    label = f"transmitter slave module {module}"
+    if args.detect or args.bl_version:
+        try:
+            ver, mode = fw.slave_module_version(module)
+        except (RuntimeError, ValueError) as e:
+            print(f"Could not query {label}: {e}")
+            return 1
+        print(f"{label}: app version {ver or 'unknown'} (mode {mode})")
+        return 0
+    legacy = True if args.legacy else None   # None = auto-detect
+    if legacy:
+        label += " — LEGACY migration (BL swap + app)"
+    if not _confirm(label, args.yes):
+        print("Aborted.")
+        return 1
+    try:
+        result = fw.update_slave(module, signed_app=args.app, legacy=legacy,
+                                 progress_callback=_progress)
+    except (ValueError, RuntimeError) as e:
+        print(f"\nUPDATE FAILED: {e}")
+        return 1
+    print(f"\n{result.summary}")
+    if result.bl_version:
+        print(f"Slave bootloader version: {result.bl_version}")
+    return 0
 
 
 def _run_console(args: Any) -> int:
@@ -675,6 +908,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--device", choices=("console", "transmitter"),
                         default="console",
                         help="Which unit to update (default: console).")
+    parser.add_argument("--module", type=int, default=0,
+                        help="Transmitter only: module index. 0 (default) is "
+                             "the USB master; >= 1 targets a SLAVE module, "
+                             "updated over I2C through the master (specify "
+                             "which slave when more than one is connected).")
     parser.add_argument("--detect", action="store_true",
                         help="Report the detected state and exit — no flashing.")
     parser.add_argument("--bl-version", action="store_true",
@@ -691,6 +929,12 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--keys", help="Optional keys dir to pre-validate the app signature.")
     parser.add_argument("--force", action="store_true",
                         help="Secure path only: flash even if not newer.")
+    parser.add_argument("--legacy", action="store_true",
+                        help="Transmitter slave only (--module >= 1): force the "
+                             "legacy->secure migration path (write the updater "
+                             "over the legacy I2C DFU, swap the bootloader, then "
+                             "flash the app). Omit to auto-detect from the "
+                             "slave's app version.")
     parser.add_argument("--force-production", action="store_true",
                         help="Force a FULL production reflash (bootloader + "
                              "app) via the STM32 ROM DFU, regardless of the "
