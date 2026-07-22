@@ -125,16 +125,11 @@ from openlifu_sdk.io.LIFUConfig import (
     LIFU_ERR_BAD_PAYLOAD_LENGTH,
     LIFU_ERR_EMPTY_RESPONSE,
     LIFU_ERR_MODULE_COUNT_MISMATCH,
-    OW_CMD,
     OW_CMD_ASYNC,
-    OW_CMD_DFU,
-    OW_CMD_ECHO,
     OW_CMD_GET_AMBIENT,
     OW_CTRL_GET_MODULE_COUNT,
     OW_CTRL_GET_MODULE_MODE,
     OW_CTRL_ENUMERATE,
-    NODE_MODE_APP,
-    NODE_MODE_BOOTLOADER,
     NODE_MODE_UNKNOWN,
     OW_CTRL_GET_PATTERN_PROFILE,
     OW_CTRL_SET_PATTERN_PROFILE,
@@ -142,18 +137,11 @@ from openlifu_sdk.io.LIFUConfig import (
     OW_CTRL_GET_DELAY_PROFILE,
     OW_CTRL_SET_PROFILE_CYCLE,
     OW_CMD_GET_TEMP,
-    OW_CMD_HWID,
-    OW_CMD_PING,
-    OW_CMD_RESET,
-    OW_CMD_TOGGLE_LED,
-    OW_CMD_USR_CFG,
-    OW_CMD_VERSION,
     OW_CONTROLLER,
     OW_CTRL_GET_SWTRIG,
     OW_CTRL_SET_SWTRIG,
     OW_CTRL_START_SWTRIG,
     OW_CTRL_STOP_SWTRIG,
-    OW_ERROR,
     OW_TRANSMITTER_PID,
     OW_TX7332,
     OW_TX7332_DEMO,
@@ -161,15 +149,12 @@ from openlifu_sdk.io.LIFUConfig import (
     OW_TX7332_ENUM,
     OW_TX7332_RREG,
     OW_TX7332_RBLOCK,
-    OW_TX7332_VWBLOCK,
-    OW_TX7332_VWREG,
     OW_TX7332_WBLOCK,
     OW_TX7332_WREG,
     OW_VID,
     TRIGGER_MODE_CONTINUOUS,
     TRIGGER_MODE_SEQUENCE,
     TRIGGER_MODE_SINGLE,
-    HW_ID_DATA_LENGTH,
     TX7332_COMMANDS
 )
 from openlifu_sdk.io.exceptions import LIFUError, LIFUProtocolError
@@ -1141,12 +1126,8 @@ class TxDevice(OWComponent):
         logger.debug("Grouped profile cycle command sent successfully")
         return True
 
-    def apply_all_registers(self, load_profile: bool = True) -> bool:
+    def apply_all_registers(self) -> bool:
         """Flush all configured TX7332 registers to the device.
-
-        Args:
-            load_profile: When True, pulse LOAD_PROF afterwards so the chips
-                latch the freshly written profile RAM.
 
         Raises:
             LIFUNotConnectedError, LIFUCommunicationError, LIFUDeviceError.
@@ -1155,8 +1136,7 @@ class TxDevice(OWComponent):
         for txi, txregs in enumerate(registers):
             for addr, reg_values in txregs.items():
                 self.write_block(identifier=txi, start_address=addr, reg_values=reg_values)
-        if load_profile:
-            self.commit_profile_ram()
+        self.commit_profile_ram()
         return True
 
     def write_ti_config_to_tx_device(self, file_path: str, txchip_id: int) -> bool:
