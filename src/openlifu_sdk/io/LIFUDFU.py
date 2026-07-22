@@ -198,19 +198,15 @@ def bundled_updater_path() -> Path:
     return Path(__file__).parent.parent / "firmware" / "updater.bin"
 
 
-def split_console_flash_image(image: bytes) -> tuple[bytes, bytes]:
-    """Split a combined full-flash console image (bootloader + signed app,
-    starting at 0x08000000) into ``(bootloader_bytes, signed_app_bytes)``.
-
-    The bootloader occupies flash up to the SBSFU slot base (offset
-    ``CONSOLE_SLOT_BASE - CONSOLE_FLASH_BASE`` = 0x10000); the signed app
-    ('SFU1' header) begins there. Trailing 0xFF fill on the bootloader
-    region is trimmed to the last non-blank 2 KB page.
+def _split_flash_image(image: bytes, slot_off: int) -> tuple[bytes, bytes]:
+    """Split a combined full-flash image (bootloader + signed app, starting
+    at 0x08000000) into ``(bootloader_bytes, signed_app_bytes)`` at
+    *slot_off*. Trailing 0xFF fill on the bootloader region is trimmed to the
+    last non-blank 2 KB page.
 
     Raises:
         ValueError: Image too small or no 'SFU1' app header at the slot.
     """
-    slot_off = CONSOLE_SLOT_BASE - CONSOLE_FLASH_BASE
     if len(image) <= slot_off:
         raise ValueError(
             f"combined image is {len(image)} B; need > 0x{slot_off:X} "
@@ -226,6 +222,19 @@ def split_console_flash_image(image: bytes) -> tuple[bytes, bytes]:
     page = 2048
     bl_len = ((len(trimmed) + page - 1) // page) * page if trimmed else 0
     return bl_region[:bl_len], image[slot_off:]
+
+
+def split_console_flash_image(image: bytes) -> tuple[bytes, bytes]:
+    """Split a combined full-flash console image (bootloader + signed app at
+    offset ``CONSOLE_SLOT_BASE - CONSOLE_FLASH_BASE`` = 0x10000)."""
+    return _split_flash_image(image, CONSOLE_SLOT_BASE - CONSOLE_FLASH_BASE)
+
+
+def split_transmitter_flash_image(image: bytes) -> tuple[bytes, bytes]:
+    """Split a combined full-flash transmitter image (bootloader + signed app
+    at offset ``TRANSMITTER_SLOT_BASE - 0x08000000`` = 0x10000; see
+    open-lifu-transmitter-bl memory_map.h)."""
+    return _split_flash_image(image, TRANSMITTER_SLOT_BASE - 0x08000000)
 
 # ---------------------------------------------------------------------------
 # Legacy (non-secure) bootloader image metadata
@@ -347,6 +356,32 @@ def infer_console_bootloader_from_app_version(app_version: str) -> str:
     if ver >= (1, 2, 0):
         return DFU_KIND_LEGACY
     return DFU_KIND_NONE
+
+
+def infer_transmitter_bootloader_from_app_version(app_version: str) -> str:
+    """Infer which bootloader generation a transmitter unit carries from the
+    version its RUNNING application reports (before entering any DFU mode).
+
+    Fleet rules:
+      app >= 2.0.8   -> secure bootloader (``DFU_KIND_SECURE``)
+      app <= 2.0.7   -> no secure bootloader; the app boots bare-metal at
+                        0x08000000 and can jump to the STM32 ROM DFU via the
+                        OW_CMD_DFU force switch (reserved=0x77)
+                        (``DFU_KIND_NONE``)
+
+    *app_version* accepts plain or git-describe semver ("2.0.8",
+    "2.0.8-rc.2", "v2.0.7-3-gabc").
+
+    Raises:
+        ValueError: Unparseable version string.
+    """
+    base = app_version.strip().lstrip("v").split("-")[0].split("+")[0]
+    parts = base.split(".")
+    if len(parts) != 3 or not all(p.isdigit() for p in parts):
+        raise ValueError(f"Invalid app version: {app_version!r} (want 'M.m.p')")
+    ver = tuple(int(p) for p in parts)
+
+    return DFU_KIND_SECURE if ver >= (2, 0, 8) else DFU_KIND_NONE
 
 # OW_I2C_PASSTHRU sub-commands (must match firmware if_commands.c handler)
 _PASSTHRU_WRITE       = 0x00   # write only
@@ -1401,6 +1436,85 @@ class LIFUDFUManager:
                 "in DFU until power-cycle)")
         except Exception as e:
             logger.warning("DFU abort reset failed: %s", e)
+
+    def migrate_transmitter_full_image(self, combined_image: str,
+                                       enter_stm32_rom_dfu_fn: Callable | None = None,
+                                       keys_dir: str | None = None,
+                                       vid: int = 0x0483, pid: int = 0xDF11,
+                                       libusb_dll: str | None = None,
+                                       dfu_wait_s: float = 3.0,
+                                       dfu_enum_timeout_s: float = 30.0,
+                                       progress_callback: Callable | None = None) -> None:
+        """Migrate a transmitter to the secure bootloader by MASS-ERASING the
+        chip and writing the whole combined production image (bootloader +
+        signed app) at the flash base in one contiguous write, via STM32 ROM
+        DFU.
+
+        This is the path for pre-secure-bootloader units (app <= 2.0.7, which
+        boots bare-metal at 0x08000000): the running app is forced into the
+        STM32 ROM loader with the OW_CMD_DFU hidden switch (reserved=0x77,
+        ``TxDevice.enter_stm32_rom_dfu``), and the full erase leaves a clean
+        slate (no stale app remnants or anti-rollback state).
+
+        Args:
+            combined_image: The full-flash production image beginning at
+                0x08000000 (bootloader region + 'SFU1' signed app at offset
+                0x10000), e.g. ``openlifu-transmitter-fw-production.bin``.
+            enter_stm32_rom_dfu_fn: Callable that forces the ROM loader, e.g.
+                ``lambda: interface.txdevice.enter_stm32_rom_dfu(module=0)``.
+                Omit if the unit is already in STM32 ROM DFU.
+            keys_dir: Optional keys dir to fully verify the embedded signed app.
+
+        Raises:
+            ValueError: Image is not a valid combined bootloader+app image.
+            RuntimeError: ROM DFU not reached, or a write failure.
+
+        NOTE: beta/unlocked units only. After RDP/FDA lockdown the force
+        switch is inert and the flash cannot be mass-erased over DFU.
+        """
+        from openlifu_sdk.io import LIFUCrypto
+
+        image = Path(combined_image).read_bytes()
+        # Structural sanity: must be a combined image, and its embedded signed
+        # app must be valid (the new bootloader authenticates it at boot).
+        _, app_bytes = split_transmitter_flash_image(image)
+        report = LIFUCrypto.validate_signed_image(app_bytes, keys_dir=keys_dir)
+        if not (report.ok or (keys_dir is None and report.structural_ok)):
+            raise ValueError(
+                f"Refusing to migrate: embedded app invalid:\n{report.describe()}")
+        logger.info("Combined image %d B; embedded app v%d (%s)",
+                    len(image), report.header.fw_version,
+                    report.header.fw_version_str)
+
+        if enter_stm32_rom_dfu_fn is not None:
+            logger.info("Forcing the transmitter into STM32 ROM DFU...")
+            enter_stm32_rom_dfu_fn()
+            if dfu_wait_s > 0:
+                time.sleep(dfu_wait_s)
+
+        self._wait_for_usb_dfu(vid=vid, pid=pid, libusb_dll=libusb_dll,
+                               timeout_s=dfu_enum_timeout_s,
+                               device_profile=TRANSMITTER_PROFILE)
+        kind, _ = self.detect_console_dfu_kind(vid=vid, pid=pid,
+                                               libusb_dll=libusb_dll)
+        if kind != DFU_KIND_ROM:
+            raise RuntimeError(
+                f"Transmitter did not enter STM32 ROM DFU (found {kind!r}). "
+                "The app may lack the force switch, or the unit is locked.")
+
+        # The bootloader-region write over the STM32 ROM loader is done with
+        # STM32CubeProgrammer (see migrate_console_full_image for rationale).
+        cli = find_stm32_programmer_cli()
+        if cli is None:
+            raise RuntimeError(
+                "STM32CubeProgrammer (STM32_Programmer_CLI) not found - it is "
+                "required for the bootloader-replacement write over STM32 ROM "
+                "DFU. Install it, add it to PATH, or set $STM32_PROGRAMMER_CLI.")
+        self._cubeprog_write_full_image(cli, combined_image, progress_callback)
+
+        logger.info("Full-image migration complete. Power-cycle the "
+                    "transmitter: the secure bootloader will verify and "
+                    "launch the app.")
 
     def migrate_console_rom_dfu(self, bootloader_bin: str, signed_app: str,
                                 keys_dir: str | None = None,

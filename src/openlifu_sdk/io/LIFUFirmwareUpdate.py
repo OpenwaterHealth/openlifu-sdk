@@ -27,12 +27,17 @@ Typical use::
     result = fw.update()          # detect + update; uses bundled images
     print(result.summary)
 
-**Transmitter** (:class:`LIFUTransmitterFirmwareUpdate`) — standard USB DFU
-update of the module 0 (USB master) application on the secure bootloader
-(open-lifu-transmitter-bl). The signed app is written to the active slot and
-verified by the bootloader at boot; no signing keys are needed. Legacy
-(non-secure bootloader) units and I2C slave-module updates are not covered
-here — use ``TxDevice.update_firmware`` for those::
+**Transmitter** (:class:`LIFUTransmitterFirmwareUpdate`) — auto-detects the
+module 0 (USB master) unit's state and updates it:
+
+  - **secure bootloader** (app >= 2.0.8) → standard USB DFU: the signed app
+    is written to the active slot and verified by the bootloader at boot.
+  - **no secure bootloader** (app <= 2.0.7) → migrate via the STM32 ROM DFU
+    (OW_CMD_DFU reserved=0x77 force switch): mass-erase and write the
+    combined bootloader+app production image.
+
+No signing keys are needed. I2C slave-module updates are not covered here —
+use ``TxDevice.update_firmware`` for those::
 
     fw = LIFUTransmitterFirmwareUpdate(tx=interface.txdevice)
     result = fw.update()          # uses the bundled signed transmitter app
@@ -59,6 +64,7 @@ from openlifu_sdk.io.LIFUDFU import (
     LIFUDFUManager,
     TRANSMITTER_PROFILE,
     infer_console_bootloader_from_app_version,
+    infer_transmitter_bootloader_from_app_version,
 )
 
 logger = logging.getLogger(__name__)
@@ -87,6 +93,12 @@ def bundled_transmitter_signed_app() -> Path:
     """Signed transmitter app image bundled with the SDK (secure app update
     source for the transmitter's USB DFU path)."""
     return _FW_DIR / "openlifu-transmitter-fw-signed.bin"
+
+
+def bundled_transmitter_production_image() -> Path:
+    """Combined bootloader + signed-app transmitter image bundled with the
+    SDK (migration source for pre-secure-bootloader units, app <= 2.0.7)."""
+    return _FW_DIR / "openlifu-transmitter-fw-production.bin"
 
 
 @dataclass
@@ -287,17 +299,24 @@ class LIFUFirmwareUpdate:
 
 
 class LIFUTransmitterFirmwareUpdate:
-    """Transmitter firmware updater — standard USB DFU on the secure bootloader.
+    """Transmitter firmware updater — auto-detects the module 0 (USB master)
+    unit's state and runs the right path:
 
-    Covers the module 0 (USB master) update path for units running the secure
-    bootloader (open-lifu-transmitter-bl): reboot the running application into
-    DFU, write the SBSFU signed image to the active slot with pre-erase
-    validation and anti-downgrade checks, and let the bootloader verify it at
-    boot. Needs no signing keys; an optional *keys_dir* only adds an ECDSA
+      - **secure bootloader** (app >= 2.0.8) → standard USB DFU update:
+        reboot the running application into DFU, write the SBSFU signed image
+        to the active slot with pre-erase validation and anti-downgrade
+        checks, and let the bootloader verify it at boot.
+      - **no secure bootloader** (app <= 2.0.7, bare-metal at 0x08000000) →
+        migrate: force the STM32 ROM DFU loader via the OW_CMD_DFU hidden
+        switch (reserved=0x77), mass-erase, and write the combined
+        bootloader + signed-app production image at the flash base
+        (beta/unlocked units only).
+
+    Needs no signing keys; an optional *keys_dir* only adds an ECDSA
     signature pre-check before flashing.
 
-    Not covered here (yet): migration of legacy (non-secure bootloader) units,
-    and I2C slave-module updates — use ``TxDevice.update_firmware`` for those.
+    Not covered here: I2C slave-module updates — use
+    ``TxDevice.update_firmware`` for those.
 
     Args:
         tx: A connected ``TxDevice`` (e.g. ``interface.txdevice``) used to read
@@ -319,23 +338,25 @@ class LIFUTransmitterFirmwareUpdate:
         self._mgr = LIFUDFUManager()
 
     def detect(self) -> tuple[str, str]:
-        """Determine how the unit will be updated.
+        """Determine what update path the unit needs.
 
-        Returns ``(state, source)`` where state is ``COHORT_SECURE`` and
-        source is ``"app"`` (application responding; DFU entry will be
-        triggered) or ``"dfu"`` (the unit is already in the secure
-        bootloader's USB DFU).
+        Returns ``(cohort, source)`` where cohort is ``COHORT_SECURE`` (app
+        >= 2.0.8, secure bootloader installed) or ``COHORT_NONE`` (app <=
+        2.0.7, bare-metal, no secure bootloader — migration needed), and
+        source is ``"app"`` (from the running app version) or ``"dfu"`` (the
+        unit was already in DFU).
 
         Raises:
-            RuntimeError: No responding application and no secure-bootloader
-                DFU device present (a legacy or ROM DFU environment is
-                refused — this path only writes SFU1 signed images).
+            RuntimeError: No responding application and no recognizable DFU
+                device present.
         """
         if self.tx is not None:
             try:
                 ver = str(self.tx.get_version())
-                logger.info("Detected transmitter app version %s", ver)
-                return COHORT_SECURE, "app"
+                cohort = infer_transmitter_bootloader_from_app_version(ver)
+                logger.info("Detected transmitter app version %s -> cohort %s",
+                            ver, cohort)
+                return cohort, "app"
             except Exception as e:
                 logger.info("Transmitter app version read failed (%s); "
                             "checking DFU state", e)
@@ -344,14 +365,15 @@ class LIFUTransmitterFirmwareUpdate:
         # DFU version, so it identifies the transmitter environments too.
         kind, dfu_ver = self._mgr.detect_console_dfu_kind(
             vid=self.vid, pid=self.pid, libusb_dll=self.libusb_dll)
-        if kind != DFU_KIND_SECURE:
-            raise RuntimeError(
-                f"Transmitter is not in the secure bootloader's DFU (found "
-                f"{kind!r}). This path only supports the secure bootloader; "
-                "connect the running app, or use TxDevice.update_firmware for "
-                "legacy units.")
-        logger.info("Detected secure-bootloader DFU %s", dfu_ver)
-        return COHORT_SECURE, "dfu"
+        if kind == DFU_KIND_SECURE:
+            logger.info("Detected secure-bootloader DFU %s", dfu_ver)
+            return COHORT_SECURE, "dfu"
+        if kind == DFU_KIND_ROM:
+            logger.info("Detected STM32 ROM DFU")
+            return COHORT_NONE, "dfu"
+        raise RuntimeError(
+            f"Cannot determine transmitter state (DFU kind {kind!r}). "
+            "Connect the running app, or put the unit in a known DFU mode.")
 
     def get_bootloader_version(self) -> str:
         """Read the transmitter bootloader's version string (its git
@@ -365,10 +387,15 @@ class LIFUTransmitterFirmwareUpdate:
         power-cycle).
 
         Raises:
-            RuntimeError: No responding application and no secure-bootloader
-                DFU present, or the DFU device did not enumerate.
+            RuntimeError: State undetectable, the unit has no secure
+                bootloader, or the DFU device did not enumerate.
         """
-        _state, source = self.detect()
+        state, source = self.detect()
+        if state == COHORT_NONE:
+            raise RuntimeError(
+                "unit has no secure bootloader (app <= 2.0.7, STM32 ROM DFU "
+                "only) — there is no bootloader version to read; run update() "
+                "to migrate it first")
         in_dfu = source == "dfu"
         if not in_dfu:
             logger.info("Entering DFU to read the bootloader version...")
@@ -383,28 +410,47 @@ class LIFUTransmitterFirmwareUpdate:
                                     libusb_dll=self.libusb_dll,
                                     profile=TRANSMITTER_PROFILE)
 
-    def update(self, *, signed_app: str | None = None, force: bool = False,
+    def update(self, *, signed_app: str | None = None,
+               production_image: str | None = None, force: bool = False,
                progress_callback: Callable | None = None) -> UpdateResult:
-        """Update the transmitter application over standard USB DFU.
+        """Detect the unit's state and run the appropriate update.
 
         Args:
-            signed_app: Override the signed app image. Defaults to the bundled
-                signed transmitter app.
-            force: Flash even if the image version is below the installed one
-                (still subject to the bootloader's anti-rollback floor at
-                boot).
+            signed_app: Override the signed app image (secure path). Defaults
+                to the bundled signed transmitter app.
+            production_image: Override the combined bootloader+app image
+                (no-secure-bootloader migration path). Defaults to the
+                bundled production image.
+            force: Secure path only: flash even if the image version is below
+                the installed one (still subject to the bootloader's
+                anti-rollback floor at boot).
 
         Returns:
             :class:`UpdateResult`.
 
         Raises:
             ValueError: Bad image / downgrade refused.
-            RuntimeError: Wrong DFU environment, or a write/verify failure.
+            RuntimeError: State undetectable, wrong DFU environment, or a
+                write/verify failure.
         """
         state, source = self.detect()
-        app = str(signed_app) if signed_app else str(bundled_transmitter_signed_app())
         in_dfu = source == "dfu"
 
+        if state == COHORT_NONE:
+            prod = (str(production_image) if production_image
+                    else str(bundled_transmitter_production_image()))
+            self._mgr.migrate_transmitter_full_image(
+                prod,
+                enter_stm32_rom_dfu_fn=None if in_dfu else self._enter_rom,
+                keys_dir=self.keys_dir, vid=self.vid, pid=self.pid,
+                libusb_dll=self.libusb_dll,
+                progress_callback=progress_callback)
+            return UpdateResult(state, "migrate-rom",
+                                "Migrated pre-secure transmitter to the "
+                                "secure bootloader (full production image).",
+                                reboot_required=True)
+
+        app = str(signed_app) if signed_app else str(bundled_transmitter_signed_app())
         bl_version = self._mgr.update_transmitter(
             app, enter_dfu_fn=None if in_dfu else self._enter_dfu,
             keys_dir=self.keys_dir, force=force, vid=self.vid, pid=self.pid,
@@ -423,6 +469,9 @@ class LIFUTransmitterFirmwareUpdate:
 
     def _enter_dfu(self) -> None:
         self._require_tx().enter_dfu(module=0)
+
+    def _enter_rom(self) -> None:
+        self._require_tx().enter_stm32_rom_dfu(module=0)
 
 
 # ---------------------------------------------------------------------------
@@ -504,7 +553,8 @@ def _run_transmitter(args: Any) -> int:
     fw = LIFUTransmitterFirmwareUpdate(tx=tx, keys_dir=args.keys)
     return _run_update_flow(
         fw, "transmitter", fw.detect,
-        lambda: fw.update(signed_app=args.app, force=args.force,
+        lambda: fw.update(signed_app=args.app,
+                          production_image=args.production, force=args.force,
                           progress_callback=_progress),
         args)
 
@@ -549,7 +599,8 @@ def main(argv: list[str] | None = None) -> int:
                              "hook; older ones stay in DFU until "
                              "power-cycle).")
     parser.add_argument("--production",
-                        help="Console only: override the combined bootloader+app image.")
+                        help="Override the combined bootloader+app image "
+                             "(migration paths).")
     parser.add_argument("--app", help="Override the signed app image.")
     parser.add_argument("--keys", help="Optional keys dir to pre-validate the app signature.")
     parser.add_argument("--force", action="store_true",
