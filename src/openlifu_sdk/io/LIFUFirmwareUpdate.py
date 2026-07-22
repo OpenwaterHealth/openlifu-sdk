@@ -445,10 +445,13 @@ class LIFUTransmitterFirmwareUpdate:
                 keys_dir=self.keys_dir, vid=self.vid, pid=self.pid,
                 libusb_dll=self.libusb_dll,
                 progress_callback=progress_callback)
+            # The ROM DFU driver leaves DFU after the verified write, so the
+            # secure bootloader boots the new app without a power-cycle.
             return UpdateResult(state, "migrate-rom",
                                 "Migrated pre-secure transmitter to the "
-                                "secure bootloader (full production image).",
-                                reboot_required=True)
+                                "secure bootloader (full production image); "
+                                "the unit is rebooting into the new app.",
+                                reboot_required=False)
 
         app = str(signed_app) if signed_app else str(bundled_transmitter_signed_app())
         bl_version = self._mgr.update_transmitter(

@@ -602,7 +602,17 @@ class STM32USBDFU:
         ))
 
     def get_status(self) -> dict:
-        raw = self._ctrl_in(self.DFU_GETSTATUS, 0, 6)
+        """One transient-failure retry: a GETSTATUS that races the device
+        mid-flash-program can be answered with a spurious STALL (observed
+        intermittently ~89% into transmitter slot writes — the L4 stalls
+        instruction fetch during each doubleword program, and the bootloader
+        advertises a poll timeout shorter than a full 1 KB block takes). The
+        STALL clears on the next SETUP, so a short-delay retry recovers."""
+        try:
+            raw = self._ctrl_in(self.DFU_GETSTATUS, 0, 6)
+        except Exception:
+            time.sleep(0.01)
+            raw = self._ctrl_in(self.DFU_GETSTATUS, 0, 6)
         poll_ms = raw[1] | (raw[2] << 8) | (raw[3] << 16)
         return {"status": raw[0], "poll_timeout_ms": poll_ms, "state": raw[4]}
 
@@ -643,17 +653,43 @@ class STM32USBDFU:
             st = self.get_status()
             if st["state"] not in busy:
                 return st
-            time.sleep(max(st["poll_timeout_ms"] / 1000.0, 0.005))
+            # Floor the DNBUSY wait at 10 ms: the transmitter bootloader
+            # (<= 1.0.1-rc.1) advertises 5 ms for PROGRAM, but a 1 KB block
+            # takes ~12 ms on the L4 — polling early risks the mid-program
+            # STALL race that get_status() retries around.
+            time.sleep(max(st["poll_timeout_ms"] / 1000.0, 0.010))
+
+    def _prepare_dnload(self) -> None:
+        """Ready the state machine for a DNLOAD **without sending ABORT**.
+
+        DNLOAD is legal from dfuIDLE and dfuDNLOAD_IDLE, so no abort is
+        needed between blocks — and it must be avoided: the secure
+        bootloaders' download-complete heuristic treats (image written +
+        dfuIDLE + manif COMPLETE) as "manifestation finished" and REBOOTS.
+        Since the DFU middleware leaves manif_state at its power-on COMPLETE
+        for the entire data phase, a per-block ABORT opens a reboot window
+        after every block — the root cause of the intermittent mid-write
+        device drops (host-side Errno 5 at random offsets).
+        """
+        for _ in range(3):
+            st = self.get_status()
+            if st["state"] == self.STATE_DFU_ERROR:
+                self.clear_status()
+            elif st["state"] in (self.STATE_DFU_DNLOAD_SYNC,
+                                 self.STATE_DFU_DNLOAD_BUSY):
+                self._wait_while_busy()
+            else:
+                return
 
     def _dnload(self, block_num: int, payload: bytes) -> dict:
-        self._recover_idle()
-        try:
-            self._ctrl_out(
-                self.DFU_DNLOAD, block_num, bytes(payload) if payload else b""
-            )
-        except Exception as e:
-            if "timeout" not in str(e).lower():
-                raise
+        # NOTE: a control-OUT timeout is a REAL failure and must raise — the
+        # block may never have reached the device, and swallowing it leaves a
+        # silent 1 KB hole in flash (caught only by read-back verify). The
+        # write path's resync/retry machinery handles the raised error.
+        self._prepare_dnload()
+        self._ctrl_out(
+            self.DFU_DNLOAD, block_num, bytes(payload) if payload else b""
+        )
         return self._wait_while_busy()
 
     def _set_address(self, address: int) -> None:
@@ -758,12 +794,68 @@ class STM32USBDFU:
             if align > 1 and (len(chunk) % align) != 0:
                 pad_len = align - (len(chunk) % align)
                 chunk = chunk + (b"\xFF" * pad_len)
-            self._dnload(block, chunk)
-            block += 1
+            block = self._dnload_block_resync(block, chunk, address, offset)
             written += len(chunk)
             if progress_callback:
                 progress_callback(written, total, "USB DFU write")
-        self.abort()
+        # Deliberately NO trailing abort: on bootloaders <= 1.0.1-rc.1 an
+        # abort here (image written, dfuIDLE) triggers the immediate reboot
+        # heuristic. Callers that need dfuIDLE (verify read / manifest)
+        # handle the state themselves.
+
+    def _dnload_block_resync(self, block: int, chunk: bytes,
+                             address: int, offset: int) -> int:
+        """Send one data block; on a transient USB failure (spurious STALL /
+        pipe error mid-write), re-sync and resend instead of aborting the
+        whole session: recover the DFU state machine, point the address
+        pointer back at this block's flash offset, and retry from block 2
+        (address = pointer + (block-2)*transfer_size, so a fresh pointer with
+        block 2 lands exactly where the failed block did — rewriting the
+        same freshly-erased region is idempotent).
+
+        Returns the block number the NEXT block must use.
+        """
+        for attempt in range(3):
+            try:
+                self._dnload(block, chunk)
+                return block + 1
+            except Exception as e:
+                if attempt == 2:
+                    raise
+                logger.warning(
+                    "USB DFU write glitch at offset 0x%X (%s) — re-syncing "
+                    "and retrying", offset, e)
+                time.sleep(0.2)
+                self._resync_session(address, offset)
+                block = 2
+        raise RuntimeError("unreachable")
+
+    def _resync_session(self, address: int, offset: int) -> None:
+        """Re-establish a writable DFU session after a mid-write bus fault.
+
+        Tries in-place recovery first. If the handle is dead — a bus error
+        can make the device (or Windows) re-enumerate, invalidating the
+        open handle — the device is closed and re-opened (polling up to
+        10 s for it to come back). Finally the DfuSe address pointer is set
+        to the interrupted flash offset so the caller can resume with
+        block 2 exactly where the failed block was.
+        """
+        try:
+            self._recover_idle()
+        except Exception as e:
+            logger.warning("DFU handle dead after bus fault (%s) — "
+                           "re-opening the device", e)
+            self.close()
+            deadline = time.monotonic() + 10.0
+            while True:
+                time.sleep(0.5)
+                try:
+                    self.open()
+                    break
+                except Exception:
+                    if time.monotonic() > deadline:
+                        raise
+        self._set_address(address + offset)
 
     def manifest(self) -> None:
         """Send zero-length DNLOAD to trigger DFU manifestation (launches firmware)."""
@@ -1209,10 +1301,56 @@ class LIFUDFUManager:
                          device_profile=profile) as dfu:
             dfu.write_memory(slot_base, image, page_erase=True,
                              progress_callback=progress_callback)
-            logger.info("%s DFU: sending manifest (device will reset "
-                        "and the bootloader will verify the image)...", label)
-            dfu.manifest()
+            # Read-back verify + targeted page repair, then manifest. On
+            # bootloaders <= 1.0.1-rc.1 the verify read's initial ABORT
+            # (image written + dfuIDLE) triggers their download-complete
+            # heuristic and the device reboots on the spot — with the slot
+            # fully written that reboot IS the manifestation (SBSFU verifies
+            # the image at boot), so a device drop here is success, not
+            # failure. A genuine verify mismatch (RuntimeError) still raises.
+            try:
+                self._verify_and_repair_slot(dfu, slot_base, image, label)
+                logger.info("%s DFU: sending manifest (device will reset "
+                            "and the bootloader will verify the image)...",
+                            label)
+                dfu.manifest()
+            except RuntimeError:
+                raise
+            except Exception as e:
+                logger.info(
+                    "%s DFU: device rebooted at end of download (legacy "
+                    "bootloader manifestation) — the bootloader verifies "
+                    "the image at boot. (%s)", label, e)
         logger.info("%s DFU: programming complete.", label)
+
+    @staticmethod
+    def _verify_and_repair_slot(dfu: "STM32USBDFU", slot_base: int,
+                                image: bytes, label: str,
+                                page: int = 2048, max_passes: int = 5) -> None:
+        """Read the freshly written slot back and repair mismatching pages.
+
+        Each pass uploads the whole slot image, diffs it page-by-page, and
+        re-erases + rewrites only the differing pages. Raises RuntimeError
+        if the slot still mismatches after *max_passes*.
+        """
+        logger.info("%s DFU: verifying slot by read-back...", label)
+        for attempt in range(max_passes):
+            readback = dfu.read_memory(slot_base, len(image))
+            bad = [off for off in range(0, len(image), page)
+                   if readback[off:off + page] != image[off:off + page]]
+            if not bad:
+                logger.info("%s DFU: read-back verify OK (%d bytes)",
+                            label, len(image))
+                return
+            logger.warning("%s DFU: verify mismatch in %d page(s) "
+                           "(pass %d) — repairing", label, len(bad), attempt + 1)
+            if attempt == max_passes - 1:
+                break
+            for off in bad:
+                dfu.write_memory(slot_base + off, image[off:off + page],
+                                 page_erase=True)
+        raise RuntimeError(f"{label} DFU: slot verify failed after "
+                           f"{max_passes} repair passes")
 
     def get_console_installed_version(self, vid: int = 0x0483, pid: int = 0xDF11,
                                       libusb_dll: str | None = None) -> int | None:
@@ -1453,8 +1591,10 @@ class LIFUDFUManager:
         This is the path for pre-secure-bootloader units (app <= 2.0.7, which
         boots bare-metal at 0x08000000): the running app is forced into the
         STM32 ROM loader with the OW_CMD_DFU hidden switch (reserved=0x77,
-        ``TxDevice.enter_stm32_rom_dfu``), and the full erase leaves a clean
-        slate (no stale app remnants or anti-rollback state).
+        ``TxDevice.enter_stm32_rom_dfu``). The write is performed by the
+        pure-Python DfuSe driver (:mod:`openlifu_sdk.io.STM32DFU`) with a
+        full read-back verify, and ends with a DfuSe leave so the unit boots
+        the new firmware without a power-cycle.
 
         Args:
             combined_image: The full-flash production image beginning at
@@ -1502,19 +1642,25 @@ class LIFUDFUManager:
                 f"Transmitter did not enter STM32 ROM DFU (found {kind!r}). "
                 "The app may lack the force switch, or the unit is locked.")
 
-        # The bootloader-region write over the STM32 ROM loader is done with
-        # STM32CubeProgrammer (see migrate_console_full_image for rationale).
-        cli = find_stm32_programmer_cli()
-        if cli is None:
-            raise RuntimeError(
-                "STM32CubeProgrammer (STM32_Programmer_CLI) not found - it is "
-                "required for the bootloader-replacement write over STM32 ROM "
-                "DFU. Install it, add it to PATH, or set $STM32_PROGRAMMER_CLI.")
-        self._cubeprog_write_full_image(cli, combined_image, progress_callback)
+        # Bootloader-region write over the STM32 ROM loader, done entirely
+        # with the SDK's pure-Python ROM DFU driver (openlifu_sdk.io.STM32DFU)
+        # - no STM32CubeProgrammer dependency. The driver honors the DfuSe
+        # bwPollTimeout windows, addresses every block individually, pads
+        # writes to 8 bytes (AN2606 L43x/44x V9.1 erratum), verifies by full
+        # read-back, and finally leaves DFU so the secure bootloader boots
+        # the app without a power-cycle. Erase covers the pages the image
+        # occupies; the anti-rollback log page starts blank-or-garbage either
+        # way and anti_rollback.c provisions it on first use.
+        from openlifu_sdk.io.STM32DFU import STM32DFU
+        logger.info("Writing the production image with the pure-Python ROM "
+                    "DFU driver...")
+        with STM32DFU(vid=vid, pid=pid, libusb_dll=libusb_dll,
+                      page_size=2048) as rom:
+            rom.flash(image, address=0x08000000,
+                      progress_callback=progress_callback)
 
-        logger.info("Full-image migration complete. Power-cycle the "
-                    "transmitter: the secure bootloader will verify and "
-                    "launch the app.")
+        logger.info("Full-image migration complete - the device left DFU; "
+                    "the secure bootloader verifies and launches the app.")
 
     def migrate_console_rom_dfu(self, bootloader_bin: str, signed_app: str,
                                 keys_dir: str | None = None,
@@ -1838,18 +1984,23 @@ class LIFUDFUManager:
                 f"Console did not enter STM32 ROM DFU (found {kind!r}). "
                 "The app may lack the force switch, or the unit is locked.")
 
-        # The bootloader-region write over the STM32 ROM loader is done with
-        # STM32CubeProgrammer: its USB-DFU implementation is verified
-        # byte-correct on this ROM loader, whereas the pure-Python DfuSe
-        # write is not reliable here. A mass-erase + verified download of the
-        # whole image gives the clean-slate result in one step.
+        # Bootloader-region write over the STM32 ROM loader: prefer
+        # STM32CubeProgrammer when installed (bench-verified byte-correct on
+        # this ROM loader); otherwise fall back to the SDK's pure-Python ROM
+        # DFU driver (openlifu_sdk.io.STM32DFU: per-page erase, individually
+        # addressed blocks — no wTransferSize address drift — and a full
+        # read-back verify).
         cli = find_stm32_programmer_cli()
-        if cli is None:
-            raise RuntimeError(
-                "STM32CubeProgrammer (STM32_Programmer_CLI) not found - it is "
-                "required for the bootloader-replacement write over STM32 ROM "
-                "DFU. Install it, add it to PATH, or set $STM32_PROGRAMMER_CLI.")
-        self._cubeprog_write_full_image(cli, combined_image, progress_callback)
+        if cli is not None:
+            self._cubeprog_write_full_image(cli, combined_image, progress_callback)
+        else:
+            logger.info("STM32CubeProgrammer not found - using the "
+                        "pure-Python ROM DFU driver")
+            from openlifu_sdk.io.STM32DFU import STM32DFU
+            with STM32DFU(vid=vid, pid=pid, libusb_dll=libusb_dll,
+                          page_size=2048) as rom:
+                rom.flash(image, address=0x08000000,
+                          progress_callback=progress_callback)
 
         logger.info("Full-image migration complete. Power-cycle the console: "
                     "the secure bootloader will verify and launch the app.")
