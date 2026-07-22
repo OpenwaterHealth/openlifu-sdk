@@ -91,6 +91,7 @@ MIN_PROFILE_SWITCH_INTERVAL = 1000e-6
 PATTERN_PROFILE_OFFSET = 4
 NUM_PATTERN_PROFILES = 32
 VALID_PATTERN_PROFILES = list(range(1, NUM_PATTERN_PROFILES+1))
+MAX_EXECUTION_ORDER = 255 # max execution order to pass for profile cycling
 PATTERN_PROFILE_SELECT_MASK = 0x3F
 BF_PROF_SEL_G1_SHIFT = 28  # Bits 28-31 for G1 delay profile selector
 BF_PROF_SEL_G2_SHIFT = 12  # Bits 12-15 for G2 delay profile selector
@@ -950,6 +951,11 @@ class TxDevice(OWComponent):
             raise ValueError("execution_order must be a list of profile indices")
         if len(execution_order) == 0:
             raise ValueError("execution_order cannot be empty")
+        if len(execution_order) > MAX_EXECUTION_ORDER:
+            raise ValueError(
+                f"execution_order length ({len(execution_order)}) exceeds the "
+                f"maximum of {MAX_EXECUTION_ORDER}"
+            )
         for idx in execution_order:
             if not isinstance(idx, int) or idx < 1 or idx > n:
                 raise ValueError(f"execution_order contains invalid profile index {idx}. Must be in 1-{n}")

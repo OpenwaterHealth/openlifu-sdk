@@ -186,6 +186,38 @@ def make_default_sequence() -> dict:
         "pulse_train_count": 5,
     }
 
+
+def make_solution(
+    pulse,
+    delays: np.ndarray,
+    apodizations: np.ndarray,
+    sequence: dict,
+    execution_order: list[int] | None = None,
+    pulse_profile_map: dict | None = None,
+    voltage: float = VOLTAGE,
+) -> dict:
+    """Assemble a solution dict for ``LIFUInterface.set_solution()``.
+
+    Mirrors the fields ``set_solution()`` reads off the solution: the
+    beamforming arrays, the trigger sequence, the HV voltage, and the
+    optional multi-profile ``execution_order`` / ``pulse_profile_map``.
+    Optional keys are omitted when None so single-profile solutions stay
+    backward compatible.
+    """
+    solution: dict = {
+        "pulse": pulse,
+        "delays": delays,
+        "apodizations": apodizations,
+        "sequence": sequence,
+        "voltage": voltage,
+    }
+    if execution_order is not None:
+        solution["execution_order"] = execution_order
+    if pulse_profile_map is not None:
+        solution["pulse_profile_map"] = pulse_profile_map
+    return solution
+
+
 # ---------------------------------------------------------------------------
 # Register readback and verification
 # ---------------------------------------------------------------------------
@@ -474,11 +506,14 @@ def test_single_profile_backward_compat(
     pulse = make_default_pulse()
     sequence = make_default_sequence()
 
-    interface.txdevice.set_solution(
+    solution = make_solution(
         pulse=pulse,
         delays=delays,
         apodizations=apodizations,
         sequence=sequence,
+    )
+    interface.set_solution(
+        solution,
         trigger_mode="sequence",
         profile_index=1,
         profile_increment=False,
@@ -516,15 +551,18 @@ def test_single_profile_with_execution_order(
     pulse = make_default_pulse()
     sequence = make_default_sequence()
 
-    interface.txdevice.set_solution(
+    solution = make_solution(
         pulse=pulse,
         delays=delays,
         apodizations=apodizations,
         sequence=sequence,
+        execution_order=[1],
+    )
+    interface.set_solution(
+        solution,
         trigger_mode="sequence",
         profile_index=1,
         profile_increment=False,
-        execution_order=[1],
     )
 
     passed = True
@@ -564,15 +602,18 @@ def test_multi_profile_shared_pulse(
     sequence = make_default_sequence()
     execution_order = list(profile_numbers)
 
-    interface.txdevice.set_solution(
+    solution = make_solution(
         pulse=pulse,
         delays=delays,
         apodizations=apodizations,
         sequence=sequence,
+        execution_order=execution_order,
+    )
+    interface.set_solution(
+        solution,
         trigger_mode="sequence",
         profile_index=1,
         profile_increment=True,
-        execution_order=execution_order,
     )
 
     passed = True
@@ -613,15 +654,18 @@ def test_apodization_per_profile(
     sequence = make_default_sequence()
     execution_order = list(profile_numbers)
 
-    interface.txdevice.set_solution(
+    solution = make_solution(
         pulse=pulse,
         delays=delays,
         apodizations=apodizations,
         sequence=sequence,
+        execution_order=execution_order,
+    )
+    interface.set_solution(
+        solution,
         trigger_mode="sequence",
         profile_index=1,
         profile_increment=True,
-        execution_order=execution_order,
     )
 
     passed = True
@@ -670,15 +714,18 @@ def test_single_channel_scan(
     print(f"  Channels under test: {scan_channels}")
     print(f"  Profiles: {num_profiles}, execution_order: {execution_order}")
 
-    interface.txdevice.set_solution(
+    solution = make_solution(
         pulse=pulse,
         delays=delays,
         apodizations=apodizations,
         sequence=sequence,
+        execution_order=execution_order,
+    )
+    interface.set_solution(
+        solution,
         trigger_mode="sequence",
         profile_index=1,
         profile_increment=True,
-        execution_order=execution_order,
     )
 
     passed = True
@@ -720,15 +767,18 @@ def test_max_profiles(
     sequence = make_default_sequence()
     execution_order = list(profile_numbers)
 
-    interface.txdevice.set_solution(
+    solution = make_solution(
         pulse=pulse,
         delays=delays,
         apodizations=apodizations,
         sequence=sequence,
+        execution_order=execution_order,
+    )
+    interface.set_solution(
+        solution,
         trigger_mode="sequence",
         profile_index=1,
         profile_increment=True,
-        execution_order=execution_order,
     )
 
     passed = True
@@ -779,15 +829,18 @@ def test_execution_order_cycling(
     apodizations = make_block_apodizations(num_profiles)
     pulse = make_default_pulse()
 
-    interface.txdevice.set_solution(
+    solution = make_solution(
         pulse=pulse,
         delays=delays,
         apodizations=apodizations,
         sequence=sequence,
+        execution_order=execution_order,
+    )
+    interface.set_solution(
+        solution,
         trigger_mode="sequence",
         profile_index=1,
         profile_increment=True,
-        execution_order=execution_order,
     )
 
     passed = True
@@ -828,8 +881,12 @@ def test_validation_errors(
 ) -> bool:
     """TC8: set_solution rejects invalid multi-profile configurations.
 
-    Exercises host-side validation only; every case must raise ValueError
-    before any register is written, so no sonication is run.
+    Exercises set_solution's host-side argument validation; every case must
+    raise ValueError before any profile/delay registers are programmed, so no
+    sonication is run. Routed through interface.set_solution with
+    _allow_unsafe_solution=True so check_solution (which raises LIFUSolutionError,
+    not ValueError, and cannot parse these deliberately malformed solutions) is
+    bypassed and the txdevice ValueError surfaces.
     """
     _print_header("TC8: Validation errors (host-side, no sonication)")
 
@@ -866,17 +923,27 @@ def test_validation_errors(
 
     passed = True
     for description, overrides in cases:
-        kwargs = {
+        params = {
             "pulse": pulse,
             "delays": delays,
             "apodizations": apodizations,
-            "trigger_mode": "sequence",
-            "profile_index": 1,
-            "profile_increment": False,
         }
-        kwargs.update(overrides)
+        params.update(overrides)
+        solution = make_solution(
+            pulse=params["pulse"],
+            delays=params["delays"],
+            apodizations=params["apodizations"],
+            sequence=params["sequence"],
+            execution_order=params.get("execution_order"),
+        )
         try:
-            interface.txdevice.set_solution(**kwargs)
+            interface.set_solution(
+                solution,
+                trigger_mode="sequence",
+                profile_index=1,
+                profile_increment=False,
+                _allow_unsafe_solution=True,
+            )
         except ValueError as exc:
             print(f"  [OK] {description}: raised ValueError ({exc})")
         else:
