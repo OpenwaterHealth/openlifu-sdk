@@ -32,7 +32,6 @@ ADDRESS_PATTERN_SEL_G2 = 0x1E
 ADDRESS_PATTERN_SEL_G1 = 0x1F
 ADDRESS_TRSW = 0x1A
 ADDRESS_APODIZATION = 0x1B
-ADDRESS_GLOBAL_CONTROL = 0x00
 GLOBAL_CONTROL_LOAD_PROFILE = 0x08  # Self-clearing LOAD_PROF bit in register 0x00.
 ADDRESSES_GLOBAL = [ADDRESS_GLOBAL_MODE,
                     ADDRESS_STANDBY,
@@ -708,7 +707,7 @@ class TxDevice(OWComponent):
         """Commit profile RAM writes by pulsing the self-clearing LOAD_PROF bit."""
         tx_ids = self._resolve_tx_ids(identifier)
         for tx_id in tx_ids:
-            self.write_register(tx_id, ADDRESS_GLOBAL_CONTROL, GLOBAL_CONTROL_LOAD_PROFILE)
+            self.write_register(tx_id, ADDRESS_GLOBAL_MODE, GLOBAL_CONTROL_LOAD_PROFILE)
         return True
 
     def set_delay_profile(self, profile: int, identifier: int = 0) -> bool:
