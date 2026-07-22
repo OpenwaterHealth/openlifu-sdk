@@ -217,15 +217,47 @@ class LIFUFirmwareUpdate:
     # Update
     # ------------------------------------------------------------------
 
+    def _force_production_update(self, production_image: str | None,
+                                 progress_callback: Callable | None
+                                 ) -> UpdateResult:
+        """Force a FULL production reflash (bootloader + signed app) via the
+        STM32 ROM DFU, regardless of the unit's cohort — the path for rolling
+        a NEW BOOTLOADER onto a unit that is already on the secure bootloader.
+
+        The running application is forced into the ROM loader with the
+        OW_CMD_DFU hidden switch (reserved=0x77). Beta/unlocked units only:
+        after RDP/FDA lockdown the bootloader flash is protected and the
+        switch is inert, so the flow aborts at the ROM-DFU gate without
+        touching flash.
+        """
+        cohort, source = self.detect_cohort()
+        in_rom_dfu = source == "dfu" and cohort == COHORT_NONE
+        if source == "dfu" and not in_rom_dfu:
+            raise RuntimeError(
+                "cannot force a production reflash from bootloader DFU — the "
+                "ROM loader is entered from the RUNNING application "
+                "(OW_CMD_DFU force switch). Boot the app first, then re-run.")
+        prod = (str(production_image) if production_image
+                else str(bundled_production_image()))
+        self._mgr.migrate_console_full_image(
+            prod,
+            enter_stm32_rom_dfu_fn=None if in_rom_dfu else self._enter_rom,
+            keys_dir=self.keys_dir, vid=self.vid, pid=self.pid,
+            libusb_dll=self.libusb_dll, progress_callback=progress_callback)
+        return UpdateResult(cohort, "force-production",
+                            "Reflashed the full production image (bootloader "
+                            "+ app) via STM32 ROM DFU.", reboot_required=True)
+
     def update(self, *, production_image: str | None = None,
                signed_app: str | None = None, updater_bin: str | None = None,
-               force: bool = False,
+               force: bool = False, force_production: bool = False,
                progress_callback: Callable | None = None) -> UpdateResult:
         """Detect the unit's state and run the appropriate update.
 
         Args:
             production_image: Override the combined bootloader+app image
-                (no-bootloader path). Defaults to the bundled production image.
+                (no-bootloader / force-production paths). Defaults to the
+                bundled production image.
             signed_app: Override the signed app (legacy + secure paths).
                 Defaults to the bundled signed app.
             updater_bin: Override the legacy RAM updater. Defaults to the
@@ -233,6 +265,9 @@ class LIFUFirmwareUpdate:
             force: For the secure app-update path, flash even if the image
                 version is below the installed one (still subject to the
                 bootloader's anti-rollback floor at boot).
+            force_production: Reflash the FULL production image (bootloader +
+                app) via STM32 ROM DFU regardless of cohort — see
+                :meth:`_force_production_update`. Beta/unlocked units only.
 
         Returns:
             :class:`UpdateResult`.
@@ -242,6 +277,9 @@ class LIFUFirmwareUpdate:
             RuntimeError: State undetectable, wrong DFU environment, or a
                 write/verify failure.
         """
+        if force_production:
+            return self._force_production_update(production_image,
+                                                 progress_callback)
         cohort, source = self.detect_cohort()
         prod = str(production_image) if production_image else str(bundled_production_image())
         app = str(signed_app) if signed_app else str(bundled_signed_app())
@@ -410,8 +448,41 @@ class LIFUTransmitterFirmwareUpdate:
                                     libusb_dll=self.libusb_dll,
                                     profile=TRANSMITTER_PROFILE)
 
+    def _force_production_update(self, production_image: str | None,
+                                 progress_callback: Callable | None
+                                 ) -> UpdateResult:
+        """Force a FULL production reflash (bootloader + signed app) via the
+        STM32 ROM DFU, regardless of the unit's cohort — the path for rolling
+        a NEW BOOTLOADER onto a unit that is already on the secure bootloader.
+
+        The running application is forced into the ROM loader with the
+        OW_CMD_DFU hidden switch (reserved=0x77). Beta/unlocked units only:
+        after RDP/FDA lockdown the bootloader flash is protected and the
+        switch is inert, so the flow aborts at the ROM-DFU gate without
+        touching flash.
+        """
+        state, source = self.detect()
+        in_rom_dfu = source == "dfu" and state == COHORT_NONE
+        if source == "dfu" and not in_rom_dfu:
+            raise RuntimeError(
+                "cannot force a production reflash from bootloader DFU — the "
+                "ROM loader is entered from the RUNNING application "
+                "(OW_CMD_DFU force switch). Boot the app first, then re-run.")
+        prod = (str(production_image) if production_image
+                else str(bundled_transmitter_production_image()))
+        self._mgr.migrate_transmitter_full_image(
+            prod,
+            enter_stm32_rom_dfu_fn=None if in_rom_dfu else self._enter_rom,
+            keys_dir=self.keys_dir, vid=self.vid, pid=self.pid,
+            libusb_dll=self.libusb_dll, progress_callback=progress_callback)
+        return UpdateResult(state, "force-production",
+                            "Reflashed the full production image (bootloader "
+                            "+ app) via STM32 ROM DFU; the unit is rebooting "
+                            "into the new app.", reboot_required=False)
+
     def update(self, *, signed_app: str | None = None,
                production_image: str | None = None, force: bool = False,
+               force_production: bool = False,
                progress_callback: Callable | None = None) -> UpdateResult:
         """Detect the unit's state and run the appropriate update.
 
@@ -419,11 +490,14 @@ class LIFUTransmitterFirmwareUpdate:
             signed_app: Override the signed app image (secure path). Defaults
                 to the bundled signed transmitter app.
             production_image: Override the combined bootloader+app image
-                (no-secure-bootloader migration path). Defaults to the
+                (migration / force-production paths). Defaults to the
                 bundled production image.
             force: Secure path only: flash even if the image version is below
                 the installed one (still subject to the bootloader's
                 anti-rollback floor at boot).
+            force_production: Reflash the FULL production image (bootloader +
+                app) via STM32 ROM DFU regardless of cohort — see
+                :meth:`_force_production_update`. Beta/unlocked units only.
 
         Returns:
             :class:`UpdateResult`.
@@ -433,6 +507,9 @@ class LIFUTransmitterFirmwareUpdate:
             RuntimeError: State undetectable, wrong DFU environment, or a
                 write/verify failure.
         """
+        if force_production:
+            return self._force_production_update(production_image,
+                                                 progress_callback)
         state, source = self.detect()
         in_dfu = source == "dfu"
 
@@ -516,7 +593,10 @@ def _run_update_flow(fw: Any, label: str, detect_fn: Callable,
             return 1
         return 0
 
-    if not _confirm(state, args.yes):
+    confirm_label = state
+    if args.force_production:
+        confirm_label = f"{state} — FULL production reflash (bootloader + app)"
+    if not _confirm(confirm_label, args.yes):
         print("Aborted.")
         return 1
 
@@ -558,6 +638,7 @@ def _run_transmitter(args: Any) -> int:
         fw, "transmitter", fw.detect,
         lambda: fw.update(signed_app=args.app,
                           production_image=args.production, force=args.force,
+                          force_production=args.force_production,
                           progress_callback=_progress),
         args)
 
@@ -576,7 +657,9 @@ def _run_console(args: Any) -> int:
     return _run_update_flow(
         fw, "console", fw.detect_cohort,
         lambda: fw.update(production_image=args.production, signed_app=args.app,
-                          force=args.force, progress_callback=_progress),
+                          force=args.force,
+                          force_production=args.force_production,
+                          progress_callback=_progress),
         args)
 
 
@@ -608,6 +691,15 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--keys", help="Optional keys dir to pre-validate the app signature.")
     parser.add_argument("--force", action="store_true",
                         help="Secure path only: flash even if not newer.")
+    parser.add_argument("--force-production", action="store_true",
+                        help="Force a FULL production reflash (bootloader + "
+                             "app) via the STM32 ROM DFU, regardless of the "
+                             "unit's state — the path for installing a NEW "
+                             "bootloader. The running app is forced into the "
+                             "ROM loader (OW_CMD_DFU reserved=0x77). "
+                             "Beta/unlocked units only: on RDP/FDA-locked "
+                             "units the bootloader flash is protected and "
+                             "the force switch is inert.")
     parser.add_argument("-y", "--yes", action="store_true",
                         help="Skip the confirmation prompt.")
     args = parser.parse_args(argv)

@@ -1993,6 +1993,18 @@ class LIFUDFUManager:
         cli = find_stm32_programmer_cli()
         if cli is not None:
             self._cubeprog_write_full_image(cli, combined_image, progress_callback)
+            # CubeProgrammer leaves the unit sitting in ROM DFU; send a DfuSe
+            # leave (best effort) so the fresh bootloader boots the app
+            # without a power-cycle. Proven on the F072 ROM loader.
+            try:
+                from openlifu_sdk.io.STM32DFU import STM32DFU
+                with STM32DFU(vid=vid, pid=pid, libusb_dll=libusb_dll) as rom:
+                    rom.leave(0x08000000)
+                logger.info("ROM DFU leave sent - the bootloader verifies "
+                            "and launches the app.")
+            except Exception as e:
+                logger.info("ROM DFU leave failed (%s) - power-cycle the "
+                            "console to boot.", e)
         else:
             logger.info("STM32CubeProgrammer not found - using the "
                         "pure-Python ROM DFU driver")
@@ -2002,8 +2014,8 @@ class LIFUDFUManager:
                 rom.flash(image, address=0x08000000,
                           progress_callback=progress_callback)
 
-        logger.info("Full-image migration complete. Power-cycle the console: "
-                    "the secure bootloader will verify and launch the app.")
+        logger.info("Full-image migration complete - the secure bootloader "
+                    "will verify and launch the app.")
 
     @staticmethod
     def _cubeprog_write_full_image(cli: str, image_path: str,
