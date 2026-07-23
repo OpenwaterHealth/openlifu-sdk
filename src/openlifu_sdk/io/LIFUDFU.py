@@ -212,13 +212,15 @@ def find_stm32_programmer_cli() -> str | None:
 
 def bundled_updater_path() -> Path:
     """Path to the RAM-resident legacy-migration updater shipped with the SDK
-    (``firmware/updater.bin``).
+    (``firmware/openlifu-console-legacy-updater.bin`` — the interim image for
+    the console legacy-bootloader migration; see console-legacy-updater).
 
     This is the one-time, keyless self-updater used by
     :meth:`LIFUDFUManager.migrate_console_legacy`. It needs no signing key: the
     legacy bootloader authenticates it with an HMAC "trust tag" that the SDK
     computes from the updater bytes at run time (``build_legacy_metadata``)."""
-    return Path(__file__).parent.parent / "firmware" / "updater.bin"
+    return (Path(__file__).parent.parent / "firmware"
+            / "openlifu-console-legacy-updater.bin")
 
 
 def _split_flash_image(image: bytes, slot_off: int) -> tuple[bytes, bytes]:

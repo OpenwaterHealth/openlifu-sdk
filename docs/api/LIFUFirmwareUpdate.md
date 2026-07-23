@@ -69,9 +69,9 @@ if result.reboot_required:
 
 Runnable script: `examples/update_console_firmware.py`.
 
-Rebuilding the bundled `updater.bin` (for an updated secure bootloader) is
-documented in `console-legacy-updater/README.md` — the updater embeds a
-specific bootloader blob and is keyless.
+Rebuilding the bundled `openlifu-console-legacy-updater.bin` (for an updated
+secure bootloader) is documented in `console-legacy-updater/README.md` — the
+updater embeds a specific bootloader blob and is keyless.
 
 ## Transmitter (`LIFUTransmitterFirmwareUpdate`)
 
