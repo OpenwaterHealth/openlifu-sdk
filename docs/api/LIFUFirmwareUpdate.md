@@ -73,6 +73,49 @@ Rebuilding the bundled `updater.bin` (for an updated secure bootloader) is
 documented in `console-legacy-updater/README.md` — the updater embeds a
 specific bootloader blob and is keyless.
 
+## Transmitter (`LIFUTransmitterFirmwareUpdate`)
+
+Same auto-detect pattern for the transmitter. Module 0 (the USB master):
+
+| Unit state | App version | Path taken |
+|---|---|---|
+| No secure bootloader | ≤ 2.0.7 | Migrate via STM32 ROM DFU (combined production image, `OW_CMD_DFU` force switch) |
+| Secure bootloader | ≥ 2.0.8 | Normal signed-app update over USB DFU |
+
+**Slave modules** (`--module N`, N ≥ 1) are updated over I2C through the
+master's passthrough with `update_slave(module, ...)`:
+
+- **secure** (app ≥ 2.0.8): the SFU1 signed app is streamed to the slave's
+  secure-bootloader I2C DFU (enumerated address 0x20+).
+- **legacy** (app ≤ 2.0.7): **one-shot migration** of bootloader + app.
+  1. The small RAM-resident **DFU stub**
+     (`firmware/openlifu-transmitter-dfu-stub.bin`, built from
+     `transmitter-dfu-stub/`) is written through the legacy I2C DFU with an
+     HMAC-trust-tagged WFM1 metadata block (computed on the fly — no keys).
+  2. The legacy bootloader validates and boots the stub, which copies itself
+     to SRAM and serves the same I2C DFU protocol at the default address
+     0x72 — with the writable window opened to the whole 256 KB flash.
+  3. The SDK full-chip-erases (this also resets any stale anti-rollback
+     floor) and streams the whole production image
+     (`firmware/openlifu-transmitter-fw-production.bin`) to 0x08000000.
+  4. On reset the freshly written secure bootloader verifies the signed app
+     in its slot and launches it.
+
+  The stub embeds no bootloader blob, so a new bootloader release only needs
+  a new production image — the stub is unchanged. **Keep the slave powered**
+  from the full-chip erase until the write completes; the stub keeps serving
+  DFU from RAM after any failed write (retry is possible), but a power loss
+  in that window leaves the module SWD-recoverable only.
+
+CLI:
+
+```
+python -m openlifu_sdk.io.LIFUFirmwareUpdate --device transmitter --module 1
+```
+
+`--legacy` forces the one-shot migration path; omit it to auto-detect from
+the slave's app version. `--production` overrides the combined image.
+
 See also: `docs/api/LIFUDFU.md` (the underlying per-scenario methods),
 `docs/api/LIFUCrypto.md` (image signing/validation),
 `docs/api/LIFUHVController.md` (DFU entry).

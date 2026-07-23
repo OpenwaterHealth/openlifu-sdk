@@ -167,6 +167,17 @@ TRANSMITTER_ANTIROLLBACK_SIZE = 0x800
 # both refuse writes to their own region.
 CONSOLE_FLASH_BASE = 0x08000000
 
+# Transmitter (STM32L443CC) flash geometry. The bootloaders' I2C DFU only
+# exposes the app slot; full-flash I2C access exists solely in the RAM-resident
+# DFU stub (transmitter-dfu-stub), which serves the same protocol but with the
+# writable window opened to the whole chip.
+TRANSMITTER_FLASH_BASE = 0x08000000
+TRANSMITTER_FLASH_SIZE = 0x40000          # 256 KB
+
+# GETVERSION prefix reported by the RAM-resident DFU stub — distinguishes the
+# stub's full-flash DFU from a bootloader's slot-only DFU at the same address.
+TRANSMITTER_DFU_STUB_PREFIX = "dfu-stub"
+
 
 def find_stm32_programmer_cli() -> str | None:
     """Locate the STM32CubeProgrammer CLI (STM32_Programmer_CLI), or None.
@@ -2245,21 +2256,22 @@ class LIFUDFUManager:
                                              i2c_addr: int,
                                              progress_callback: Callable | None = None
                                              ) -> str:
-        """Write the legacy->secure UPDATER (+ its WFM1 metadata) to a
-        LEGACY-bootloader slave over I2C, then reset it so the legacy BL boots
-        the updater and it swaps in the secure bootloader.
+        """Write a trusted app image (+ its WFM1 metadata) to a
+        LEGACY-bootloader slave over I2C, then reset it so the legacy BL
+        validates the metadata's HMAC trust tag and boots the image. Used to
+        install the RAM-resident DFU stub (transmitter-dfu-stub) that serves
+        the full-flash I2C DFU for the one-shot migration.
 
         The slave must already be in the LEGACY bootloader's I2C DFU at
         *i2c_addr*. Sequence (legacy write window = metadata page + app
         region): mass-erase the app region, erase the metadata page, write the
-        updater to 0x08010000, write the HMAC-tagged metadata to 0x0800F800,
-        manifest, reset. The updater then does the irreversible bootloader
-        swap on its own (see transmitter-legacy-updater).
+        image to 0x08010000, write the HMAC-tagged metadata to 0x0800F800,
+        manifest, reset.
 
         Returns the legacy bootloader's version string.
 
         Raises:
-            ValueError: Updater too large for the legacy slot.
+            ValueError: Image too large for the legacy slot.
             RuntimeError: No UART, or an I2C DFU communication/flash failure.
         """
         if self._uart is None:
@@ -2293,6 +2305,145 @@ class LIFUDFUManager:
                     "which swaps in the secure bootloader)...")
         dfu.reset()
         return bl_version
+
+    def wait_transmitter_slave_dfu(self, i2c_addr: int = I2C_DFU_SLAVE_ADDR,
+                                   timeout_s: float = 30.0,
+                                   expect_prefix: str | None = None) -> str:
+        """Poll a slave's I2C DFU at *i2c_addr* until GETVERSION answers.
+
+        Used for DFU environments that have NO one-wire back-channel and
+        therefore cannot be found via the master's enumeration:
+
+          - the LEGACY bootloader's I2C DFU (fixed default address 0x72), and
+          - the RAM-resident DFU stub (also 0x72).
+
+        If *expect_prefix* is given, only a version string starting with it
+        counts (e.g. ``"dfu-stub"``); anything else keeps polling. Returns
+        the responder's version string.
+
+        Raises:
+            RuntimeError: No UART.
+            TimeoutError: Nothing (matching) answered within *timeout_s*.
+        """
+        if self._uart is None:
+            raise RuntimeError(
+                "I2C slave programming needs the master UART — construct "
+                "LIFUDFUManager(uart=txdevice.uart).")
+        dfu = STM32I2CDFUviaMaster(uart=self._uart, i2c_addr=i2c_addr)
+        deadline = time.monotonic() + timeout_s
+        last: str | None = None
+        while time.monotonic() < deadline:
+            try:
+                ver = dfu.get_version()
+                last = ver
+                if ver and (expect_prefix is None
+                            or ver.startswith(expect_prefix)):
+                    return ver
+            except (RuntimeError, TimeoutError) as e:
+                last = str(e)
+            time.sleep(1.0)
+        wanted = (f"a version starting with {expect_prefix!r}"
+                  if expect_prefix else "a DFU version")
+        raise TimeoutError(
+            f"no I2C DFU answered with {wanted} at 0x{i2c_addr:02X} within "
+            f"{timeout_s:.0f}s (last seen: {last!r}).")
+
+    def wait_transmitter_slave_stub(self, i2c_addr: int = I2C_DFU_SLAVE_ADDR,
+                                    timeout_s: float = 30.0) -> str:
+        """Poll a slave's I2C DFU until the RAM-resident DFU stub responds.
+
+        After the stub is written over the legacy I2C DFU and the slave is
+        reset, the legacy bootloader validates the stub's WFM1 metadata and
+        boots it; the stub then listens at the DEFAULT DFU address (0x72 — it
+        has no one-wire back-channel, so it never gets an enumerated address).
+        Returns the stub's version string (``dfu-stub-x.y.z``).
+
+        Raises:
+            RuntimeError: No UART.
+            TimeoutError: The stub did not come up within *timeout_s* (the
+                legacy bootloader may have rejected the stub's metadata; the
+                slave should still be recoverable via its legacy DFU after a
+                power-cycle).
+        """
+        return self.wait_transmitter_slave_dfu(
+            i2c_addr=i2c_addr, timeout_s=timeout_s,
+            expect_prefix=TRANSMITTER_DFU_STUB_PREFIX)
+
+    def program_transmitter_slave_production_i2c(
+            self, combined_image: str, i2c_addr: int = I2C_DFU_SLAVE_ADDR,
+            keys_dir: str | None = None,
+            progress_callback: Callable | None = None) -> str:
+        """Write the FULL production image (bootloader + signed app) to a slave
+        transmitter over I2C, via the RAM-resident DFU stub.
+
+        The slave must be running the DFU stub (see
+        :meth:`program_transmitter_slave_legacy_i2c` +
+        :meth:`wait_transmitter_slave_stub`), which serves the standard I2C
+        DFU protocol with the writable window opened to the whole 256 KB
+        flash. Sequence: validate the image, FULL-CHIP erase (also resets any
+        stale anti-rollback floor at 0x0803F000 — the "update runs but won't
+        boot" trap of the old decimal version scheme), write the image at
+        0x08000000 (the stub skips blank pad regions and verifies every
+        doubleword), manifest, reset. The freshly written secure bootloader
+        then verifies the signed app in its slot and launches it.
+
+        The image is validated BEFORE the erase; a rejected image never
+        touches the slave's flash. After the erase the stub keeps serving DFU
+        from RAM, so a failed/interrupted write can be retried while power
+        holds — only power loss mid-migration strands the module (SWD only).
+
+        Returns the stub's version string.
+
+        Raises:
+            ValueError: Not a valid combined bootloader+app image.
+            RuntimeError: No UART, the stub is not answering, or an I2C DFU
+                communication/flash failure.
+        """
+        from openlifu_sdk.io import LIFUCrypto
+
+        if self._uart is None:
+            raise RuntimeError(
+                "I2C slave programming needs the master UART — construct "
+                "LIFUDFUManager(uart=txdevice.uart).")
+
+        image = Path(combined_image).read_bytes()
+        if len(image) > TRANSMITTER_FLASH_SIZE:
+            raise ValueError(
+                f"combined image is {len(image)} bytes; the transmitter flash "
+                f"is {TRANSMITTER_FLASH_SIZE} bytes")
+        # Structural sanity: a combined image whose embedded signed app is
+        # valid (the new bootloader authenticates it at boot).
+        _, app_bytes = split_transmitter_flash_image(image)
+        report = LIFUCrypto.validate_signed_image(app_bytes, keys_dir=keys_dir)
+        if not (report.ok or (keys_dir is None and report.structural_ok)):
+            raise ValueError(
+                f"Refusing to flash: embedded app invalid:\n{report.describe()}")
+        logger.info("Production image %d B; embedded app v%d (%s)",
+                    len(image), report.header.fw_version,
+                    report.header.fw_version_str)
+
+        dfu = STM32I2CDFUviaMaster(uart=self._uart, i2c_addr=i2c_addr)
+        stub_version = dfu.get_version()
+        if not stub_version.startswith(TRANSMITTER_DFU_STUB_PREFIX):
+            raise RuntimeError(
+                f"expected the DFU stub at I2C 0x{i2c_addr:02X} but "
+                f"GETVERSION returned {stub_version!r} — refusing a full-flash "
+                "write against a bootloader's slot-only DFU.")
+        logger.info("DFU stub @ 0x%02X: %s", i2c_addr, stub_version)
+
+        logger.info("I2C DFU: FULL-CHIP erase (the point of no return — keep "
+                    "the unit powered)...")
+        dfu.mass_erase()
+        logger.info("I2C DFU: writing the production image (%d bytes at "
+                    "0x%08X)...", len(image), TRANSMITTER_FLASH_BASE)
+        dfu.write_memory(TRANSMITTER_FLASH_BASE, image,
+                         progress_callback=progress_callback)
+        logger.info("I2C DFU: sending manifest...")
+        dfu.manifest()
+        logger.info("I2C DFU: resetting the slave (the new secure bootloader "
+                    "verifies the signed app and launches it)...")
+        dfu.reset()
+        return stub_version
 
     def _wait_for_usb_dfu(self, vid: int, pid: int, libusb_dll: str | None,
                            timeout_s: float = 30.0, poll_interval_s: float = 1.0,

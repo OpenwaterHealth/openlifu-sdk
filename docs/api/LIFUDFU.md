@@ -42,6 +42,10 @@ Transmitter paths
 - `program_usb(package_file, ...)` — program module 0 via `STM32USBDFU` (PGK1 package).
 - `program_i2c(package_file, ...)` — program slave modules via `STM32I2CDFUviaMaster`.
 - `update_module(module, package_file, enter_dfu_fn, ...)` — trigger DFU entry, wait, detect bootloader, program, manifest.
+- `program_transmitter_slave_i2c(signed_image, i2c_addr, ...)` — stream an SFU1 signed app to a **secure-bootloader** slave's I2C DFU (validated before the erase).
+- `program_transmitter_slave_legacy_i2c(image, i2c_addr, ...)` — write a trusted image (+ on-the-fly WFM1 trust-tag metadata) through a **legacy-bootloader** slave's I2C DFU; used to install the RAM-resident DFU stub.
+- `wait_transmitter_slave_stub(i2c_addr=0x72, timeout_s=30)` — poll until the booted DFU stub answers `GETVERSION` (`dfu-stub-x.y.z`) at the default DFU address.
+- `program_transmitter_slave_production_i2c(combined_image, i2c_addr=0x72, ...)` — **one-shot legacy migration write**: via the DFU stub, full-chip erase (also resets a stale anti-rollback floor) and stream the whole production image (bootloader + signed app) to `0x08000000`. Keep the slave powered from erase to completion.
 
 Console paths (SBSFU signed images from `LIFUCrypto`)
 - `detect_console_dfu_kind(...) -> (kind, version)` — identify the enumerated DFU environment from the USB product string (no DFU transaction).
