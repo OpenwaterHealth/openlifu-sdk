@@ -32,16 +32,21 @@ module 0 (USB master) unit's state and updates it:
 
   - **secure bootloader** (app >= 2.0.8) → standard USB DFU: the signed app
     is written to the active slot and verified by the bootloader at boot.
-  - **no secure bootloader** (app <= 2.0.7) → migrate via the STM32 ROM DFU
-    (OW_CMD_DFU reserved=0x77 force switch): mass-erase and write the
+  - **legacy bootloader** (app 2.0.4 - 2.0.7) → migrate via the STM32 ROM
+    DFU (OW_CMD_DFU reserved=0x77 force switch): mass-erase and write the
     combined bootloader+app production image.
+  - **no bootloader** (app <= 2.0.3) → same production-image migration, but
+    entered with a PLAIN OW_CMD_DFU (those apps ignore the reserved byte and
+    always reboot into the STM32 ROM DFU).
 
 Slave modules (index >= 1) are updated over I2C through the master with
 :meth:`LIFUTransmitterFirmwareUpdate.update_slave`: secure-bootloader slaves
-get the signed app streamed to their slot; legacy slaves (app <= 2.0.7) are
-migrated in ONE SHOT — a small RAM-resident DFU stub is written through the
-legacy I2C DFU, and the full production image (bootloader + app) is then
-streamed through the stub's full-flash I2C DFU.
+get the signed app streamed to their slot; legacy-bootloader slaves (app
+2.0.4 - 2.0.7) are migrated in ONE SHOT — a small RAM-resident DFU stub is
+written through the legacy I2C DFU, and the full production image
+(bootloader + app) is then streamed through the stub's full-flash I2C DFU.
+Slaves on app <= 2.0.3 (no bootloader) cannot be updated over I2C — connect
+them as the USB master and update as module 0.
 
 No signing keys are needed::
 
@@ -112,8 +117,16 @@ def bundled_transmitter_dfu_stub() -> Path:
     """The RAM-resident I2C DFU stub bundled with the SDK (source for
     migrating a LEGACY-bootloader transmitter slave over I2C — uploaded
     through the legacy DFU as an app, it opens a full-flash I2C DFU so the
-    whole production image can be streamed; see transmitter-dfu-stub)."""
+    whole production image can be streamed; see stub-code/transmitter)."""
     return _FW_DIR / "openlifu-transmitter-dfu-stub.bin"
+
+
+def bundled_transmitter_dfu_stub_signed() -> Path:
+    """The SFU1-SIGNED build of the RAM-resident I2C DFU stub (source for the
+    slave FORCE-PRODUCTION path — installed through the SECURE bootloader's
+    I2C DFU like a normal app; signed with the same version as the bundled
+    production app so the anti-rollback floor is untouched)."""
+    return _FW_DIR / "openlifu-transmitter-dfu-stub-signed.bin"
 
 
 @dataclass
@@ -359,18 +372,26 @@ class LIFUTransmitterFirmwareUpdate:
         reboot the running application into DFU, write the SBSFU signed image
         to the active slot with pre-erase validation and anti-downgrade
         checks, and let the bootloader verify it at boot.
-      - **no secure bootloader** (app <= 2.0.7, bare-metal at 0x08000000) →
-        migrate: force the STM32 ROM DFU loader via the OW_CMD_DFU hidden
-        switch (reserved=0x77), mass-erase, and write the combined
-        bootloader + signed-app production image at the flash base
-        (beta/unlocked units only).
+      - **legacy bootloader** (app 2.0.4 - 2.0.7) → migrate: force the STM32
+        ROM DFU loader via the OW_CMD_DFU hidden switch (reserved=0x77,
+        added in 2.0.4), mass-erase, and write the combined bootloader +
+        signed-app production image at the flash base (beta/unlocked units
+        only).
+      - **no bootloader** (app <= 2.0.3, bare-metal at 0x08000000) → same
+        production-image migration, but entered with a PLAIN OW_CMD_DFU:
+        those apps ignore the reserved byte and always reboot straight into
+        the STM32 ROM DFU (there is no other bootloader to enter).
 
     Slave modules (index >= 1) are updated over I2C through the master with
     :meth:`update_slave` — the master puts the slave into its bootloader's
-    I2C DFU, assigns it an address, and the images are streamed over the
-    master's I2C passthrough. Secure-bootloader slaves get the signed app;
-    LEGACY slaves (app <= 2.0.7) are migrated in one shot via the
-    RAM-resident DFU stub (bootloader + app from the production image).
+    I2C DFU and the images are streamed over the master's I2C passthrough.
+    Secure-bootloader slaves get the signed app; LEGACY-bootloader slaves
+    (app 2.0.4 - 2.0.7) are migrated in one shot via the RAM-resident DFU
+    stub (bootloader + app from the production image). Slaves on app <=
+    2.0.3 have NO bootloader and cannot be updated over I2C at all (their
+    DFU entry jumps to the STM32 ROM loader, which does not speak our I2C
+    protocol) — connect such a module as the USB master and update it as
+    module 0.
 
     Needs no signing keys; an optional *keys_dir* only adds an ECDSA
     signature pre-check before flashing.
@@ -398,10 +419,13 @@ class LIFUTransmitterFirmwareUpdate:
         """Determine what update path the unit needs.
 
         Returns ``(cohort, source)`` where cohort is ``COHORT_SECURE`` (app
-        >= 2.0.8, secure bootloader installed) or ``COHORT_NONE`` (app <=
-        2.0.7, bare-metal, no secure bootloader — migration needed), and
-        source is ``"app"`` (from the running app version) or ``"dfu"`` (the
-        unit was already in DFU).
+        >= 2.0.8, secure bootloader installed), ``COHORT_LEGACY`` (app
+        2.0.4 - 2.0.7, legacy bootloader — production-image migration via the
+        reserved=0x77 ROM-DFU force switch) or ``COHORT_NONE`` (app <= 2.0.3,
+        bare-metal, no bootloader — production-image migration via a plain
+        DFU entry, which already lands in the STM32 ROM loader), and source
+        is ``"app"`` (from the running app version) or ``"dfu"`` (the unit
+        was already in DFU).
 
         Raises:
             RuntimeError: No responding application and no recognizable DFU
@@ -448,11 +472,10 @@ class LIFUTransmitterFirmwareUpdate:
                 bootloader, or the DFU device did not enumerate.
         """
         state, source = self.detect()
-        if state == COHORT_NONE:
+        if state in (COHORT_NONE, COHORT_LEGACY):
             raise RuntimeError(
-                "unit has no secure bootloader (app <= 2.0.7, STM32 ROM DFU "
-                "only) — there is no bootloader version to read; run update() "
-                "to migrate it first")
+                "unit has no secure bootloader (app <= 2.0.7) — there is no "
+                "bootloader version to read; run update() to migrate it first")
         in_dfu = source == "dfu"
         if not in_dfu:
             logger.info("Entering DFU to read the bootloader version...")
@@ -489,9 +512,13 @@ class LIFUTransmitterFirmwareUpdate:
                 "(OW_CMD_DFU force switch). Boot the app first, then re-run.")
         prod = (str(production_image) if production_image
                 else str(bundled_transmitter_production_image()))
+        # No-bootloader apps (<= 2.0.3) ignore the reserved byte — a plain DFU
+        # entry already reboots into the ROM loader. All later apps need the
+        # 0x77 force switch to bypass their bootloader's DFU.
+        enter = self._enter_dfu if state == COHORT_NONE else self._enter_rom
         self._mgr.migrate_transmitter_full_image(
             prod,
-            enter_stm32_rom_dfu_fn=None if in_rom_dfu else self._enter_rom,
+            enter_stm32_rom_dfu_fn=None if in_rom_dfu else enter,
             keys_dir=self.keys_dir, vid=self.vid, pid=self.pid,
             libusb_dll=self.libusb_dll, progress_callback=progress_callback)
         return UpdateResult(state, "force-production",
@@ -532,12 +559,17 @@ class LIFUTransmitterFirmwareUpdate:
         state, source = self.detect()
         in_dfu = source == "dfu"
 
-        if state == COHORT_NONE:
+        if state in (COHORT_NONE, COHORT_LEGACY):
             prod = (str(production_image) if production_image
                     else str(bundled_transmitter_production_image()))
+            # COHORT_NONE (<= 2.0.3): the app ignores the reserved byte and a
+            # plain DFU entry reboots straight into the STM32 ROM loader.
+            # COHORT_LEGACY (2.0.4 - 2.0.7): a plain entry would land in the
+            # LEGACY bootloader's DFU, so use the reserved=0x77 force switch.
+            enter = self._enter_dfu if state == COHORT_NONE else self._enter_rom
             self._mgr.migrate_transmitter_full_image(
                 prod,
-                enter_stm32_rom_dfu_fn=None if in_dfu else self._enter_rom,
+                enter_stm32_rom_dfu_fn=None if in_dfu else enter,
                 keys_dir=self.keys_dir, vid=self.vid, pid=self.pid,
                 libusb_dll=self.libusb_dll,
                 progress_callback=progress_callback)
@@ -578,6 +610,7 @@ class LIFUTransmitterFirmwareUpdate:
     def update_slave(self, module: int, *, signed_app: str | None = None,
                      production_image: str | None = None,
                      legacy: bool | None = None, stub_bin: str | None = None,
+                     force_production: bool = False,
                      dfu_wait_s: float = 6.0,
                      progress_callback: Callable | None = None) -> UpdateResult:
         """Update a SLAVE transmitter module (index >= 1) over I2C, through
@@ -587,24 +620,42 @@ class LIFUTransmitterFirmwareUpdate:
 
           - **secure** (app >= 2.0.8): stream the SFU1 signed app to the
             slave's secure bootloader over I2C.
-          - **legacy** (app <= 2.0.7): one-shot migration. Write the small
-            RAM-resident DFU stub (+ its HMAC-trust-tagged WFM1 metadata)
-            over the LEGACY I2C DFU; the legacy BL boots the stub, which
-            serves a FULL-FLASH I2C DFU from RAM; then stream the whole
+          - **legacy** (app 2.0.4 - 2.0.7): one-shot migration. Write the
+            small RAM-resident DFU stub (+ its HMAC-trust-tagged WFM1
+            metadata) over the LEGACY I2C DFU; the legacy BL boots the stub,
+            which serves a FULL-FLASH I2C DFU from RAM; then stream the whole
             production image (secure bootloader + signed app) to 0x08000000
             in one pass. Bootloader and application are updated together.
+
+        With ``force_production=True`` a SECURE-bootloader slave is given the
+        same full-image treatment — the path for rolling a NEW BOOTLOADER
+        onto an already-migrated slave: the SIGNED build of the DFU stub is
+        installed through the secure I2C DFU like a normal app (the
+        bootloader verifies it at boot), the stub opens the full-flash DFU,
+        and the whole production image is streamed. A legacy slave with
+        ``force_production=True`` just takes the normal legacy path (which
+        already reflashes the bootloader).
+
+        Slaves on app <= 2.0.3 (no bootloader at all) CANNOT be updated over
+        I2C — their DFU entry jumps to the STM32 ROM loader, which does not
+        speak this I2C protocol. Auto-detect raises a clear error for them:
+        connect such a module as the USB master and update it as module 0.
 
         Args:
             module: slave module index (>= 1). Module 0 is the USB master —
                 use :meth:`update`.
             signed_app: signed app image (secure path); defaults to the
                 bundled signed app.
-            production_image: combined bootloader+app image (legacy path);
-                defaults to the bundled production image.
+            production_image: combined bootloader+app image (legacy /
+                force-production paths); defaults to the bundled production
+                image.
             legacy: force the legacy-migration path (True) or the secure path
                 (False); ``None`` auto-detects from the slave's app version.
-            stub_bin: override the RAM-resident DFU stub; defaults to the
-                bundled one.
+            stub_bin: override the RAM-resident DFU stub (legacy path: raw
+                build; force-production path: SFU1-signed build). Defaults to
+                the bundled ones.
+            force_production: reflash bootloader + app on a SECURE slave via
+                the signed DFU stub (see above). Beta/unlocked units only.
             dfu_wait_s: seconds to wait for a slave BL to come up on I2C.
 
         Raises:
@@ -625,8 +676,16 @@ class LIFUTransmitterFirmwareUpdate:
                 raise RuntimeError(
                     f"could not read slave {module} version to choose the "
                     f"update path ({e}); pass legacy=True or legacy=False.")
-            legacy = (infer_transmitter_bootloader_from_app_version(ver)
-                      == COHORT_NONE)
+            cohort = infer_transmitter_bootloader_from_app_version(ver)
+            if cohort == COHORT_NONE:
+                raise RuntimeError(
+                    f"slave module {module} runs app {ver} (<= 2.0.3): it has "
+                    "NO bootloader, and its DFU entry jumps to the STM32 ROM "
+                    "loader, which cannot be reached over the master's I2C "
+                    "passthrough. Connect that module as the USB master and "
+                    "update it as module 0 (full production image via ROM "
+                    "DFU).")
+            legacy = cohort == COHORT_LEGACY
             logger.info("Slave %d app %s -> %s bootloader", module, ver,
                         "legacy" if legacy else "secure")
 
@@ -634,6 +693,10 @@ class LIFUTransmitterFirmwareUpdate:
             return self._update_slave_legacy(module, production_image,
                                              stub_bin, dfu_wait_s,
                                              progress_callback)
+        if force_production:
+            return self._update_slave_force_production(
+                module, production_image, stub_bin, dfu_wait_s,
+                progress_callback)
         return self._update_slave_secure(module, signed_app, dfu_wait_s,
                                          progress_callback)
 
@@ -763,6 +826,64 @@ class LIFUTransmitterFirmwareUpdate:
         return UpdateResult(COHORT_SECURE, "migrate-legacy-i2c", summary,
                             reboot_required=False, bl_version=legacy_bl)
 
+    def _update_slave_force_production(self, module: int,
+                                       production_image: str | None,
+                                       stub_bin: str | None,
+                                       dfu_wait_s: float,
+                                       progress_callback: Callable | None
+                                       ) -> UpdateResult:
+        """Force a FULL production reflash (bootloader + app) on a
+        SECURE-bootloader slave — the path for rolling a NEW BOOTLOADER onto
+        an already-migrated slave over I2C.
+
+        The raw stub cannot be used here (the secure BL only boots
+        SFU1-signed images), so the SIGNED stub build is installed through
+        the secure I2C DFU like a normal app update; the BL verifies it at
+        boot and launches it, the stub opens its full-flash I2C DFU at 0x72,
+        and the whole production image is streamed to 0x08000000. The signed
+        stub carries the SAME FwVersion as the bundled production app, so the
+        anti-rollback floor is not disturbed (boot check is version >=
+        floor). Beta/unlocked units only.
+        """
+        tx = self._require_tx()
+        prod = (str(production_image) if production_image
+                else str(bundled_transmitter_production_image()))
+        stub = (str(stub_bin) if stub_bin
+                else str(bundled_transmitter_dfu_stub_signed()))
+        mgr = LIFUDFUManager(uart=tx.uart)
+
+        # Phase 1: install the SIGNED stub into the slot via the secure BL's
+        # I2C DFU (enumerated address); the reset boots it after signature
+        # verification.
+        logger.info("Slave %d: FORCE-PRODUCTION reflash (signed DFU stub + "
+                    "full production image) over I2C", module)
+        addr = self._slave_enter_dfu(module, dfu_wait_s)
+        secure_bl = mgr.program_transmitter_slave_i2c(
+            stub, i2c_addr=addr, keys_dir=self.keys_dir,
+            progress_callback=progress_callback)
+        logger.info("Secure slave BL was %s; signed DFU stub installed.",
+                    secure_bl)
+
+        # Phase 2: the stub listens at the default DFU address (0x72).
+        logger.info("Waiting for the RAM-resident DFU stub to come up...")
+        stub_version = mgr.wait_transmitter_slave_stub(timeout_s=45.0)
+        logger.info("DFU stub is up (%s); streaming the production image "
+                    "(bootloader + app)...", stub_version)
+
+        # Phase 3: full-chip erase + write the production image. If this
+        # phase is aborted the stub keeps serving DFU from RAM (retry while
+        # powered); if the unit is instead power-cycled BEFORE the write, the
+        # secure BL just boots the stub again — rerun via wait + program.
+        mgr.program_transmitter_slave_production_i2c(
+            prod, keys_dir=self.keys_dir, progress_callback=progress_callback)
+
+        app_version = self._slave_post_boot_version(module, dfu_wait_s)
+        summary = (f"Reflashed slave transmitter module {module} with the "
+                   f"full production image (bootloader + app) over I2C"
+                   + (f" (now {app_version})" if app_version else "."))
+        return UpdateResult(COHORT_SECURE, "force-production-i2c", summary,
+                            reboot_required=False, bl_version=secure_bl)
+
     def _require_tx(self):
         if self.tx is None:
             raise RuntimeError(
@@ -883,13 +1004,17 @@ def _run_transmitter_slave(fw: Any, args: Any) -> int:
     legacy = True if args.legacy else None   # None = auto-detect
     if legacy:
         label += " — LEGACY one-shot migration (DFU stub + bootloader + app)"
+    elif args.force_production:
+        label += " — FULL production reflash (signed DFU stub + bootloader + app)"
     if not _confirm(label, args.yes):
         print("Aborted.")
         return 1
     try:
         result = fw.update_slave(module, signed_app=args.app,
                                  production_image=args.production,
-                                 legacy=legacy, progress_callback=_progress)
+                                 legacy=legacy,
+                                 force_production=args.force_production,
+                                 progress_callback=_progress)
     except (ValueError, RuntimeError) as e:
         print(f"\nUPDATE FAILED: {e}")
         return 1
@@ -961,13 +1086,16 @@ def main(argv: list[str] | None = None) -> int:
                              "auto-detect from the slave's app version.")
     parser.add_argument("--force-production", action="store_true",
                         help="Force a FULL production reflash (bootloader + "
-                             "app) via the STM32 ROM DFU, regardless of the "
-                             "unit's state — the path for installing a NEW "
-                             "bootloader. The running app is forced into the "
-                             "ROM loader (OW_CMD_DFU reserved=0x77). "
-                             "Beta/unlocked units only: on RDP/FDA-locked "
-                             "units the bootloader flash is protected and "
-                             "the force switch is inert.")
+                             "app) regardless of the unit's state — the path "
+                             "for installing a NEW bootloader. Module 0: the "
+                             "running app is forced into the STM32 ROM "
+                             "loader (OW_CMD_DFU reserved=0x77). Transmitter "
+                             "slave (--module >= 1): the SIGNED DFU stub is "
+                             "installed through the secure I2C DFU, then the "
+                             "production image is streamed through its "
+                             "full-flash DFU. Beta/unlocked units only: on "
+                             "RDP/FDA-locked units the bootloader flash is "
+                             "protected and these paths are inert.")
     parser.add_argument("-y", "--yes", action="store_true",
                         help="Skip the confirmation prompt.")
     args = parser.parse_args(argv)

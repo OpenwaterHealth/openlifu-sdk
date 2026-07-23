@@ -169,7 +169,7 @@ CONSOLE_FLASH_BASE = 0x08000000
 
 # Transmitter (STM32L443CC) flash geometry. The bootloaders' I2C DFU only
 # exposes the app slot; full-flash I2C access exists solely in the RAM-resident
-# DFU stub (transmitter-dfu-stub), which serves the same protocol but with the
+# DFU stub (stub-code/transmitter), which serves the same protocol but with the
 # writable window opened to the whole chip.
 TRANSMITTER_FLASH_BASE = 0x08000000
 TRANSMITTER_FLASH_SIZE = 0x40000          # 256 KB
@@ -399,11 +399,17 @@ def infer_transmitter_bootloader_from_app_version(app_version: str) -> str:
     version its RUNNING application reports (before entering any DFU mode).
 
     Fleet rules:
-      app >= 2.0.8   -> secure bootloader (``DFU_KIND_SECURE``)
-      app <= 2.0.7   -> no secure bootloader; the app boots bare-metal at
-                        0x08000000 and can jump to the STM32 ROM DFU via the
-                        OW_CMD_DFU force switch (reserved=0x77)
-                        (``DFU_KIND_NONE``)
+      app >= 2.0.8         -> secure bootloader (``DFU_KIND_SECURE``)
+      app 2.0.4 - 2.0.7    -> LEGACY bootloader (``DFU_KIND_LEGACY``): plain
+                              OW_CMD_DFU enters the legacy BL's DFU; the
+                              reserved=0x77 force switch (added in 2.0.4)
+                              enters the STM32 ROM DFU instead.
+      app <= 2.0.3         -> NO bootloader (``DFU_KIND_NONE``): the app boots
+                              bare-metal at 0x08000000 and ignores the
+                              reserved byte — plain OW_CMD_DFU already reboots
+                              into the STM32 ROM DFU (0xDEADBEEF magic at
+                              0x20003FF0, checked by SystemInit). These apps
+                              predate slave I2C update support entirely.
 
     *app_version* accepts plain or git-describe semver ("2.0.8",
     "2.0.8-rc.2", "v2.0.7-3-gabc").
@@ -417,7 +423,11 @@ def infer_transmitter_bootloader_from_app_version(app_version: str) -> str:
         raise ValueError(f"Invalid app version: {app_version!r} (want 'M.m.p')")
     ver = tuple(int(p) for p in parts)
 
-    return DFU_KIND_SECURE if ver >= (2, 0, 8) else DFU_KIND_NONE
+    if ver >= (2, 0, 8):
+        return DFU_KIND_SECURE
+    if ver >= (2, 0, 4):
+        return DFU_KIND_LEGACY
+    return DFU_KIND_NONE
 
 # OW_I2C_PASSTHRU sub-commands (must match firmware if_commands.c handler)
 _PASSTHRU_WRITE       = 0x00   # write only
@@ -2261,7 +2271,7 @@ class LIFUDFUManager:
         """Write a trusted app image (+ its WFM1 metadata) to a
         LEGACY-bootloader slave over I2C, then reset it so the legacy BL
         validates the metadata's HMAC trust tag and boots the image. Used to
-        install the RAM-resident DFU stub (transmitter-dfu-stub) that serves
+        install the RAM-resident DFU stub (stub-code/transmitter) that serves
         the full-flash I2C DFU for the one-shot migration.
 
         The slave must already be in the LEGACY bootloader's I2C DFU at

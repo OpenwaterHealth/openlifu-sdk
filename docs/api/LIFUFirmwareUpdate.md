@@ -79,7 +79,8 @@ Same auto-detect pattern for the transmitter. Module 0 (the USB master):
 
 | Unit state | App version | Path taken |
 |---|---|---|
-| No secure bootloader | ≤ 2.0.7 | Migrate via STM32 ROM DFU (combined production image, `OW_CMD_DFU` force switch) |
+| No bootloader | ≤ 2.0.3 | Migrate via STM32 ROM DFU (combined production image; plain `OW_CMD_DFU` — those apps ignore the reserved byte and always reboot into the ROM loader) |
+| Legacy bootloader | 2.0.4 – 2.0.7 | Migrate via STM32 ROM DFU (combined production image, `OW_CMD_DFU` reserved=0x77 force switch) |
 | Secure bootloader | ≥ 2.0.8 | Normal signed-app update over USB DFU |
 
 **Slave modules** (`--module N`, N ≥ 1) are updated over I2C through the
@@ -87,10 +88,13 @@ master's passthrough with `update_slave(module, ...)`:
 
 - **secure** (app ≥ 2.0.8): the SFU1 signed app is streamed to the slave's
   secure-bootloader I2C DFU (enumerated address 0x20+).
-- **legacy** (app ≤ 2.0.7): **one-shot migration** of bootloader + app.
+- **no bootloader** (app ≤ 2.0.3): **not updatable over I2C** — DFU entry
+  jumps those units into the STM32 ROM loader, which does not speak our I2C
+  protocol. Connect the module as the USB master and update it as module 0.
+- **legacy** (app 2.0.4 – 2.0.7): **one-shot migration** of bootloader + app.
   1. The small RAM-resident **DFU stub**
      (`firmware/openlifu-transmitter-dfu-stub.bin`, built from
-     `transmitter-dfu-stub/`) is written through the legacy I2C DFU with an
+     `stub-code/transmitter/`) is written through the legacy I2C DFU with an
      HMAC-trust-tagged WFM1 metadata block (computed on the fly — no keys).
   2. The legacy bootloader validates and boots the stub, which copies itself
      to SRAM and serves the same I2C DFU protocol at the default address
@@ -106,6 +110,20 @@ master's passthrough with `update_slave(module, ...)`:
   from the full-chip erase until the write completes; the stub keeps serving
   DFU from RAM after any failed write (retry is possible), but a power loss
   in that window leaves the module SWD-recoverable only.
+
+**Rolling a NEW bootloader onto already-migrated units** (`--force-production`):
+
+- **Module 0** (≥ 2.0.4): the running app is forced into the STM32 ROM DFU
+  (`OW_CMD_DFU` reserved=0x77) and the full production image is reflashed.
+- **Slave, secure BL** (≥ 2.0.8): the **signed** DFU stub
+  (`firmware/openlifu-transmitter-dfu-stub-signed.bin`) is installed through
+  the secure I2C DFU like a normal app — the bootloader verifies its SFU1
+  signature at boot — then the production image is streamed through the
+  stub's full-flash DFU, same as the legacy migration. The signed stub
+  carries the same FwVersion as the bundled production app, so the
+  anti-rollback floor (boot check: version ≥ floor) is untouched.
+- A legacy slave with `--force-production` simply takes the normal legacy
+  path, which already reflashes the bootloader.
 
 CLI:
 
