@@ -281,7 +281,7 @@ class TxDevice(OWComponent):
             pulse_train_interval = pulse_interval
         elif pulse_train_interval > 0 and (pulse_train_interval < pulse_interval * pulse_count):
             raise ValueError("Pulse train interval cannot be less than pulse interval * pulse count")
-        elif pulse_train_interval == 0:
+        elif pulse_train_interval - (pulse_interval * pulse_count) < MIN_PROFILE_SWITCH_INTERVAL:
             # Back-to-back trains: pad the train duration with a safety margin.
             # If the interval exactly equals the train duration, the firmware
             # TIM2 (train) expiry races the final TIM1 pulse and the trigger
