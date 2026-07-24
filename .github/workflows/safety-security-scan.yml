@@ -19,7 +19,7 @@ jobs:
           python-version: "3.12"
 
       - name: Install Analysis Tools
-        run: pip install ruff bandit lizard
+        run: pip install ruff==0.15.0 bandit lizard
 
       # 1. Ruff (correctness / dead code / import hygiene)
       # Python counterpart of the firmware repos' cppcheck gate; any finding
