@@ -4,16 +4,14 @@ import json
 import logging
 import re
 import struct
-import time
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Annotated, Dict, List, Literal, Optional
+from typing import TYPE_CHECKING, Annotated, Dict, List, Literal
 
 import numpy as np
 
 from openlifu_sdk.io.component import OWComponent, register_command_packet_types
 from openlifu_sdk.util.annotations import OpenLIFUFieldData
 from openlifu_sdk.util.units import getunitconversion
-from openlifu_sdk.util.hwid import format_hwid
 
 DEFAULT_NUM_TRANSMITTERS = 2
 TRANSMITTERS_PER_MODULE = 2
@@ -1701,7 +1699,6 @@ class Tx7332Registers:
             y = pattern['y']*int(cycles+1)
             y = y[:(16*elastic_repeat)]
             y = y + ([0]*pulse_profile.tail_count)
-            t = np.arange(len(y))*(1/clk_n)
             elastic_mode = 1
             if elastic_repeat > MAX_ELASTIC_REPEAT:
                 raise ValueError("Pattern duration too long for elastic repeat")
