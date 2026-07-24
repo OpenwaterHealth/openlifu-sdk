@@ -33,3 +33,10 @@ set_trigger
 # handshake.
 _sender_loop
 _read_response_sync
+
+# Beamforming solution loader (io/LIFUTXDevice.py) — programs delay profiles,
+# pulse profiles, apodization, and execution-order cycling into the TX device
+# in one atomic call; branching comes from multi-profile validation + mapping
+# logic that must stay co-located to keep the JSON payload consistent
+# (CCN 44, NLOC 145).
+set_solution
