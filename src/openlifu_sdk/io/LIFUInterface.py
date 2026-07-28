@@ -484,9 +484,8 @@ class LIFUInterface:
             sequence=solution['sequence'],
             profile_index=profile_index,
             profile_increment=profile_increment,
-            trigger_mode=trigger_mode,
-            execution_order=solution.get('execution_order'),
-            pulse_profile_map=solution.get('pulse_profile_map'),
+            profile_order = solution.get('order', None),
+            trigger_mode=trigger_mode
         )
         self.set_status(LIFUInterfaceStatus.STATUS_READY)
 

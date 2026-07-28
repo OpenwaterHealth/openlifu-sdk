@@ -849,8 +849,8 @@ class TxDevice(OWComponent):
                      trigger_mode: TriggerModeOpts = "sequence",
                      profile_index: int = 1,
                      profile_increment: bool = True,
-                     execution_order: List[int] | None = None,
-                     pulse_profile_map: Dict[int, int] | None = None) -> bool:
+                     profile_order: List[int] | None = None,
+                     _pulse_profile_map: Dict[int, int] | None = None) -> bool:
         """Program the TX device with the supplied beamforming solution.
 
         For multi-profile solutions, row ``i`` of ``delays`` and ``apodizations``
@@ -881,9 +881,8 @@ class TxDevice(OWComponent):
             trigger_mode:       "sequence", "continuous", or "single".
             profile_index:      Initial active delay profile (1-16).
             profile_increment:  Whether firmware auto-increments profile on sequence end.
-            execution_order:    List[int] of delay profile indices to cycle.
-                               If None, defaults to [1, 2, ..., N].
-            pulse_profile_map:  Optional dict mapping delay profile index (1-based) to
+            profile_order:      Optional list of delay profile indices (1-based) to execute in order.
+            _pulse_profile_map:  Optional dict mapping delay profile index (1-based) to
                                pulse profile index (1-based).  When None, derived from
                                the ``pulse`` argument type.
 
@@ -919,43 +918,42 @@ class TxDevice(OWComponent):
         num_pulse_profiles = len(pulse_configs)
 
         # Build pulse_profile_map: delay profile index (1-based) -> pulse profile index (1-based)
-        if pulse_profile_map is None:
+        if _pulse_profile_map is None:
             if num_pulse_profiles == 1:
                 # Single pulse config: all delay profiles share pulse profile 1.
-                pulse_profile_map = {i + 1: 1 for i in range(n)}
+                _pulse_profile_map = {i + 1: 1 for i in range(n)}
             else:
                 if num_pulse_profiles != n:
                     raise ValueError(
                         f"When pulse is a list without pulse_profile_map, "
                         f"it must have one entry per delay profile row ({n}), got {num_pulse_profiles}"
                     )
-                pulse_profile_map = {i + 1: i + 1 for i in range(n)}
+                _pulse_profile_map = {i + 1: i + 1 for i in range(n)}
         else:
-            for dp_idx, pp_idx in pulse_profile_map.items():
+            for dp_idx, pp_idx in _pulse_profile_map.items():
                 if dp_idx < 1 or dp_idx > n:
-                    raise ValueError(f"pulse_profile_map key {dp_idx} out of range 1-{n}")
+                    raise ValueError(f"_pulse_profile_map key {dp_idx} out of range 1-{n}")
                 if pp_idx < 1 or pp_idx > num_pulse_profiles:
-                    raise ValueError(f"pulse_profile_map value {pp_idx} out of range 1-{num_pulse_profiles}")
+                    raise ValueError(f"_pulse_profile_map value {pp_idx} out of range 1-{num_pulse_profiles}")
             for i in range(1, n + 1):
-                if i not in pulse_profile_map:
-                    raise ValueError(f"pulse_profile_map missing mapping for delay profile {i}")
+                if i not in _pulse_profile_map:
+                    raise ValueError(f"_pulse_profile_map missing mapping for delay profile {i}")
 
-        # Default to sequential execution order: [1, 2, ..., n].
-        if execution_order is None:
-            execution_order = list(range(1, n + 1))
-
-        if not isinstance(execution_order, list):
-            raise ValueError("execution_order must be a list of profile indices")
-        if len(execution_order) == 0:
-            raise ValueError("execution_order cannot be empty")
-        if len(execution_order) > MAX_EXECUTION_ORDER:
+        if profile_order is None:
+            # Default to sequential execution order: [1, 2, ..., n].
+            profile_order = list(range(1, n + 1))
+        if not isinstance(profile_order, list):
+            raise ValueError("profile_order must be a list of profile indices")
+        if len(profile_order) == 0:
+            raise ValueError("profile_order cannot be empty")
+        if len(profile_order) > MAX_EXECUTION_ORDER:
             raise ValueError(
-                f"execution_order length ({len(execution_order)}) exceeds the "
+                f"profile_order length ({len(profile_order)}) exceeds the "
                 f"maximum of {MAX_EXECUTION_ORDER}"
             )
-        for idx in execution_order:
+        for idx in profile_order:
             if not isinstance(idx, int) or idx < 1 or idx > n:
-                raise ValueError(f"execution_order contains invalid profile index {idx}. Must be in 1-{n}")
+                raise ValueError(f"profile_order contains invalid profile index {idx}. Must be in 1-{n}")
 
         # Pulse-level profile switching interlocks: firmware switches profiles
         # between pulses, so pulse_count must be divisible by the execution
@@ -964,7 +962,7 @@ class TxDevice(OWComponent):
         # the profile-switch SPI writes.
         if n > 1:
             pulse_count = sequence["pulse_count"]
-            n_exec = len(execution_order)
+            n_exec = len(profile_order)
             if pulse_count % n_exec != 0:
                 raise ValueError(
                     f"pulse_count ({pulse_count}) must be divisible by the number of "
@@ -983,7 +981,7 @@ class TxDevice(OWComponent):
                     f"the pulse duration."
                 )
 
-        logger.info(f"Grouped profile package system: {n} profiles, execution_order={execution_order}")
+        logger.info(f"Grouped profile package system: {n} profiles, profile_order={profile_order}")
 
         n_elements = delays.shape[1]
         n_required_devices = int(n_elements / NUM_CHANNELS)
@@ -993,9 +991,9 @@ class TxDevice(OWComponent):
         # Pre-compute duty cycle per mapped pulse config: use max apodization
         # across all delay profiles sharing the same pulse config.
         duty_cycle_by_pulse = {}
-        for pidx in set(pulse_profile_map.values()):
+        for pidx in set(_pulse_profile_map.values()):
             pulse_cfg = pulse_configs[pidx - 1]
-            mapped_dps = [k for k, v in pulse_profile_map.items() if v == pidx]
+            mapped_dps = [k for k, v in _pulse_profile_map.items() if v == pidx]
             max_apod = max(max(apodizations[dp - 1, :]) for dp in mapped_dps)
             duty_cycle_by_pulse[pidx] = DEFAULT_PATTERN_DUTY_CYCLE * max_apod * pulse_cfg["amplitude"]
 
@@ -1005,7 +1003,7 @@ class TxDevice(OWComponent):
         # When multiple delay profiles share the same pulse config, the
         # pattern data is replicated across their slots.
         for dp in range(n):
-            pidx = pulse_profile_map[dp + 1]
+            pidx = _pulse_profile_map[dp + 1]
             pulse_cfg = pulse_configs[pidx - 1]
             pulse_profile = Tx7332PulseProfile(
                 profile=dp + 1,
@@ -1066,11 +1064,11 @@ class TxDevice(OWComponent):
             for profile in sorted(self.tx_registers.configured_delay_profiles()):
                 delay_control = self.tx_registers.get_delay_control_registers(profile)
                 apod_reg_values.append([regs[ADDRESS_APODIZATION] for regs in delay_control])
-            self._send_grouped_profile_cycle(execution_order, apod_reg_values)
+            self._send_grouped_profile_cycle(profile_order, apod_reg_values)
 
         return True
 
-    def _send_grouped_profile_cycle(self, execution_order: List[int], apod_reg_values: List[List[int]]) -> bool:
+    def _send_grouped_profile_cycle(self, profile_order: List[int], apod_reg_values: List[List[int]]) -> bool:
         """Send grouped profile cycle command with pre-computed apodization registers.
 
         The SDK pre-computes the TX7332 apodization register values (including the
@@ -1102,10 +1100,10 @@ class TxDevice(OWComponent):
         # Header
         payload.append(n_profiles)
         payload.append(n_chips)
-        payload.append(len(execution_order))
+        payload.append(len(profile_order))
 
-        # Execution order indices (1-based profile numbers)
-        for profile_idx in execution_order:
+        # Profile order indices (1-based profile numbers)
+        for profile_idx in profile_order:
             payload.append(profile_idx & 0xFF)
 
         # Pre-computed apodization registers: uint32 little-endian per chip per profile
@@ -1116,7 +1114,7 @@ class TxDevice(OWComponent):
 
         logger.info(
             f"Sending grouped profile cycle: {n_profiles} profiles, {n_chips} chips, "
-            f"execution_order={execution_order}, payload_size={len(payload)} bytes"
+            f"profile_order={profile_order}, payload_size={len(payload)} bytes"
         )
 
         self.send_checked(
