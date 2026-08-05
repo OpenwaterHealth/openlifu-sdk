@@ -249,15 +249,40 @@ class TxDevice(OWComponent):
         """
         Set the trigger configuration on the TX device.
 
+        Values are sent to the firmware exactly as given, with two
+        exceptions: (1) in sequence/single mode an interval equal to the
+        train duration (in host or on-device arithmetic) means zero gap
+        and is sent as 0 (logged), using the firmware's native
+        single-timer back-to-back path; (2) with a single train in
+        sequence/single mode the spacing has no effect, so a too-short
+        interval is coerced to 0. Continuous mode rejects train-duration
+        equality (it cannot use the 0 path without losing per-train
+        bookkeeping).
+
         Args:
-            pulse_interval (float): The time interval between pulses in seconds.
-            pulse_count (int): The number of pulses to generate.
+            pulse_interval (float): The time interval between pulses in
+                seconds. Must be <= 1 s (the firmware parses the trigger
+                frequency as an integer number of Hz).
+            pulse_count (int): The number of pulses to generate per train.
             pulse_width (int): The pulse width in microseconds.
-            pulse_train_interval (float): The time interval between pulse trains in seconds.
+            pulse_train_interval (float): The time interval between pulse
+                train starts in seconds. 0 means back-to-back trains (no
+                inter-train gap). A nonzero value must be at least the
+                train duration; equality (in host or on-device arithmetic)
+                is treated as zero gap -- see above and the ValueError
+                below.
             pulse_train_count (int): The number of pulse trains to generate.
-            mode (TriggerModeOpts): The trigger mode to use.
-            profile_index (int): The pulse profile to use.
-            profile_increment (bool): Whether to increment the pulse profile.
+            trigger_mode (TriggerModeOpts): The trigger mode to use.
+            profile_index (int): Reserved; not sent to the firmware (the
+                trigger JSON hardcodes ProfileIndex 0).
+            profile_increment (bool): Reserved; not sent to the firmware.
+
+        Raises:
+            ValueError: If the inputs are invalid, including a nonzero
+                pulse_train_interval shorter than the on-device train
+                duration ``pulse_count * (1_000_000 // int(1/pulse_interval))``
+                microseconds (the firmware truncates fractional Hz, so its
+                train can run longer than the host-side float math suggests).
         """
 
         trigger_mode = trigger_mode.lower()
@@ -270,20 +295,58 @@ class TxDevice(OWComponent):
         else:
             raise ValueError("Invalid trigger mode")
 
-        if pulse_train_count <= 1:
-            # Only one train will ever fire, so the inter-train spacing is
-            # functionally meaningless. Force it to a value derived from
-            # pulse_interval so the firmware compatibility shim below can
-            # bump it above the per-pulse period.
-            pulse_train_interval = pulse_interval
-        elif pulse_train_interval > 0 and (pulse_train_interval < pulse_interval * pulse_count):
-            raise ValueError("Pulse train interval cannot be less than pulse interval * pulse count")
-        elif pulse_train_interval - (pulse_interval * pulse_count) < MIN_PROFILE_SWITCH_INTERVAL:
-            # Back-to-back trains: pad the train duration with a safety margin.
-            # If the interval exactly equals the train duration, the firmware
-            # TIM2 (train) expiry races the final TIM1 pulse and the trigger
-            # output becomes unstable.
-            pulse_train_interval = pulse_interval * pulse_count + MIN_PROFILE_SWITCH_INTERVAL
+        if pulse_interval <= 0:
+            raise ValueError("pulse_interval must be positive")
+
+        # FW truncates Hz to int and integer-divides the period,
+        # so the train on the transmitter can be longer than what the host math says.
+        fw_freq_int = int(1.0 / pulse_interval)
+        if fw_freq_int <= 0:
+            raise ValueError(
+                f"pulse_interval {pulse_interval} s implies a trigger "
+                f"frequency below 1 Hz; the firmware parses the trigger "
+                f"frequency as an integer number of Hz and cannot represent "
+                f"this."
+            )
+        fw_period_us = 1_000_000 // fw_freq_int
+        fw_train_us = fw_period_us * pulse_count
+
+        # With only one train the spacing has no effect
+        single_train = (pulse_train_count <= 1
+                        and trigger_mode_int != TRIGGER_MODE_CONTINUOUS)
+
+        host_train_us = int(round(pulse_interval * pulse_count * 1e6))
+
+        interval_us = int(round(pulse_train_interval * 1e6))
+        if pulse_train_interval == 0 or (single_train
+                                         and interval_us < fw_train_us):
+            pulse_train_interval = 0.0
+        elif interval_us == host_train_us or interval_us == fw_train_us:
+            if trigger_mode_int == TRIGGER_MODE_CONTINUOUS:
+                # The train timer would expire on the final pulse tick, and
+                # continuous mode's 0 path has no per-train bookkeeping.
+                raise ValueError(
+                    f"pulse_train_interval equals the on-device train "
+                    f"duration ({fw_train_us} us); in continuous mode this "
+                    f"puts the firmware train-timer expiry on the same tick "
+                    f"as the final pulse. Use a longer interval."
+                )
+            # Zero gap: use the firmware's single-timer back-to-back path.
+            logger.info(
+                "pulse_train_interval %s s equals the train duration "
+                "(%s us on-device) -- zero inter-train gap; sending 0 to "
+                "use the firmware's native back-to-back path.",
+                pulse_train_interval, fw_train_us,
+            )
+            pulse_train_interval = 0.0
+        elif interval_us < fw_train_us:
+            raise ValueError(
+                f"pulse_train_interval {pulse_train_interval} s "
+                f"({interval_us} us) is shorter than the on-device train "
+                f"duration ({fw_train_us} us = {pulse_count} x {fw_period_us} "
+                f"us integer-truncated firmware periods). Use at least "
+                f"{fw_train_us / 1e6} s, or 0 for back-to-back trains."
+            )
 
         # Firmware <= 2.0.3 compatibility shim.
         #
@@ -335,7 +398,7 @@ class TxDevice(OWComponent):
             "TriggerFrequencyHz": 1/pulse_interval,
             "TriggerPulseCount": pulse_count,
             "TriggerPulseWidthUsec": pulse_width,
-            "TriggerPulseTrainInterval": pulse_train_interval * 1000000,
+            "TriggerPulseTrainInterval": int(round(pulse_train_interval * 1_000_000)),
             "TriggerPulseTrainCount": pulse_train_count,
             "TriggerMode": trigger_mode_int,
             "ProfileIndex": 0,
@@ -866,8 +929,8 @@ class TxDevice(OWComponent):
         (possibly shared across delay profiles), delay values (register 0x16
         selector + delay RAM), and an apodization configuration (register 0x1B).
 
-        For multi-profile solutions the firmware cycles through
-        ``execution_order`` at pulse boundaries: each entry gets
+        When ``execution_order`` has more than one entry, the firmware
+        cycles through it at pulse boundaries: each entry gets
         ``pulse_count / len(execution_order)`` consecutive pulses, and the
         order restarts at the beginning of every pulse train.
 
@@ -956,12 +1019,16 @@ class TxDevice(OWComponent):
             if not isinstance(idx, int) or idx < 1 or idx > n:
                 raise ValueError(f"execution_order contains invalid profile index {idx}. Must be in 1-{n}")
 
-        # Pulse-level profile switching interlocks: firmware switches profiles
-        # between pulses, so pulse_count must be divisible by the execution
-        # order length, and the acoustic burst must end before the dead-time
-        # window at the end of each trigger period where the firmware performs
-        # the profile-switch SPI writes.
-        if n > 1:
+        rastering = len(execution_order) > 1
+        if not rastering and execution_order[0] != profile_index:
+            logger.info(
+                "Single-entry execution_order [%d]: activating that profile "
+                "instead of profile_index=%d.",
+                execution_order[0], profile_index,
+            )
+            profile_index = execution_order[0]
+
+        if rastering:
             pulse_count = sequence["pulse_count"]
             n_exec = len(execution_order)
             if pulse_count % n_exec != 0:
@@ -1058,9 +1125,10 @@ class TxDevice(OWComponent):
                 self.write_register(txi, ADDRESS_PATTERN_SEL_G1, (profile_index - 1) & PATTERN_PROFILE_SELECT_MASK)
                 self.write_register(txi, ADDRESS_PATTERN_SEL_G2, (profile_index - 1) & PATTERN_PROFILE_SELECT_MASK)
 
-            # Send execution_order plus the pre-computed per-chip apodization
-            # register of each profile so firmware can auto-cycle profiles at
-            # pulse boundaries: apod_reg_values[profile - 1][chip] = uint32.
+        if rastering:
+            # Send execution_order plus per-chip apodization registers so
+            # firmware can auto-cycle profiles at pulse boundaries:
+            # apod_reg_values[profile - 1][chip] = uint32.
             apod_reg_values = []
             for profile in sorted(self.tx_registers.configured_delay_profiles()):
                 delay_control = self.tx_registers.get_delay_control_registers(profile)
