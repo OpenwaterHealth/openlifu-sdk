@@ -249,33 +249,16 @@ class TxDevice(OWComponent):
         """
         Set the trigger configuration on the TX device.
 
-        Values are sent to the firmware exactly as given, with two
-        exceptions: (1) in sequence/single mode an interval equal to the
-        train duration (in host or on-device arithmetic) means zero gap
-        and is sent as 0 (logged), using the firmware's native
-        single-timer back-to-back path; (2) with a single train in
-        sequence/single mode the spacing has no effect, so a too-short
-        interval is coerced to 0. Continuous mode rejects train-duration
-        equality (it cannot use the 0 path without losing per-train
-        bookkeeping).
-
         Args:
-            pulse_interval (float): The time interval between pulses in
-                seconds. Must be <= 1 s (the firmware parses the trigger
-                frequency as an integer number of Hz).
-            pulse_count (int): The number of pulses to generate per train.
+            pulse_interval (float): The time interval between pulses in seconds. 
+            pulse_count (int): The number of pulses to generate.
             pulse_width (int): The pulse width in microseconds.
             pulse_train_interval (float): The time interval between pulse
-                train starts in seconds. 0 means back-to-back trains (no
-                inter-train gap). A nonzero value must be at least the
-                train duration; equality (in host or on-device arithmetic)
-                is treated as zero gap -- see above and the ValueError
-                below.
+                train starts in seconds.
             pulse_train_count (int): The number of pulse trains to generate.
             trigger_mode (TriggerModeOpts): The trigger mode to use.
-            profile_index (int): Reserved; not sent to the firmware (the
-                trigger JSON hardcodes ProfileIndex 0).
-            profile_increment (bool): Reserved; not sent to the firmware.
+            profile_index (int): The pulse profile to use.
+            profile_increment (bool): Whether to increment the pulse profile.
 
         Raises:
             ValueError: If the inputs are invalid, including a nonzero
@@ -295,8 +278,11 @@ class TxDevice(OWComponent):
         else:
             raise ValueError("Invalid trigger mode")
 
+        # Validate inputs
         if pulse_interval <= 0:
             raise ValueError("pulse_interval must be positive")
+        if pulse_count < 1:
+            raise ValueError("pulse_count must be at least 1")
 
         # FW truncates Hz to int and integer-divides the period,
         # so the train on the transmitter can be longer than what the host math says.
