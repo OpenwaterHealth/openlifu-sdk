@@ -183,9 +183,12 @@ def find_stm32_programmer_cli() -> str | None:
     """Locate the STM32CubeProgrammer CLI (STM32_Programmer_CLI), or None.
 
     Checks $STM32_PROGRAMMER_CLI, PATH, and the default Windows/macOS/Linux
-    install locations. STM32CubeProgrammer provides a rock-solid USB-DFU
-    implementation used for the bootloader-replacement write, where a
-    pure-Python DfuSe write against the STM32 ROM loader is unreliable.
+    install locations.
+
+    NOTE: no SDK path depends on CubeProgrammer any more — every ROM-loader
+    write goes through the pure-Python DfuSe driver
+    (:mod:`openlifu_sdk.io.STM32DFU`). This helper is kept for callers that
+    want to drive CubeProgrammer themselves.
     """
     import os
     import shutil
@@ -365,6 +368,21 @@ DFU_KIND_NONE    = "no-bootloader"
 DFU_KIND_NO_DFU  = "no-dfu"
 DFU_KIND_UNKNOWN = "unknown"
 
+# Oldest console app that can put itself into ANY DFU mode. Below this the
+# OW_CMD_DFU request does not reboot the unit into a DFU environment at all, so
+# no software update path exists — those units need BOOT0 (STM32 ROM loader) or
+# SWD.
+CONSOLE_MIN_DFU_APP_VERSION = (1, 1, 0)
+
+# First console app shipped WITH the (legacy) custom bootloader. Below it the
+# app boots bare-metal and a DFU request lands in the STM32 ROM loader; from
+# here up to CONSOLE_SECURE_BL_APP_VERSION the legacy bootloader answers the
+# DFU request and the RAM-resident updater is required to move on.
+CONSOLE_LEGACY_BL_APP_VERSION = (1, 2, 3)
+
+# First console app shipped with the current (secure/SBSFU) bootloader.
+CONSOLE_SECURE_BL_APP_VERSION = (1, 2, 6)
+
 # Oldest transmitter app that can put itself into ANY DFU mode: 2.0.2 added the
 # OW_CMD_DFU handler that arms the ROM-loader magic (0xDEADBEEF at 0x20003FF0)
 # and resets. Anything older simply ignores the command, so no software path —
@@ -379,10 +397,22 @@ def infer_console_bootloader_from_app_version(app_version: str) -> str:
     version its RUNNING application reports (before entering any DFU mode).
 
     Fleet rules:
-      app >= 1.2.6           -> secure bootloader (``DFU_KIND_SECURE``)
-      1.2.0 <= app < 1.2.6   -> legacy bootloader (``DFU_KIND_LEGACY``)
-      app < 1.2.0            -> no bootloader; the app boots directly and can
-                                jump to STM32 ROM DFU (``DFU_KIND_NONE``)
+      app >= 1.2.6           -> secure bootloader (``DFU_KIND_SECURE``): the
+                                current custom bootloader; a DFU request enters
+                                its own DFU and the signed app is flashed.
+      1.2.3 <= app < 1.2.6   -> LEGACY bootloader (``DFU_KIND_LEGACY``): the
+                                first custom bootloader. A DFU request enters
+                                ITS DFU, which can only write the app slot, so
+                                moving to the secure bootloader needs the
+                                RAM-resident updater.
+      1.1.0 <= app < 1.2.3   -> NO bootloader (``DFU_KIND_NONE``): the app
+                                boots bare-metal and a DFU request reboots
+                                straight into the STM32 ROM DFU, where the
+                                combined production image is written.
+      app < 1.1.0            -> NO DFU AT ALL (``DFU_KIND_NO_DFU``): the DFU
+                                request does not reach a DFU environment, so
+                                there is no software update path. Not
+                                upgradable by this SDK — BOOT0 or SWD.
 
     *app_version* accepts plain or git-describe semver ("1.2.6",
     "1.2.6-rc.1-3-gabc", "v1.1.4").
@@ -396,11 +426,13 @@ def infer_console_bootloader_from_app_version(app_version: str) -> str:
         raise ValueError(f"Invalid app version: {app_version!r} (want 'M.m.p')")
     ver = tuple(int(p) for p in parts)
 
-    if ver >= (1, 2, 6):
+    if ver >= CONSOLE_SECURE_BL_APP_VERSION:
         return DFU_KIND_SECURE
-    if ver >= (1, 2, 0):
+    if ver >= CONSOLE_LEGACY_BL_APP_VERSION:
         return DFU_KIND_LEGACY
-    return DFU_KIND_NONE
+    if ver >= CONSOLE_MIN_DFU_APP_VERSION:
+        return DFU_KIND_NONE
+    return DFU_KIND_NO_DFU
 
 
 def infer_transmitter_bootloader_from_app_version(app_version: str) -> str:
@@ -1901,29 +1933,31 @@ class LIFUDFUManager:
         """Migrate a console that is in **STM32 ROM DFU** to the secure
         bootloader, in a single DFU session.
 
-        Intended for field units with NO bootloader (app < 1.2.0): the app
-        jumps to the ROM system loader, which - unlike the legacy or secure
-        bootloaders - can write the entire flash. This writes the new secure
-        bootloader at 0x08000000 and the signed application at the SBSFU slot
-        0x08010000, so that after a power cycle the secure bootloader verifies
-        and launches the app.
+        Intended for field units with NO bootloader (app 1.1.0 - 1.2.2): the
+        app jumps to the ROM system loader, which - unlike the legacy or
+        secure bootloaders - can write the entire flash. This writes the new
+        secure bootloader at 0x08000000 and the signed application at the
+        SBSFU slot 0x08010000, so that after a power cycle the secure
+        bootloader verifies and launches the app.
+
+        Prefer :meth:`migrate_console_full_image` when a combined production
+        image is available; this variant exists for builds where the
+        bootloader and signed app are separate files.
 
         Args:
             bootloader_bin: Raw secure bootloader binary
                 (open-lifu-console-bl build/<cfg>/lifu-console-bl.bin).
             signed_app: SBSFU signed application image (from LIFUCrypto).
             keys_dir: Optional keys dir to fully verify *signed_app* first.
-            verify_rom: Ignored (CubeProgrammer verifies its own download);
-                kept for backwards compatibility.
+            verify_rom: Read the whole image back after writing and compare
+                (default True).
 
         Raises:
             ValueError: Signed app invalid, or bootloader overlaps the slot.
-            RuntimeError: Not in ROM DFU, CubeProgrammer missing, or a write
-                failure.
+            RuntimeError: Not in ROM DFU, or a write/verify failure.
         """
         from openlifu_sdk.io import LIFUCrypto
 
-        del verify_rom   # CubeProgrammer's -v handles verification
         bl_image = Path(bootloader_bin).read_bytes()
         app_image = Path(signed_app).read_bytes()
 
@@ -1934,11 +1968,9 @@ class LIFUDFUManager:
             raise ValueError(
                 f"Refusing to migrate: invalid signed app:\n{report.describe()}")
 
-        # Combine the two regions into one full-flash image so it can be
-        # written with STM32CubeProgrammer, whose USB-DFU implementation is
-        # verified byte-correct on the STM32 ROM loader (the pure-Python DfuSe
-        # writer is NOT reliable there). The bootloader lives at 0x08000000
-        # and the signed app at the slot base 0x08010000.
+        # Combine the two regions into one full-flash image and write it in a
+        # single pass: the bootloader lives at 0x08000000 and the signed app
+        # at the slot base 0x08010000, with 0xFF fill between them.
         slot_off = CONSOLE_SLOT_BASE - CONSOLE_FLASH_BASE
         if len(bl_image) > slot_off:
             raise ValueError(
@@ -1955,24 +1987,22 @@ class LIFUDFUManager:
                 f"Expected STM32 ROM DFU ('STM32 BOOTLOADER'), found {kind!r}. "
                 "This migration path is only for no-bootloader units in ROM DFU.")
 
-        cli = find_stm32_programmer_cli()
-        if cli is None:
-            raise RuntimeError(
-                "STM32CubeProgrammer (STM32_Programmer_CLI) not found - it is "
-                "required for the bootloader-replacement write over STM32 ROM "
-                "DFU. Install it, add it to PATH, or set $STM32_PROGRAMMER_CLI.")
+        # Written with the SDK's own pure-Python DfuSe driver: mass erase (so
+        # nothing outside the image extent survives), program, read-back
+        # verify, then leave DFU so the fresh bootloader boots the app.
+        from openlifu_sdk.io.STM32DFU import STM32DFU
+        logger.info("ROM DFU: writing bootloader (%d B) + signed app "
+                    "(%d B) as one image @ 0x%08X",
+                    len(bl_image), len(app_image), CONSOLE_FLASH_BASE)
+        with STM32DFU(vid=vid, pid=pid, libusb_dll=libusb_dll,
+                      page_size=2048) as rom:
+            rom.mass_erase(progress_callback=progress_callback)
+            rom.flash(bytes(combined), address=CONSOLE_FLASH_BASE, erase=False,
+                      verify=verify_rom, leave=True,
+                      progress_callback=progress_callback)
 
-        import tempfile
-        with tempfile.TemporaryDirectory() as td:
-            img_path = Path(td) / "console_full.bin"
-            img_path.write_bytes(bytes(combined))
-            logger.info("ROM DFU: writing bootloader (%d B) + signed app "
-                        "(%d B) as one image @ 0x%08X",
-                        len(bl_image), len(app_image), CONSOLE_FLASH_BASE)
-            self._cubeprog_write_full_image(cli, str(img_path), progress_callback)
-
-        logger.info("ROM DFU migration complete. Power-cycle the console: the "
-                    "secure bootloader will verify and launch the app.")
+        logger.info("ROM DFU migration complete - the device left DFU; the "
+                    "secure bootloader verifies and launches the app.")
 
     def migrate_console(self, bootloader_bin: str, signed_app: str,
                         enter_stm32_rom_dfu_fn: Callable | None = None,
@@ -2165,11 +2195,16 @@ class LIFUDFUManager:
         combined production image (bootloader + signed app) at the flash base
         in one contiguous write, via STM32 ROM DFU.
 
-        This is the recommended path for legacy-bootloader units: the full
-        erase wipes the legacy metadata page, user-config page and any stale
+        This is the recommended path for no-bootloader units: the full erase
+        wipes the legacy metadata page, user-config page and any stale
         anti-rollback state, leaving a clean slate, and the single verbatim
         write of the production .bin is simpler and less error-prone than
         splitting it into separate bootloader/app regions.
+
+        The write is performed by the SDK's own pure-Python DfuSe driver
+        (:mod:`openlifu_sdk.io.STM32DFU`) — mass erase, program, full
+        read-back verify, then a DfuSe leave so the unit boots the new
+        firmware without a power-cycle. No STM32CubeProgrammer needed.
 
         Args:
             combined_image: The full-flash production image beginning at
@@ -2214,63 +2249,29 @@ class LIFUDFUManager:
                 f"Console did not enter STM32 ROM DFU (found {kind!r}). "
                 "The app may lack the force switch, or the unit is locked.")
 
-        # Bootloader-region write over the STM32 ROM loader: prefer
-        # STM32CubeProgrammer when installed (bench-verified byte-correct on
-        # this ROM loader); otherwise fall back to the SDK's pure-Python ROM
-        # DFU driver (openlifu_sdk.io.STM32DFU: per-page erase, individually
-        # addressed blocks — no wTransferSize address drift — and a full
-        # read-back verify).
-        cli = find_stm32_programmer_cli()
-        if cli is not None:
-            self._cubeprog_write_full_image(cli, combined_image, progress_callback)
-            # CubeProgrammer leaves the unit sitting in ROM DFU; send a DfuSe
-            # leave (best effort) so the fresh bootloader boots the app
-            # without a power-cycle. Proven on the F072 ROM loader.
-            try:
-                from openlifu_sdk.io.STM32DFU import STM32DFU
-                with STM32DFU(vid=vid, pid=pid, libusb_dll=libusb_dll) as rom:
-                    rom.leave(0x08000000)
-                logger.info("ROM DFU leave sent - the bootloader verifies "
-                            "and launches the app.")
-            except Exception as e:
-                logger.info("ROM DFU leave failed (%s) - power-cycle the "
-                            "console to boot.", e)
-        else:
-            logger.info("STM32CubeProgrammer not found - using the "
-                        "pure-Python ROM DFU driver")
-            from openlifu_sdk.io.STM32DFU import STM32DFU
-            with STM32DFU(vid=vid, pid=pid, libusb_dll=libusb_dll,
-                          page_size=2048) as rom:
-                rom.flash(image, address=0x08000000,
-                          progress_callback=progress_callback)
+        # Bootloader-region write over the STM32 ROM loader, done entirely
+        # with the SDK's pure-Python ROM DFU driver (openlifu_sdk.io.STM32DFU)
+        # — no STM32CubeProgrammer dependency. The driver honors the DfuSe
+        # bwPollTimeout windows, addresses every block individually (no
+        # wTransferSize address drift) and verifies by full read-back.
+        #
+        # Mass erase FIRST, exactly as the CubeProgrammer path did with
+        # '-e all': the image's own per-page erase covers only the pages it
+        # occupies, so anything living outside that extent — the user-config
+        # page, any anti-rollback floor log — would survive and could make the
+        # freshly written app unbootable. leave=True so the fresh bootloader
+        # boots the app without a power-cycle.
+        from openlifu_sdk.io.STM32DFU import STM32DFU
+        logger.info("Writing the production image with the pure-Python ROM "
+                    "DFU driver...")
+        with STM32DFU(vid=vid, pid=pid, libusb_dll=libusb_dll,
+                      page_size=2048) as rom:
+            rom.mass_erase(progress_callback=progress_callback)
+            rom.flash(image, address=CONSOLE_FLASH_BASE, erase=False,
+                      leave=True, progress_callback=progress_callback)
 
-        logger.info("Full-image migration complete - the secure bootloader "
-                    "will verify and launch the app.")
-
-    @staticmethod
-    def _cubeprog_write_full_image(cli: str, image_path: str,
-                                   progress_callback: Callable | None) -> None:
-        """Mass-erase and write+verify a full-flash image at 0x08000000 over
-        USB DFU using STM32CubeProgrammer. Raises RuntimeError on failure."""
-        import subprocess
-
-        cmd = [cli, "-c", "port=USB1", "-e", "all",
-               "-d", str(Path(image_path)), "0x08000000", "-v"]
-        logger.info("Running STM32CubeProgrammer: %s", " ".join(cmd))
-        proc = subprocess.run(cmd, capture_output=True, text=True)
-        out = (proc.stdout or "") + (proc.stderr or "")
-        for line in out.splitlines():
-            if any(k in line for k in ("Download", "verified", "Erasing",
-                                       "Error", "erased", "complete")):
-                logger.info("  cubeprog: %s", line.strip())
-        if proc.returncode != 0 or "Download verified successfully" not in out:
-            raise RuntimeError(
-                "STM32CubeProgrammer USB-DFU write/verify failed "
-                f"(rc={proc.returncode}). Output tail:\n"
-                + "\n".join(out.splitlines()[-15:]))
-        if progress_callback:
-            n = Path(image_path).stat().st_size
-            progress_callback(n, n, "CubeProgrammer USB-DFU write+verify")
+        logger.info("Full-image migration complete - the device left DFU; "
+                    "the secure bootloader verifies and launches the app.")
 
     def dwell_rom_dfu_check(self, enter_stm32_rom_dfu_fn: Callable | None = None,
                             seconds: float = 30.0,

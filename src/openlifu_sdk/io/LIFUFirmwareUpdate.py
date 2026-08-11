@@ -1,12 +1,13 @@
 """High-level firmware update for the console and the transmitter.
 
-**Console** (:class:`LIFUFirmwareUpdate`) — one entry point for all three
-cases. A console unit is in one of three states, each needing a different
-update path:
+**Console** (:class:`LIFUFirmwareUpdate`) — one entry point for every case. A
+console unit is in one of four states, each needing a different update path:
 
-  - **no bootloader** (app < 1.2.0)     → migrate to the secure bootloader via
-    the STM32 ROM DFU (write the combined bootloader+app image).
-  - **legacy bootloader** (1.2.0–1.2.5) → migrate via the RAM-resident
+  - **no DFU** (app < 1.1.0)            → REFUSED: the DFU request never
+    reaches a DFU environment, so no software update path exists.
+  - **no bootloader** (1.1.0–1.2.2)     → a plain DFU request reboots into the
+    STM32 ROM DFU; write the combined bootloader+app production image.
+  - **legacy bootloader** (1.2.3–1.2.5) → migrate via the RAM-resident
     self-updater (the legacy DFU can't reach the ROM loader).
   - **secure bootloader** (≥ 1.2.6)     → normal signed-app update.
 
@@ -78,6 +79,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from openlifu_sdk.io.LIFUDFU import (
+    CONSOLE_MIN_DFU_APP_VERSION,
     CONSOLE_PROFILE,
     DFU_KIND_LEGACY,
     DFU_KIND_NO_DFU,
@@ -157,6 +159,30 @@ def bundled_transmitter_dfu_stub_signed() -> Path:
     return _FW_DIR / "openlifu-transmitter-dfu-stub-signed.bin"
 
 
+def _no_dfu_message(device: str, app_version: str | None,
+                    floor: tuple[int, ...], action: str = "updated") -> str:
+    """Message for a unit whose application predates DFU support entirely.
+
+    DFU entry is a request to the RUNNING application (OW_CMD_DFU): it arms
+    the bootloader/ROM-loader path and resets. Apps below *floor* never reboot
+    into a DFU environment in response, so every software path — plain entry,
+    the reserved=0x77 ROM-DFU force switch, any bootloader DFU — dead-ends
+    before it starts. Refusing keeps the unit running instead of stranding it
+    after a half-attempted entry.
+    """
+    ver = app_version or "unknown"
+    floor_str = ".".join(str(p) for p in floor)
+    return (
+        f"{device} app {ver} is older than {floor_str} and cannot be {action}: "
+        "those builds do not reboot into any DFU mode when asked, so no "
+        "software update path exists (not the plain OW_CMD_DFU entry, not the "
+        "reserved=0x77 ROM-DFU force switch). Recover the unit in hardware — "
+        "enter the STM32 ROM loader with BOOT0 at power-up where the board "
+        "exposes it, then re-run this command (it enumerates as 'STM32 "
+        "BOOTLOADER' and the full production image is written from there) — "
+        "or program it over SWD.")
+
+
 @dataclass
 class UpdateResult:
     """Outcome of an update run."""
@@ -170,7 +196,25 @@ class UpdateResult:
 
 
 class LIFUFirmwareUpdate:
-    """Auto-detecting console firmware updater covering all three unit states.
+    """Auto-detecting console firmware updater covering every unit state.
+
+    From a RUNNING application the app version names the cohort, a DFU request
+    is issued, and whichever DFU environment the unit lands in gets the image
+    that belongs to it:
+
+      - **app >= 1.2.6** (current bootloader) → its own DFU → signed app.
+      - **app 1.2.3 - 1.2.5** (legacy bootloader) → the legacy DFU, which can
+        only write the app slot → the RAM-resident updater swaps in the
+        current bootloader, then the signed app is flashed.
+      - **app 1.1.0 - 1.2.2** (no bootloader) → a plain DFU request reboots
+        straight into the STM32 ROM DFU → combined production image.
+      - **app < 1.1.0** → REFUSED: the DFU request never reaches a DFU
+        environment, so there is no software update path (BOOT0 or SWD).
+
+    A unit that is ALREADY in DFU is identified from its USB product string
+    and takes the same image mapping without any DFU request: STM32 ROM DFU →
+    production image, legacy bootloader DFU → updater + signed app, current
+    bootloader DFU → signed app.
 
     Args:
         hv: A connected ``HVController`` (e.g. ``interface.hvcontroller``) used
@@ -190,6 +234,14 @@ class LIFUFirmwareUpdate:
         self.vid = vid
         self.pid = pid
         self._mgr = LIFUDFUManager()
+        # Version string the running app last reported, for error messages.
+        self._last_app_version: str | None = None
+
+    def _no_dfu_message(self, action: str = "updated") -> str:
+        """Why a console app older than 1.1.0 cannot be touched at all; see
+        :func:`_no_dfu_message`."""
+        return _no_dfu_message("console", self._last_app_version,
+                               CONSOLE_MIN_DFU_APP_VERSION, action)
 
     # ------------------------------------------------------------------
     # Detection
@@ -198,9 +250,18 @@ class LIFUFirmwareUpdate:
     def detect_cohort(self) -> tuple[str, str | None]:
         """Determine what update path the unit needs.
 
-        Returns ``(cohort, source)`` where cohort is ``COHORT_NONE`` /
-        ``COHORT_LEGACY`` / ``COHORT_SECURE`` and source is ``"app"`` (from the
+        Returns ``(cohort, source)`` where cohort is ``COHORT_NO_DFU`` (app <
+        1.1.0 — no DFU environment is reachable, so :meth:`update` refuses),
+        ``COHORT_NONE`` (app 1.1.0 - 1.2.2, no bootloader), ``COHORT_LEGACY``
+        (app 1.2.3 - 1.2.5, first custom bootloader) or ``COHORT_SECURE`` (app
+        >= 1.2.6, current bootloader), and source is ``"app"`` (from the
         running app version) or ``"dfu"`` (the unit was already in DFU).
+
+        A unit already in DFU is classified from its USB product string alone:
+        "STM32 BOOTLOADER" -> ``COHORT_NONE``, "LIFU BL DFU x.y.z" ->
+        ``COHORT_LEGACY``, "OW DFU x.y.z" -> ``COHORT_SECURE``. ``COHORT_NO_DFU``
+        can only come from an app version — a unit sitting in a DFU has, by
+        definition, reached one.
 
         Raises:
             RuntimeError: Cannot determine the state (no HV controller and no
@@ -211,6 +272,7 @@ class LIFUFirmwareUpdate:
             try:
                 ver = str(self.hv.get_version())
                 cohort = infer_console_bootloader_from_app_version(ver)
+                self._last_app_version = ver
                 logger.info("Detected app version %s -> cohort %s", ver, cohort)
                 return cohort, "app"
             except Exception as e:
@@ -251,6 +313,8 @@ class LIFUFirmwareUpdate:
                 enumerate.
         """
         cohort, source = self.detect_cohort()
+        if cohort == COHORT_NO_DFU:
+            raise RuntimeError(self._no_dfu_message("put into DFU"))
         if cohort == COHORT_NONE:
             raise RuntimeError(
                 "unit has no bootloader (STM32 ROM DFU) — there is no "
@@ -288,6 +352,8 @@ class LIFUFirmwareUpdate:
         """
         cohort, source = self.detect_cohort()
         in_rom_dfu = source == "dfu" and cohort == COHORT_NONE
+        if cohort == COHORT_NO_DFU:
+            raise RuntimeError(self._no_dfu_message("reflashed"))
         if source == "dfu" and not in_rom_dfu:
             raise RuntimeError(
                 "cannot force a production reflash from bootloader DFU — the "
@@ -295,9 +361,13 @@ class LIFUFirmwareUpdate:
                 "(OW_CMD_DFU force switch). Boot the app first, then re-run.")
         prod = (str(production_image) if production_image
                 else str(bundled_production_image()))
+        # Apps without a bootloader (1.1.0 - 1.2.2) predate the reserved=0x77
+        # force switch; their plain DFU request already lands in the ROM
+        # loader, which is where this path needs to be.
+        enter = self._enter_dfu if cohort == COHORT_NONE else self._enter_rom
         self._mgr.migrate_console_full_image(
             prod,
-            enter_stm32_rom_dfu_fn=None if in_rom_dfu else self._enter_rom,
+            enter_stm32_rom_dfu_fn=None if in_rom_dfu else enter,
             keys_dir=self.keys_dir, vid=self.vid, pid=self.pid,
             libusb_dll=self.libusb_dll, progress_callback=progress_callback)
         return UpdateResult(cohort, "force-production",
@@ -309,6 +379,13 @@ class LIFUFirmwareUpdate:
                force: bool = False, force_production: bool = False,
                progress_callback: Callable | None = None) -> UpdateResult:
         """Detect the unit's state and run the appropriate update.
+
+        The DFU environment the unit reaches decides the image: STM32 ROM DFU
+        (app 1.1.0 - 1.2.2, entered with a plain DFU request) takes the
+        combined production image; the legacy bootloader's DFU (app
+        1.2.3 - 1.2.5) takes the RAM updater and then the signed app; the
+        current bootloader's DFU (app >= 1.2.6) takes the signed app alone.
+        Apps below 1.1.0 are refused — they never reach a DFU environment.
 
         Args:
             production_image: Override the combined bootloader+app image
@@ -337,20 +414,27 @@ class LIFUFirmwareUpdate:
             return self._force_production_update(production_image,
                                                  progress_callback)
         cohort, source = self.detect_cohort()
+        if cohort == COHORT_NO_DFU:
+            raise RuntimeError(self._no_dfu_message())
         prod = str(production_image) if production_image else str(bundled_production_image())
         app = str(signed_app) if signed_app else str(bundled_signed_app())
         # When already in DFU we must not trigger another DFU entry.
         in_dfu = source == "dfu"
 
         if cohort == COHORT_NONE:
+            # App 1.1.0 - 1.2.2 (or already sitting in the STM32 ROM DFU). A
+            # PLAIN DFU request is what these apps understand — they have no
+            # bootloader to intercept it and no reserved=0x77 force switch, so
+            # the request reboots them straight into the ROM loader.
             self._mgr.migrate_console_full_image(
                 prod,
-                enter_stm32_rom_dfu_fn=None if in_dfu else self._enter_rom,
+                enter_stm32_rom_dfu_fn=None if in_dfu else self._enter_dfu,
                 keys_dir=self.keys_dir, vid=self.vid, pid=self.pid,
                 libusb_dll=self.libusb_dll, progress_callback=progress_callback)
             return UpdateResult(cohort, "migrate-rom",
-                                "Migrated no-bootloader unit to the secure "
-                                "bootloader (full image).", reboot_required=True)
+                                "Migrated no-bootloader unit to the current "
+                                "bootloader (full production image via STM32 "
+                                "ROM DFU).", reboot_required=True)
 
         if cohort == COHORT_LEGACY:
             self._mgr.migrate_console_legacy(
@@ -524,26 +608,10 @@ class LIFUTransmitterFirmwareUpdate:
             "Connect the running app, or put the unit in a known DFU mode.")
 
     def _no_dfu_message(self, action: str = "updated") -> str:
-        """Explain why an app older than 2.0.2 cannot be touched at all.
-
-        DFU entry on the transmitter is a request to the RUNNING application
-        (OW_CMD_DFU): it arms the ROM-loader magic word and resets. Apps
-        before 2.0.2 have no handler for that command, so every software path
-        the SDK could take — plain entry, the reserved=0x77 force switch, the
-        bootloader DFUs — dead-ends before it starts. Refusing here keeps the
-        unit intact instead of stranding it after a half-attempted entry.
-        """
-        ver = self._last_app_version or "unknown"
-        floor = ".".join(str(p) for p in TRANSMITTER_MIN_DFU_APP_VERSION)
-        return (
-            f"transmitter app {ver} is older than {floor} and cannot be "
-            f"{action}: those builds have no OW_CMD_DFU handler, so no "
-            "software request can reboot them into any DFU mode (not the "
-            "plain entry, not the reserved=0x77 ROM-DFU force switch). Enter "
-            "the STM32 ROM loader in hardware instead — hold BOOT0 while "
-            "power-cycling the unit, then re-run this command: it enumerates "
-            "as 'STM32 BOOTLOADER' and the full production image (bootloader "
-            "+ app) is written from there. Failing that, program it over SWD.")
+        """Why a transmitter app older than 2.0.2 (no OW_CMD_DFU handler)
+        cannot be touched at all; see :func:`_no_dfu_message`."""
+        return _no_dfu_message("transmitter", self._last_app_version,
+                               TRANSMITTER_MIN_DFU_APP_VERSION, action)
 
     def _legacy_dfu_recovery_message(self, why: str) -> str:
         """Explain, when the USB legacy-updater migration is unavailable, why
@@ -1239,14 +1307,24 @@ def _run_transmitter_slave(fw: Any, args: Any) -> int:
 def _run_console(args: Any) -> int:
     from openlifu_sdk.io.LIFUInterface import LIFUInterface
 
-    interface = LIFUInterface(TX_test_mode=False)
-    _tx, hv = interface.is_device_connected()
-    if not hv:
-        print("Console not connected.")
-        return 1
-    interface.hvcontroller.ping()
+    # A running app is preferred (it lets us trigger DFU entry), but a unit
+    # already sitting in one of the DFU environments works too — its USB
+    # product string names the bootloader and picks the image.
+    hvc = None
+    try:
+        interface = LIFUInterface(TX_test_mode=False)
+        _tx, hv_connected = interface.is_device_connected()
+        if hv_connected:
+            interface.hvcontroller.ping()
+            hvc = interface.hvcontroller
+    except Exception as e:
+        logger.info("Console app connection failed (%s); the unit must "
+                    "already be in USB DFU mode", e)
+    if hvc is None:
+        print("Console app not connected — checking for a unit already in "
+              "USB DFU mode.")
 
-    fw = LIFUFirmwareUpdate(hv=interface.hvcontroller, keys_dir=args.keys)
+    fw = LIFUFirmwareUpdate(hv=hvc, keys_dir=args.keys)
     return _run_update_flow(
         fw, "console", fw.detect_cohort,
         lambda: fw.update(production_image=args.production, signed_app=args.app,

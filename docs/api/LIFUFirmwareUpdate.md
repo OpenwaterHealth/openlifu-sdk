@@ -3,11 +3,19 @@
 One high-level entry point for **console** firmware updates. It auto-detects
 the unit's state and runs the correct path — you don't choose the scenario:
 
-| Unit state | App version | Path taken |
-|---|---|---|
-| No bootloader | < 1.2.0 | Migrate to the secure bootloader via STM32 ROM DFU (combined image) |
-| Legacy bootloader | 1.2.0–1.2.5 | Migrate via the RAM-resident self-updater |
-| Secure bootloader | ≥ 1.2.6 | Normal signed-app update |
+| Unit state | App version | DFU entered | Image used |
+|---|---|---|---|
+| **No DFU support** | **< 1.1.0** | — the request never reaches a DFU | **Refused** (BOOT0 / SWD only) |
+| No bootloader | 1.1.0 – 1.2.2 | STM32 ROM DFU (plain `OW_CMD_DFU`) | `openlifu-console-fw-production.bin` |
+| Legacy bootloader | 1.2.3 – 1.2.5 | the legacy BL's own DFU | `openlifu-console-legacy-updater.bin`, then `openlifu-console-fw-signed.bin` |
+| Current bootloader | ≥ 1.2.6 | the current BL's own DFU | `openlifu-console-fw-signed.bin` |
+
+The app version picks the row, the DFU request is issued, and the bootloader
+that answers it decides the image. A unit **already in DFU** skips the request
+and is classified from its USB product string alone — `STM32 BOOTLOADER` →
+production image, `LIFU BL DFU x.y.z` → updater + signed app, `OW DFU x.y.z` →
+signed app — so a console whose app is dead is still recoverable as long as it
+reaches one of those.
 
 Defaults to the firmware images **bundled with the SDK** and needs **no
 signing keys**: the legacy updater is authenticated by an HMAC trust tag
@@ -46,8 +54,9 @@ Behaviour notes
   string is used and no extra DFU entry is triggered.
 - Migrations are for **unlocked (beta) units only** — after RDP/FDA lockdown
   the force-ROM-DFU switch is inert and the bootloader is not erasable.
-- The no-bootloader/ROM path requires **STM32CubeProgrammer** (the ROM-loader
-  write is delegated to it). See `LIFUDFU.find_stm32_programmer_cli`.
+- The no-bootloader/ROM path needs **no external tools**: the ROM-loader write
+  (mass erase → program → read-back verify → leave DFU) is done by the SDK's
+  own DfuSe driver, `openlifu_sdk.io.STM32DFU`.
 - **Version encoding**: bundled images use the SDK's bitfield `FwVersion`
   (1.2.6 = 2118). A unit whose anti-rollback floor was latched under the old
   decimal scheme (1.2.6 = 10206) rejects bitfield images until the floor is

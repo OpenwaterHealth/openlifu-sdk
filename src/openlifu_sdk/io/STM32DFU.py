@@ -249,14 +249,18 @@ class STM32DFU:
         if state != _STATE_DFU_IDLE:
             raise STM32DFUError(f"could not reach dfuIDLE (state {state})")
 
-    def _wait_command_done(self, op: str) -> None:
+    def _wait_command_done(self, op: str, timeout_s: float | None = None) -> None:
         """Drive a pending DNLOAD (command or data) to completion.
 
         The ROM loader executes the operation during the DNBUSY window
         entered by GETSTATUS; the advertised bwPollTimeout MUST elapse before
         the next request or the operation can be corrupted.
+
+        *timeout_s* raises the ceiling for long operations (mass erase);
+        the default suits per-page erases and data blocks.
         """
-        deadline = time.monotonic() + max(self.timeout_ms / 1000.0, 30.0)
+        deadline = time.monotonic() + max(
+            timeout_s or self.timeout_ms / 1000.0, 30.0)
         while True:
             status, poll_ms, state = self.get_status()
             if state == _STATE_ERROR or status != 0:
@@ -270,9 +274,10 @@ class STM32DFU:
                 continue
             return  # dfuDNLOAD_IDLE (or dfuIDLE)
 
-    def _dnload(self, block: int, payload: bytes, op: str) -> None:
+    def _dnload(self, block: int, payload: bytes, op: str,
+                timeout_s: float | None = None) -> None:
         self._ctrl_out(_REQ_DNLOAD, block, payload)
-        self._wait_command_done(op)
+        self._wait_command_done(op, timeout_s)
 
     def _set_address(self, address: int) -> None:
         cmd = bytes([_CMD_SET_ADDRESS]) + address.to_bytes(4, "little")
@@ -281,6 +286,28 @@ class STM32DFU:
     # ------------------------------------------------------------------
     # Flash operations
     # ------------------------------------------------------------------
+
+    def mass_erase(self, timeout_s: float = 120.0,
+                   progress_callback: Callable | None = None) -> None:
+        """Erase the ENTIRE user flash (DfuSe mass erase: an ERASE command
+        with no address operand — the same operation as
+        ``STM32_Programmer_CLI -e all``).
+
+        Use this before writing a full-flash image when everything outside
+        the image's own extent must go too: stale bootloader metadata, the
+        user-config page, and any anti-rollback floor log. A per-page erase
+        (:meth:`erase_pages`, and the one :meth:`flash` does) only covers the
+        pages the image occupies, so those survive and can make a freshly
+        written app unbootable.
+
+        Option bytes / read-protection are NOT affected. Mass erase takes far
+        longer than a page erase, hence the generous default timeout.
+        """
+        self._recover_idle()
+        logger.info("ROM DFU mass erase (whole user flash)...")
+        self._dnload(0, bytes([_CMD_ERASE]), "MASS ERASE", timeout_s=timeout_s)
+        if progress_callback:
+            progress_callback(1, 1, "ROM DFU mass erase")
 
     def erase_pages(self, address: int, length: int,
                     progress_callback: Callable | None = None) -> None:
