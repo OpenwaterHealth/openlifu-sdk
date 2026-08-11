@@ -845,41 +845,14 @@ class LIFUTransmitterFirmwareUpdate:
             RuntimeError: master can't see/reach the module, DFU entry failed,
                 or an I2C programming failure.
         """
-        tx = self._require_tx()
+        self._require_tx()
         if module < 1:
             raise ValueError(
                 "update_slave targets slave modules (>= 1); use update() for "
                 "the master (module 0).")
 
         if legacy is None:
-            try:
-                ver = str(tx.get_version(module=module))
-            except Exception as e:
-                raise RuntimeError(
-                    f"could not read slave {module} version to choose the "
-                    f"update path ({e}); pass legacy=True or legacy=False.")
-            cohort = infer_transmitter_bootloader_from_app_version(ver)
-            if cohort == COHORT_NO_DFU:
-                floor = ".".join(str(p) for p in TRANSMITTER_MIN_DFU_APP_VERSION)
-                raise RuntimeError(
-                    f"slave module {module} runs app {ver}, older than "
-                    f"{floor}: those builds have no OW_CMD_DFU handler, so the "
-                    "master cannot put the module into ANY DFU mode. It is not "
-                    "updatable over I2C or as a USB master — enter the STM32 "
-                    "ROM loader in hardware (BOOT0 at power-up) with the "
-                    "module connected over USB and update it as module 0, or "
-                    "program it over SWD.")
-            if cohort == COHORT_NONE:
-                raise RuntimeError(
-                    f"slave module {module} runs app {ver} (2.0.2 - 2.0.3): it "
-                    "has NO bootloader, and its DFU entry jumps to the STM32 "
-                    "ROM loader, which cannot be reached over the master's I2C "
-                    "passthrough. Connect that module as the USB master and "
-                    "update it as module 0 (full production image via ROM "
-                    "DFU).")
-            legacy = cohort == COHORT_LEGACY
-            logger.info("Slave %d app %s -> %s bootloader", module, ver,
-                        "legacy" if legacy else "secure")
+            legacy = self._slave_path_is_legacy(module)
 
         if legacy:
             return self._update_slave_legacy(module, production_image,
@@ -891,6 +864,47 @@ class LIFUTransmitterFirmwareUpdate:
                 progress_callback)
         return self._update_slave_secure(module, signed_app, dfu_wait_s,
                                          progress_callback)
+
+    def _slave_path_is_legacy(self, module: int) -> bool:
+        """Choose the slave's update path from its running app version:
+        ``True`` for the legacy one-shot migration (app 2.0.4 - 2.0.7),
+        ``False`` for the secure I2C app update (>= 2.0.8).
+
+        Raises RuntimeError for the two cohorts that cannot be reached over
+        the master's I2C passthrough at all — apps 2.0.2 - 2.0.3 (no
+        bootloader: DFU entry lands in the STM32 ROM loader, which does not
+        speak this protocol) and apps < 2.0.2 (no OW_CMD_DFU handler, so no
+        DFU mode is reachable from software at all) — and when the version
+        cannot be read to make the choice.
+        """
+        tx = self._require_tx()
+        try:
+            ver = str(tx.get_version(module=module))
+        except Exception as e:
+            raise RuntimeError(
+                f"could not read slave {module} version to choose the "
+                f"update path ({e}); pass legacy=True or legacy=False.")
+        cohort = infer_transmitter_bootloader_from_app_version(ver)
+        if cohort == COHORT_NO_DFU:
+            floor = ".".join(str(p) for p in TRANSMITTER_MIN_DFU_APP_VERSION)
+            raise RuntimeError(
+                f"slave module {module} runs app {ver}, older than {floor}: "
+                "those builds have no OW_CMD_DFU handler, so the master "
+                "cannot put the module into ANY DFU mode. It is not updatable "
+                "over I2C or as a USB master — enter the STM32 ROM loader in "
+                "hardware (BOOT0 at power-up) with the module connected over "
+                "USB and update it as module 0, or program it over SWD.")
+        if cohort == COHORT_NONE:
+            raise RuntimeError(
+                f"slave module {module} runs app {ver} (2.0.2 - 2.0.3): it has "
+                "NO bootloader, and its DFU entry jumps to the STM32 ROM "
+                "loader, which cannot be reached over the master's I2C "
+                "passthrough. Connect that module as the USB master and update "
+                "it as module 0 (full production image via ROM DFU).")
+        legacy = cohort == COHORT_LEGACY
+        logger.info("Slave %d app %s -> %s bootloader", module, ver,
+                    "legacy" if legacy else "secure")
+        return legacy
 
     def _slave_enter_dfu(self, module: int, dfu_wait_s: float) -> int:
         """Confirm the master sees *module*, put it into its bootloader's I2C

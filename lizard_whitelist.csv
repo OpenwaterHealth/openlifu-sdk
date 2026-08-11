@@ -24,6 +24,15 @@ update_module
 # (CCN 10).
 migrate_console_legacy
 
+# Transmitter twin of the above (io/LIFUDFU.py) — the USB recovery for a
+# master parked in its legacy bootloader's DFU: write updater+metadata to the
+# legacy slot, read-back verify, reset, wait for the swapped-in secure BL,
+# flash the signed app. Same reasoning as migrate_console_legacy: the steps
+# are strictly ordered and each carries its own failure message, so splitting
+# them would hide the sequence; CCN 12 (< 15), length from step count +
+# docstring, not nesting.
+migrate_transmitter_legacy_usb
+
 # Trigger configuration (io/LIFUTXDevice.py) — validates and packs the full
 # trigger parameter set in one place to keep the JSON payload atomic.
 set_trigger
