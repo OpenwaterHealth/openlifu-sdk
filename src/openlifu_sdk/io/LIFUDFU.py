@@ -362,7 +362,16 @@ DFU_KIND_ROM     = "stm32-rom"
 DFU_KIND_LEGACY  = "legacy-bl"
 DFU_KIND_SECURE  = "secure-bl"
 DFU_KIND_NONE    = "no-bootloader"
+DFU_KIND_NO_DFU  = "no-dfu"
 DFU_KIND_UNKNOWN = "unknown"
+
+# Oldest transmitter app that can put itself into ANY DFU mode: 2.0.2 added the
+# OW_CMD_DFU handler that arms the ROM-loader magic (0xDEADBEEF at 0x20003FF0)
+# and resets. Anything older simply ignores the command, so no software path —
+# not the SDK's, not a bootloader's — can reach a DFU environment on it. Such a
+# unit is updatable only after entering the STM32 ROM loader in hardware
+# (BOOT0), or over SWD.
+TRANSMITTER_MIN_DFU_APP_VERSION = (2, 0, 2)
 
 
 def infer_console_bootloader_from_app_version(app_version: str) -> str:
@@ -404,12 +413,17 @@ def infer_transmitter_bootloader_from_app_version(app_version: str) -> str:
                               OW_CMD_DFU enters the legacy BL's DFU; the
                               reserved=0x77 force switch (added in 2.0.4)
                               enters the STM32 ROM DFU instead.
-      app <= 2.0.3         -> NO bootloader (``DFU_KIND_NONE``): the app boots
+      app 2.0.2 - 2.0.3    -> NO bootloader (``DFU_KIND_NONE``): the app boots
                               bare-metal at 0x08000000 and ignores the
                               reserved byte — plain OW_CMD_DFU already reboots
                               into the STM32 ROM DFU (0xDEADBEEF magic at
                               0x20003FF0, checked by SystemInit). These apps
                               predate slave I2C update support entirely.
+      app < 2.0.2          -> NO DFU AT ALL (``DFU_KIND_NO_DFU``): the app has
+                              no OW_CMD_DFU handler, so nothing in software
+                              can reboot it into a DFU environment. Not
+                              updatable by this SDK — enter the STM32 ROM
+                              loader in hardware (BOOT0) or use SWD.
 
     *app_version* accepts plain or git-describe semver ("2.0.8",
     "2.0.8-rc.2", "v2.0.7-3-gabc").
@@ -427,7 +441,9 @@ def infer_transmitter_bootloader_from_app_version(app_version: str) -> str:
         return DFU_KIND_SECURE
     if ver >= (2, 0, 4):
         return DFU_KIND_LEGACY
-    return DFU_KIND_NONE
+    if ver >= TRANSMITTER_MIN_DFU_APP_VERSION:
+        return DFU_KIND_NONE
+    return DFU_KIND_NO_DFU
 
 # OW_I2C_PASSTHRU sub-commands (must match firmware if_commands.c handler)
 _PASSTHRU_WRITE       = 0x00   # write only
@@ -1720,6 +1736,161 @@ class LIFUDFUManager:
 
         logger.info("Full-image migration complete - the device left DFU; "
                     "the secure bootloader verifies and launches the app.")
+
+    def migrate_transmitter_legacy_usb(self, signed_app: str,
+                                       updater_bin: str,
+                                       enter_dfu_fn: Callable | None = None,
+                                       keys_dir: str | None = None,
+                                       vid: int = 0x0483, pid: int = 0xDF11,
+                                       libusb_dll: str | None = None,
+                                       dfu_wait_s: float = 3.0,
+                                       dfu_enum_timeout_s: float = 40.0,
+                                       updater_wait_s: float = 6.0,
+                                       progress_callback: Callable | None = None
+                                       ) -> str:
+        """Migrate a LEGACY-bootloader transmitter MASTER to the secure
+        bootloader over USB only — the recovery path for a unit whose
+        application is dead.
+
+        The normal legacy migration (:meth:`migrate_transmitter_full_image`)
+        needs the RUNNING app to force the STM32 ROM loader with the
+        OW_CMD_DFU 0x77 switch. When the app is missing or corrupt the legacy
+        bootloader parks in its own USB DFU instead, and that DFU can only
+        write the app slot (0x08010000) and its WFM1 metadata page — never
+        the bootloader region. The I2C DFU stub is no help either: it has no
+        USB stack and needs a healthy master to broker it.
+
+        So the bootloader is replaced from the inside, exactly as on the
+        console (:meth:`migrate_console_legacy`): a RAM-resident updater that
+        EMBEDS the secure bootloader is written into the legacy app slot,
+        authenticated with an HMAC trust tag computed here, and booted; it
+        rewrites the bootloader region and resets. Sequence:
+
+          1. optional enter_dfu_fn() -> the legacy BL's own DFU.
+          2. Write the updater to 0x08010000 and its trust-tag metadata to
+             0x0800F800 over the legacy DFU; verify by read-back.
+          3. Reset -> the legacy BL validates the tag and boots the updater ->
+             it swaps in the secure bootloader -> resets.
+          4. The secure BL finds no SFU1 image in the slot (the updater is
+             sitting there) and parks in its own DFU; flash the signed app
+             over it (:meth:`program_transmitter`).
+
+        Args:
+            signed_app: SBSFU signed transmitter application image.
+            updater_bin: The transmitter-legacy-updater binary (embeds the
+                secure bootloader; links at 0x08010000).
+            enter_dfu_fn: Callable that reboots a RUNNING app into the legacy
+                DFU. Omit when the unit is already parked there.
+            keys_dir: Optional keys dir to ECDSA-validate the signed app.
+
+        Returns:
+            The secure bootloader's version string, once it is up.
+
+        Raises:
+            ValueError: Invalid signed app, or an updater too big for the slot.
+            RuntimeError: Wrong DFU environment, or a write/verify failure.
+
+        NOTE: beta/unlocked units only. The bootloader self-replacement is the
+        single irreversible step — keep the unit powered throughout. Unlike
+        the ROM-DFU migration this leaves the anti-rollback floor page
+        (0x0803F000) untouched, so a unit carrying a stale OLD-SCHEME floor
+        still needs a ``--force-production`` pass afterwards.
+        """
+        from openlifu_sdk.io import LIFUCrypto
+
+        updater_path = Path(updater_bin)
+        if not updater_path.is_file():
+            raise ValueError(f"Updater not found: {updater_path}")
+        updater = updater_path.read_bytes()
+        app_image = Path(signed_app).read_bytes()
+        report = LIFUCrypto.validate_signed_image(app_image, keys_dir=keys_dir)
+        if not (report.ok or (keys_dir is None and report.structural_ok)):
+            raise ValueError(
+                f"Refusing to migrate: invalid signed app:\n{report.describe()}")
+        # Raises if the updater does not fit the transmitter's legacy slot.
+        metadata = build_legacy_metadata(
+            updater, fw_address=TX_LEGACY_APP_ADDRESS,
+            max_size=TX_LEGACY_APP_MAX_SIZE)
+        logger.info("Legacy USB migration: updater %d B -> 0x%08X, metadata "
+                    "%d B -> 0x%08X, app v%d", len(updater),
+                    TX_LEGACY_APP_ADDRESS, len(metadata),
+                    TX_LEGACY_META_ADDRESS, report.header.fw_version)
+
+        # --- Step 1: be in the legacy bootloader's DFU ---
+        if enter_dfu_fn is not None:
+            logger.info("Requesting DFU (legacy bootloader)...")
+            enter_dfu_fn()
+            if dfu_wait_s > 0:
+                time.sleep(dfu_wait_s)
+        self._wait_for_usb_dfu(vid=vid, pid=pid, libusb_dll=libusb_dll,
+                               timeout_s=dfu_enum_timeout_s,
+                               device_profile=TRANSMITTER_PROFILE)
+        kind, ver = self.detect_console_dfu_kind(vid=vid, pid=pid,
+                                                 libusb_dll=libusb_dll)
+        if kind != DFU_KIND_LEGACY:
+            raise RuntimeError(
+                f"Expected the legacy bootloader DFU, found {kind!r} {ver!r}. "
+                "Use migrate_transmitter_full_image for ROM-DFU units.")
+        logger.info("In legacy bootloader DFU %s", ver)
+
+        # --- Step 2: write the updater, then its metadata, and verify ---
+        # App first, metadata second: the metadata is what makes the legacy BL
+        # boot the slot, so an interrupted run leaves an unauthenticated slot
+        # (BL stays in DFU, retryable) rather than a tag vouching for a
+        # half-written image.
+        with STM32USBDFU(vid=vid, pid=pid, libusb_dll=libusb_dll,
+                         device_profile=TRANSMITTER_PROFILE) as dfu:
+            dfu.write_memory(TX_LEGACY_APP_ADDRESS, updater, page_erase=True,
+                             progress_callback=progress_callback)
+            dfu.write_memory(TX_LEGACY_META_ADDRESS, metadata, page_erase=True,
+                             progress_callback=progress_callback)
+            # Read-back verify. A legacy BL that does not implement UPLOAD
+            # cannot be verified this way — warn and go on rather than
+            # refusing to recover the unit; a bad write simply leaves the
+            # legacy BL in DFU (the tag will not validate) and is retryable.
+            try:
+                rb_app = dfu.read_memory(TX_LEGACY_APP_ADDRESS, len(updater))
+                rb_meta = dfu.read_memory(TX_LEGACY_META_ADDRESS, len(metadata))
+            except Exception as e:
+                logger.warning("Legacy DFU read-back unavailable (%s) — "
+                               "proceeding without write verification", e)
+            else:
+                if rb_app != updater or rb_meta != metadata:
+                    raise RuntimeError(
+                        "Legacy DFU write verify FAILED (updater/metadata "
+                        "mismatch) — aborting before reset; the bootloader is "
+                        "untouched and still in DFU for a retry.")
+                logger.info("Updater + metadata written and verified.")
+
+            # --- Step 3: reset -> the legacy BL boots the updater ---
+            logger.info("Resetting; the updater will replace the bootloader...")
+            dfu.trigger_reset()
+
+        # --- Step 4: wait for the swapped-in secure bootloader's DFU ---
+        # Two resets (legacy BL -> updater -> secure BL) plus USB
+        # re-enumeration, so poll for the kind instead of a fixed delay.
+        logger.info("Waiting %.0fs for the updater to replace the "
+                    "bootloader...", updater_wait_s)
+        time.sleep(updater_wait_s)
+        try:
+            bl_version = self._wait_for_dfu_kind(
+                DFU_KIND_SECURE, vid=vid, pid=pid, libusb_dll=libusb_dll,
+                timeout_s=dfu_enum_timeout_s)
+        except RuntimeError as e:
+            raise RuntimeError(
+                f"After the updater ran, the secure bootloader DFU did not "
+                f"appear ({e}). The bootloader replacement may have failed; "
+                "recover via BOOT0 (STM32 ROM DFU) or SWD.") from e
+        logger.info("Secure bootloader is up (%s); flashing the signed app...",
+                    bl_version)
+
+        # --- Step 5: flash the signed app over the secure DFU ---
+        self.program_transmitter(signed_app, keys_dir=keys_dir, vid=vid,
+                                 pid=pid, libusb_dll=libusb_dll,
+                                 progress_callback=progress_callback)
+        logger.info("Legacy USB migration complete; the secure bootloader "
+                    "verifies and launches the app.")
+        return bl_version
 
     def migrate_console_rom_dfu(self, bootloader_bin: str, signed_app: str,
                                 keys_dir: str | None = None,

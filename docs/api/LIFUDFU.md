@@ -42,6 +42,7 @@ Transmitter paths
 - `program_usb(package_file, ...)` — program module 0 via `STM32USBDFU` (PGK1 package).
 - `program_i2c(package_file, ...)` — program slave modules via `STM32I2CDFUviaMaster`.
 - `update_module(module, package_file, enter_dfu_fn, ...)` — trigger DFU entry, wait, detect bootloader, program, manifest.
+- `migrate_transmitter_legacy_usb(signed_app, updater_bin, enter_dfu_fn=None, ...) -> str` — **USB recovery for a master parked in the legacy bootloader's DFU** (dead app, so the ROM loader is unreachable): write the RAM-resident legacy updater to `0x08010000` + on-the-fly WFM1 trust-tag metadata to `0x0800F800`, read-back verify, reset so the updater swaps in the secure bootloader, then flash the signed app over the secure DFU. Returns the secure bootloader's version. Leaves the anti-rollback floor page untouched — follow with a `--force-production` pass. Keep the unit powered through the bootloader swap.
 - `program_transmitter_slave_i2c(signed_image, i2c_addr, ...)` — stream an SFU1 signed app to a **secure-bootloader** slave's I2C DFU (validated before the erase).
 - `program_transmitter_slave_legacy_i2c(image, i2c_addr, ...)` — write a trusted image (+ on-the-fly WFM1 trust-tag metadata) through a **legacy-bootloader** slave's I2C DFU; used to install the RAM-resident DFU stub.
 - `wait_transmitter_slave_stub(i2c_addr=0x72, timeout_s=30)` — poll until the booted DFU stub answers `GETVERSION` (`dfu-stub-x.y.z`) at the default DFU address.

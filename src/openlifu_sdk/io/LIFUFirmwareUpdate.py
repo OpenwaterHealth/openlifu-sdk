@@ -35,9 +35,18 @@ module 0 (USB master) unit's state and updates it:
   - **legacy bootloader** (app 2.0.4 - 2.0.7) → migrate via the STM32 ROM
     DFU (OW_CMD_DFU reserved=0x77 force switch): mass-erase and write the
     combined bootloader+app production image.
-  - **no bootloader** (app <= 2.0.3) → same production-image migration, but
-    entered with a PLAIN OW_CMD_DFU (those apps ignore the reserved byte and
-    always reboot into the STM32 ROM DFU).
+  - **no bootloader** (app 2.0.2 - 2.0.3) → same production-image migration,
+    but entered with a PLAIN OW_CMD_DFU (those apps ignore the reserved byte
+    and always reboot into the STM32 ROM DFU).
+  - **no DFU at all** (app < 2.0.2) → REFUSED: those builds have no
+    OW_CMD_DFU handler, so no software request can reboot them into a DFU
+    environment. Enter the STM32 ROM loader in hardware (BOOT0) and re-run,
+    or program over SWD.
+  - **legacy bootloader, dead app** (unit already parked in "LIFU BL DFU") →
+    USB-only recovery: the ROM loader is out of reach without a running app,
+    so the RAM-resident legacy updater is written into the legacy app slot and
+    replaces the bootloader from the inside; the signed app is then flashed
+    over the secure DFU that comes up.
 
 Slave modules (index >= 1) are updated over I2C through the master with
 :meth:`LIFUTransmitterFirmwareUpdate.update_slave`: secure-bootloader slaves
@@ -45,8 +54,9 @@ get the signed app streamed to their slot; legacy-bootloader slaves (app
 2.0.4 - 2.0.7) are migrated in ONE SHOT — a small RAM-resident DFU stub is
 written through the legacy I2C DFU, and the full production image
 (bootloader + app) is then streamed through the stub's full-flash I2C DFU.
-Slaves on app <= 2.0.3 (no bootloader) cannot be updated over I2C — connect
-them as the USB master and update as module 0.
+Slaves on app 2.0.2 - 2.0.3 (no bootloader) cannot be updated over I2C —
+connect them as the USB master and update as module 0. Slaves below 2.0.2
+cannot be updated at all without BOOT0 or SWD.
 
 No signing keys are needed::
 
@@ -70,10 +80,12 @@ from typing import Any, Callable
 from openlifu_sdk.io.LIFUDFU import (
     CONSOLE_PROFILE,
     DFU_KIND_LEGACY,
+    DFU_KIND_NO_DFU,
     DFU_KIND_ROM,
     DFU_KIND_SECURE,
     I2C_DFU_SLAVE_ADDR,
     LIFUDFUManager,
+    TRANSMITTER_MIN_DFU_APP_VERSION,
     TRANSMITTER_PROFILE,
     infer_console_bootloader_from_app_version,
     infer_transmitter_bootloader_from_app_version,
@@ -87,6 +99,9 @@ _FW_DIR = Path(__file__).parent.parent / "firmware"
 COHORT_NONE = "no-bootloader"
 COHORT_LEGACY = "legacy-bl"
 COHORT_SECURE = "secure-bl"
+# Transmitter only: app too old to enter ANY DFU mode (< 2.0.2 — no OW_CMD_DFU
+# handler). Not updatable by this SDK; see LIFUDFU.DFU_KIND_NO_DFU.
+COHORT_NO_DFU = DFU_KIND_NO_DFU
 
 
 def bundled_production_image() -> Path:
@@ -111,6 +126,19 @@ def bundled_transmitter_production_image() -> Path:
     """Combined bootloader + signed-app transmitter image bundled with the
     SDK (migration source for pre-secure-bootloader units, app <= 2.0.7)."""
     return _FW_DIR / "openlifu-transmitter-fw-production.bin"
+
+
+def bundled_transmitter_legacy_updater() -> Path:
+    """The RAM-resident legacy updater bundled with the SDK — a legacy-slot
+    app that EMBEDS the secure bootloader and swaps it in from the inside
+    (see transmitter-legacy-updater).
+
+    This is the USB recovery image for a MASTER parked in its legacy
+    bootloader's DFU with a dead application: the legacy DFU can reach only
+    the app slot, so the bootloader has to replace itself. Keyless — the
+    legacy bootloader authenticates it with an HMAC trust tag the SDK
+    computes at run time (``build_legacy_metadata``)."""
+    return _FW_DIR / "openlifu-transmitter-legacy-updater.bin"
 
 
 def bundled_transmitter_dfu_stub() -> Path:
@@ -377,21 +405,38 @@ class LIFUTransmitterFirmwareUpdate:
         added in 2.0.4), mass-erase, and write the combined bootloader +
         signed-app production image at the flash base (beta/unlocked units
         only).
-      - **no bootloader** (app <= 2.0.3, bare-metal at 0x08000000) → same
-        production-image migration, but entered with a PLAIN OW_CMD_DFU:
+      - **no bootloader** (app 2.0.2 - 2.0.3, bare-metal at 0x08000000) →
+        same production-image migration, but entered with a PLAIN OW_CMD_DFU:
         those apps ignore the reserved byte and always reboot straight into
         the STM32 ROM DFU (there is no other bootloader to enter).
+      - **no DFU support** (app < 2.0.2) → :meth:`update` REFUSES. OW_CMD_DFU
+        did not exist yet, so the unit cannot be rebooted into any DFU mode
+        from software; it needs BOOT0 (STM32 ROM loader) or SWD. Refusing
+        keeps it running instead of stranding it mid-attempt.
+
+    Both migration paths need the RUNNING app to reach the ROM loader. A unit
+    whose app is corrupt instead sits in its LEGACY bootloader's own USB DFU
+    ("LIFU BL DFU x.y.z"); :meth:`detect` reports ``(COHORT_LEGACY, "dfu")``
+    and :meth:`update` recovers it over USB alone:
+
+      - **legacy bootloader DFU, dead app** → write the RAM-resident legacy
+        updater (which embeds the secure bootloader) into the legacy app slot
+        with an HMAC-trust-tagged WFM1 block, reset so the legacy BL boots it
+        and it swaps in the secure bootloader, then flash the signed app over
+        the secure DFU that comes up. This path leaves the anti-rollback floor
+        page alone, so follow it with ``--force-production`` from the running
+        app to roll the newest bootloader.
 
     Slave modules (index >= 1) are updated over I2C through the master with
     :meth:`update_slave` — the master puts the slave into its bootloader's
     I2C DFU and the images are streamed over the master's I2C passthrough.
     Secure-bootloader slaves get the signed app; LEGACY-bootloader slaves
     (app 2.0.4 - 2.0.7) are migrated in one shot via the RAM-resident DFU
-    stub (bootloader + app from the production image). Slaves on app <=
+    stub (bootloader + app from the production image). Slaves on app 2.0.2 -
     2.0.3 have NO bootloader and cannot be updated over I2C at all (their
     DFU entry jumps to the STM32 ROM loader, which does not speak our I2C
     protocol) — connect such a module as the USB master and update it as
-    module 0.
+    module 0. Slaves below 2.0.2 are refused outright (BOOT0 or SWD).
 
     Needs no signing keys; an optional *keys_dir* only adds an ECDSA
     signature pre-check before flashing.
@@ -414,6 +459,11 @@ class LIFUTransmitterFirmwareUpdate:
         self.vid = vid
         self.pid = pid
         self._mgr = LIFUDFUManager()
+        # (kind, version) of the last DFU environment seen by detect(), used to
+        # name the environment in recovery messages. None until a DFU probe ran.
+        self._last_dfu: tuple[str, str] | None = None
+        # Version string the running app last reported, for the same purpose.
+        self._last_app_version: str | None = None
 
     def detect(self) -> tuple[str, str]:
         """Determine what update path the unit needs.
@@ -421,11 +471,19 @@ class LIFUTransmitterFirmwareUpdate:
         Returns ``(cohort, source)`` where cohort is ``COHORT_SECURE`` (app
         >= 2.0.8, secure bootloader installed), ``COHORT_LEGACY`` (app
         2.0.4 - 2.0.7, legacy bootloader — production-image migration via the
-        reserved=0x77 ROM-DFU force switch) or ``COHORT_NONE`` (app <= 2.0.3,
-        bare-metal, no bootloader — production-image migration via a plain
-        DFU entry, which already lands in the STM32 ROM loader), and source
-        is ``"app"`` (from the running app version) or ``"dfu"`` (the unit
-        was already in DFU).
+        reserved=0x77 ROM-DFU force switch), ``COHORT_NONE`` (app 2.0.2 -
+        2.0.3, bare-metal, no bootloader — production-image migration via a
+        plain DFU entry, which already lands in the STM32 ROM loader) or
+        ``COHORT_NO_DFU`` (app < 2.0.2 — no OW_CMD_DFU handler, so no DFU
+        mode is reachable from software and :meth:`update` refuses), and
+        source is ``"app"`` (from the running app version) or ``"dfu"`` (the
+        unit was already in DFU).
+
+        A unit found in the LEGACY bootloader's own USB DFU ("LIFU BL DFU
+        x.y.z") reports ``(COHORT_LEGACY, "dfu")``. That is the corrupt- or
+        missing-application case: the legacy BL refused to boot the slot and
+        parked in DFU. It is detected here so the state can be reported, but
+        it CANNOT be updated over USB — see :meth:`update`.
 
         Raises:
             RuntimeError: No responding application and no recognizable DFU
@@ -435,6 +493,7 @@ class LIFUTransmitterFirmwareUpdate:
             try:
                 ver = str(self.tx.get_version())
                 cohort = infer_transmitter_bootloader_from_app_version(ver)
+                self._last_app_version = ver
                 logger.info("Detected transmitter app version %s -> cohort %s",
                             ver, cohort)
                 return cohort, "app"
@@ -446,15 +505,104 @@ class LIFUTransmitterFirmwareUpdate:
         # DFU version, so it identifies the transmitter environments too.
         kind, dfu_ver = self._mgr.detect_console_dfu_kind(
             vid=self.vid, pid=self.pid, libusb_dll=self.libusb_dll)
+        self._last_dfu = (kind, dfu_ver)
         if kind == DFU_KIND_SECURE:
             logger.info("Detected secure-bootloader DFU %s", dfu_ver)
             return COHORT_SECURE, "dfu"
         if kind == DFU_KIND_ROM:
             logger.info("Detected STM32 ROM DFU")
             return COHORT_NONE, "dfu"
+        if kind == DFU_KIND_LEGACY:
+            # The unit is parked in the LEGACY bootloader's own USB DFU —
+            # normally because its application is missing or corrupt, so the
+            # app-side ROM-DFU force switch is unreachable. Report the cohort
+            # honestly; update() explains the recovery.
+            logger.info("Detected legacy-bootloader DFU %s", dfu_ver)
+            return COHORT_LEGACY, "dfu"
         raise RuntimeError(
             f"Cannot determine transmitter state (DFU kind {kind!r}). "
             "Connect the running app, or put the unit in a known DFU mode.")
+
+    def _no_dfu_message(self, action: str = "updated") -> str:
+        """Explain why an app older than 2.0.2 cannot be touched at all.
+
+        DFU entry on the transmitter is a request to the RUNNING application
+        (OW_CMD_DFU): it arms the ROM-loader magic word and resets. Apps
+        before 2.0.2 have no handler for that command, so every software path
+        the SDK could take — plain entry, the reserved=0x77 force switch, the
+        bootloader DFUs — dead-ends before it starts. Refusing here keeps the
+        unit intact instead of stranding it after a half-attempted entry.
+        """
+        ver = self._last_app_version or "unknown"
+        floor = ".".join(str(p) for p in TRANSMITTER_MIN_DFU_APP_VERSION)
+        return (
+            f"transmitter app {ver} is older than {floor} and cannot be "
+            f"{action}: those builds have no OW_CMD_DFU handler, so no "
+            "software request can reboot them into any DFU mode (not the "
+            "plain entry, not the reserved=0x77 ROM-DFU force switch). Enter "
+            "the STM32 ROM loader in hardware instead — hold BOOT0 while "
+            "power-cycling the unit, then re-run this command: it enumerates "
+            "as 'STM32 BOOTLOADER' and the full production image (bootloader "
+            "+ app) is written from there. Failing that, program it over SWD.")
+
+    def _legacy_dfu_recovery_message(self, why: str) -> str:
+        """Explain, when the USB legacy-updater migration is unavailable, why
+        a master parked in the LEGACY bootloader's DFU cannot be updated over
+        USB and how to recover it by other means.
+
+        The secure bootloader can only be installed by something with
+        full-flash access. The STM32 ROM loader has it but is entered from the
+        RUNNING application (OW_CMD_DFU reserved=0x77) — exactly what is
+        missing when the legacy BL parks in DFU. The legacy DFU's own write
+        window is just the app slot (0x08010000) plus its WFM1 metadata page.
+        The RAM-resident DFU stub that rescues legacy SLAVES is no help
+        either: it serves I2C only (1.6 KB, no USB stack) and needs a healthy
+        master app to broker it. That leaves the legacy updater (which
+        replaces the bootloader from inside the slot), BOOT0, or SWD.
+        """
+        ver = (self._last_dfu[1] if self._last_dfu else "") or "unknown version"
+        return (
+            f"the transmitter is parked in its LEGACY bootloader's USB DFU "
+            f"(LIFU BL DFU {ver}) — its application is missing or corrupt, so "
+            "the app-side OW_CMD_DFU force switch that reaches the STM32 ROM "
+            f"loader is gone. {why} The legacy bootloader can only write the "
+            "app slot (0x08010000) and its metadata page, never its own "
+            "region, so nothing else here can install the secure bootloader. "
+            "Recover by entering the STM32 ROM loader in hardware: hold BOOT0 "
+            "while power-cycling the unit, then re-run this command — it will "
+            "enumerate as 'STM32 BOOTLOADER' and the full production image "
+            "(bootloader + app) is written from there. Alternatively connect "
+            "the module as a SLAVE on a healthy master and migrate it over "
+            "I2C with --module <n>.")
+
+    def _migrate_legacy_usb(self, signed_app: str | None,
+                            updater_bin: str | None,
+                            progress_callback: Callable | None) -> UpdateResult:
+        """Rescue a master parked in the legacy bootloader's USB DFU: write
+        the RAM-resident legacy updater into the legacy app slot so it swaps
+        in the secure bootloader from the inside, then flash the signed app
+        over the secure DFU that comes up. See
+        :meth:`LIFUDFUManager.migrate_transmitter_legacy_usb`."""
+        updater = (Path(updater_bin) if updater_bin
+                   else bundled_transmitter_legacy_updater())
+        if not updater.is_file():
+            raise RuntimeError(self._legacy_dfu_recovery_message(
+                f"The legacy updater image that would replace the bootloader "
+                f"from inside the app slot is not available ({updater}) — "
+                "pass one with updater_bin/--updater to use that path."))
+        app = (str(signed_app) if signed_app
+               else str(bundled_transmitter_signed_app()))
+        bl_version = self._mgr.migrate_transmitter_legacy_usb(
+            signed_app=app, updater_bin=str(updater), enter_dfu_fn=None,
+            keys_dir=self.keys_dir, vid=self.vid, pid=self.pid,
+            libusb_dll=self.libusb_dll, progress_callback=progress_callback)
+        return UpdateResult(
+            COHORT_LEGACY, "migrate-legacy-usb",
+            "Recovered a legacy-bootloader transmitter over USB: the updater "
+            "swapped in the secure bootloader and the signed app was flashed. "
+            "Run --force-production once the app boots to roll the newest "
+            "bootloader and clear any stale anti-rollback floor.",
+            reboot_required=True, bl_version=bl_version)
 
     def get_bootloader_version(self) -> str:
         """Read the transmitter bootloader's version string (its git
@@ -472,6 +620,13 @@ class LIFUTransmitterFirmwareUpdate:
                 bootloader, or the DFU device did not enumerate.
         """
         state, source = self.detect()
+        if state == COHORT_NO_DFU:
+            raise RuntimeError(self._no_dfu_message("put into DFU"))
+        if state == COHORT_LEGACY and source == "dfu" and self._last_dfu:
+            # Already in the legacy BL's DFU: its version came from the USB
+            # product string, so report that rather than claiming there is
+            # nothing to read.
+            return f"LIFU BL DFU {self._last_dfu[1]}".strip()
         if state in (COHORT_NONE, COHORT_LEGACY):
             raise RuntimeError(
                 "unit has no secure bootloader (app <= 2.0.7) — there is no "
@@ -505,6 +660,14 @@ class LIFUTransmitterFirmwareUpdate:
         """
         state, source = self.detect()
         in_rom_dfu = source == "dfu" and state == COHORT_NONE
+        if state == COHORT_NO_DFU:
+            raise RuntimeError(self._no_dfu_message("reflashed"))
+        if source == "dfu" and state == COHORT_LEGACY:
+            raise RuntimeError(self._legacy_dfu_recovery_message(
+                "A forced production reflash cannot start here. Re-run "
+                "WITHOUT --force-production to recover the unit with the "
+                "legacy updater first, then force-production from the "
+                "running app to roll the newest bootloader."))
         if source == "dfu" and not in_rom_dfu:
             raise RuntimeError(
                 "cannot force a production reflash from bootloader DFU — the "
@@ -527,10 +690,18 @@ class LIFUTransmitterFirmwareUpdate:
                             "into the new app.", reboot_required=False)
 
     def update(self, *, signed_app: str | None = None,
-               production_image: str | None = None, force: bool = False,
+               production_image: str | None = None,
+               updater_bin: str | None = None, force: bool = False,
                force_production: bool = False,
                progress_callback: Callable | None = None) -> UpdateResult:
         """Detect the unit's state and run the appropriate update.
+
+        A unit found parked in its LEGACY bootloader's USB DFU (dead app)
+        takes the USB legacy-updater recovery path — the bootloader replaces
+        itself from the app slot, then the signed app is flashed over the
+        secure DFU that comes up. Every other legacy unit (app still running)
+        takes the ROM-DFU production-image migration, which also clears the
+        anti-rollback floor.
 
         Args:
             signed_app: Override the signed app image (secure path). Defaults
@@ -538,6 +709,8 @@ class LIFUTransmitterFirmwareUpdate:
             production_image: Override the combined bootloader+app image
                 (migration / force-production paths). Defaults to the
                 bundled production image.
+            updater_bin: Override the RAM-resident legacy updater (USB
+                legacy-DFU recovery path). Defaults to the bundled updater.
             force: Secure path only: flash even if the image version is below
                 the installed one (still subject to the bootloader's
                 anti-rollback floor at boot).
@@ -558,6 +731,13 @@ class LIFUTransmitterFirmwareUpdate:
                                                  progress_callback)
         state, source = self.detect()
         in_dfu = source == "dfu"
+        if state == COHORT_NO_DFU:
+            raise RuntimeError(self._no_dfu_message())
+        if state == COHORT_LEGACY and in_dfu:
+            # Dead app: the ROM loader is unreachable, so the bootloader has
+            # to replace itself from the legacy app slot.
+            return self._migrate_legacy_usb(signed_app, updater_bin,
+                                            progress_callback)
 
         if state in (COHORT_NONE, COHORT_LEGACY):
             prod = (str(production_image) if production_image
@@ -636,10 +816,12 @@ class LIFUTransmitterFirmwareUpdate:
         ``force_production=True`` just takes the normal legacy path (which
         already reflashes the bootloader).
 
-        Slaves on app <= 2.0.3 (no bootloader at all) CANNOT be updated over
-        I2C — their DFU entry jumps to the STM32 ROM loader, which does not
-        speak this I2C protocol. Auto-detect raises a clear error for them:
-        connect such a module as the USB master and update it as module 0.
+        Slaves on app 2.0.2 - 2.0.3 (no bootloader at all) CANNOT be updated
+        over I2C — their DFU entry jumps to the STM32 ROM loader, which does
+        not speak this I2C protocol. Auto-detect raises a clear error for
+        them: connect such a module as the USB master and update it as module
+        0. Slaves below 2.0.2 have no DFU entry at all and are refused
+        outright — BOOT0 (ROM loader over USB) or SWD only.
 
         Args:
             module: slave module index (>= 1). Module 0 is the USB master —
@@ -677,11 +859,21 @@ class LIFUTransmitterFirmwareUpdate:
                     f"could not read slave {module} version to choose the "
                     f"update path ({e}); pass legacy=True or legacy=False.")
             cohort = infer_transmitter_bootloader_from_app_version(ver)
+            if cohort == COHORT_NO_DFU:
+                floor = ".".join(str(p) for p in TRANSMITTER_MIN_DFU_APP_VERSION)
+                raise RuntimeError(
+                    f"slave module {module} runs app {ver}, older than "
+                    f"{floor}: those builds have no OW_CMD_DFU handler, so the "
+                    "master cannot put the module into ANY DFU mode. It is not "
+                    "updatable over I2C or as a USB master — enter the STM32 "
+                    "ROM loader in hardware (BOOT0 at power-up) with the "
+                    "module connected over USB and update it as module 0, or "
+                    "program it over SWD.")
             if cohort == COHORT_NONE:
                 raise RuntimeError(
-                    f"slave module {module} runs app {ver} (<= 2.0.3): it has "
-                    "NO bootloader, and its DFU entry jumps to the STM32 ROM "
-                    "loader, which cannot be reached over the master's I2C "
+                    f"slave module {module} runs app {ver} (2.0.2 - 2.0.3): it "
+                    "has NO bootloader, and its DFU entry jumps to the STM32 "
+                    "ROM loader, which cannot be reached over the master's I2C "
                     "passthrough. Connect that module as the USB master and "
                     "update it as module 0 (full production image via ROM "
                     "DFU).")
@@ -929,6 +1121,11 @@ def _run_update_flow(fw: Any, label: str, detect_fn: Callable,
     print(f"{label.capitalize()} state: {state} (from {source})")
     if args.detect:
         return 0
+    # Refuse before prompting: nothing here can reach a DFU mode (transmitter
+    # app < 2.0.2), so there is no update to confirm.
+    if state == COHORT_NO_DFU:
+        print(f"CANNOT UPDATE: {fw._no_dfu_message()}")
+        return 1
     if args.bl_version:
         try:
             print(f"Bootloader version: {fw.get_bootloader_version()}")
@@ -983,7 +1180,8 @@ def _run_transmitter(args: Any) -> int:
     return _run_update_flow(
         fw, "transmitter", fw.detect,
         lambda: fw.update(signed_app=args.app,
-                          production_image=args.production, force=args.force,
+                          production_image=args.production,
+                          updater_bin=args.updater, force=args.force,
                           force_production=args.force_production,
                           progress_callback=_progress),
         args)
@@ -1038,7 +1236,7 @@ def _run_console(args: Any) -> int:
     return _run_update_flow(
         fw, "console", fw.detect_cohort,
         lambda: fw.update(production_image=args.production, signed_app=args.app,
-                          force=args.force,
+                          updater_bin=args.updater, force=args.force,
                           force_production=args.force_production,
                           progress_callback=_progress),
         args)
@@ -1074,6 +1272,11 @@ def main(argv: list[str] | None = None) -> int:
                         help="Override the combined bootloader+app image "
                              "(migration paths).")
     parser.add_argument("--app", help="Override the signed app image.")
+    parser.add_argument("--updater",
+                        help="Override the RAM-resident legacy updater used "
+                             "when a unit is parked in its LEGACY bootloader's "
+                             "DFU with a dead app (console legacy migration; "
+                             "transmitter USB legacy recovery).")
     parser.add_argument("--keys", help="Optional keys dir to pre-validate the app signature.")
     parser.add_argument("--force", action="store_true",
                         help="Secure path only: flash even if not newer.")

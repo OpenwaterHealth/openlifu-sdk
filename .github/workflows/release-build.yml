@@ -71,6 +71,63 @@ jobs:
       - name: Install build tooling
         run: python -m pip install --upgrade build setuptools-scm
 
+      # ── Bundled firmware from the firmware repos' releases ───────
+      # rc tags and next builds take each repo's latest pre-release
+      # (when it is at least as new as the latest stable); everything
+      # else -- and rc/next builds with no usable pre-release -- takes
+      # the latest stable release. The dfu-stub and legacy-updater
+      # images have no publishing CI and stay as committed.
+      - name: Resolve firmware releases
+        id: fw
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          resolve() {
+            local repo="$1" REL PRE TAG KIND
+            REL=$(gh release list --repo "$repo" --json tagName,isPrerelease \
+                  --jq 'map(select(.isPrerelease | not)) | .[0].tagName // empty')
+            PRE=$(gh release list --repo "$repo" --json tagName,isPrerelease \
+                  --jq 'map(select(.isPrerelease)) | .[0].tagName // empty')
+            TAG="$REL"
+            KIND="release"
+            if [[ "${GITHUB_REF_NAME}" == "next" || "${GITHUB_REF_NAME}" =~ -rc\.[0-9]+$ ]]; then
+              # semver compare: '-rc.' -> '~rc.' makes sort -V rank a pre-release
+              # below its own stable release but above older ones.
+              if [ -n "$PRE" ] && { [ -z "$REL" ] || \
+                   [ "$(printf '%s\n' "${PRE/-rc./~rc.}" "$REL" | sort -V | tail -n1)" = "${PRE/-rc./~rc.}" ]; }; then
+                TAG="$PRE"
+                KIND="pre-release"
+              fi
+            fi
+            if [ -z "$TAG" ]; then
+              echo "::error::No release found in ${repo}." >&2
+              return 1
+            fi
+            echo "${repo}: $KIND @ $TAG (stable='${REL:-none}' pre-release='${PRE:-none}')" >&2
+            printf '%s' "$TAG"
+          }
+          CONSOLE_TAG=$(resolve OpenwaterHealth/openlifu-console-fw)
+          TRANSMITTER_TAG=$(resolve OpenwaterHealth/openlifu-transmitter-fw)
+          echo "console=$CONSOLE_TAG" >> "$GITHUB_OUTPUT"
+          echo "transmitter=$TRANSMITTER_TAG" >> "$GITHUB_OUTPUT"
+
+      - name: Pull firmware binaries
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          FW_DIR=src/openlifu_sdk/firmware
+          gh release download "${{ steps.fw.outputs.console }}" \
+            --repo OpenwaterHealth/openlifu-console-fw --dir "$FW_DIR" --clobber \
+            --pattern 'openlifu-console-fw-signed.bin' \
+            --pattern 'openlifu-console-fw-production.bin'
+          gh release download "${{ steps.fw.outputs.transmitter }}" \
+            --repo OpenwaterHealth/openlifu-transmitter-fw --dir "$FW_DIR" --clobber \
+            --pattern 'openlifu-transmitter-fw-signed.bin' \
+            --pattern 'openlifu-transmitter-fw-production.bin'
+          ls -l "$FW_DIR"
+
       - name: Build sdist & wheel
         run: python -m build
 

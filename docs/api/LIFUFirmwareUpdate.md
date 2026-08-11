@@ -79,18 +79,47 @@ Same auto-detect pattern for the transmitter. Module 0 (the USB master):
 
 | Unit state | App version | Path taken |
 |---|---|---|
-| No bootloader | ≤ 2.0.3 | Migrate via STM32 ROM DFU (combined production image; plain `OW_CMD_DFU` — those apps ignore the reserved byte and always reboot into the ROM loader) |
+| **No DFU support** | **< 2.0.2** | **Refused** — no `OW_CMD_DFU` handler, so no software request can reboot the unit into any DFU mode. BOOT0 (ROM loader) or SWD only |
+| No bootloader | 2.0.2 – 2.0.3 | Migrate via STM32 ROM DFU (combined production image; plain `OW_CMD_DFU` — those apps ignore the reserved byte and always reboot into the ROM loader) |
 | Legacy bootloader | 2.0.4 – 2.0.7 | Migrate via STM32 ROM DFU (combined production image, `OW_CMD_DFU` reserved=0x77 force switch) |
 | Secure bootloader | ≥ 2.0.8 | Normal signed-app update over USB DFU |
+| Legacy bootloader, **dead app** | — (unit parked in `LIFU BL DFU x.y.z`) | USB legacy-updater recovery (see below) |
+
+**Recovering a master with a corrupt/missing app.** Both migration rows above
+need the *running* app to reach the STM32 ROM loader. When the app is corrupt
+the legacy bootloader refuses to boot the slot and parks in its own USB DFU,
+so that switch is gone — `detect()` reports `("legacy-bl", "dfu")` and
+`update()` takes a USB-only path instead:
+
+1. The RAM-resident **legacy updater**
+   (`firmware/openlifu-transmitter-legacy-updater.bin`), which *embeds* the
+   secure bootloader, is written to the legacy app slot (0x08010000) with an
+   HMAC-trust-tagged WFM1 block at 0x0800F800 (computed on the fly — no keys),
+   then read back and verified.
+2. Reset: the legacy bootloader validates the trust tag, boots the updater,
+   and the updater rewrites the bootloader region from the inside and resets.
+3. The secure bootloader finds no SFU1 image in the slot (the updater is
+   sitting there), parks in its own DFU, and the bundled signed app is flashed
+   over it.
+
+The I2C DFU stub cannot be used here — it has no USB stack and needs a healthy
+master app to broker it. **Keep the unit powered** through step 2; if the
+secure bootloader never appears, recover via BOOT0 (STM32 ROM DFU) or SWD.
+Unlike the ROM-DFU migration this path leaves the anti-rollback floor page
+(0x0803F000) alone, so follow it with `--force-production` from the recovered
+app to roll the newest bootloader and clear any stale floor.
 
 **Slave modules** (`--module N`, N ≥ 1) are updated over I2C through the
 master's passthrough with `update_slave(module, ...)`:
 
 - **secure** (app ≥ 2.0.8): the SFU1 signed app is streamed to the slave's
   secure-bootloader I2C DFU (enumerated address 0x20+).
-- **no bootloader** (app ≤ 2.0.3): **not updatable over I2C** — DFU entry
+- **no bootloader** (app 2.0.2 – 2.0.3): **not updatable over I2C** — DFU entry
   jumps those units into the STM32 ROM loader, which does not speak our I2C
   protocol. Connect the module as the USB master and update it as module 0.
+- **no DFU support** (app < 2.0.2): **refused outright** — the master cannot
+  put the module into any DFU mode, and connecting it as the USB master does
+  not help. BOOT0 (ROM loader over USB) or SWD only.
 - **legacy** (app 2.0.4 – 2.0.7): **one-shot migration** of bootloader + app.
   1. The small RAM-resident **DFU stub**
      (`firmware/openlifu-transmitter-dfu-stub.bin`, built from
@@ -132,7 +161,9 @@ python -m openlifu_sdk.io.LIFUFirmwareUpdate --device transmitter --module 1
 ```
 
 `--legacy` forces the one-shot migration path; omit it to auto-detect from
-the slave's app version. `--production` overrides the combined image.
+the slave's app version. `--production` overrides the combined image, and
+`--updater` overrides the RAM-resident legacy updater used by the USB
+recovery path (and by the console legacy migration).
 
 See also: `docs/api/LIFUDFU.md` (the underlying per-scenario methods),
 `docs/api/LIFUCrypto.md` (image signing/validation),
