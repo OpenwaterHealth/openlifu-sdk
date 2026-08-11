@@ -179,40 +179,6 @@ TRANSMITTER_FLASH_SIZE = 0x40000          # 256 KB
 TRANSMITTER_DFU_STUB_PREFIX = "dfu-stub"
 
 
-def find_stm32_programmer_cli() -> str | None:
-    """Locate the STM32CubeProgrammer CLI (STM32_Programmer_CLI), or None.
-
-    Checks $STM32_PROGRAMMER_CLI, PATH, and the default Windows/macOS/Linux
-    install locations.
-
-    NOTE: no SDK path depends on CubeProgrammer any more — every ROM-loader
-    write goes through the pure-Python DfuSe driver
-    (:mod:`openlifu_sdk.io.STM32DFU`). This helper is kept for callers that
-    want to drive CubeProgrammer themselves.
-    """
-    import os
-    import shutil
-
-    env = os.environ.get("STM32_PROGRAMMER_CLI")
-    if env and Path(env).is_file():
-        return env
-    exe = "STM32_Programmer_CLI.exe" if sys.platform == "win32" else "STM32_Programmer_CLI"
-    onpath = shutil.which(exe)
-    if onpath:
-        return onpath
-    candidates = [
-        r"C:\Program Files\STMicroelectronics\STM32Cube\STM32CubeProgrammer\bin",
-        r"C:\Program Files (x86)\STMicroelectronics\STM32Cube\STM32CubeProgrammer\bin",
-        "/Applications/STMicroelectronics/STM32Cube/STM32CubeProgrammer/STM32CubeProgrammer.app/Contents/MacOs/bin",
-        str(Path.home() / "STM32CubeProgrammer" / "bin"),
-    ]
-    for base in candidates:
-        p = Path(base) / exe
-        if p.is_file():
-            return str(p)
-    return None
-
-
 def bundled_updater_path() -> Path:
     """Path to the RAM-resident legacy-migration updater shipped with the SDK
     (``firmware/openlifu-console-legacy-updater.bin`` — the interim image for

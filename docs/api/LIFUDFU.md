@@ -9,7 +9,7 @@ Module contents
 - `parse_signed_package(pkg: bytes) -> dict` — validate a transmitter 'PGK1' firmware package and return `fw_address`, `meta_address`, `fw`, `meta`.
 - `split_console_flash_image(image: bytes) -> (bootloader, signed_app)` — split a combined console full-flash image (bootloader @0x08000000 + 'SFU1' app @0x08010000).
 - `build_legacy_metadata(app_bytes, ...) -> bytes` — build a legacy-console-bootloader metadata block (124 B, HMAC trust tag; no private key required).
-- `find_stm32_programmer_cli() -> str | None` — locate `STM32_Programmer_CLI` (`$STM32_PROGRAMMER_CLI`, PATH, default installs). No SDK path uses it any more; ROM-loader writes go through `openlifu_sdk.io.STM32DFU`.
+- (Firmware is written only by the SDK's own drivers — `STM32USBDFU` / `STM32I2CDFUviaMaster` in this module and `openlifu_sdk.io.STM32DFU` for the ROM loader. No external programmer is invoked, and the SDK never spawns a subprocess.)
 
 Console DFU environment detection
 - All three console DFU environments enumerate as `0483:DF11`; the USB product string tells them apart:
