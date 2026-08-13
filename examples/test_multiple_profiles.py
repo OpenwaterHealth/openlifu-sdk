@@ -20,6 +20,13 @@ Tests verify register-level correctness of delays, apodizations, and pattern
 data written to TX7332 devices. Each test calls set_solution(), reads back
 hardware registers, and asserts correctness.
 
+Sizing is taken from the enumerated hardware, so the same run covers a single
+module (2 chips / 64 channels) or a multi-module stack (2 modules / 4 chips /
+128 channels). On a multi-module stack every module holds its own copy of the
+execution order and advances it off the shared trigger line, so the checks
+below verify all chips, and TC7 verifies that every module ends the sequence on
+the same profile.
+
 Test cases:
     TC1: Single profile, backward compatible (no execution_order).
     TC2: Single profile with explicit execution_order=[1].
@@ -27,12 +34,13 @@ Test cases:
     TC4: Apodization register verification per profile.
     TC5: Maximum 16 delay profiles.
     TC6: Single-channel scan for oscilloscope verification.
-    TC7: Host-side validation rejects invalid configurations.
-    TC8: Non-sequential, repeated execution_order cycling.
+    TC7: Non-sequential, repeated execution_order cycling.
+    TC8: Host-side validation rejects invalid configurations.
 """
 
 from __future__ import annotations
 
+import argparse
 import sys
 import time
 import traceback
@@ -47,9 +55,14 @@ from openlifu_sdk.io.LIFUTXDevice import MIN_PROFILE_SWITCH_INTERVAL
 # Constants
 # ---------------------------------------------------------------------------
 
-CHANNEL_COUNT = 64
 CHANNELS_PER_CHIP = 32
+CHIPS_PER_MODULE = 2
+CHANNELS_PER_MODULE = CHANNELS_PER_CHIP * CHIPS_PER_MODULE
 VOLTAGE = 20.0
+
+# Optional test-only override: copy module 0's 64-channel slice onto the
+# first N connected modules before programming profiles.
+MIRROR_MODULES = 1
 
 # Channels enabled per profile by make_block_apodizations().
 APOD_BLOCK_SIZE = 16
@@ -77,13 +90,98 @@ ADDR_PATTERN_SEL_G1 = 0x1F
 ADDR_PATTERN_SEL_G2 = 0x1E
 
 # ---------------------------------------------------------------------------
+# Hardware sizing
+# ---------------------------------------------------------------------------
+
+
+def channel_count_for(num_tx: int) -> int:
+    """Total channels across the enumerated TX chips."""
+    return num_tx * CHANNELS_PER_CHIP
+
+
+def module_count_for(num_tx: int) -> int:
+    """Modules implied by the enumerated TX chip count."""
+    return max(1, -(-num_tx // CHIPS_PER_MODULE))
+
+
+def mirror_first_module_profile_data(
+    values: np.ndarray,
+    num_tx: int,
+    mirror_modules: int,
+) -> np.ndarray:
+    """Mirror module 0's 64-channel slice onto the first N modules.
+
+    This is a test-only override for oscilloscope work: matching pins on each
+    mirrored module see the same delays and apodizations, so any observed skew
+    comes from switching behavior rather than different programmed values.
+
+    Args:
+        values: Profile data with shape (profiles, channels) or (channels,).
+        num_tx: Enumerated TX chip count.
+        mirror_modules: Number of connected modules to mirror.
+
+    Returns:
+        Copy of ``values`` with the first module slice replicated across the
+        requested number of modules.
+    """
+    if mirror_modules <= 1:
+        return values
+
+    connected_modules = module_count_for(num_tx)
+    if mirror_modules > connected_modules:
+        raise ValueError(
+            f"mirror_modules={mirror_modules} exceeds connected module count "
+            f"({connected_modules})"
+        )
+
+    profile_data = np.array(values, copy=True)
+    squeeze = profile_data.ndim == 1
+    if squeeze:
+        profile_data = profile_data.reshape(1, -1)
+
+    expected_channels = channel_count_for(num_tx)
+    if profile_data.shape[1] != expected_channels:
+        raise ValueError(
+            f"Expected {expected_channels} channel values, got {profile_data.shape[1]}"
+        )
+
+    source = profile_data[:, :CHANNELS_PER_MODULE].copy()
+    for module in range(mirror_modules):
+        start = module * CHANNELS_PER_MODULE
+        stop = start + CHANNELS_PER_MODULE
+        profile_data[:, start:stop] = source
+
+    if squeeze:
+        return profile_data.reshape(-1)
+    return profile_data
+
+
+def apply_profile_test_overrides(
+    delays: np.ndarray,
+    apodizations: np.ndarray,
+    num_tx: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Apply optional test-only layout overrides before programming."""
+    if MIRROR_MODULES <= 1:
+        return delays, apodizations
+
+    mirrored_delays = mirror_first_module_profile_data(
+        delays, num_tx, MIRROR_MODULES,
+    )
+    mirrored_apodizations = mirror_first_module_profile_data(
+        apodizations, num_tx, MIRROR_MODULES,
+    )
+    return mirrored_delays, mirrored_apodizations
+
+
+# ---------------------------------------------------------------------------
 # Delay generation
 # ---------------------------------------------------------------------------
 
 
 def generate_per_channel_delays(
     profile_number: int,
-    channel_count: int = CHANNEL_COUNT,
+    channel_count: int,
     base_step_us: float = 10.0,
     channel_step_ns: float = 100.0,
 ) -> np.ndarray:
@@ -119,7 +217,7 @@ def quantize_delays(delays_s: np.ndarray, bf_clk_hz: float) -> np.ndarray:
 
 def make_block_apodizations(
     num_profiles: int,
-    channel_count: int = CHANNEL_COUNT,
+    channel_count: int,
 ) -> np.ndarray:
     """Create apodizations with one 16-channel block per profile.
 
@@ -138,7 +236,7 @@ def make_block_apodizations(
 
 def make_single_channel_apodizations(
     channels: Sequence[int],
-    channel_count: int = CHANNEL_COUNT,
+    channel_count: int,
 ) -> np.ndarray:
     """Create apodizations that enable exactly one channel per profile.
 
@@ -157,7 +255,7 @@ def make_single_channel_apodizations(
 
 def make_all_on_apodizations(
     num_profiles: int,
-    channel_count: int = CHANNEL_COUNT,
+    channel_count: int,
 ) -> np.ndarray:
     """All channels enabled for every profile."""
     return np.ones((num_profiles, channel_count), dtype=float)
@@ -235,6 +333,7 @@ def verify_delays(
     """
     bf_clk_hz = interface.txdevice.tx_registers.bf_clk
     tick_s = 1.0 / bf_clk_hz
+    channels = channel_count_for(num_tx)
     passed = True
 
     for idx, profile_number in enumerate(profile_numbers):
@@ -243,9 +342,9 @@ def verify_delays(
         )
         expected = quantize_delays(expected_delays[idx], bf_clk_hz)
 
-        if readback.size != CHANNEL_COUNT:
+        if readback.size != channels:
             print(f"  [FAIL] profile {profile_number}: "
-                  f"expected {CHANNEL_COUNT} channels, got {readback.size}")
+                  f"expected {channels} channels, got {readback.size}")
             passed = False
             continue
 
@@ -262,7 +361,7 @@ def verify_delays(
                       f"read={readback[ch]:.9e}  err={abs_err[ch]:.3e}")
             passed = False
         else:
-            print(f"  [OK] profile {profile_number}: all {CHANNEL_COUNT} "
+            print(f"  [OK] profile {profile_number}: all {channels} "
                   f"delays match (max_err={max_err:.3e} at ch{max_err_ch + 1})")
 
     return passed
@@ -396,17 +495,16 @@ def _read_delays_all_chips(
     channels 0-31 (mirroring Tx7332System.add_delay_profile). This
     function places each chip's readback at the correct global positions.
     """
-    total = num_tx * CHANNELS_PER_CHIP
-    all_delays = np.zeros(total, dtype=float)
+    all_delays = np.zeros(channel_count_for(num_tx), dtype=float)
     for txi in range(num_tx):
         result = interface.txdevice.read_delay_profile_value(
             profile_number=profile_number,
             identifier=txi,
             units="s",
         )
-        module = txi // 2
-        chip = (txi + 1) % 2
-        start = module * CHANNELS_PER_CHIP * 2 + chip * CHANNELS_PER_CHIP
+        module = txi // CHIPS_PER_MODULE
+        chip = (txi + 1) % CHIPS_PER_MODULE
+        start = (module * CHIPS_PER_MODULE + chip) * CHANNELS_PER_CHIP
         all_delays[start:start + CHANNELS_PER_CHIP] = result["delays"]
     return all_delays
 
@@ -423,6 +521,9 @@ def _setup_hardware(interface: LIFUInterface) -> int:
         num_tx = interface.txdevice.tx_registers.num_transmitters
 
     interface.hvcontroller.set_voltage(VOLTAGE)
+
+    print(f"Hardware: {module_count_for(num_tx)} module(s), {num_tx} TX chips, "
+          f"{channel_count_for(num_tx)} channels")
     return num_tx
 
 
@@ -501,8 +602,12 @@ def test_single_profile_backward_compat(
     """
     _print_header("TC1: Single profile - backwards compatibility (all channels on)")
 
-    delays = generate_per_channel_delays(profile_number=1).reshape(1, -1)
-    apodizations = make_all_on_apodizations(num_profiles=1)
+    channels = channel_count_for(num_tx)
+    delays = generate_per_channel_delays(1, channels).reshape(1, -1)
+    apodizations = make_all_on_apodizations(1, channels)
+    delays, apodizations = apply_profile_test_overrides(
+        delays, apodizations, num_tx,
+    )
     pulse = make_default_pulse()
     sequence = make_default_sequence()
 
@@ -530,7 +635,8 @@ def test_single_profile_backward_compat(
     passed &= verify_pattern_ram(interface, [1], num_tx)
 
     if passed:
-        _run_sonication(interface, sequence, "1 profile, all 64 channels on")
+        _run_sonication(interface, sequence,
+                        f"1 profile, all {channels} channels on")
 
     return passed
 
@@ -546,8 +652,12 @@ def test_single_profile_with_execution_order(
     """
     _print_header("TC2: Single profile with execution_order=[1]")
 
-    delays = generate_per_channel_delays(profile_number=1).reshape(1, -1)
-    apodizations = make_all_on_apodizations(num_profiles=1)
+    channels = channel_count_for(num_tx)
+    delays = generate_per_channel_delays(1, channels).reshape(1, -1)
+    apodizations = make_all_on_apodizations(1, channels)
+    delays, apodizations = apply_profile_test_overrides(
+        delays, apodizations, num_tx,
+    )
     pulse = make_default_pulse()
     sequence = make_default_sequence()
 
@@ -593,11 +703,15 @@ def test_multi_profile_shared_pulse(
 
     num_profiles = 4
     profile_numbers = list(range(1, num_profiles + 1))
+    channels = channel_count_for(num_tx)
 
     delays = np.array([
-        generate_per_channel_delays(p) for p in profile_numbers
+        generate_per_channel_delays(p, channels) for p in profile_numbers
     ])
-    apodizations = make_all_on_apodizations(num_profiles)
+    apodizations = make_all_on_apodizations(num_profiles, channels)
+    delays, apodizations = apply_profile_test_overrides(
+        delays, apodizations, num_tx,
+    )
     pulse = make_default_pulse()
     sequence = make_default_sequence()
     execution_order = list(profile_numbers)
@@ -645,11 +759,15 @@ def test_apodization_per_profile(
 
     num_profiles = 4
     profile_numbers = list(range(1, num_profiles + 1))
+    channels = channel_count_for(num_tx)
 
     delays = np.array([
-        generate_per_channel_delays(p) for p in profile_numbers
+        generate_per_channel_delays(p, channels) for p in profile_numbers
     ])
-    apodizations = make_block_apodizations(num_profiles)
+    apodizations = make_block_apodizations(num_profiles, channels)
+    delays, apodizations = apply_profile_test_overrides(
+        delays, apodizations, num_tx,
+    )
     pulse = make_default_pulse()
     sequence = make_default_sequence()
     execution_order = list(profile_numbers)
@@ -676,9 +794,14 @@ def test_apodization_per_profile(
     passed &= verify_apodization_register(interface, 1, num_tx)
 
     if passed:
+        blocks = ", ".join(
+            f"ch{(APOD_BLOCK_SIZE * k) % channels}-"
+            f"{(APOD_BLOCK_SIZE * k) % channels + APOD_BLOCK_SIZE - 1}"
+            for k in range(num_profiles)
+        )
         _run_sonication(
             interface, sequence,
-            "4 profiles cycling, 16-channel blocks (ch0-15, 16-31, 32-47, 48-63)",
+            f"4 profiles cycling, {APOD_BLOCK_SIZE}-channel blocks ({blocks})",
         )
 
     return passed
@@ -696,7 +819,10 @@ def test_single_channel_scan(
 
     Channels tested: 1, 2, 63, 64.
     """
-    scan_channels = [1, 2, 63, 64]
+    # First and last pair of channels, so the scan covers both ends of the
+    # array however many modules are attached.
+    channels = channel_count_for(num_tx)
+    scan_channels = [1, 2, channels - 1, channels]
     _print_header(
         f"TC6: Single-channel scan - {len(scan_channels)} profiles, one channel each"
     )
@@ -704,9 +830,12 @@ def test_single_channel_scan(
     profile_numbers = list(range(1, num_profiles + 1))
 
     delays = np.array([
-        generate_per_channel_delays(p) for p in profile_numbers
+        generate_per_channel_delays(p, channels) for p in profile_numbers
     ])
-    apodizations = make_single_channel_apodizations(scan_channels)
+    apodizations = make_single_channel_apodizations(scan_channels, channels)
+    delays, apodizations = apply_profile_test_overrides(
+        delays, apodizations, num_tx,
+    )
     pulse = make_default_pulse()
     sequence = make_default_sequence()
     execution_order = list(profile_numbers)
@@ -758,11 +887,15 @@ def test_max_profiles(
 
     num_profiles = 16
     profile_numbers = list(range(1, num_profiles + 1))
+    channels = channel_count_for(num_tx)
 
     delays = np.array([
-        generate_per_channel_delays(p) for p in profile_numbers
+        generate_per_channel_delays(p, channels) for p in profile_numbers
     ])
-    apodizations = make_all_on_apodizations(num_profiles)
+    apodizations = make_all_on_apodizations(num_profiles, channels)
+    delays, apodizations = apply_profile_test_overrides(
+        delays, apodizations, num_tx,
+    )
     pulse = make_default_pulse()
     sequence = make_default_sequence()
     execution_order = list(profile_numbers)
@@ -782,7 +915,7 @@ def test_max_profiles(
     )
 
     passed = True
-    print("  Delay verification (16 profiles x 64 channels):")
+    print(f"  Delay verification (16 profiles x {channels} channels):")
     passed &= verify_delays(interface, profile_numbers, delays, num_tx)
     print("  Control register verification:")
     passed &= verify_control_registers(interface, 1, num_tx)
@@ -810,11 +943,13 @@ def test_execution_order_cycling(
     After the sequence completes, the last executed entry must remain
     active: the firmware applies the next entry after each group's final
     pulse but never after the sequence's last pulse, and the profile reset
-    at train boundaries only occurs between trains.
+    at train boundaries only occurs between trains. Every module is checked,
+    since each one tracks the execution order independently.
     """
     execution_order = [1, 4, 1, 4, 2, 3, 2, 3]
     num_profiles = 4
     profile_numbers = list(range(1, num_profiles + 1))
+    channels = channel_count_for(num_tx)
 
     sequence = make_default_sequence()
     pulses_per_entry = sequence["pulse_count"] // len(execution_order)
@@ -824,9 +959,12 @@ def test_execution_order_cycling(
     )
 
     delays = np.array([
-        generate_per_channel_delays(p) for p in profile_numbers
+        generate_per_channel_delays(p, channels) for p in profile_numbers
     ])
-    apodizations = make_block_apodizations(num_profiles)
+    apodizations = make_block_apodizations(num_profiles, channels)
+    delays, apodizations = apply_profile_test_overrides(
+        delays, apodizations, num_tx,
+    )
     pulse = make_default_pulse()
 
     solution = make_solution(
@@ -858,16 +996,20 @@ def test_execution_order_cycling(
         f"16-channel block per profile",
     )
 
-    # Post-run: the last execution_order entry must still be selected.
+    # Post-run: the last execution_order entry must still be selected, on
+    # every module — a module that fell out of step with the trigger would
+    # show up here as a different final profile.
     expected_final = execution_order[-1]
-    final_profile = interface.txdevice.get_delay_profile()
-    if final_profile == expected_final:
-        print(f"  [OK] final active delay profile = {final_profile} "
-              f"(last execution_order entry)")
-    else:
-        print(f"  [FAIL] final active delay profile = {final_profile}, "
-              f"expected {expected_final} (last execution_order entry)")
-        passed = False
+    for module in range(module_count_for(num_tx)):
+        final_profile = interface.txdevice.get_delay_profile(module=module)
+        if final_profile == expected_final:
+            print(f"  [OK] module {module}: final active delay profile = "
+                  f"{final_profile} (last execution_order entry)")
+        else:
+            print(f"  [FAIL] module {module}: final active delay profile = "
+                  f"{final_profile}, expected {expected_final} "
+                  f"(last execution_order entry)")
+            passed = False
 
     print(f"  Apodization register after run (expect profile {expected_final}'s block):")
     passed &= verify_apodization_register(interface, expected_final, num_tx)
@@ -890,8 +1032,11 @@ def test_validation_errors(
     """
     _print_header("TC8: Validation errors (host-side, no sonication)")
 
-    delays = np.array([generate_per_channel_delays(p) for p in (1, 2, 3)])
-    apodizations = make_all_on_apodizations(3)
+    channels = channel_count_for(num_tx)
+    delays = np.array([
+        generate_per_channel_delays(p, channels) for p in (1, 2, 3)
+    ])
+    apodizations = make_all_on_apodizations(3, channels)
     pulse = make_default_pulse()
 
     cases = [
@@ -912,7 +1057,7 @@ def test_validation_errors(
         (
             "mismatched delays/apodizations rows",
             {"sequence": make_default_sequence(),
-             "apodizations": make_all_on_apodizations(2)},
+             "apodizations": make_all_on_apodizations(2, channels)},
         ),
         (
             "pulse list length != profile rows without pulse_profile_map",
@@ -958,10 +1103,41 @@ def test_validation_errors(
 # ---------------------------------------------------------------------------
 
 
+def parse_args() -> argparse.Namespace:
+    """Parse command-line flags for optional test overrides."""
+    parser = argparse.ArgumentParser(
+        description="Run multi-profile TX7332 verification tests.",
+    )
+    parser.add_argument(
+        "--mirror-modules",
+        type=int,
+        default=1,
+        help=(
+            "Copy module 0 delays and apodizations onto the first N connected "
+            "modules before programming profiles. Use 1 to keep the default "
+            "per-module channel mapping."
+        ),
+    )
+    return parser.parse_args()
+
+
 def main() -> None:
     """Run all test cases and report results."""
+    args = parse_args()
+    if args.mirror_modules < 1:
+        raise ValueError("--mirror-modules must be at least 1")
+
+    global MIRROR_MODULES
+    MIRROR_MODULES = args.mirror_modules
+
     interface = LIFUInterface()
     num_tx = _setup_hardware(interface)
+
+    if MIRROR_MODULES > 1:
+        print(
+            f"Test override: mirroring module 0 delays/apodizations across "
+            f"the first {MIRROR_MODULES} connected module(s)"
+        )
 
     # Ensure no stale sonication or auto-cycle is active from a previous run.
     interface.stop_sonication(turn_hv_off=False)

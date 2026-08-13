@@ -464,7 +464,7 @@ class TxDevice(OWComponent):
             "profile_increment": bool(trigger_json["ProfileIncrement"]),
         }
 
-    def set_pattern_profile(self, profile: int, identifier: int | None = None) -> bool:
+    def set_pattern_profile(self, profile: int, module: int | None = None) -> bool:
         """Set the active TX pattern profile via MCU controller command.
 
         Routes profile switching through firmware (OW_CTRL_SET_PATTERN_PROFILE)
@@ -473,7 +473,8 @@ class TxDevice(OWComponent):
 
         Args:
             profile: Pattern profile to activate (1-16).
-            identifier: TX chip index, or None to apply to every chip.
+            module: Module index, or None to apply to every module. A module
+                applies the profile to both of its TX chips.
 
         Raises:
             ValueError: If profile is out of range.
@@ -484,82 +485,80 @@ class TxDevice(OWComponent):
             raise ValueError(f"Invalid profile {profile}. Expected 1-16.")
 
         payload = struct.pack('<B', profile)
-        for tx_id in self._resolve_tx_ids(identifier):
+        for module_id in self._resolve_module_ids(module):
             self.send_checked(
                 packet_type=OW_CONTROLLER,
                 command=OW_CTRL_SET_PATTERN_PROFILE,
-                addr=tx_id,
+                addr=module_id,
                 data=payload,
-                op=f"set_pattern_profile[{tx_id}]",
+                op=f"set_pattern_profile[module {module_id}]",
             )
         return True
 
-    def get_pattern_profile(self, identifier: int | None = None) -> int:
+    def get_pattern_profile(self, module: int | None = None) -> int:
         """Read the active TX pattern profile via MCU controller command.
 
         Args:
-            identifier: TX chip index, or None to read every chip and require
-                that all chips report the same profile.
+            module: Module index, or None to read every module and require
+                that all modules report the same profile.
 
         Returns:
             Active pattern profile (1-16).
 
         Raises:
-            ValueError: If identifier is negative.
-            LIFUProtocolError: If a payload is malformed or chips disagree.
+            ValueError: If module is negative.
+            LIFUProtocolError: If a payload is malformed or modules disagree.
         """
-        if identifier is not None and identifier < 0:
-            raise ValueError("TX chip identifier must be >= 0")
-
         profile: int | None = None
-        for tx_id in self._resolve_tx_ids(identifier):
+        for module_id in self._resolve_module_ids(module):
             r = self.send_checked(
                 packet_type=OW_CONTROLLER,
                 command=OW_CTRL_GET_PATTERN_PROFILE,
-                addr=tx_id,
-                op=f"get_pattern_profile[{tx_id}]",
+                addr=module_id,
+                op=f"get_pattern_profile[module {module_id}]",
             )
             if r.data_len < 1 or not r.data:
                 raise LIFUProtocolError(
                     f"TX: get_pattern_profile payload too short ({r.data_len} < 1)",
                     code=LIFU_ERR_BAD_PAYLOAD_LENGTH,
                 )
-            chip_profile = int(r.data[0])
+            module_profile = int(r.data[0])
             if profile is None:
-                profile = chip_profile
-            elif profile != chip_profile:
+                profile = module_profile
+            elif profile != module_profile:
                 raise LIFUProtocolError(
-                    f"TX: pattern profile mismatch across chips ({profile} != {chip_profile})",
+                    f"TX: pattern profile mismatch across modules ({profile} != {module_profile})",
                     code=LIFU_ERR_BAD_PAYLOAD_FORMAT,
                 )
         if profile is None:
-            raise ValueError("No TX chips selected to read pattern profile")
+            raise ValueError("No modules selected to read pattern profile")
         return profile
 
-    def get_delay_profile(self, identifier: int = 0) -> int:
+    def get_delay_profile(self, module: int = 0) -> int:
         """Read the active TX delay profile via MCU controller command.
 
         Mirrors ``set_delay_profile`` by reading the same selector fields
         (G1/G2) used for register-based profile switching.
 
         Args:
-            identifier: TX chip index to read from.
+            module: Module index to read from. Both chips on a module share
+                the selector, so this reports the whole module.
 
         Returns:
             Active delay profile (1-16).
 
         Raises:
-            ValueError: If identifier is negative.
+            ValueError: If module is negative.
             LIFUProtocolError: If the payload is malformed or out of range.
         """
-        if identifier < 0:
-            raise ValueError("TX chip identifier must be >= 0")
+        if module < 0:
+            raise ValueError("Module index must be >= 0")
 
         r = self.send_checked(
             packet_type=OW_CONTROLLER,
             command=OW_CTRL_GET_DELAY_PROFILE,
-            addr=identifier,
-            op=f"get_delay_profile[{identifier}]",
+            addr=module,
+            op=f"get_delay_profile[module {module}]",
         )
         if r.data_len < 1 or not r.data:
             raise LIFUProtocolError(
@@ -749,6 +748,31 @@ class TxDevice(OWComponent):
             raise ValueError("TX chip identifier must be >= 0")
         return [identifier]
 
+    def module_count(self) -> int:
+        """Number of modules implied by the enumerated TX chip count.
+
+        Derived rather than queried so it stays consistent with the chip
+        indices used everywhere else (``TRANSMITTERS_PER_MODULE`` chips per
+        module). Use :meth:`get_module_count` to ask the device directly.
+        """
+        if self.tx_registers is None:
+            raise ValueError("TX devices not enumerated. Call enum_tx7332_devices() first.")
+        chips = self.tx_registers.num_transmitters
+        return max(1, -(-chips // TRANSMITTERS_PER_MODULE))
+
+    def _resolve_module_ids(self, module: int | None = None) -> List[int]:
+        """Resolve an optional module index: every module when None, else just that one.
+
+        Profile selection is module-scoped in firmware - a module applies the
+        profile to both of its chips - so these commands address modules, not
+        chips, unlike the register-level commands.
+        """
+        if module is None:
+            return list(range(self.module_count()))
+        if module < 0:
+            raise ValueError("Module index must be >= 0")
+        return [module]
+
     def commit_profile_ram(self, identifier: int | None = None) -> bool:
         """Commit profile RAM writes by pulsing the self-clearing LOAD_PROF bit."""
         tx_ids = self._resolve_tx_ids(identifier)
@@ -756,17 +780,16 @@ class TxDevice(OWComponent):
             self.write_register(tx_id, ADDRESS_GLOBAL_MODE, GLOBAL_CONTROL_LOAD_PROFILE)
         return True
 
-    def set_delay_profile(self, profile: int, identifier: int = 0) -> bool:
+    def set_delay_profile(self, profile: int, module: int | None = None) -> bool:
         """Set the active TX delay profile via MCU controller command.
 
         Routes delay profile switching through firmware (OW_CTRL_SET_DELAY_PROFILE),
-        allowing MCU-side profile bookkeeping and apodization handling. Note the
-        firmware applies the profile to every TX chip on the module regardless
-        of ``identifier``.
+        allowing MCU-side profile bookkeeping and apodization handling. A module
+        applies the profile to both of its TX chips.
 
         Args:
             profile: Delay profile to activate (1-16).
-            identifier: TX chip index used for addressing/validation.
+            module: Module index, or None to apply to every module.
 
         Raises:
             ValueError: If profile is out of range.
@@ -777,13 +800,14 @@ class TxDevice(OWComponent):
             raise ValueError(f"Invalid delay profile {profile}. Expected 1-16.")
 
         payload = struct.pack('<B', profile)
-        self.send_checked(
-            packet_type=OW_CONTROLLER,
-            command=OW_CTRL_SET_DELAY_PROFILE,
-            addr=identifier,
-            data=payload,
-            op=f"set_delay_profile[{identifier}]",
-        )
+        for module_id in self._resolve_module_ids(module):
+            self.send_checked(
+                packet_type=OW_CONTROLLER,
+                command=OW_CTRL_SET_DELAY_PROFILE,
+                addr=module_id,
+                data=payload,
+                op=f"set_delay_profile[module {module_id}]",
+            )
         return True
 
     def set_pattern_profile_select(self,
@@ -1131,54 +1155,70 @@ class TxDevice(OWComponent):
         The firmware stores and writes them as-is during profile cycling — no mapping
         logic needed on the MCU.
 
+        One command is sent per module, addressed by module index and carrying
+        only that module's chips. Every module keeps its own copy of the
+        execution order because each one advances it independently off the
+        shared trigger line during rastering - per-pulse commands could never
+        meet the firmware's inter-pulse deadline.
+
         Protocol:
           Packet format: [n_profiles] [n_chips] [exec_order_len] [execution_order...]
                          [profile_0_chip_0_reg:4B LE] [profile_0_chip_1_reg:4B LE] ...
           - n_profiles: Number of configured profiles (1-16)
-          - n_chips: Number of TX chips (typically 2)
+          - n_chips: TX chips on the addressed module (TRANSMITTERS_PER_MODULE)
           - exec_order_len: Length of execution order array
           - execution_order: Array of 1-based profile indices to cycle through
           - apod registers: Pre-computed uint32 apodization register per chip per profile (LE)
 
         Args:
             execution_order: List of 1-based profile indices to cycle through.
-            apod_reg_values: List of lists — apod_reg_values[profile][chip] = uint32 register value.
+            apod_reg_values: List of lists — apod_reg_values[profile][chip] = uint32
+                register value, indexed by global TX chip index.
         """
         if not hasattr(self, 'uart') or self.uart is None:
             raise ValueError("UART not initialized for grouped profile cycle setup")
 
         n_profiles = len(apod_reg_values)
-        n_chips = len(apod_reg_values[0]) if n_profiles > 0 else 0
+        n_chips_total = len(apod_reg_values[0]) if n_profiles > 0 else 0
+        n_modules = max(1, -(-n_chips_total // TRANSMITTERS_PER_MODULE))
 
-        payload = bytearray()
+        for module_id in range(n_modules):
+            first_chip = module_id * TRANSMITTERS_PER_MODULE
+            module_chips = list(range(
+                first_chip, min(first_chip + TRANSMITTERS_PER_MODULE, n_chips_total)
+            ))
 
-        # Header
-        payload.append(n_profiles)
-        payload.append(n_chips)
-        payload.append(len(execution_order))
+            payload = bytearray()
 
-        # Execution order indices (1-based profile numbers)
-        for profile_idx in execution_order:
-            payload.append(profile_idx & 0xFF)
+            # Header
+            payload.append(n_profiles)
+            payload.append(len(module_chips))
+            payload.append(len(execution_order))
 
-        # Pre-computed apodization registers: uint32 little-endian per chip per profile
-        for profile_idx in range(n_profiles):
-            for chip_idx in range(n_chips):
-                reg_val = apod_reg_values[profile_idx][chip_idx] & 0xFFFFFFFF
-                payload.extend(reg_val.to_bytes(REGISTER_BYTES, byteorder='little'))
+            # Execution order indices (1-based profile numbers)
+            for profile_idx in execution_order:
+                payload.append(profile_idx & 0xFF)
 
-        logger.info(
-            f"Sending grouped profile cycle: {n_profiles} profiles, {n_chips} chips, "
-            f"execution_order={execution_order}, payload_size={len(payload)} bytes"
-        )
+            # Pre-computed apodization registers: uint32 little-endian per chip per profile
+            for profile_idx in range(n_profiles):
+                for chip_idx in module_chips:
+                    reg_val = apod_reg_values[profile_idx][chip_idx] & 0xFFFFFFFF
+                    payload.extend(reg_val.to_bytes(REGISTER_BYTES, byteorder='little'))
 
-        self.send_checked(
-            packet_type=OW_CONTROLLER,
-            command=OW_CTRL_SET_PROFILE_CYCLE,
-            addr=0,
-            data=bytes(payload),
-            op="set_grouped_profile_cycle"
-        )
+            logger.info(
+                f"Sending grouped profile cycle to module {module_id}: {n_profiles} profiles, "
+                f"{len(module_chips)} chips, execution_order={execution_order}, "
+                f"payload_size={len(payload)} bytes"
+            )
+
+            self.send_checked(
+                packet_type=OW_CONTROLLER,
+                command=OW_CTRL_SET_PROFILE_CYCLE,
+                addr=module_id,
+                data=bytes(payload),
+                op=f"set_grouped_profile_cycle[module {module_id}]"
+            )
+
         logger.debug("Grouped profile cycle command sent successfully")
         return True
 
