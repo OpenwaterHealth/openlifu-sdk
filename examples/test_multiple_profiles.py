@@ -62,7 +62,10 @@ VOLTAGE = 20.0
 
 # Optional test-only override: copy module 0's 64-channel slice onto the
 # first N connected modules before programming profiles.
-MIRROR_MODULES = 1
+TEST_OVERRIDES = {
+    "mirror_modules": 1,
+    "skip_readbacks": False,
+}
 
 # Channels enabled per profile by make_block_apodizations().
 APOD_BLOCK_SIZE = 16
@@ -162,14 +165,15 @@ def apply_profile_test_overrides(
     num_tx: int,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Apply optional test-only layout overrides before programming."""
-    if MIRROR_MODULES <= 1:
+    mirror_modules = TEST_OVERRIDES["mirror_modules"]
+    if mirror_modules <= 1:
         return delays, apodizations
 
     mirrored_delays = mirror_first_module_profile_data(
-        delays, num_tx, MIRROR_MODULES,
+        delays, num_tx, mirror_modules,
     )
     mirrored_apodizations = mirror_first_module_profile_data(
-        apodizations, num_tx, MIRROR_MODULES,
+        apodizations, num_tx, mirror_modules,
     )
     return mirrored_delays, mirrored_apodizations
 
@@ -625,14 +629,17 @@ def test_single_profile_backward_compat(
     )
 
     passed = True
-    print("  Delay verification:")
-    passed &= verify_delays(interface, [1], delays, num_tx)
-    print("  Control register verification:")
-    passed &= verify_control_registers(interface, 1, num_tx)
-    print("  Apodization register verification:")
-    passed &= verify_apodization_register(interface, 1, num_tx)
-    print("  Pattern RAM verification:")
-    passed &= verify_pattern_ram(interface, [1], num_tx)
+    if TEST_OVERRIDES["skip_readbacks"]:
+        print("  Register readback verification: [SKIPPED]")
+    else:
+        print("  Delay verification:")
+        passed &= verify_delays(interface, [1], delays, num_tx)
+        print("  Control register verification:")
+        passed &= verify_control_registers(interface, 1, num_tx)
+        print("  Apodization register verification:")
+        passed &= verify_apodization_register(interface, 1, num_tx)
+        print("  Pattern RAM verification:")
+        passed &= verify_pattern_ram(interface, [1], num_tx)
 
     if passed:
         _run_sonication(interface, sequence,
@@ -676,12 +683,15 @@ def test_single_profile_with_execution_order(
     )
 
     passed = True
-    print("  Delay verification:")
-    passed &= verify_delays(interface, [1], delays, num_tx)
-    print("  Control register verification:")
-    passed &= verify_control_registers(interface, 1, num_tx)
-    print("  Apodization register verification:")
-    passed &= verify_apodization_register(interface, 1, num_tx)
+    if TEST_OVERRIDES["skip_readbacks"]:
+        print("  Register readback verification: [SKIPPED]")
+    else:
+        print("  Delay verification:")
+        passed &= verify_delays(interface, [1], delays, num_tx)
+        print("  Control register verification:")
+        passed &= verify_control_registers(interface, 1, num_tx)
+        print("  Apodization register verification:")
+        passed &= verify_apodization_register(interface, 1, num_tx)
 
     if passed:
         _run_sonication(interface, sequence, "1 profile with execution_order=[1]")
@@ -731,14 +741,17 @@ def test_multi_profile_shared_pulse(
     )
 
     passed = True
-    print("  Delay verification (per-channel unique values):")
-    passed &= verify_delays(interface, profile_numbers, delays, num_tx)
-    print("  Control register verification (active profile = 1):")
-    passed &= verify_control_registers(interface, 1, num_tx)
-    print("  Apodization register verification (all channels on):")
-    passed &= verify_apodization_register(interface, 1, num_tx)
-    print("  Pattern RAM verification (all slots identical):")
-    passed &= verify_pattern_ram(interface, profile_numbers, num_tx)
+    if TEST_OVERRIDES["skip_readbacks"]:
+        print("  Register readback verification: [SKIPPED]")
+    else:
+        print("  Delay verification (per-channel unique values):")
+        passed &= verify_delays(interface, profile_numbers, delays, num_tx)
+        print("  Control register verification (active profile = 1):")
+        passed &= verify_control_registers(interface, 1, num_tx)
+        print("  Apodization register verification (all channels on):")
+        passed &= verify_apodization_register(interface, 1, num_tx)
+        print("  Pattern RAM verification (all slots identical):")
+        passed &= verify_pattern_ram(interface, profile_numbers, num_tx)
 
     if passed:
         _run_sonication(interface, sequence, "4 profiles cycling, all channels on")
@@ -787,11 +800,14 @@ def test_apodization_per_profile(
     )
 
     passed = True
-    print("  Delay verification:")
-    passed &= verify_delays(interface, profile_numbers, delays, num_tx)
-    print("  Apodization register for active profile (profile 1):")
-    print("    Expected enabled channels: 0-15")
-    passed &= verify_apodization_register(interface, 1, num_tx)
+    if TEST_OVERRIDES["skip_readbacks"]:
+        print("  Register readback verification: [SKIPPED]")
+    else:
+        print("  Delay verification:")
+        passed &= verify_delays(interface, profile_numbers, delays, num_tx)
+        print("  Apodization register for active profile (profile 1):")
+        print("    Expected enabled channels: 0-15")
+        passed &= verify_apodization_register(interface, 1, num_tx)
 
     if passed:
         blocks = ", ".join(
@@ -858,13 +874,16 @@ def test_single_channel_scan(
     )
 
     passed = True
-    print("  Delay verification:")
-    passed &= verify_delays(interface, profile_numbers, delays, num_tx)
-    print("  Apodization register for active profile "
-          "(profile 1, ch 1 only):")
-    passed &= verify_apodization_register(interface, 1, num_tx)
-    print("  Pattern RAM verification:")
-    passed &= verify_pattern_ram(interface, profile_numbers, num_tx)
+    if TEST_OVERRIDES["skip_readbacks"]:
+        print("  Register readback verification: [SKIPPED]")
+    else:
+        print("  Delay verification:")
+        passed &= verify_delays(interface, profile_numbers, delays, num_tx)
+        print("  Apodization register for active profile "
+              "(profile 1, ch 1 only):")
+        passed &= verify_apodization_register(interface, 1, num_tx)
+        print("  Pattern RAM verification:")
+        passed &= verify_pattern_ram(interface, profile_numbers, num_tx)
 
     if passed:
         _run_sonication(
@@ -915,12 +934,15 @@ def test_max_profiles(
     )
 
     passed = True
-    print(f"  Delay verification (16 profiles x {channels} channels):")
-    passed &= verify_delays(interface, profile_numbers, delays, num_tx)
-    print("  Control register verification:")
-    passed &= verify_control_registers(interface, 1, num_tx)
-    print("  Pattern RAM verification (all 16 slots):")
-    passed &= verify_pattern_ram(interface, profile_numbers, num_tx)
+    if TEST_OVERRIDES["skip_readbacks"]:
+        print("  Register readback verification: [SKIPPED]")
+    else:
+        print(f"  Delay verification (16 profiles x {channels} channels):")
+        passed &= verify_delays(interface, profile_numbers, delays, num_tx)
+        print("  Control register verification:")
+        passed &= verify_control_registers(interface, 1, num_tx)
+        print("  Pattern RAM verification (all 16 slots):")
+        passed &= verify_pattern_ram(interface, profile_numbers, num_tx)
 
     if passed:
         _run_sonication(interface, sequence, "16 profiles cycling, all channels on")
@@ -982,10 +1004,13 @@ def test_execution_order_cycling(
     )
 
     passed = True
-    print("  Delay verification:")
-    passed &= verify_delays(interface, profile_numbers, delays, num_tx)
-    print("  Control register verification (active profile = 1):")
-    passed &= verify_control_registers(interface, 1, num_tx)
+    if TEST_OVERRIDES["skip_readbacks"]:
+        print("  Register readback verification: [SKIPPED]")
+    else:
+        print("  Delay verification:")
+        passed &= verify_delays(interface, profile_numbers, delays, num_tx)
+        print("  Control register verification (active profile = 1):")
+        passed &= verify_control_registers(interface, 1, num_tx)
 
     if not passed:
         return False
@@ -1000,19 +1025,22 @@ def test_execution_order_cycling(
     # every module — a module that fell out of step with the trigger would
     # show up here as a different final profile.
     expected_final = execution_order[-1]
-    for module in range(module_count_for(num_tx)):
-        final_profile = interface.txdevice.get_delay_profile(module=module)
-        if final_profile == expected_final:
-            print(f"  [OK] module {module}: final active delay profile = "
-                  f"{final_profile} (last execution_order entry)")
-        else:
-            print(f"  [FAIL] module {module}: final active delay profile = "
-                  f"{final_profile}, expected {expected_final} "
-                  f"(last execution_order entry)")
-            passed = False
+    if TEST_OVERRIDES["skip_readbacks"]:
+        print("  Post-run register readback verification: [SKIPPED]")
+    else:
+        for module in range(module_count_for(num_tx)):
+            final_profile = interface.txdevice.get_delay_profile(module=module)
+            if final_profile == expected_final:
+                print(f"  [OK] module {module}: final active delay profile = "
+                      f"{final_profile} (last execution_order entry)")
+            else:
+                print(f"  [FAIL] module {module}: final active delay profile = "
+                      f"{final_profile}, expected {expected_final} "
+                      f"(last execution_order entry)")
+                passed = False
 
-    print(f"  Apodization register after run (expect profile {expected_final}'s block):")
-    passed &= verify_apodization_register(interface, expected_final, num_tx)
+        print(f"  Apodization register after run (expect profile {expected_final}'s block):")
+        passed &= verify_apodization_register(interface, expected_final, num_tx)
 
     return passed
 
@@ -1118,6 +1146,14 @@ def parse_args() -> argparse.Namespace:
             "per-module channel mapping."
         ),
     )
+    parser.add_argument(
+        "--skip-readbacks",
+        action="store_true",
+        help=(
+            "Bypass delay/control/apodization/pattern register readback "
+            "verification and run programming/sonication only."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -1127,17 +1163,19 @@ def main() -> None:
     if args.mirror_modules < 1:
         raise ValueError("--mirror-modules must be at least 1")
 
-    global MIRROR_MODULES
-    MIRROR_MODULES = args.mirror_modules
+    TEST_OVERRIDES["mirror_modules"] = args.mirror_modules
+    TEST_OVERRIDES["skip_readbacks"] = args.skip_readbacks
 
     interface = LIFUInterface()
     num_tx = _setup_hardware(interface)
 
-    if MIRROR_MODULES > 1:
+    if TEST_OVERRIDES["mirror_modules"] > 1:
         print(
             f"Test override: mirroring module 0 delays/apodizations across "
-            f"the first {MIRROR_MODULES} connected module(s)"
+            f"the first {TEST_OVERRIDES['mirror_modules']} connected module(s)"
         )
+    if TEST_OVERRIDES["skip_readbacks"]:
+        print("Test override: skipping register readback verification")
 
     # Ensure no stale sonication or auto-cycle is active from a previous run.
     interface.stop_sonication(turn_hv_off=False)
