@@ -265,7 +265,7 @@ class TxDevice(OWComponent):
                 pulse_train_interval shorter than the on-device train
                 duration ``pulse_count * (1_000_000 // int(1/pulse_interval))``
                 microseconds (the firmware truncates fractional Hz, so its
-                train can run longer than the host-side float math suggests).
+                train can run longer than what we calculate here).
         """
 
         trigger_mode = trigger_mode.lower()
@@ -302,8 +302,8 @@ class TxDevice(OWComponent):
                         and trigger_mode_int != TRIGGER_MODE_CONTINUOUS)
 
         host_train_us = int(round(pulse_interval * pulse_count * 1e6))
-
         interval_us = int(round(pulse_train_interval * 1e6))
+
         if pulse_train_interval == 0 or (single_train
                                          and interval_us < fw_train_us):
             pulse_train_interval = 0.0
@@ -317,7 +317,7 @@ class TxDevice(OWComponent):
                     f"puts the firmware train-timer expiry on the same tick "
                     f"as the final pulse. Use a longer interval."
                 )
-            # Zero gap: use the firmware's single-timer back-to-back path.
+            # If zero gap use the firmware's single-timer back-to-back path.
             logger.info(
                 "pulse_train_interval %s s equals the train duration "
                 "(%s us on-device) -- zero inter-train gap; sending 0 to "
@@ -484,8 +484,15 @@ class TxDevice(OWComponent):
         if profile not in VALID_PULSE_PROFILES:
             raise ValueError(f"Invalid profile {profile}. Expected 1-16.")
 
+        if module is None:
+            module_ids = list(range(self.get_module_count()))
+        else:
+            if module < 0:
+                raise ValueError("Module index must be >= 0")
+            module_ids = [module]
+
         payload = struct.pack('<B', profile)
-        for module_id in self._resolve_module_ids(module):
+        for module_id in module_ids:
             self.send_checked(
                 packet_type=OW_CONTROLLER,
                 command=OW_CTRL_SET_PATTERN_PROFILE,
@@ -509,8 +516,15 @@ class TxDevice(OWComponent):
             ValueError: If module is negative.
             LIFUProtocolError: If a payload is malformed or modules disagree.
         """
+        if module is None:
+            module_ids = list(range(self.get_module_count()))
+        else:
+            if module < 0:
+                raise ValueError("Module index must be >= 0")
+            module_ids = [module]
+
         profile: int | None = None
-        for module_id in self._resolve_module_ids(module):
+        for module_id in module_ids:
             r = self.send_checked(
                 packet_type=OW_CONTROLLER,
                 command=OW_CTRL_GET_PATTERN_PROFILE,
@@ -748,31 +762,6 @@ class TxDevice(OWComponent):
             raise ValueError("TX chip identifier must be >= 0")
         return [identifier]
 
-    def module_count(self) -> int:
-        """Number of modules implied by the enumerated TX chip count.
-
-        Derived rather than queried so it stays consistent with the chip
-        indices used everywhere else (``TRANSMITTERS_PER_MODULE`` chips per
-        module). Use :meth:`get_module_count` to ask the device directly.
-        """
-        if self.tx_registers is None:
-            raise ValueError("TX devices not enumerated. Call enum_tx7332_devices() first.")
-        chips = self.tx_registers.num_transmitters
-        return max(1, -(-chips // TRANSMITTERS_PER_MODULE))
-
-    def _resolve_module_ids(self, module: int | None = None) -> List[int]:
-        """Resolve an optional module index: every module when None, else just that one.
-
-        Profile selection is module-scoped in firmware - a module applies the
-        profile to both of its chips - so these commands address modules, not
-        chips, unlike the register-level commands.
-        """
-        if module is None:
-            return list(range(self.module_count()))
-        if module < 0:
-            raise ValueError("Module index must be >= 0")
-        return [module]
-
     def commit_profile_ram(self, identifier: int | None = None) -> bool:
         """Commit profile RAM writes by pulsing the self-clearing LOAD_PROF bit."""
         tx_ids = self._resolve_tx_ids(identifier)
@@ -799,8 +788,15 @@ class TxDevice(OWComponent):
         if profile not in VALID_DELAY_PROFILES:
             raise ValueError(f"Invalid delay profile {profile}. Expected 1-16.")
 
+        if module is None:
+            module_ids = list(range(self.get_module_count()))
+        else:
+            if module < 0:
+                raise ValueError("Module index must be >= 0")
+            module_ids = [module]
+
         payload = struct.pack('<B', profile)
-        for module_id in self._resolve_module_ids(module):
+        for module_id in module_ids:
             self.send_checked(
                 packet_type=OW_CONTROLLER,
                 command=OW_CTRL_SET_DELAY_PROFILE,
@@ -1158,8 +1154,7 @@ class TxDevice(OWComponent):
         One command is sent per module, addressed by module index and carrying
         only that module's chips. Every module keeps its own copy of the
         execution order because each one advances it independently off the
-        shared trigger line during rastering - per-pulse commands could never
-        meet the firmware's inter-pulse deadline.
+        shared trigger line during rastering.
 
         Protocol:
           Packet format: [n_profiles] [n_chips] [exec_order_len] [execution_order...]
