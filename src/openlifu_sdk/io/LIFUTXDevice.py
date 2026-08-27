@@ -254,7 +254,13 @@ class TxDevice(OWComponent):
             pulse_count (int): The number of pulses to generate.
             pulse_width (int): The pulse width in microseconds.
             pulse_train_interval (float): The time interval between pulse
-                train starts in seconds.
+                train starts in seconds. ``0`` and
+                ``pulse_interval * pulse_count`` both mean back-to-back
+                trains and are both sent as 0, which selects the firmware's
+                free-running path off the single pulse timer. In
+                ``"continuous"`` mode that path also drives multi-profile
+                rastering: the firmware restarts the execution order every
+                ``pulse_count`` pulses.
             pulse_train_count (int): The number of pulse trains to generate.
             trigger_mode (TriggerModeOpts): The trigger mode to use.
             profile_index (int): The pulse profile to use.
@@ -308,15 +314,6 @@ class TxDevice(OWComponent):
                                          and interval_us < fw_train_us):
             pulse_train_interval = 0.0
         elif interval_us == host_train_us or interval_us == fw_train_us:
-            if trigger_mode_int == TRIGGER_MODE_CONTINUOUS:
-                # The train timer would expire on the final pulse tick, and
-                # continuous mode's 0 path has no per-train bookkeeping.
-                raise ValueError(
-                    f"pulse_train_interval equals the on-device train "
-                    f"duration ({fw_train_us} us); in continuous mode this "
-                    f"puts the firmware train-timer expiry on the same tick "
-                    f"as the final pulse. Use a longer interval."
-                )
             # If zero gap use the firmware's single-timer back-to-back path.
             logger.info(
                 "pulse_train_interval %s s equals the train duration "
@@ -938,7 +935,9 @@ class TxDevice(OWComponent):
         When ``execution_order`` has more than one entry, the firmware
         cycles through it at pulse boundaries: each entry gets
         ``pulse_count / len(execution_order)`` consecutive pulses, and the
-        order restarts at the beginning of every pulse train.
+        order restarts at the beginning of every pulse train (in continuous
+        mode with ``pulse_train_interval`` 0 there is no train boundary, so
+        it restarts every ``pulse_count`` pulses).
 
         Args:
             pulse:              Dict (single shared pulse config) or List[Dict]
