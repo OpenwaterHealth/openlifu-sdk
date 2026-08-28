@@ -16,6 +16,11 @@ on:
         required: false
         default: false
         type: boolean
+      update_firmware:
+        description: "Refresh bundled firmware from the firmware repos' releases"
+        required: false
+        default: true
+        type: boolean
 
 permissions:
   contents: write 
@@ -26,6 +31,9 @@ jobs:
     permissions:
       contents: write
       id-token: write
+    env:
+      # On by default; only a manual run can turn the firmware refresh off.
+      UPDATE_FIRMWARE: ${{ github.event_name != 'workflow_dispatch' || inputs.update_firmware }}
 
     steps:
       - name: Checkout (need tags for setuptools-scm)
@@ -77,8 +85,11 @@ jobs:
       # else -- and rc/next builds with no usable pre-release -- takes
       # the latest stable release. The dfu-stub and legacy-updater
       # images have no publishing CI and stay as committed.
+      # Skipping the refresh (manual runs, update_firmware=false) bundles
+      # whatever firmware images are committed in the repo.
       - name: Resolve firmware releases
         id: fw
+        if: env.UPDATE_FIRMWARE == 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
@@ -113,6 +124,7 @@ jobs:
           echo "transmitter=$TRANSMITTER_TAG" >> "$GITHUB_OUTPUT"
 
       - name: Pull firmware binaries
+        if: env.UPDATE_FIRMWARE == 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
@@ -127,6 +139,12 @@ jobs:
             --pattern 'openlifu-transmitter-fw-signed.bin' \
             --pattern 'openlifu-transmitter-fw-production.bin'
           ls -l "$FW_DIR"
+
+      - name: Show bundled firmware (committed images)
+        if: env.UPDATE_FIRMWARE != 'true'
+        run: |
+          echo "Firmware refresh disabled -- bundling the committed images."
+          ls -l src/openlifu_sdk/firmware
 
       - name: Build sdist & wheel
         run: python -m build
