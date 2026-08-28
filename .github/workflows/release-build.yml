@@ -118,14 +118,55 @@ jobs:
         run: |
           set -euo pipefail
           FW_DIR=src/openlifu_sdk/firmware
-          gh release download "${{ steps.fw.outputs.console }}" \
-            --repo OpenwaterHealth/openlifu-console-fw --dir "$FW_DIR" --clobber \
-            --pattern 'openlifu-console-fw-signed.bin' \
-            --pattern 'openlifu-console-fw-production.bin'
-          gh release download "${{ steps.fw.outputs.transmitter }}" \
-            --repo OpenwaterHealth/openlifu-transmitter-fw --dir "$FW_DIR" --clobber \
-            --pattern 'openlifu-transmitter-fw-signed.bin' \
-            --pattern 'openlifu-transmitter-fw-production.bin'
+
+          pull_fw_file() {
+            local repo=$1
+            local tag=$2
+            local target=$3
+            shift 3
+
+            for pattern in "$@"; do
+              if gh release download "$tag" --repo "$repo" --dir "$FW_DIR" --clobber --pattern "$pattern"; then
+                for downloaded in "$FW_DIR"/$pattern; do
+                  [ -e "$downloaded" ] || continue
+                  if [ "$(basename "$downloaded")" != "$target" ]; then
+                    mv -f "$downloaded" "$FW_DIR/$target"
+                  fi
+                  break
+                done
+                return 0
+              fi
+            done
+
+            if [ -f "$FW_DIR/$target" ]; then
+              echo "::warning::Using existing $target from repository (no matching asset found in ${repo}@${tag})."
+              return 0
+            fi
+
+            echo "::error::No compatible asset found for $target in ${repo}@${tag}."
+            return 1
+          }
+
+          pull_fw_file OpenwaterHealth/openlifu-console-fw "${{ steps.fw.outputs.console }}" \
+            openlifu-console-fw-signed.bin \
+            'openlifu-console-fw-signed.bin' \
+            'openlifu-console-fw_v*.signed.bin'
+
+          pull_fw_file OpenwaterHealth/openlifu-console-fw "${{ steps.fw.outputs.console }}" \
+            openlifu-console-fw-production.bin \
+            'openlifu-console-fw-production.bin' \
+            'openlifu-console-prod_v*.bin'
+
+          pull_fw_file OpenwaterHealth/openlifu-transmitter-fw "${{ steps.fw.outputs.transmitter }}" \
+            openlifu-transmitter-fw-signed.bin \
+            'openlifu-transmitter-fw-signed.bin' \
+            'openlifu-transmitter-fw_v*.signed.bin'
+
+          pull_fw_file OpenwaterHealth/openlifu-transmitter-fw "${{ steps.fw.outputs.transmitter }}" \
+            openlifu-transmitter-fw-production.bin \
+            'openlifu-transmitter-fw-production.bin' \
+            'openlifu-transmitter-prod_v*.bin'
+
           ls -l "$FW_DIR"
 
       - name: Build sdist & wheel
