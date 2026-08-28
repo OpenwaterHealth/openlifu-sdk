@@ -1,0 +1,85 @@
+name: "Medical Software Safety & Security Scan"
+
+on:
+  push:
+    branches: [ main, next ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  static-analysis:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Analysis Tools
+        run: pip install ruff==0.15.0 bandit lizard
+
+      # 1. Ruff (correctness / dead code / import hygiene)
+      # Python counterpart of the firmware repos' cppcheck gate; any finding
+      # fails the build. Suppressions are inline (# noqa: <rule> -- reason).
+      - name: Run Ruff (Correctness)
+        run: ruff check src
+
+      # 2. Bandit (security static analysis)
+      # Gates on MEDIUM and higher severity. LOW findings (e.g. B110
+      # try/except/pass in device-cleanup paths) are reported in the log but
+      # do not fail the build.
+      - name: Run Bandit (Security)
+        run: bandit -r src --severity-level medium
+
+      # 3. Complexity Analysis (Lizard)
+      # IEC 62304 recommends low cyclomatic complexity for testability.
+      # Same thresholds as the firmware repos (-C 15 -L 100); functions that
+      # are structurally complex by design are whitelisted in
+      # lizard_whitelist.csv.
+      - name: Check Code Complexity (IEC 62304 Requirement)
+        run: |
+          lizard src \
+            -C 15 -L 100 -w \
+            --whitelist lizard_whitelist.csv
+
+      # 4. Vulnerability Scan against the committed SBOM
+      # grype consumes the CycloneDX SBOM and checks each component against
+      # the Grype vulnerability database (NVD, OSV, GHSA, and others).
+      # Dependency versions are pinned in pyproject.toml and mirrored in the
+      # SBOM, so PyPI purl matching is exact.
+      # Fails the build on any HIGH or CRITICAL finding.
+      - name: Scan SBOM for Vulnerabilities (grype)
+        id: grype
+        uses: anchore/scan-action@v6
+        with:
+          sbom: "sbom.cdx.json"
+          fail-build: true
+          severity-cutoff: high
+          output-format: sarif
+
+      # 5. Upload SARIF results to GitHub Security tab
+      # Makes vulnerability findings visible in the repository's Security view.
+      # Code Scanning (Security tab) requires GitHub Advanced Security, which is
+      # off by default on private repos. Don't fail the scan if it isn't enabled:
+      # grype already gates the build on HIGH/CRITICAL CVEs, and the SARIF is kept
+      # as a build artifact below. Remove continue-on-error once GHAS is enabled.
+      - name: Upload SARIF to GitHub Security
+        if: always() && steps.grype.conclusion != 'skipped'
+        continue-on-error: true
+        uses: github/codeql-action/upload-sarif@v4
+        with:
+          sarif_file: ${{ steps.grype.outputs.sarif }}
+
+      # 6. Upload Audit Artifacts
+      # Keeps a record of the scan results for regulatory submission.
+      - name: Archive Regulatory Evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sdk-compliance-report
+          path: |
+            sbom.cdx.json
+            ${{ steps.grype.outputs.sarif }}

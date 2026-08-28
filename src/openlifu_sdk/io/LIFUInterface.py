@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import asyncio
 import importlib.metadata
 import logging
 import os
@@ -486,6 +485,8 @@ class LIFUInterface:
             profile_index=profile_index,
             profile_increment=profile_increment,
             trigger_mode=trigger_mode,
+            execution_order=solution.get('execution_order'),
+            pulse_profile_map=solution.get('pulse_profile_map'),
         )
         self.set_status(LIFUInterfaceStatus.STATUS_READY)
 
@@ -670,4 +671,12 @@ class LIFUInterface:
 
     @staticmethod
     def get_sdk_version() -> str:
-        return importlib.metadata.version("openlifu-sdk")
+        # Report the version of the module actually imported (baked from the
+        # git tag at build time), not whichever dist-info importlib finds
+        # first -- the two can disagree when a stale install lingers on the
+        # path. Runtime import avoids a circular import at module load.
+        import openlifu_sdk
+
+        return getattr(
+            openlifu_sdk, "__version__", None
+        ) or importlib.metadata.version("openlifu-sdk")

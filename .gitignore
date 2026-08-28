@@ -45,3 +45,4 @@ htmlcov/
 
 #Downloaded Firmware
 src/openlifu_sdk/firmware/downloads
+src/openlifu_sdk/_version.py

@@ -12,7 +12,7 @@ authors = [
 description = "Openwater LIFU SDK — hardware I/O interface library"
 readme = { file = "README.md", content-type = "text/markdown" }
 requires-python = ">=3.10"
-license = "MIT"
+license = "AGPL-3.0-only"
 license-files = ["LICENSE"]
 classifiers = [
   "Development Status :: 4 - Beta",
@@ -27,15 +27,18 @@ classifiers = [
   "Typing :: Typed",
 ]
 dependencies = [
-  "numpy",
-  "pandas",
-  "xarray",
-  "pyserial",
-  "pyusb",
-  "base58"
+  "numpy==2.5.1",
+  "pandas==3.0.3",
+  "xarray==2026.7.0",
+  "pyserial==3.5",
+  "pyusb==1.3.1",
+  "base58==2.1.1"
 ]
 
 [project.optional-dependencies]
+crypto = [
+  "cryptography==46.0.5",
+]
 test = [
   "pytest>=6",
   "pytest-cov>=3",
@@ -45,11 +48,12 @@ dev = [
   "pytest>=6",
   "pytest-cov>=3",
   "pytest-mock",
+  "cryptography==46.0.5",
 ]
 ui = [
-  "PyQt6>=6.5",
-  "packaging>=21.0",
-  "requests>=2.25.0",
+  "PyQt6==6.11.0",
+  "packaging==26.2",
+  "requests==2.34.2",
 ]
 
 
@@ -71,7 +75,13 @@ openlifu_sdk = [
 
 
 [tool.setuptools_scm]
-# Uses tags like v1.2.3 or 1.2.3  ->  1.2.3
-tag_regex = "^(?:pre-)?v?(?P<version>\\d+\\.\\d+\\.\\d+)$"
+# The version comes from the git tag, verbatim. Accepts release and
+# pre-release tags with optional pre-/v prefixes, e.g.:
+#   1.2.3  v1.2.3  pre-v1.2.3  2.0.15-rc.0  2.0.15rc0  1.2.3.post1
+# The captured part is normalized per PEP 440 (2.0.15-rc.0 -> 2.0.15rc0).
+tag_regex = "^(?:pre-)?v?(?P<version>\\d+\\.\\d+\\.\\d+(?:[-._]?(?:rc|a|b|c|alpha|beta|post|dev)[-._]?\\d*)?)$"
 version_scheme = "no-guess-dev"
 local_scheme = "no-local-version"
+# Bake the resolved version into the package so openlifu_sdk.__version__
+# always matches the wheel that was actually imported.
+version_file = "src/openlifu_sdk/_version.py"

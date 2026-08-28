@@ -1,0 +1,1224 @@
+# ---
+# jupyter:
+#   jupytext:
+#     formats: ipynb,py:percent
+#     text_representation:
+#       extension: .py
+#       format_name: percent
+#       format_version: '1.3'
+#       jupytext_version: 1.16.4
+#   kernelspec:
+#     display_name: env
+#     language: python
+#     name: python3
+# ---
+
+# %%
+"""QA verification for set_solution() single-profile and multi-profile paths.
+
+Tests verify register-level correctness of delays, apodizations, and pattern
+data written to TX7332 devices. Each test calls set_solution(), reads back
+hardware registers, and asserts correctness.
+
+Sizing is taken from the enumerated hardware, so the same run covers a single
+module (2 chips / 64 channels) or a multi-module stack (2 modules / 4 chips /
+128 channels). On a multi-module stack every module holds its own copy of the
+execution order and advances it off the shared trigger line, so the checks
+below verify all chips, and TC7 verifies that every module ends the sequence on
+the same profile.
+
+Test cases:
+    TC1: Single profile, backward compatible (no execution_order).
+    TC2: Single profile with explicit execution_order=[1].
+    TC3: Multiple delay profiles with shared pulse config.
+    TC4: Apodization register verification per profile.
+    TC5: Maximum 16 delay profiles.
+    TC6: Single-channel scan for oscilloscope verification.
+    TC7: Non-sequential, repeated execution_order cycling.
+    TC8: Host-side validation rejects invalid configurations.
+"""
+
+from __future__ import annotations
+
+import argparse
+import sys
+import time
+import traceback
+from typing import Sequence
+
+import numpy as np
+
+from openlifu_sdk import LIFUInterface
+from openlifu_sdk.io.LIFUTXDevice import MIN_PROFILE_SWITCH_INTERVAL
+
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
+
+CHANNELS_PER_CHIP = 32
+CHIPS_PER_MODULE = 2
+CHANNELS_PER_MODULE = CHANNELS_PER_CHIP * CHIPS_PER_MODULE
+VOLTAGE = 20.0
+
+# Optional test-only override: copy module 0's 64-channel slice onto the
+# first N connected modules before programming profiles.
+TEST_OVERRIDES = {
+    "mirror_modules": 1,
+    "skip_readbacks": False,
+}
+
+# Channels enabled per profile by make_block_apodizations().
+APOD_BLOCK_SIZE = 16
+
+# Wait after enabling the 12 V rail before talking to the TX chips.
+RAIL_12V_SETTLE_S = 2.0
+
+# Default pulse parameters shared by all tests.
+DEFAULT_FREQUENCY_HZ = 400e3
+DEFAULT_DURATION_S = 5e-3
+
+# Extra wall-clock margin (seconds) on top of the computed sequence duration,
+# covering start/stop command latency and per-train firmware ISR overhead.
+SONICATION_MARGIN_S = 0.0
+
+# Pattern RAM layout.
+PATTERN_DATA_START = 0x120
+PATTERN_PROFILE_BLOCK = 4  # Registers per profile block in TX7332 RAM.
+PATTERN_DATA_REGS = 2  # Only the first 2 hold actual pattern data.
+
+# TX7332 register addresses.
+ADDR_DELAY_SEL = 0x16
+ADDR_APODIZATION = 0x1B
+ADDR_PATTERN_SEL_G1 = 0x1F
+ADDR_PATTERN_SEL_G2 = 0x1E
+
+# ---------------------------------------------------------------------------
+# Hardware sizing
+# ---------------------------------------------------------------------------
+
+
+def channel_count_for(num_tx: int) -> int:
+    """Total channels across the enumerated TX chips."""
+    return num_tx * CHANNELS_PER_CHIP
+
+
+def module_count_for(num_tx: int) -> int:
+    """Modules implied by the enumerated TX chip count."""
+    return max(1, -(-num_tx // CHIPS_PER_MODULE))
+
+
+def mirror_first_module_profile_data(
+    values: np.ndarray,
+    num_tx: int,
+    mirror_modules: int,
+) -> np.ndarray:
+    """Mirror module 0's 64-channel slice onto the first N modules.
+
+    This is a test-only override for oscilloscope work: matching pins on each
+    mirrored module see the same delays and apodizations, so any observed skew
+    comes from switching behavior rather than different programmed values.
+
+    Args:
+        values: Profile data with shape (profiles, channels) or (channels,).
+        num_tx: Enumerated TX chip count.
+        mirror_modules: Number of connected modules to mirror.
+
+    Returns:
+        Copy of ``values`` with the first module slice replicated across the
+        requested number of modules.
+    """
+    if mirror_modules <= 1:
+        return values
+
+    connected_modules = module_count_for(num_tx)
+    if mirror_modules > connected_modules:
+        raise ValueError(
+            f"mirror_modules={mirror_modules} exceeds connected module count "
+            f"({connected_modules})"
+        )
+
+    profile_data = np.array(values, copy=True)
+    squeeze = profile_data.ndim == 1
+    if squeeze:
+        profile_data = profile_data.reshape(1, -1)
+
+    expected_channels = channel_count_for(num_tx)
+    if profile_data.shape[1] != expected_channels:
+        raise ValueError(
+            f"Expected {expected_channels} channel values, got {profile_data.shape[1]}"
+        )
+
+    source = profile_data[:, :CHANNELS_PER_MODULE].copy()
+    for module in range(mirror_modules):
+        start = module * CHANNELS_PER_MODULE
+        stop = start + CHANNELS_PER_MODULE
+        profile_data[:, start:stop] = source
+
+    if squeeze:
+        return profile_data.reshape(-1)
+    return profile_data
+
+
+def apply_profile_test_overrides(
+    delays: np.ndarray,
+    apodizations: np.ndarray,
+    num_tx: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Apply optional test-only layout overrides before programming."""
+    mirror_modules = TEST_OVERRIDES["mirror_modules"]
+    if mirror_modules <= 1:
+        return delays, apodizations
+
+    mirrored_delays = mirror_first_module_profile_data(
+        delays, num_tx, mirror_modules,
+    )
+    mirrored_apodizations = mirror_first_module_profile_data(
+        apodizations, num_tx, mirror_modules,
+    )
+    return mirrored_delays, mirrored_apodizations
+
+
+# ---------------------------------------------------------------------------
+# Delay generation
+# ---------------------------------------------------------------------------
+
+
+def generate_per_channel_delays(
+    profile_number: int,
+    channel_count: int,
+    base_step_us: float = 10.0,
+    channel_step_ns: float = 100.0,
+) -> np.ndarray:
+    """Generate a delay vector with unique per-channel values.
+
+    Each profile has a distinct base delay, and each channel within the
+    profile adds a small linear offset so that every register value is
+    unique and independently verifiable.
+
+    Args:
+        profile_number: 1-based profile index.
+        channel_count: Number of channels (typically 64).
+        base_step_us: Microsecond step between profiles.
+        channel_step_ns: Nanosecond increment per channel within a profile.
+
+    Returns:
+        1-D array of delays in seconds, shape (channel_count,).
+    """
+    base_s = (profile_number - 1) * base_step_us * 1e-6
+    channel_offsets_s = np.arange(channel_count) * channel_step_ns * 1e-9
+    return base_s + channel_offsets_s
+
+
+def quantize_delays(delays_s: np.ndarray, bf_clk_hz: float) -> np.ndarray:
+    """Quantize delays to device resolution (truncation to clock ticks)."""
+    return np.floor(delays_s * bf_clk_hz) / bf_clk_hz
+
+
+# ---------------------------------------------------------------------------
+# Apodization helpers
+# ---------------------------------------------------------------------------
+
+
+def make_block_apodizations(
+    num_profiles: int,
+    channel_count: int,
+) -> np.ndarray:
+    """Create apodizations with one 16-channel block per profile.
+
+    Profile k enables channels [(k-1)*16 .. k*16), wrapping modulo
+    channel_count.
+
+    Returns:
+        Array of shape (num_profiles, channel_count).
+    """
+    apodizations = np.zeros((num_profiles, channel_count), dtype=float)
+    for k in range(num_profiles):
+        start = (APOD_BLOCK_SIZE * k) % channel_count
+        apodizations[k, start:start + APOD_BLOCK_SIZE] = 1.0
+    return apodizations
+
+
+def make_single_channel_apodizations(
+    channels: Sequence[int],
+    channel_count: int,
+) -> np.ndarray:
+    """Create apodizations that enable exactly one channel per profile.
+
+    Args:
+        channels: 1-based global channel numbers, one per profile.
+        channel_count: Total channels.
+
+    Returns:
+        Array of shape (len(channels), channel_count).
+    """
+    apodizations = np.zeros((len(channels), channel_count), dtype=float)
+    for i, ch in enumerate(channels):
+        apodizations[i, ch - 1] = 1.0
+    return apodizations
+
+
+def make_all_on_apodizations(
+    num_profiles: int,
+    channel_count: int,
+) -> np.ndarray:
+    """All channels enabled for every profile."""
+    return np.ones((num_profiles, channel_count), dtype=float)
+
+
+# ---------------------------------------------------------------------------
+# Shared pulse / sequence builders
+# ---------------------------------------------------------------------------
+
+
+def make_default_pulse() -> dict:
+    """Standard pulse config used across tests."""
+    return {
+        "frequency": DEFAULT_FREQUENCY_HZ,
+        "duration": DEFAULT_DURATION_S,
+        "amplitude": 1.0,
+    }
+
+
+def make_default_sequence() -> dict:
+    """Standard trigger sequence used across tests."""
+    return {
+        "pulse_interval": 0.1,
+        "pulse_count": 16,
+        "pulse_train_interval": 0,
+        "pulse_train_count": 5,
+    }
+
+
+def make_solution(
+    pulse,
+    delays: np.ndarray,
+    apodizations: np.ndarray,
+    sequence: dict,
+    execution_order: list[int] | None = None,
+    pulse_profile_map: dict | None = None,
+    voltage: float = VOLTAGE,
+) -> dict:
+    """Assemble a solution dict for ``LIFUInterface.set_solution()``.
+
+    Mirrors the fields ``set_solution()`` reads off the solution: the
+    beamforming arrays, the trigger sequence, the HV voltage, and the
+    optional multi-profile ``execution_order`` / ``pulse_profile_map``.
+    Optional keys are omitted when None so single-profile solutions stay
+    backward compatible.
+    """
+    solution: dict = {
+        "pulse": pulse,
+        "delays": delays,
+        "apodizations": apodizations,
+        "sequence": sequence,
+        "voltage": voltage,
+    }
+    if execution_order is not None:
+        solution["execution_order"] = execution_order
+    if pulse_profile_map is not None:
+        solution["pulse_profile_map"] = pulse_profile_map
+    return solution
+
+
+# ---------------------------------------------------------------------------
+# Register readback and verification
+# ---------------------------------------------------------------------------
+
+
+def verify_delays(
+    interface: LIFUInterface,
+    profile_numbers: list[int],
+    expected_delays: np.ndarray,
+    num_tx: int,
+) -> bool:
+    """Read delay RAM for each profile and verify against expected values.
+
+    Returns True if all profiles match within one clock tick.
+    """
+    bf_clk_hz = interface.txdevice.tx_registers.bf_clk
+    tick_s = 1.0 / bf_clk_hz
+    channels = channel_count_for(num_tx)
+    passed = True
+
+    for idx, profile_number in enumerate(profile_numbers):
+        readback = _read_delays_all_chips(
+            interface, profile_number, num_tx,
+        )
+        expected = quantize_delays(expected_delays[idx], bf_clk_hz)
+
+        if readback.size != channels:
+            print(f"  [FAIL] profile {profile_number}: "
+                  f"expected {channels} channels, got {readback.size}")
+            passed = False
+            continue
+
+        abs_err = np.abs(readback - expected)
+        max_err = float(np.max(abs_err))
+        max_err_ch = int(np.argmax(abs_err))
+
+        if np.any(abs_err > tick_s + 1e-15):
+            mismatches = np.where(abs_err > (tick_s + 1e-15))[0]
+            print(f"  [FAIL] profile {profile_number}: "
+                  f"{len(mismatches)} channel(s) exceed 1-tick tolerance")
+            for ch in mismatches[:5]:
+                print(f"    ch{ch + 1}: expected={expected[ch]:.9e}  "
+                      f"read={readback[ch]:.9e}  err={abs_err[ch]:.3e}")
+            passed = False
+        else:
+            print(f"  [OK] profile {profile_number}: all {channels} "
+                  f"delays match (max_err={max_err:.3e} at ch{max_err_ch + 1})")
+
+    return passed
+
+
+def verify_pattern_ram(
+    interface: LIFUInterface,
+    profile_numbers: list[int],
+    num_tx: int,
+) -> bool:
+    """Verify pattern RAM data registers are identical across all slots.
+
+    Only compares the first PATTERN_DATA_REGS registers (the meaningful ones).
+    Returns True if all match.
+    """
+    reference = None
+    passed = True
+
+    print("  Pattern RAM (data registers only):")
+    for profile_number in profile_numbers:
+        start_addr = (
+            PATTERN_DATA_START + (profile_number - 1) * PATTERN_PROFILE_BLOCK
+        )
+        for txi in range(num_tx):
+            regs = interface.txdevice.read_block(
+                identifier=txi,
+                start_address=start_addr,
+                count=PATTERN_PROFILE_BLOCK,
+            )
+            data_regs = regs[:PATTERN_DATA_REGS]
+            hex_str = " ".join(f"0x{r:08X}" for r in data_regs)
+
+            if reference is None:
+                reference = data_regs
+                print(f"    profile {profile_number} tx={txi}: "
+                      f"{hex_str} (reference)")
+            elif data_regs != reference:
+                ref_hex = " ".join(f"0x{r:08X}" for r in reference)
+                print(f"    profile {profile_number} tx={txi}: "
+                      f"{hex_str} [FAIL] differs from reference {ref_hex}")
+                passed = False
+            else:
+                print(f"    profile {profile_number} tx={txi}: "
+                      f"{hex_str} [OK]")
+
+    return passed
+
+
+def verify_control_registers(
+    interface: LIFUInterface,
+    expected_profile_index: int,
+    num_tx: int,
+) -> bool:
+    """Verify DELAY_SEL and PATTERN_SEL reflect the expected active profile.
+
+    Both selectors are 0-based in the TX7332 hardware.
+    """
+    expected_delay_g1 = (expected_profile_index - 1) << 28
+    expected_delay_g2 = (expected_profile_index - 1) << 12
+    expected_delay_sel = expected_delay_g1 | expected_delay_g2
+    expected_pat_sel = expected_profile_index - 1
+    passed = True
+
+    for txi in range(num_tx):
+        delay_sel = interface.txdevice.read_register(txi, ADDR_DELAY_SEL)
+        pat_g1 = interface.txdevice.read_register(txi, ADDR_PATTERN_SEL_G1)
+        pat_g2 = interface.txdevice.read_register(txi, ADDR_PATTERN_SEL_G2)
+
+        ok_delay = delay_sel == expected_delay_sel
+        ok_pat = (pat_g1 == expected_pat_sel) and (pat_g2 == expected_pat_sel)
+
+        status = "[OK]" if (ok_delay and ok_pat) else "[FAIL]"
+        print(f"    tx={txi}: DELAY_SEL=0x{delay_sel:08X} "
+              f"PAT_G1=0x{pat_g1:08X} PAT_G2=0x{pat_g2:08X}  {status}")
+
+        if not ok_delay:
+            print(f"      expected DELAY_SEL=0x{expected_delay_sel:08X}")
+            passed = False
+        if not ok_pat:
+            print(f"      expected PAT_SEL=0x{expected_pat_sel:08X}")
+            passed = False
+
+    return passed
+
+
+def verify_apodization_register(
+    interface: LIFUInterface,
+    profile: int,
+    num_tx: int,
+) -> bool:
+    """Read the APODIZATION register from each TX chip and compare.
+
+    Uses the SDK's own get_delay_control_registers() to obtain the expected
+    register value, then compares against hardware readback.
+    """
+    passed = True
+    for txi in range(num_tx):
+        expected_regs = (
+            interface.txdevice.tx_registers.transmitters[txi]
+            .get_delay_control_registers(profile)
+        )
+        expected = expected_regs[ADDR_APODIZATION]
+        actual = interface.txdevice.read_register(txi, ADDR_APODIZATION)
+
+        if actual == expected:
+            print(f"    tx={txi}: APOD=0x{actual:08X}  [OK]")
+        else:
+            print(f"    tx={txi}: APOD=0x{actual:08X}  "
+                  f"expected=0x{expected:08X}  [FAIL]")
+            diff = actual ^ expected
+            differing_bits = [b for b in range(32) if diff & (1 << b)]
+            print(f"      differing bits: {differing_bits}")
+            passed = False
+
+    return passed
+
+
+# ---------------------------------------------------------------------------
+# Internal helpers
+# ---------------------------------------------------------------------------
+
+
+def _read_delays_all_chips(
+    interface: LIFUInterface,
+    profile_number: int,
+    num_tx: int,
+) -> np.ndarray:
+    """Read delay profile values from all TX chips in global channel order.
+
+    The SDK maps txi=0 to global channels 32-63 and txi=1 to global
+    channels 0-31 (mirroring Tx7332System.add_delay_profile). This
+    function places each chip's readback at the correct global positions.
+    """
+    all_delays = np.zeros(channel_count_for(num_tx), dtype=float)
+    for txi in range(num_tx):
+        result = interface.txdevice.read_delay_profile_value(
+            profile_number=profile_number,
+            identifier=txi,
+            units="s",
+        )
+        module = txi // CHIPS_PER_MODULE
+        chip = (txi + 1) % CHIPS_PER_MODULE
+        start = (module * CHIPS_PER_MODULE + chip) * CHANNELS_PER_CHIP
+        all_delays[start:start + CHANNELS_PER_CHIP] = result["delays"]
+    return all_delays
+
+
+def _setup_hardware(interface: LIFUInterface) -> int:
+    """Ensure 12 V rail and TX enumeration are ready. Returns num_tx."""
+    if not interface.hvcontroller.get_12v_status():
+        interface.hvcontroller.turn_12v_on()
+        time.sleep(RAIL_12V_SETTLE_S)
+
+    if interface.txdevice.tx_registers is None:
+        num_tx = interface.txdevice.enum_tx7332_devices()
+    else:
+        num_tx = interface.txdevice.tx_registers.num_transmitters
+
+    interface.hvcontroller.set_voltage(VOLTAGE)
+
+    print(f"Hardware: {module_count_for(num_tx)} module(s), {num_tx} TX chips, "
+          f"{channel_count_for(num_tx)} channels")
+    return num_tx
+
+
+def _print_header(name: str) -> None:
+    """Print a test case header."""
+    print(f"\n{'=' * 80}")
+    print(f"  {name}")
+    print(f"{'=' * 80}")
+
+
+def compute_sonication_duration(sequence: dict) -> float:
+    """Compute the wall-clock duration of one full trigger sequence.
+
+    Mirrors the SDK/firmware timing model: trains repeat every
+    ``pulse_train_interval`` (auto-filled by ``set_trigger`` to the train
+    duration plus MIN_PROFILE_SWITCH_INTERVAL when 0), and the sequence ends
+    when the last train's pulses complete.
+
+    Args:
+        sequence: Trigger sequence dict with pulse_interval, pulse_count,
+            pulse_train_interval, and pulse_train_count.
+
+    Returns:
+        Expected sequence duration in seconds (no margin).
+    """
+    pulse_interval = sequence["pulse_interval"]
+    pulse_count = sequence["pulse_count"]
+    train_count = sequence["pulse_train_count"]
+    train_interval = sequence["pulse_train_interval"]
+
+    train_duration = pulse_interval * pulse_count
+    if train_count <= 1:
+        return train_duration
+
+    if train_interval == 0:
+        # Back-to-back trains: set_trigger() auto-fills the interval with the
+        # train duration plus the TIM1/TIM2 race-margin.
+        train_interval = train_duration + MIN_PROFILE_SWITCH_INTERVAL
+
+    return (train_count - 1) * train_interval + train_duration
+
+
+def _run_sonication(
+    interface: LIFUInterface,
+    sequence: dict,
+    description: str,
+) -> None:
+    """Start sonication, wait for the sequence to complete, then stop.
+
+    The wait time is derived from the sequence's own pulse parameters via
+    compute_sonication_duration(), plus a fixed safety margin.
+    """
+    duration = compute_sonication_duration(sequence)
+    print(f"\n  Sonication: {description}")
+    print(f"  Sequence duration: {duration:.2f}s "
+          f"(+{SONICATION_MARGIN_S:.1f}s margin) — observe on oscilloscope.")
+    interface.start_sonication()
+    time.sleep(duration + SONICATION_MARGIN_S)
+    interface.stop_sonication()
+    print("  Sonication stopped.")
+
+
+# ---------------------------------------------------------------------------
+# Test cases
+# ---------------------------------------------------------------------------
+
+
+def test_single_profile_backward_compat(
+    interface: LIFUInterface,
+    num_tx: int,
+) -> bool:
+    """TC1: Single delay profile, no execution_order (backward compatible).
+
+    Verifies the n=1 path that existing callers (example scripts, Slicer) rely on. 
+    No grouped profile cycle is sent to firmware.
+    """
+    _print_header("TC1: Single profile - backwards compatibility (all channels on)")
+
+    channels = channel_count_for(num_tx)
+    delays = generate_per_channel_delays(1, channels).reshape(1, -1)
+    apodizations = make_all_on_apodizations(1, channels)
+    delays, apodizations = apply_profile_test_overrides(
+        delays, apodizations, num_tx,
+    )
+    pulse = make_default_pulse()
+    sequence = make_default_sequence()
+
+    solution = make_solution(
+        pulse=pulse,
+        delays=delays,
+        apodizations=apodizations,
+        sequence=sequence,
+    )
+    interface.set_solution(
+        solution,
+        trigger_mode="sequence",
+        profile_index=1,
+        profile_increment=False,
+    )
+
+    passed = True
+    if TEST_OVERRIDES["skip_readbacks"]:
+        print("  Register readback verification: [SKIPPED]")
+    else:
+        print("  Delay verification:")
+        passed &= verify_delays(interface, [1], delays, num_tx)
+        print("  Control register verification:")
+        passed &= verify_control_registers(interface, 1, num_tx)
+        print("  Apodization register verification:")
+        passed &= verify_apodization_register(interface, 1, num_tx)
+        print("  Pattern RAM verification:")
+        passed &= verify_pattern_ram(interface, [1], num_tx)
+
+    if passed:
+        _run_sonication(interface, sequence,
+                        f"1 profile, all {channels} channels on")
+
+    return passed
+
+
+def test_single_profile_with_execution_order(
+    interface: LIFUInterface,
+    num_tx: int,
+) -> bool:
+    """TC2: Single profile with explicit execution_order=[1].
+
+    Verifies n=1 still takes the single-profile path even when
+    execution_order is provided.
+    """
+    _print_header("TC2: Single profile with execution_order=[1]")
+
+    channels = channel_count_for(num_tx)
+    delays = generate_per_channel_delays(1, channels).reshape(1, -1)
+    apodizations = make_all_on_apodizations(1, channels)
+    delays, apodizations = apply_profile_test_overrides(
+        delays, apodizations, num_tx,
+    )
+    pulse = make_default_pulse()
+    sequence = make_default_sequence()
+
+    solution = make_solution(
+        pulse=pulse,
+        delays=delays,
+        apodizations=apodizations,
+        sequence=sequence,
+        execution_order=[1],
+    )
+    interface.set_solution(
+        solution,
+        trigger_mode="sequence",
+        profile_index=1,
+        profile_increment=False,
+    )
+
+    passed = True
+    if TEST_OVERRIDES["skip_readbacks"]:
+        print("  Register readback verification: [SKIPPED]")
+    else:
+        print("  Delay verification:")
+        passed &= verify_delays(interface, [1], delays, num_tx)
+        print("  Control register verification:")
+        passed &= verify_control_registers(interface, 1, num_tx)
+        print("  Apodization register verification:")
+        passed &= verify_apodization_register(interface, 1, num_tx)
+
+    if passed:
+        _run_sonication(interface, sequence, "1 profile with execution_order=[1]")
+
+    return passed
+
+
+def test_multi_profile_shared_pulse(
+    interface: LIFUInterface,
+    num_tx: int,
+) -> bool:
+    """TC3: Four delay profiles with distinct per-channel delays.
+
+    All profiles share one pulse config and have all channels enabled.
+    Verifies that each profile's delay RAM has unique, correct values and
+    that pattern RAM is replicated identically across all slots.
+    """
+    _print_header("TC3: Multi-profile shared pulse - 4 profiles, all channels on")
+
+    num_profiles = 4
+    profile_numbers = list(range(1, num_profiles + 1))
+    channels = channel_count_for(num_tx)
+
+    delays = np.array([
+        generate_per_channel_delays(p, channels) for p in profile_numbers
+    ])
+    apodizations = make_all_on_apodizations(num_profiles, channels)
+    delays, apodizations = apply_profile_test_overrides(
+        delays, apodizations, num_tx,
+    )
+    pulse = make_default_pulse()
+    sequence = make_default_sequence()
+    execution_order = list(profile_numbers)
+
+    solution = make_solution(
+        pulse=pulse,
+        delays=delays,
+        apodizations=apodizations,
+        sequence=sequence,
+        execution_order=execution_order,
+    )
+    interface.set_solution(
+        solution,
+        trigger_mode="sequence",
+        profile_index=1,
+        profile_increment=True,
+    )
+
+    passed = True
+    if TEST_OVERRIDES["skip_readbacks"]:
+        print("  Register readback verification: [SKIPPED]")
+    else:
+        print("  Delay verification (per-channel unique values):")
+        passed &= verify_delays(interface, profile_numbers, delays, num_tx)
+        print("  Control register verification (active profile = 1):")
+        passed &= verify_control_registers(interface, 1, num_tx)
+        print("  Apodization register verification (all channels on):")
+        passed &= verify_apodization_register(interface, 1, num_tx)
+        print("  Pattern RAM verification (all slots identical):")
+        passed &= verify_pattern_ram(interface, profile_numbers, num_tx)
+
+    if passed:
+        _run_sonication(interface, sequence, "4 profiles cycling, all channels on")
+
+    return passed
+
+
+def test_apodization_per_profile(
+    interface: LIFUInterface,
+    num_tx: int,
+) -> bool:
+    """TC4: Four profiles with 16-channel block apodizations.
+
+    Verifies that the initial active profile's apodization register is
+    correctly written. Each profile enables a different 16-channel block.
+    """
+    _print_header("TC4: Apodization register - 4 profiles, 16-channel blocks")
+
+    num_profiles = 4
+    profile_numbers = list(range(1, num_profiles + 1))
+    channels = channel_count_for(num_tx)
+
+    delays = np.array([
+        generate_per_channel_delays(p, channels) for p in profile_numbers
+    ])
+    apodizations = make_block_apodizations(num_profiles, channels)
+    delays, apodizations = apply_profile_test_overrides(
+        delays, apodizations, num_tx,
+    )
+    pulse = make_default_pulse()
+    sequence = make_default_sequence()
+    execution_order = list(profile_numbers)
+
+    solution = make_solution(
+        pulse=pulse,
+        delays=delays,
+        apodizations=apodizations,
+        sequence=sequence,
+        execution_order=execution_order,
+    )
+    interface.set_solution(
+        solution,
+        trigger_mode="sequence",
+        profile_index=1,
+        profile_increment=True,
+    )
+
+    passed = True
+    if TEST_OVERRIDES["skip_readbacks"]:
+        print("  Register readback verification: [SKIPPED]")
+    else:
+        print("  Delay verification:")
+        passed &= verify_delays(interface, profile_numbers, delays, num_tx)
+        print("  Apodization register for active profile (profile 1):")
+        print("    Expected enabled channels: 0-15")
+        passed &= verify_apodization_register(interface, 1, num_tx)
+
+    if passed:
+        blocks = ", ".join(
+            f"ch{(APOD_BLOCK_SIZE * k) % channels}-"
+            f"{(APOD_BLOCK_SIZE * k) % channels + APOD_BLOCK_SIZE - 1}"
+            for k in range(num_profiles)
+        )
+        _run_sonication(
+            interface, sequence,
+            f"4 profiles cycling, {APOD_BLOCK_SIZE}-channel blocks ({blocks})",
+        )
+
+    return passed
+
+
+def test_single_channel_scan(
+    interface: LIFUInterface,
+    num_tx: int,
+) -> bool:
+    """TC6: Sequential single-channel profiles for oscilloscope verification.
+
+    Creates one profile per selected channel. Each profile enables exactly
+    one channel. After programming, starts sonication so the user can
+    observe each channel activating in sequence on an oscilloscope.
+
+    Channels tested: 1, 2, 63, 64.
+    """
+    # First and last pair of channels, so the scan covers both ends of the
+    # array however many modules are attached.
+    channels = channel_count_for(num_tx)
+    scan_channels = [1, 2, channels - 1, channels]
+    _print_header(
+        f"TC6: Single-channel scan - {len(scan_channels)} profiles, one channel each"
+    )
+    num_profiles = len(scan_channels)
+    profile_numbers = list(range(1, num_profiles + 1))
+
+    delays = np.array([
+        generate_per_channel_delays(p, channels) for p in profile_numbers
+    ])
+    apodizations = make_single_channel_apodizations(scan_channels, channels)
+    delays, apodizations = apply_profile_test_overrides(
+        delays, apodizations, num_tx,
+    )
+    pulse = make_default_pulse()
+    sequence = make_default_sequence()
+    execution_order = list(profile_numbers)
+
+    print(f"  Channels under test: {scan_channels}")
+    print(f"  Profiles: {num_profiles}, execution_order: {execution_order}")
+
+    solution = make_solution(
+        pulse=pulse,
+        delays=delays,
+        apodizations=apodizations,
+        sequence=sequence,
+        execution_order=execution_order,
+    )
+    interface.set_solution(
+        solution,
+        trigger_mode="sequence",
+        profile_index=1,
+        profile_increment=True,
+    )
+
+    passed = True
+    if TEST_OVERRIDES["skip_readbacks"]:
+        print("  Register readback verification: [SKIPPED]")
+    else:
+        print("  Delay verification:")
+        passed &= verify_delays(interface, profile_numbers, delays, num_tx)
+        print("  Apodization register for active profile "
+              "(profile 1, ch 1 only):")
+        passed &= verify_apodization_register(interface, 1, num_tx)
+        print("  Pattern RAM verification:")
+        passed &= verify_pattern_ram(interface, profile_numbers, num_tx)
+
+    if passed:
+        _run_sonication(
+            interface, sequence,
+            f"{num_profiles} profiles cycling, only one channel active on each: {scan_channels}",
+        )
+
+    return passed
+
+
+def test_max_profiles(
+    interface: LIFUInterface,
+    num_tx: int,
+) -> bool:
+    """TC5: Maximum 16 delay profiles.
+
+    Verifies the boundary condition with all 16 profile slots populated.
+    """
+    _print_header("TC5: Maximum profiles - 16 profiles, all channels on")
+
+    num_profiles = 16
+    profile_numbers = list(range(1, num_profiles + 1))
+    channels = channel_count_for(num_tx)
+
+    delays = np.array([
+        generate_per_channel_delays(p, channels) for p in profile_numbers
+    ])
+    apodizations = make_all_on_apodizations(num_profiles, channels)
+    delays, apodizations = apply_profile_test_overrides(
+        delays, apodizations, num_tx,
+    )
+    pulse = make_default_pulse()
+    sequence = make_default_sequence()
+    execution_order = list(profile_numbers)
+
+    solution = make_solution(
+        pulse=pulse,
+        delays=delays,
+        apodizations=apodizations,
+        sequence=sequence,
+        execution_order=execution_order,
+    )
+    interface.set_solution(
+        solution,
+        trigger_mode="sequence",
+        profile_index=1,
+        profile_increment=True,
+    )
+
+    passed = True
+    if TEST_OVERRIDES["skip_readbacks"]:
+        print("  Register readback verification: [SKIPPED]")
+    else:
+        print(f"  Delay verification (16 profiles x {channels} channels):")
+        passed &= verify_delays(interface, profile_numbers, delays, num_tx)
+        print("  Control register verification:")
+        passed &= verify_control_registers(interface, 1, num_tx)
+        print("  Pattern RAM verification (all 16 slots):")
+        passed &= verify_pattern_ram(interface, profile_numbers, num_tx)
+
+    if passed:
+        _run_sonication(interface, sequence, "16 profiles cycling, all channels on")
+
+    return passed
+
+
+def test_execution_order_cycling(
+    interface: LIFUInterface,
+    num_tx: int,
+) -> bool:
+    """TC7: Non-sequential, repeated execution_order.
+
+    Uses execution_order=[1, 4, 1, 4, 2, 3, 2, 3] over 4 delay profiles so
+    the firmware's pulses-per-entry grouping (pulse_count / len(order)) and
+    the order wraparound are exercised with repeated and out-of-order
+    entries. Each profile enables a distinct 16-channel block so the order
+    is visible on an oscilloscope.
+
+    After the sequence completes, the last executed entry must remain
+    active: the firmware applies the next entry after each group's final
+    pulse but never after the sequence's last pulse, and the profile reset
+    at train boundaries only occurs between trains. Every module is checked,
+    since each one tracks the execution order independently.
+    """
+    execution_order = [1, 4, 1, 4, 2, 3, 2, 3]
+    num_profiles = 4
+    profile_numbers = list(range(1, num_profiles + 1))
+    channels = channel_count_for(num_tx)
+
+    sequence = make_default_sequence()
+    pulses_per_entry = sequence["pulse_count"] // len(execution_order)
+    _print_header(
+        f"TC7: Execution order cycling - order={execution_order}, "
+        f"{pulses_per_entry} pulse(s) per entry"
+    )
+
+    delays = np.array([
+        generate_per_channel_delays(p, channels) for p in profile_numbers
+    ])
+    apodizations = make_block_apodizations(num_profiles, channels)
+    delays, apodizations = apply_profile_test_overrides(
+        delays, apodizations, num_tx,
+    )
+    pulse = make_default_pulse()
+
+    solution = make_solution(
+        pulse=pulse,
+        delays=delays,
+        apodizations=apodizations,
+        sequence=sequence,
+        execution_order=execution_order,
+    )
+    interface.set_solution(
+        solution,
+        trigger_mode="sequence",
+        profile_index=1,
+        profile_increment=True,
+    )
+
+    passed = True
+    if TEST_OVERRIDES["skip_readbacks"]:
+        print("  Register readback verification: [SKIPPED]")
+    else:
+        print("  Delay verification:")
+        passed &= verify_delays(interface, profile_numbers, delays, num_tx)
+        print("  Control register verification (active profile = 1):")
+        passed &= verify_control_registers(interface, 1, num_tx)
+
+    if not passed:
+        return False
+
+    _run_sonication(
+        interface, sequence,
+        f"order {execution_order}, {pulses_per_entry} pulse(s) per entry, "
+        f"16-channel block per profile",
+    )
+
+    # Post-run: the last execution_order entry must still be selected, on
+    # every module — a module that fell out of step with the trigger would
+    # show up here as a different final profile.
+    expected_final = execution_order[-1]
+    if TEST_OVERRIDES["skip_readbacks"]:
+        print("  Post-run register readback verification: [SKIPPED]")
+    else:
+        for module in range(module_count_for(num_tx)):
+            final_profile = interface.txdevice.get_delay_profile(module=module)
+            if final_profile == expected_final:
+                print(f"  [OK] module {module}: final active delay profile = "
+                      f"{final_profile} (last execution_order entry)")
+            else:
+                print(f"  [FAIL] module {module}: final active delay profile = "
+                      f"{final_profile}, expected {expected_final} "
+                      f"(last execution_order entry)")
+                passed = False
+
+        print(f"  Apodization register after run (expect profile {expected_final}'s block):")
+        passed &= verify_apodization_register(interface, expected_final, num_tx)
+
+    return passed
+
+
+def test_validation_errors(
+    interface: LIFUInterface,
+    num_tx: int,
+) -> bool:
+    """TC8: set_solution rejects invalid multi-profile configurations.
+
+    Exercises set_solution's host-side argument validation; every case must
+    raise ValueError before any profile/delay registers are programmed, so no
+    sonication is run. Routed through interface.set_solution with
+    _allow_unsafe_solution=True so check_solution (which raises LIFUSolutionError,
+    not ValueError, and cannot parse these deliberately malformed solutions) is
+    bypassed and the txdevice ValueError surfaces.
+    """
+    _print_header("TC8: Validation errors (host-side, no sonication)")
+
+    channels = channel_count_for(num_tx)
+    delays = np.array([
+        generate_per_channel_delays(p, channels) for p in (1, 2, 3)
+    ])
+    apodizations = make_all_on_apodizations(3, channels)
+    pulse = make_default_pulse()
+
+    cases = [
+        (
+            "pulse_count not divisible by len(execution_order)",
+            {"sequence": {"pulse_interval": 0.1, "pulse_count": 10,
+                          "pulse_train_interval": 0, "pulse_train_count": 1}},
+        ),
+        (
+            "execution_order index out of range",
+            {"sequence": make_default_sequence(), "execution_order": [1, 2, 4]},
+        ),
+        (
+            "inter-pulse dead time below profile-switch minimum",
+            {"sequence": {"pulse_interval": 0.0005, "pulse_count": 15,
+                          "pulse_train_interval": 0, "pulse_train_count": 1}},
+        ),
+        (
+            "mismatched delays/apodizations rows",
+            {"sequence": make_default_sequence(),
+             "apodizations": make_all_on_apodizations(2, channels)},
+        ),
+        (
+            "pulse list length != profile rows without pulse_profile_map",
+            {"sequence": make_default_sequence(),
+             "pulse": [make_default_pulse(), make_default_pulse()]},
+        ),
+    ]
+
+    passed = True
+    for description, overrides in cases:
+        params = {
+            "pulse": pulse,
+            "delays": delays,
+            "apodizations": apodizations,
+        }
+        params.update(overrides)
+        solution = make_solution(
+            pulse=params["pulse"],
+            delays=params["delays"],
+            apodizations=params["apodizations"],
+            sequence=params["sequence"],
+            execution_order=params.get("execution_order"),
+        )
+        try:
+            interface.set_solution(
+                solution,
+                trigger_mode="sequence",
+                profile_index=1,
+                profile_increment=False,
+                _allow_unsafe_solution=True,
+            )
+        except ValueError as exc:
+            print(f"  [OK] {description}: raised ValueError ({exc})")
+        else:
+            print(f"  [FAIL] {description}: no ValueError raised")
+            passed = False
+
+    return passed
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+
+def parse_args() -> argparse.Namespace:
+    """Parse command-line flags for optional test overrides."""
+    parser = argparse.ArgumentParser(
+        description="Run multi-profile TX7332 verification tests.",
+    )
+    parser.add_argument(
+        "--mirror-modules",
+        type=int,
+        default=1,
+        help=(
+            "Copy module 0 delays and apodizations onto the first N connected "
+            "modules before programming profiles. Use 1 to keep the default "
+            "per-module channel mapping."
+        ),
+    )
+    parser.add_argument(
+        "--skip-readbacks",
+        action="store_true",
+        help=(
+            "Bypass delay/control/apodization/pattern register readback "
+            "verification and run programming/sonication only."
+        ),
+    )
+    return parser.parse_args()
+
+
+def main() -> None:
+    """Run all test cases and report results."""
+    args = parse_args()
+    if args.mirror_modules < 1:
+        raise ValueError("--mirror-modules must be at least 1")
+
+    TEST_OVERRIDES["mirror_modules"] = args.mirror_modules
+    TEST_OVERRIDES["skip_readbacks"] = args.skip_readbacks
+
+    interface = LIFUInterface()
+    num_tx = _setup_hardware(interface)
+
+    if TEST_OVERRIDES["mirror_modules"] > 1:
+        print(
+            f"Test override: mirroring module 0 delays/apodizations across "
+            f"the first {TEST_OVERRIDES['mirror_modules']} connected module(s)"
+        )
+    if TEST_OVERRIDES["skip_readbacks"]:
+        print("Test override: skipping register readback verification")
+
+    # Ensure no stale sonication or auto-cycle is active from a previous run.
+    interface.stop_sonication(turn_hv_off=False)
+
+    tests = [
+        ("TC1", test_single_profile_backward_compat),
+        ("TC2", test_single_profile_with_execution_order),
+        ("TC3", test_multi_profile_shared_pulse),
+        ("TC4", test_apodization_per_profile),
+        ("TC5", test_max_profiles),
+        ("TC6", test_single_channel_scan),
+        ("TC7", test_execution_order_cycling),
+        ("TC8", test_validation_errors),
+    ]
+
+    results: dict[str, str] = {}
+    try:
+        for name, test_fn in tests:
+            try:
+                passed = test_fn(interface, num_tx)
+                results[name] = "PASS" if passed else "FAIL"
+            except Exception:
+                traceback.print_exc()
+                results[name] = "ERROR"
+    finally:
+        # Never leave the array sonicating if a test dies mid-run.
+        interface.stop_sonication(turn_hv_off=False)
+
+    # Summary.
+    print(f"\n{'=' * 60}")
+    print("  TEST SUMMARY")
+    print(f"{'=' * 60}")
+    for name, result in results.items():
+        print(f"  [{result}] {name}")
+
+    total = len(results)
+    passed_count = sum(1 for r in results.values() if r == "PASS")
+    print(f"\n  {passed_count}/{total} passed")
+
+    if passed_count < total:
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()
+# %%

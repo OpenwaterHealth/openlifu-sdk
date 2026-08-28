@@ -1,29 +1,40 @@
 """LIFU Transmitter I2C Firmware Update — DFU-already-active variant
 
 Use this script when the slave module is already sitting in DFU bootloader
-mode (e.g. it failed to boot its application and fell back to the BL, or you
-entered DFU mode manually) and the normal test_tx_fw_update.py flow cannot
-connect to the live application to request DFU entry.
+mode (e.g. it has no application yet, it failed to boot its application and
+fell back to the BL, or you entered DFU mode manually) and the normal
+firmware-update flow cannot connect to the live application to request DFU
+entry.
+
+The SECURE bootloader (open-lifu-transmitter-bl) consumes the RAW signed
+image produced by sign_firmware.py — [320B 'SFU1' header][0xFF pad][encrypted
+firmware] — written whole to the slot base 0x08010000. It does NOT use the
+legacy PGK1 package format (parse_signed_package / program_i2c), whose
+metadata-page writes the secure BL rejects with BAD_ADDR.
 
 The script:
-  1. Connects to the master module via UART (USB VCP).
+  1. Connects to the master module via LIFUInterface (USB VCP).
   2. Pings the slave I2C DFU bootloader at *i2c_addr* (default 0x72) via the
      master's OW_I2C_PASSTHRU passthrough to confirm it is responsive.
-  3. Programs the signed firmware package.
-  4. Optionally pings the slave after reset to report the new version.
+  3. Programs the raw signed image: mass erase -> write @0x08010000 ->
+     manifest -> reset.
+  4. Reads back the new application version through the master.
 
 Usage
 -----
   set PYTHONPATH=%cd%\\src;%PYTHONPATH%
-  python examples\\test_tx_i2c_update.py <package_file> [options]
+  python examples\\test_tx_i2c_update.py <signed_image> [options]
 
 Examples
 --------
-  # Defaults (VID=0x0483, PID=0x57AF, slave addr=0x72)
-  python examples\\test_tx_i2c_update.py build\\DebugBL\\lifu-transmitter-fw.bin.signed.bin
+  # Defaults (slave addr=0x72, module index 1)
+  python examples\\test_tx_i2c_update.py openlifu-transmitter-fw-signed.bin
 
   # Custom slave address
-  python examples\\test_tx_i2c_update.py firmware.bin.signed.bin --i2c-addr 0x73
+  python examples\\test_tx_i2c_update.py openlifu-transmitter-fw-signed.bin --i2c-addr 0x73
+
+See also: open-lifu-transmitter-bl/test/program_slave_i2c.py (same flow, with
+an optional enter-DFU step for a slave whose application is still running).
 """
 
 from __future__ import annotations
@@ -32,16 +43,18 @@ import argparse
 import sys
 import time
 
-from openlifu_sdk.io.LIFUDFU import I2C_DFU_SLAVE_ADDR, LIFUDFUManager
-from openlifu_sdk.io.LIFUUart import LIFUUart
+from openlifu_sdk.io.LIFUDFU import I2C_DFU_SLAVE_ADDR, STM32I2CDFUviaMaster
+from openlifu_sdk.io.LIFUInterface import LIFUInterface
+
+SLOT_BASE = 0x08010000   # raw signed image is written here whole
 
 
 # ---------------------------------------------------------------------------
 # Progress display helper
 # ---------------------------------------------------------------------------
 
-def _progress(written: int, total: int, label: str) -> None:
-    pct = 100 * written // total
+def _progress(written: int, total: int, label: str = "write") -> None:
+    pct = 100 * written // total if total else 100
     filled = pct // 5
     bar = "#" * filled + "-" * (20 - filled)
     print(f"\r  {label}: [{bar}] {pct:3d}%  ({written}/{total} B)",
@@ -61,8 +74,13 @@ def main() -> None:
         epilog=__doc__,
     )
     p.add_argument(
-        "package_file",
-        help="Path to signed firmware package (.bin.signed.bin)"
+        "signed_image",
+        help="Raw signed image from sign_firmware.py "
+             "(e.g. openlifu-transmitter-fw-signed.bin)"
+    )
+    p.add_argument(
+        "--module", type=int, default=1, metavar="IDX",
+        help="Module index of the slave (default: 1)"
     )
     p.add_argument(
         "--i2c-addr", type=lambda x: int(x, 0),
@@ -70,20 +88,8 @@ def main() -> None:
         help=f"I2C slave address of DFU bootloader (default: 0x{I2C_DFU_SLAVE_ADDR:02X})"
     )
     p.add_argument(
-        "--vid", type=lambda x: int(x, 0), default=0x0483,
-        help="USB VID of the master TX module VCP (default: 0x0483)"
-    )
-    p.add_argument(
-        "--pid", type=lambda x: int(x, 0), default=0x57AF,
-        help="USB PID of the master TX module VCP (default: 0x57AF)"
-    )
-    p.add_argument(
-        "--baudrate", type=int, default=921600,
-        help="UART baud rate (default: 921600)"
-    )
-    p.add_argument(
-        "--post-wait", type=float, default=3.0, metavar="SEC",
-        help="Seconds to wait after reset before reading new version (default: 3.0)"
+        "--post-wait", type=float, default=6.0, metavar="SEC",
+        help="Seconds to wait after reset before reading new version (default: 6.0)"
     )
     p.add_argument(
         "--yes", "-y", action="store_true",
@@ -94,41 +100,52 @@ def main() -> None:
     print("=" * 60)
     print("  LIFU I2C DFU Firmware Update (slave already in DFU mode)")
     print("=" * 60)
-    print(f"  Package file  : {args.package_file}")
+    print(f"  Signed image  : {args.signed_image}")
+    print(f"  Module index  : {args.module}")
     print(f"  Slave I2C addr: 0x{args.i2c_addr:02X}")
-    print(f"  Master VCP    : VID=0x{args.vid:04X}, PID=0x{args.pid:04X}")
     print()
 
     # ------------------------------------------------------------------
-    # Connect to master module UART
+    # Sanity-check the image before anything touches hardware
     # ------------------------------------------------------------------
-    print("Connecting to master module UART...")
-    uart = LIFUUart(vid=args.vid, pid=args.pid, baudrate=args.baudrate,
-                    timeout=10, desc="TX")
-    uart.port = uart.list_vcp_with_vid_pid()
-    if uart.port is None:
-        print(f"ERROR: No USB VCP found with VID=0x{args.vid:04X}, PID=0x{args.pid:04X}.")
+    with open(args.signed_image, "rb") as f:
+        raw = f.read()
+    if raw[0:4] != b"SFU1":
+        print(f"ERROR: {args.signed_image} does not start with 'SFU1' — "
+              f"expected a raw signed image from sign_firmware.py.")
         sys.exit(1)
-    uart.connect()
+    print(f"  Image: {len(raw)} bytes -> slave slot 0x{SLOT_BASE:08X}")
+    print()
 
-    if not uart.is_connected():
-        print("ERROR: Could not connect to master module UART.")
+    # ------------------------------------------------------------------
+    # Connect to the master module
+    # ------------------------------------------------------------------
+    print("Connecting to LIFU interface...")
+    interface = LIFUInterface()
+    tx_connected, _ = interface.is_device_connected()
+    if not tx_connected:
+        print("ERROR: TX device (master) not connected.")
         sys.exit(1)
-    print(f"  Connected on {uart.port}.")
+    if not interface.txdevice.ping():
+        print("ERROR: master module did not answer ping.")
+        sys.exit(1)
+    print(f"  Master module connected "
+          f"(version {interface.txdevice.get_version(module=0)}).")
 
-    mgr = LIFUDFUManager(uart=uart)
+    dfu = STM32I2CDFUviaMaster(uart=interface.txdevice.uart,
+                               i2c_addr=args.i2c_addr)
 
     # ------------------------------------------------------------------
     # Ping the slave DFU bootloader
     # ------------------------------------------------------------------
     print(f"\nPinging slave DFU bootloader at 0x{args.i2c_addr:02X}...")
     try:
-        bl_version = mgr.get_bootloader_version_i2c(i2c_addr=args.i2c_addr)
-        print(f"  Bootloader version: {bl_version}")
+        blver = dfu.get_version()
+        blver = blver.decode(errors="replace") if isinstance(blver, (bytes, bytearray)) else blver
+        print(f"  Bootloader version: {blver}")
     except Exception as e:
         print(f"ERROR: Slave DFU bootloader at 0x{args.i2c_addr:02X} did not respond: {e}")
         print("  Make sure the slave module is powered and in DFU bootloader mode.")
-        uart.disconnect()
         sys.exit(1)
 
     # ------------------------------------------------------------------
@@ -141,69 +158,40 @@ def main() -> None:
         ).strip().lower()
         if answer != "y":
             print("Aborted by user.")
-            uart.disconnect()
             sys.exit(0)
 
     # ------------------------------------------------------------------
-    # Show package layout before programming
-    # ------------------------------------------------------------------
-    from openlifu_sdk.io.LIFUDFU import STM32I2CDFUviaMaster, parse_signed_package
-    with open(args.package_file, "rb") as _f:
-        _pkg = parse_signed_package(_f.read())
-    print(f"  Package layout:")
-    print(f"    fw  : {len(_pkg['fw']):6d} B @ 0x{_pkg['fw_address']:08X}")
-    print(f"    meta: {len(_pkg['meta']):6d} B @ 0x{_pkg['meta_address']:08X}  (written by bootloader at manifest)")
-
-    # ------------------------------------------------------------------
-    # Program
+    # Program: mass-erase app slot, write the raw signed image whole at the
+    # slot base, manifest, reset. The secure BL verifies the signature,
+    # decrypts and launches the application on the next boot.
     # ------------------------------------------------------------------
     print(f"\nProgramming slave 0x{args.i2c_addr:02X}...")
     try:
-        mgr.program_i2c(
-            package_file=args.package_file,
-            i2c_addr=args.i2c_addr,
-            progress_callback=_progress,
-        )
-    except RuntimeError as e:
-        print(f"\nERROR: Programming failed — {e}")
-        uart.disconnect()
-        sys.exit(1)
-    except Exception as e:
-        print(f"\nERROR: Unexpected error — {e}")
-        uart.disconnect()
-        sys.exit(1)
-
-    print("\nProgramming complete. Resetting slave...")
-    try:
-        dfu = STM32I2CDFUviaMaster(uart=uart, i2c_addr=args.i2c_addr)
+        print("  mass-erasing slave application slot...")
+        dfu.mass_erase()
+        dfu.write_memory(SLOT_BASE, raw, progress_callback=_progress)
+        print("  manifest...")
+        dfu.manifest()
+        print("  resetting slave (secure BL verifies signature + launches app)...")
         dfu.reset()
     except Exception as e:
-        print(f"  WARNING: reset command failed ({e}) — slave may self-reset after manifest.")
+        print(f"\nERROR: Programming failed — {e}")
+        sys.exit(1)
 
     # ------------------------------------------------------------------
-    # Post-update version check
+    # Post-update version check via the normal application protocol
     # ------------------------------------------------------------------
     print(f"Waiting {args.post_wait:.0f} s for slave to boot application...")
     time.sleep(args.post_wait)
 
     try:
-        from openlifu_sdk.io.LIFUConfig import OW_CONTROLLER
-        from openlifu_sdk.io.LIFUConfig import OW_CMD_VERSION
-
-        # Module index 1 is the first slave; send version request via UART OW
-        r = uart.send_packet(id=None, packetType=OW_CONTROLLER,
-                             command=OW_CMD_VERSION, addr=1)
-        if r is not None and r.data:
-            new_version = bytes(r.data).rstrip(b"\x00").decode("ascii", errors="replace")
-            print(f"  New firmware version: {new_version}")
-        else:
-            print("  WARNING: version read returned no data — "
-                  "slave may still be booting or module index differs.")
+        version = interface.txdevice.get_version(module=args.module)
+        print(f"  Module {args.module} firmware version: {version}")
+        print("\nSLAVE I2C UPDATE COMPLETE")
     except Exception as e:
-        print(f"  WARNING: post-update version check failed ({e})")
-
-    uart.disconnect()
-    print("\nDone.")
+        print(f"  WARNING: could not read module {args.module} version yet ({e}).")
+        print("  The bootloader may still be verifying/installing; "
+              "retry test_tx_getversion.py shortly.")
 
 
 if __name__ == "__main__":

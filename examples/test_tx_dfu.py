@@ -8,6 +8,10 @@ from openlifu_sdk.io.LIFUInterface import LIFUInterface
 # set PYTHONPATH=%cd%\src;%PYTHONPATH%
 # python examples\test_tx_dfu.py
 MODULE_ID = 0
+DFU_RESERVED_LEGACY = 0x77
+DFU_RESERVED = 0x00
+LEGACY_VERSION_MAX = (2, 0, 3)
+
 print("Starting LIFU Test Script...")
 interface = LIFUInterface()
 
@@ -54,7 +58,7 @@ version = interface.txdevice.get_version(module=MODULE_ID)
 print(f"Version: {version}")
 
 
-def _parse_fw_version(ver: str) -> tuple[int, int, int] | None:
+def parse_fw_version(ver: str) -> tuple[int, int, int] | None:
     """Parse a 'vX.Y.Z' (or 'X.Y.Z') firmware string into a tuple, or None."""
     if not ver:
         return None
@@ -72,10 +76,9 @@ def _parse_fw_version(ver: str) -> tuple[int, int, int] | None:
 # (and in some intermediate builds, sending it causes a NAK), so only set
 # it when we're talking to a known-old firmware. If the version is
 # unparseable we err on the side of NOT sending it (assume modern firmware).
-_LEGACY_DFU_MAX = (2, 0, 3)
-_parsed = _parse_fw_version(version)
-_dfu_reserved = 0x77 if (_parsed is not None and _parsed <= _LEGACY_DFU_MAX) else 0x00
-if _dfu_reserved:
+fw_version = parse_fw_version(version)
+reserved = DFU_RESERVED_LEGACY if (fw_version is not None and fw_version <= LEGACY_VERSION_MAX) else DFU_RESERVED
+if reserved == DFU_RESERVED_LEGACY:
     print(f"Firmware {version} <= v2.0.3 detected; using legacy reserved=0x77 DFU flag.")
 else:
     print(f"Firmware {version} > v2.0.3 (or unparseable); using reserved=0x00.")
@@ -86,7 +89,7 @@ user_input = input("Do you want to Enter DFU Mode? (y/n): ").strip().lower()
 
 if user_input == 'y':
     print("Enter DFU mode")
-    if interface.txdevice.enter_dfu(module=MODULE_ID, reserved=_dfu_reserved):
+    if interface.txdevice.enter_dfu(module=MODULE_ID, reserved=reserved):
         print("Successful.")
 
 elif user_input == 'n':

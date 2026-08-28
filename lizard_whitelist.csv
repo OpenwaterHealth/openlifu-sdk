@@ -1,0 +1,51 @@
+# lizard complexity/length whitelist (IEC 62304)
+# Structurally large/branchy by design; covered by review + tests.
+# One function name per line (lizard matches on the bare name).
+
+# Unit-conversion lookup ladders (util/units.py) — flat unit/prefix mapping
+# tables expressed as if/elif chains; CCN comes from the number of units,
+# not nesting.
+getunitconversion
+getsiscale
+
+# Checked-command send path (io/component.py) — parameter-validation ladder
+# plus retry/timeout handling kept in one function to preserve the
+# request/response pairing (CCN 18, 9 params).
+send_checked
+
+# DFU module-update orchestration (io/LIFUDFU.py) — sequential update steps
+# with per-step error reporting; length from step count, not nesting.
+update_module
+
+# Legacy->secure bootloader migration orchestration (io/LIFUDFU.py) — the
+# sequential legacy-DFU steps (write updater+metadata, reset, wait for the
+# secure BL, flash the signed app) with per-step error reporting, kept inline
+# to preserve the ordering; length from step count + docstring, not nesting
+# (CCN 10).
+migrate_console_legacy
+
+# Transmitter twin of the above (io/LIFUDFU.py) — the USB recovery for a
+# master parked in its legacy bootloader's DFU: write updater+metadata to the
+# legacy slot, read-back verify, reset, wait for the swapped-in secure BL,
+# flash the signed app. Same reasoning as migrate_console_legacy: the steps
+# are strictly ordered and each carries its own failure message, so splitting
+# them would hide the sequence; CCN 12 (< 15), length from step count +
+# docstring, not nesting.
+migrate_transmitter_legacy_usb
+
+# Trigger configuration (io/LIFUTXDevice.py) — validates and packs the full
+# trigger parameter set in one place to keep the JSON payload atomic.
+set_trigger
+
+# UART async sender loop and sync response reader (io/uart.py) — protocol
+# state machines; per-state dispatch kept inline to preserve the framing
+# handshake.
+_sender_loop
+_read_response_sync
+
+# Beamforming solution loader (io/LIFUTXDevice.py) — programs delay profiles,
+# pulse profiles, apodization, and execution-order cycling into the TX device
+# in one atomic call; branching comes from multi-profile validation + mapping
+# logic that must stay co-located to keep the JSON payload consistent
+# (CCN 44, NLOC 145).
+set_solution

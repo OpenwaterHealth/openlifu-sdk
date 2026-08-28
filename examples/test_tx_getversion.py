@@ -49,6 +49,16 @@ if not interface.txdevice.ping():
     print("❌ failed to communicate with transmit module")
     sys.exit(1)
 
-print("Get Version")
-version = interface.txdevice.get_version()
-print(f"Version: {version}")
+module_idx = 0  # Assuming you want to get the version for module index 0
+module_count = interface.txdevice.get_tx_module_count()
+print(f"TX Module Count: {module_count}")
+
+for module_idx in range(module_count):
+    print(f"Getting version for module index: {module_idx}")
+    version = interface.txdevice.get_version(module=module_idx)
+    print(f"Version for module {module_idx}: {version}")
+
+    hardware_id = interface.txdevice.get_hardware_id(module=module_idx)
+    print(f"Hardware ID for module {module_idx}: {hardware_id}")
+
+
