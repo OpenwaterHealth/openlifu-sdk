@@ -81,6 +81,13 @@ class TestSimulatedInterfaceFirmware(unittest.TestCase):
         self.assertEqual(iface.hvcontroller.get_version(), "v3.2.1")
         self.assertEqual(hv_progress, [(0, 1, "simulated-update"), (1, 1, "simulated-update")])
 
+    def test_update_without_args_applies_latest_bundled_versions(self):
+        iface = self._track(SimulatedLIFUInterface(firmware_version="0.0.1"))
+        iface.txdevice.update_firmware()
+        iface.hvcontroller.update_firmware()
+        self.assertEqual(iface.txdevice.get_version(), f"v{get_transmitter_firmware_version()}")
+        self.assertEqual(iface.hvcontroller.get_version(), f"v{get_console_firmware_version()}")
+
     def test_simulated_update_can_read_version_from_firmware_file(self):
         iface = self._track(SimulatedLIFUInterface(firmware_version="0.0.1"))
         fw_dir = Path(_SRC) / "openlifu_sdk" / "firmware"

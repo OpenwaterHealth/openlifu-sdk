@@ -458,10 +458,11 @@ class SimulatedTxDevice:
                         **_kwargs):
         if module < 0 or module >= self.num_modules:
             raise ValueError(f"Module index out of range: {module}")
-        current = self._firmware_versions[module]
-        target = _version_for_component(firmware_version, current)
-        if package_file and firmware_version is None:
-            target = _read_version_from_firmware_image(package_file, current)
+        target = _latest_tx_fw_version()
+        if firmware_version is not None:
+            target = _version_for_component(firmware_version, target)
+        elif package_file:
+            target = _read_version_from_firmware_image(package_file, target)
         if progress_callback is not None:
             try:
                 progress_callback(0, 1, "simulated-update")
@@ -555,9 +556,11 @@ class SimulatedHVController:
                         progress_callback=None,
                         firmware_version: Optional[str] = None,
                         **_kwargs):
-        target = _version_for_component(firmware_version, self._firmware_version)
-        if package_file and firmware_version is None:
-            target = _read_version_from_firmware_image(package_file, self._firmware_version)
+        target = _latest_console_fw_version()
+        if firmware_version is not None:
+            target = _version_for_component(firmware_version, target)
+        elif package_file:
+            target = _read_version_from_firmware_image(package_file, target)
         if progress_callback is not None:
             try:
                 progress_callback(0, 1, "simulated-update")
