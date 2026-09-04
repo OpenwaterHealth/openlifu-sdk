@@ -624,7 +624,7 @@ class SimulatedHVController:
         return True
 
     def enter_dfu(self):
-        return True
+        raise NotImplementedError("DFU not supported in simulation mode")
 
     def close(self):
         self._connected = False

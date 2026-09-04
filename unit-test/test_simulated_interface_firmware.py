@@ -88,6 +88,17 @@ class TestSimulatedInterfaceFirmware(unittest.TestCase):
         self.assertEqual(iface.txdevice.get_version(), f"v{get_transmitter_firmware_version()}")
         self.assertEqual(iface.hvcontroller.get_version(), f"v{get_console_firmware_version()}")
 
+    def test_progress_callback_exceptions_are_propagated(self):
+        iface = self._track(SimulatedLIFUInterface())
+
+        def _boom(*_args):
+            raise RuntimeError("callback-failed")
+
+        with self.assertRaises(RuntimeError):
+            iface.txdevice.update_firmware(progress_callback=_boom)
+        with self.assertRaises(RuntimeError):
+            iface.hvcontroller.update_firmware(progress_callback=_boom)
+
     def test_simulated_update_can_read_version_from_firmware_file(self):
         iface = self._track(SimulatedLIFUInterface(firmware_version="0.0.1"))
         fw_dir = Path(_SRC) / "openlifu_sdk" / "firmware"
