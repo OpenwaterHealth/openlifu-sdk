@@ -23,7 +23,9 @@ import json
 import logging
 import math
 import random
+import re
 import time
+from datetime import datetime, timezone
 from typing import List, Optional
 
 # Qt backend selection: prefer 3D Slicer's PythonQt-based ``qt`` module
@@ -68,6 +70,9 @@ from openlifu_sdk.ui.status_frame import format_status_frame as _format_status_f
 logger = logging.getLogger(__name__)
 logger.debug("openlifu_sdk.ui.simulated_interface using Qt backend: %s", _QT_BACKEND)
 
+_FALLBACK_CONSOLE_FW_VERSION = "1.2.6"
+_FALLBACK_TX_FW_VERSION = "2.0.5"
+
 # k chosen so 45 V * 0.25 duty * 600 s -> 50 deg C
 TX_HEATING_K = 50.0 / (45.0 * 45.0 * 0.25 * 600.0)
 # Newton's-law cooling time constant (seconds). 600 s ~ 10 min half-life-ish.
@@ -89,6 +94,54 @@ HEARTBEAT_INTERVAL_MS = 1000
 
 def _gauss(sigma: float) -> float:
     return random.gauss(0.0, sigma)
+
+
+def _normalize_semver(version: Optional[str], fallback: str) -> str:
+    text = str(version or "").strip()
+    if not text:
+        return fallback
+    base = text.lstrip("v").split("-")[0].split("+")[0]
+    if re.match(r"^\d+\.\d+\.\d+$", base):
+        return base
+    return text
+
+
+def _version_for_component(version: Optional[str], fallback: str) -> str:
+    return _normalize_semver(version, fallback)
+
+
+def _latest_console_fw_version() -> str:
+    try:
+        from openlifu_sdk.util.firmware import get_console_firmware_version
+
+        return _normalize_semver(get_console_firmware_version(), _FALLBACK_CONSOLE_FW_VERSION)
+    except Exception:
+        logger.debug("Falling back to default simulated console firmware version", exc_info=True)
+        return _FALLBACK_CONSOLE_FW_VERSION
+
+
+def _latest_tx_fw_version() -> str:
+    try:
+        from openlifu_sdk.util.firmware import get_transmitter_firmware_version
+
+        return _normalize_semver(get_transmitter_firmware_version(), _FALLBACK_TX_FW_VERSION)
+    except Exception:
+        logger.debug("Falling back to default simulated transmitter firmware version", exc_info=True)
+        return _FALLBACK_TX_FW_VERSION
+
+
+def _sim_updated_timestamp() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _read_version_from_firmware_image(package_file: str, fallback: str) -> str:
+    try:
+        from openlifu_sdk.util.firmware import _get_firmware_version
+
+        return _normalize_semver(_get_firmware_version(package_file), fallback)
+    except Exception:
+        logger.debug("Could not parse firmware version from %s", package_file, exc_info=True)
+        return fallback
 
 
 # =============================================================================
@@ -140,8 +193,12 @@ class SimulatedTxDevice:
     the emitter for unsolicited STATUS frames during sonication.
     """
 
-    def __init__(self, num_modules: int = 1):
+    def __init__(self, num_modules: int = 1, firmware_version: Optional[str] = None):
         self.num_modules = max(1, int(num_modules))
+        self._firmware_versions = [
+            _version_for_component(firmware_version, _latest_tx_fw_version())
+            for _ in range(self.num_modules)
+        ]
         self.signal_connected = OWSignal()
         self.signal_disconnected = OWSignal()
         self.signal_data_received = OWSignal()
@@ -171,9 +228,9 @@ class SimulatedTxDevice:
             "hwid": "ABCDEFGH",
             "freq": 400,
             "hw_ver": "SIM",
-            "fw_ver": "2.0.5",
+            "fw_ver": self._firmware_versions[idx],
             "sdk_ver": "1.0.7",
-            "updated": "2026-05-12 08:00:41",
+            "updated": _sim_updated_timestamp(),
             "module": {
                 "id": "txm_400_sim-400k-01",
                 "name": "TXM 400kHz (S/N SIMULATED-400K-01)",
@@ -241,7 +298,7 @@ class SimulatedTxDevice:
         return self._modules[module].read_ambient()
 
     def get_version(self, module: int = 0) -> str:
-        return "sim-1.0.7"
+        return f"v{self._firmware_versions[module]}"
 
     def get_hardware_id(self, module: int = 0, raw_hex: bool = False) -> str:
         return f"{0xA0A1A2A3A4A5A6A7B0B1B2B3B4B5B6B7 + module:032X}"
@@ -273,8 +330,14 @@ class SimulatedTxDevice:
         modules_list = list(getattr(arr, "modules", []) or [])
         n = max(1, len(modules_list))
         if n != self.num_modules:
+            current = list(self._firmware_versions)
             self.num_modules = n
             self._modules = [_ModuleThermal(i) for i in range(n)]
+            default_fw = current[0] if current else _latest_tx_fw_version()
+            self._firmware_versions = [
+                current[i] if i < len(current) else default_fw
+                for i in range(n)
+            ]
             self._user_configs = [self._default_user_config(i) for i in range(n)]
         for i, m in enumerate(modules_list):
             cfg = self._user_configs[i]
@@ -390,9 +453,29 @@ class SimulatedTxDevice:
     def soft_reset(self, module: Optional[int] = None):
         return True
 
-    def update_firmware(self, *args, **kwargs):
-        # Verification tests / FW updater aren't in the simulator scope.
-        raise NotImplementedError("Firmware update not supported in simulation mode")
+    def update_firmware(self, module: int = 0, package_file: Optional[str] = None,
+                        progress_callback=None, firmware_version: Optional[str] = None,
+                        **_kwargs):
+        if module < 0 or module >= self.num_modules:
+            raise ValueError(f"Module index out of range: {module}")
+        current = self._firmware_versions[module]
+        target = _version_for_component(firmware_version, current)
+        if package_file and firmware_version is None:
+            target = _read_version_from_firmware_image(package_file, current)
+        if progress_callback is not None:
+            try:
+                progress_callback(0, 1, "simulated-update")
+            except Exception:
+                logger.debug("Simulated update progress callback failed", exc_info=True)
+        self._firmware_versions[module] = target
+        self._user_configs[module]["fw_ver"] = target
+        self._user_configs[module]["updated"] = _sim_updated_timestamp()
+        if progress_callback is not None:
+            try:
+                progress_callback(1, 1, "simulated-update")
+            except Exception:
+                logger.debug("Simulated update progress callback failed", exc_info=True)
+        return True
 
     def close(self):
         self._connected = False
@@ -412,13 +495,14 @@ class SimulatedHVController:
     """Implements every attribute / method that a connector calls on
     ``interface.hvcontroller``."""
 
-    def __init__(self):
+    def __init__(self, firmware_version: Optional[str] = None):
         self.signal_connected = OWSignal()
         self.signal_disconnected = OWSignal()
         self.signal_data_received = OWSignal()
         self.signal_error = OWSignal()
 
         self._connected = False
+        self._firmware_version = _version_for_component(firmware_version, _latest_console_fw_version())
         self._hv_on = False
         self._v12_on = True
         self._voltage_setpoint = 0.0
@@ -465,7 +549,27 @@ class SimulatedHVController:
         return self._v12_on
 
     def get_version(self) -> str:
-        return "sim-1.0.7"
+        return f"v{self._firmware_version}"
+
+    def update_firmware(self, package_file: Optional[str] = None,
+                        progress_callback=None,
+                        firmware_version: Optional[str] = None,
+                        **_kwargs):
+        target = _version_for_component(firmware_version, self._firmware_version)
+        if package_file and firmware_version is None:
+            target = _read_version_from_firmware_image(package_file, self._firmware_version)
+        if progress_callback is not None:
+            try:
+                progress_callback(0, 1, "simulated-update")
+            except Exception:
+                logger.debug("Simulated update progress callback failed", exc_info=True)
+        self._firmware_version = target
+        if progress_callback is not None:
+            try:
+                progress_callback(1, 1, "simulated-update")
+            except Exception:
+                logger.debug("Simulated update progress callback failed", exc_info=True)
+        return True
 
     def get_hardware_id(self, raw_hex: bool = False) -> str:
         return "C0C1C2C3C4C5C6C7D0D1D2D3D4D5D6D7"
@@ -529,7 +633,7 @@ class SimulatedHVController:
         return True
 
     def enter_dfu(self):
-        raise NotImplementedError("DFU not supported in simulation mode")
+        return True
 
     def close(self):
         self._connected = False
@@ -742,6 +846,9 @@ class SimulatedLIFUInterface(QObject):
 
     def __init__(self, num_modules: int = 1,
                  transducer=None,
+                 tx_firmware_version: Optional[str] = None,
+                 hv_firmware_version: Optional[str] = None,
+                 firmware_version: Optional[str] = None,
                  voltage_table_selection: Optional[str] = None,
                  **_unused):
         # When a transducer (array) is supplied, derive num_modules from it
@@ -751,8 +858,10 @@ class SimulatedLIFUInterface(QObject):
             if modules_attr is not None:
                 num_modules = max(1, len(list(modules_attr)))
         super().__init__()
-        self.txdevice = SimulatedTxDevice(num_modules=num_modules)
-        self.hvcontroller = SimulatedHVController()
+        tx_version = tx_firmware_version if tx_firmware_version is not None else firmware_version
+        hv_version = hv_firmware_version if hv_firmware_version is not None else firmware_version
+        self.txdevice = SimulatedTxDevice(num_modules=num_modules, firmware_version=tx_version)
+        self.hvcontroller = SimulatedHVController(firmware_version=hv_version)
         self.status = LIFUInterfaceStatus.STATUS_SYS_OFF
         self._engine: Optional[_SimulatedRunEngine] = None
         self.voltage_table_selection = voltage_table_selection
