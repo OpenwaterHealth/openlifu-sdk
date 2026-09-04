@@ -131,14 +131,14 @@ def _latest_tx_fw_version() -> str:
 
 
 def _sim_updated_timestamp() -> str:
-    return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+    return datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
 
 
 def _read_version_from_firmware_image(package_file: str, fallback: str) -> str:
     try:
-        from openlifu_sdk.util.firmware import _get_firmware_version
+        from openlifu_sdk.util.firmware import get_firmware_version
 
-        return _normalize_semver(_get_firmware_version(package_file), fallback)
+        return _normalize_semver(get_firmware_version(package_file), fallback)
     except Exception:
         logger.debug("Could not parse firmware version from %s", package_file, exc_info=True)
         return fallback
