@@ -464,18 +464,12 @@ class SimulatedTxDevice:
         elif package_file:
             target = _read_version_from_firmware_image(package_file, target)
         if progress_callback is not None:
-            try:
-                progress_callback(0, 1, "simulated-update")
-            except Exception:
-                logger.debug("Simulated update progress callback failed", exc_info=True)
+            progress_callback(0, 1, "simulated-update")
         self._firmware_versions[module] = target
         self._user_configs[module]["fw_ver"] = target
         self._user_configs[module]["updated"] = _sim_updated_timestamp()
         if progress_callback is not None:
-            try:
-                progress_callback(1, 1, "simulated-update")
-            except Exception:
-                logger.debug("Simulated update progress callback failed", exc_info=True)
+            progress_callback(1, 1, "simulated-update")
         return True
 
     def close(self):
@@ -562,16 +556,10 @@ class SimulatedHVController:
         elif package_file:
             target = _read_version_from_firmware_image(package_file, target)
         if progress_callback is not None:
-            try:
-                progress_callback(0, 1, "simulated-update")
-            except Exception:
-                logger.debug("Simulated update progress callback failed", exc_info=True)
+            progress_callback(0, 1, "simulated-update")
         self._firmware_version = target
         if progress_callback is not None:
-            try:
-                progress_callback(1, 1, "simulated-update")
-            except Exception:
-                logger.debug("Simulated update progress callback failed", exc_info=True)
+            progress_callback(1, 1, "simulated-update")
         return True
 
     def get_hardware_id(self, raw_hex: bool = False) -> str:
