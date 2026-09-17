@@ -61,6 +61,14 @@ Closes #<task-issue> (or Refs #<task-issue> for WIP commits)
 - PR must pass CI (unit tests, linters) before review.
 - PR must be reviewed by a person / agent independent of the author (per
   P-06 SDP peer review).
+- **When the work is complete, mark the PR as ready for review.** The
+  SDP peer-review workflow (independent AI review + human review) only
+  triggers on non-draft PRs. Do not leave a completed PR in draft
+  state waiting for someone else to flip it; opening `Draft` is fine
+  while work is in progress, but the last thing you do before handing
+  off is flip it to `Ready for review` (via `gh pr ready <N>` or the
+  GitHub UI). Removing `[WIP]` from the title is not enough on its
+  own — the draft flag is a separate field.
 
 ### Self-review section (required in PR body)
 
