@@ -1,0 +1,124 @@
+# SPDX-License-Identifier: Apache-2.0
+#
+# Independent AI review of Copilot-Coding-Agent-authored PRs, per the
+# SDP peer-review requirement (P-06). Fetches the rubric and helper
+# from openlifu-diathermy-application so the artifact stays
+# single-source: any change to the rubric is a PR against diathermy
+# and propagates to every constituent repo on next trigger.
+#
+# Runs on ``pull_request_target`` so repository secrets are available
+# and the CA PR's contents cannot modify the reviewer to exfiltrate
+# them (workflows execute from the target branch, not the PR head).
+#
+# The reviewer only runs when a CA PR is *ready for review* — draft
+# PRs are ignored. This aligns the AI review with the same gate that
+# invites human review, matching SDP peer-review semantics.
+name: SDP Independent AI Review
+
+on:
+  pull_request_target:
+    types: [opened, ready_for_review, reopened, synchronize]
+
+# Cancel superseded runs on the same PR when CA pushes iteratively.
+concurrency:
+  group: sdp-review-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+permissions:
+  # We do NOT grant write here; the review is posted via GH_TOKEN
+  # (openlifu-agent PAT) using the REST API. The default GITHUB_TOKEN
+  # is intentionally read-only.
+  contents: read
+  pull-requests: read
+
+jobs:
+  review:
+    name: Independent AI review
+    # CA PRs only. Human-authored PRs go through human peer review per
+    # the SDP; the AI is not in that loop yet. Drafts are excluded so
+    # the AI review is not spent on in-progress work.
+    if: >-
+      github.event.pull_request.draft == false && (
+        startsWith(github.event.pull_request.head.ref, 'copilot/') ||
+        github.event.pull_request.user.login == 'Copilot' ||
+        github.event.pull_request.user.login == 'copilot-swe-agent[bot]'
+      )
+    runs-on: ubuntu-latest
+    steps:
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+
+      - name: Install Copilot CLI
+        # Pinned to 1.0.83 until actions/ai-inference releases a version
+        # compatible with the clap-based argument parser (which rejects
+        # `--no-ask-user` and other flags the v3 action still emits).
+        # 1.0.83 is the last release with the Commander-based parser;
+        # 1.0.84 and later ship the new grammar. Track
+        # https://github.com/actions/ai-inference/issues for the fix
+        # and unpin when resolved.
+        run: npm install -g @github/copilot@1.0.83
+
+      - name: Fetch reviewer helper + rubric from diathermy
+        env:
+          # Org-owned PAT with Contents:read on the diathermy repo.
+          # Required because the workflow's default GITHUB_TOKEN is
+          # scoped to this repo and cannot cross into a sibling
+          # private repo.
+          GH_TOKEN: ${{ secrets.OPENLIFU_AGENT_ORG_PAT }}
+        run: |
+          set -euo pipefail
+          mkdir -p .sdp
+          fetch() {
+            local src="$1"
+            local dst="$2"
+            gh api \
+              "repos/OpenwaterHealth/openlifu-diathermy-application/contents/${src}" \
+              --jq .content | base64 -d > "${dst}"
+          }
+          fetch ".github/scripts/run_sdp_reviewer.py" .sdp/run_sdp_reviewer.py
+          fetch ".github/prompts/sdp-reviewer.prompt.md" .sdp/sdp-reviewer.prompt.md
+
+      - name: Build reviewer prompt from PR context
+        env:
+          # Org-owned PAT: reads PR, linked issues, and diff on this
+          # repo. Default GITHUB_TOKEN would also work for this step,
+          # but sharing the ORG PAT keeps auth uniform across steps.
+          GH_TOKEN: ${{ secrets.OPENLIFU_AGENT_ORG_PAT }}
+        run: |
+          python .sdp/run_sdp_reviewer.py build \
+            --pr-number ${{ github.event.pull_request.number }} \
+            --repo ${{ github.repository }} \
+            --state-dir .sdp
+
+      - name: Invoke Copilot (claude-opus-4.7 via ai-inference@v3)
+        id: ai
+        uses: actions/ai-inference@v3
+        with:
+          model: claude-opus-4.7
+          system-prompt-file: .sdp/sdp-reviewer.prompt.md
+          prompt-file: .sdp/user_prompt.txt
+        env:
+          # openlifu-agent PAT with the "Copilot Requests" fine-grained
+          # user permission. Org-owned PATs cannot grant this; the PAT
+          # must be user-owned. Rotate at
+          # https://github.com/organizations/OpenwaterHealth/settings/secrets/actions.
+          COPILOT_GITHUB_TOKEN: ${{ secrets.OPENLIFU_AGENT_PAT }}
+
+      - name: Post review as openlifu-agent
+        env:
+          # Org-owned PAT authors the review COMMENT as openlifu-agent
+          # so it satisfies the auto-review-request GitHub attaches to
+          # CA PRs (CODEOWNERS or CA default reviewer list). Needs
+          # Issues:write on this repo.
+          GH_TOKEN: ${{ secrets.OPENLIFU_AGENT_ORG_PAT }}
+        run: |
+          python .sdp/run_sdp_reviewer.py post \
+            --state-dir .sdp \
+            --body-file "${{ steps.ai.outputs.response-file }}"
