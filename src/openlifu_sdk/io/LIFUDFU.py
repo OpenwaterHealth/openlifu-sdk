@@ -819,8 +819,8 @@ class STM32USBDFU:
 
     def write_memory(self, address: int, data: bytes,
                      page_erase: bool = True,
-                     erase_bytes: int | None = None,
-                     progress_callback: Callable | None = None) -> None:
+                     progress_callback: Callable | None = None,
+                     *, erase_bytes: int | None = None) -> None:
         """Write data to target flash, optionally erasing each 2 KB page first.
 
         IMPORTANT: All page erases are performed before any data is written.
@@ -1351,6 +1351,15 @@ class LIFUDFUManager:
                 f"Refusing to flash invalid image {signed_image}:\n"
                 + report.describe()
             )
+        # validate_signed_image() has no slot limit, so bound the size here.
+        # The device would refuse the out-of-slot writes anyway, but only after
+        # the erase phase had already wiped the slot — this keeps the
+        # "nothing is erased until the image is accepted" contract above.
+        if profile.slot_size is not None and len(image) > profile.slot_size:
+            raise ValueError(
+                f"{label} image rejected before erase: {len(image)} bytes "
+                f"exceeds the {profile.slot_size}-byte slot capacity")
+
         new_version = report.header.fw_version
         logger.info("%s image: version %d (%s), %d bytes", label,
                     new_version, report.header.fw_version_str, len(image))
