@@ -132,9 +132,10 @@ TRANSMITTER_PROFILE = DeviceProfile(
     program_alignment_bytes=8,
     app_default_address=None,
     reset_virt_addr=0xFFFFFF08,
-    # TODO: needs the transmitter's slot size from
-    # open-lifu-transmitter-bl mapping_fwimg.ld.
-    slot_size=None,
+    # Pages 32-125 = the DFU-writable window. The erase stops at 0x0803EFFF,
+    # short of the anti-rollback log (0x0803F000) and the user config
+    # (0x0803F800).
+    slot_size=0x2F000,
 )
 
 CONSOLE_PROFILE = DeviceProfile(
