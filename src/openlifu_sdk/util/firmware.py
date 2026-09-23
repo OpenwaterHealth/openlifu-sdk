@@ -103,6 +103,11 @@ def get_transmitter_firmware_version() -> str:
     return _get_firmware_version(get_transmitter_firmware_path())
 
 
+def get_firmware_version(path: Path | str) -> str:
+    """Version of a firmware image at *path*."""
+    return _get_firmware_version(path)
+
+
 __all__ = [
     "CONSOLE_FIRMWARE_FILENAME",
     "CONSOLE_FIRMWARE_URL",
@@ -111,6 +116,7 @@ __all__ = [
     "TRANSMITTER_FIRMWARE_URL",
     "get_console_firmware_path",
     "get_console_firmware_version",
+    "get_firmware_version",
     "get_transmitter_firmware_path",
     "get_transmitter_firmware_version",
 ]
