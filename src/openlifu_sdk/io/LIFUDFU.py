@@ -122,6 +122,7 @@ class DeviceProfile:
     program_alignment_bytes: int
     app_default_address: int | None = None
     reset_virt_addr: int | None = 0xFFFFFF08
+    slot_size: int | None = None
 
 # Built-in profiles
 TRANSMITTER_PROFILE = DeviceProfile(
@@ -131,6 +132,10 @@ TRANSMITTER_PROFILE = DeviceProfile(
     program_alignment_bytes=8,
     app_default_address=None,
     reset_virt_addr=0xFFFFFF08,
+    # Pages 32-125 = the DFU-writable window. The erase stops at 0x0803EFFF,
+    # short of the anti-rollback log (0x0803F000) and the user config
+    # (0x0803F800).
+    slot_size=0x2F000,
 )
 
 CONSOLE_PROFILE = DeviceProfile(
@@ -140,6 +145,10 @@ CONSOLE_PROFILE = DeviceProfile(
     program_alignment_bytes=4,
     app_default_address=0x08010000,  # SBSFU active slot (console memory_map.h)
     reset_virt_addr=0xFFFFFF08,
+    # Pages 32-61 = the DFU-writable window. The erase stops at 0x0801EFFF,
+    # short of the app config block (0x0801F000, exposed over OW_CMD_USR_CFG
+    # since app 1.2.7) and the anti-rollback floor (0x0801F800).
+    slot_size=0xF000,
 )
 
 # Console SBSFU active slot: the signed image (320 B header + app @ +0x400)
@@ -810,7 +819,8 @@ class STM32USBDFU:
 
     def write_memory(self, address: int, data: bytes,
                      page_erase: bool = True,
-                     progress_callback: Callable | None = None) -> None:
+                     progress_callback: Callable | None = None,
+                     *, erase_bytes: int | None = None) -> None:
         """Write data to target flash, optionally erasing each 2 KB page first.
 
         IMPORTANT: All page erases are performed before any data is written.
@@ -820,6 +830,9 @@ class STM32USBDFU:
         interleaved.  Separating the two phases — erase all required pages
         first, then set the address pointer once and write sequentially —
         matches the behaviour of dfu-test.py and avoids this issue.
+
+        *erase_bytes* widens the erase (not the write) to that many bytes from
+        *address* — see ``DeviceProfile.slot_size``.
         """
         total = len(data)
         page_size = 2048
@@ -835,8 +848,9 @@ class STM32USBDFU:
         # data_ptr in the STM32 middleware, so erases must be completed before
         # any data DNLOAD block is sent.
         if page_erase and data:
+            erase_span = max(total, erase_bytes or 0)
             first_page = address & ~(page_size - 1)
-            last_page = (address + total - 1) & ~(page_size - 1)
+            last_page = (address + erase_span - 1) & ~(page_size - 1)
             page = first_page
             while page <= last_page:
                 self._erase_page(page)
@@ -1337,6 +1351,15 @@ class LIFUDFUManager:
                 f"Refusing to flash invalid image {signed_image}:\n"
                 + report.describe()
             )
+        # validate_signed_image() has no slot limit, so bound the size here.
+        # The device would refuse the out-of-slot writes anyway, but only after
+        # the erase phase had already wiped the slot — this keeps the
+        # "nothing is erased until the image is accepted" contract above.
+        if profile.slot_size is not None and len(image) > profile.slot_size:
+            raise ValueError(
+                f"{label} image rejected before erase: {len(image)} bytes "
+                f"exceeds the {profile.slot_size}-byte slot capacity")
+
         new_version = report.header.fw_version
         logger.info("%s image: version %d (%s), %d bytes", label,
                     new_version, report.header.fw_version_str, len(image))
@@ -1359,7 +1382,11 @@ class LIFUDFUManager:
 
         with STM32USBDFU(vid=vid, pid=pid, libusb_dll=libusb_dll,
                          device_profile=profile) as dfu:
+            # Erase the whole slot, not just this image's pages: a smaller
+            # image would leave the old tail behind, and the bootloader rejects
+            # it at boot and 0x00-fills the slot, stranding the unit.
             dfu.write_memory(slot_base, image, page_erase=True,
+                             erase_bytes=profile.slot_size,
                              progress_callback=progress_callback)
             # Read-back verify + targeted page repair, then manifest. On
             # bootloaders <= 1.0.1-rc.1 the verify read's initial ABORT
