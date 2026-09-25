@@ -1,18 +1,19 @@
-"""Resolve an operator preset into the machine configuration a TX image bakes in.
+"""Capture a preset's TX7332 register mapping off connected hardware.
 
 In FDA mode the transmitter firmware -- not the host -- programs the TX7332
-chips, so the register values have to exist before the host is in the loop.
-:func:`calculate_machine_config` runs the SDK's own register math over a preset
-document and returns the result as a plain dict, which a header generator turns
-into C tables for the firmware build.
+chips, so the register values have to be baked into the image. They are
+captured by programming a real transmitter: :func:`capture_machine_config`
+hands the preset to :meth:`LIFUTXDevice.set_solution`, the same call that
+configures a device for a live treatment, and then reads back the register
+model it produced.
 
-The register math itself is not reimplemented here: this is a wrapper over
-``TxDeviceRegisters``, the same model :meth:`LIFUTXDevice.set_solution` programs
-a live device from. What lives here is the layer above it -- how a preset
-document maps onto pulse and delay profiles, and which registers the firmware
-needs per profile in order to raster.
+Nothing about the register mapping is computed here. That is the point -- the
+values come from :func:`build_solution_registers`, the same function that
+programs a live device, so there is no second implementation to drift. Pass a
+transmitter to program and capture off real hardware (how release artifacts are
+built); pass None to compute only, for development and CI.
 
-:func:`generate_header` writes a machine config out as a C header. The headers
+:func:`generate_header` writes a captured config out as a C header. The headers
 are generated here and copied into the firmware tree by hand, so the firmware
 build itself needs neither Python nor this SDK.
 
@@ -23,186 +24,147 @@ firmware's ``presets.h``::
 
     #define ARRAY_COUNT(a) (sizeof(a) / sizeof((a)[0]))
     typedef struct { const uint32_t (*regs)[2]; uint16_t count; } PresetRegList;
+
+Every header also carries two CRC-32s the host verifies against: ``SETTINGS_CRC``
+over the raw source .json, and ``REGS_CRC`` over the emitted tables in the order
+:func:`_crc_stream` defines (the firmware recomputes that one from flash).
 """
 
 from __future__ import annotations
 
 import logging
 import re
+import struct
+import zlib
 from pathlib import Path
 from typing import Dict, List, Sequence
-
-import numpy as np
 
 from openlifu_sdk.io.LIFUTXDevice import (
     ADDRESS_APODIZATION,
     ADDRESS_DELAY_SEL,
     ADDRESS_PATTERN_SEL_G1,
     ADDRESS_PATTERN_SEL_G2,
-    DEFAULT_PATTERN_DUTY_CYCLE,
-    MIN_PROFILE_SWITCH_INTERVAL,
-    NUM_CHANNELS,
     PATTERN_PROFILE_SELECT_MASK,
-    VALID_DELAY_PROFILES,
-    Tx7332DelayProfile,
-    Tx7332PulseProfile,
-    TxDeviceRegisters,
+    build_solution_registers,
 )
 
 logger = logging.getLogger(__name__)
 
-# Preset fields copied into the machine config as-is. Anything the firmware or
-# the operator interface needs at runtime has to be listed here, because the
-# preset document itself is not baked into the image.
+# Preset fields copied into the captured config as-is, for the header to emit.
 PASSTHROUGH_FIELDS = (
-    "label",
-    "voltage",
-    "voltage_range",
-    "sensitivity",
-    "depth_mm",
-    "frequency_khz",
-    "start_C",
-    "shutoff_C",
-    "pulse_length_us",
-    "pulse_interval_ms",
     "pulse_count",
+    "pulse_interval_ms",
     "pulse_train_interval_s",
-    "pulse_train_count_selections",
 )
 
 # Amplitude scales the pattern duty cycle. Presets that do not carry one are
 # full-amplitude.
 DEFAULT_PULSE_AMPLITUDE = 1.0
 
+# Trains to configure while capturing. Run length is not preset data -- it
+# arrives with OW_PRESET_LOAD -- but set_solution needs a value for set_trigger.
+CAPTURE_PULSE_TRAIN_COUNT = 1
 
-def calculate_machine_config(preset: Dict, preset_id: str | None = None) -> Dict:
-    """Resolve a preset document into a bakeable machine configuration.
+
+def capture_machine_config(txdevice, preset: Dict, preset_id: str | None = None,
+                           settings_bytes: bytes | None = None) -> Dict:
+    """Resolve a preset into the register mapping a TX image bakes in.
+
+    The mapping comes from :func:`build_solution_registers`, the same function
+    :meth:`TxDevice.set_solution` uses to program a live device, so there is
+    only ever one implementation to keep correct.
 
     Args:
-        preset:     Preset document (the operator-facing JSON), with at least
-                    ``delays``, ``apodization``, ``frequency_khz`` and
-                    ``pulse_length_us``.
-        preset_id:  Identifier for the generated config. Defaults to
-                    ``preset["id"]``.
+        txdevice:  A ``TxDevice`` to program, or None to only compute. Passing
+                   a device runs the full :meth:`set_solution` path, which
+                   programs the chips and lets the result be read back --
+                   that is how release artifacts are captured. Passing None
+                   computes the same registers with no device at all.
+        preset:    Preset document (the operator-facing JSON).
+        preset_id: Identifier for the generated config. Defaults to
+                   ``preset["id"]``.
+        settings_bytes: The raw bytes of the preset .json file. Hashed into
+                   ``settings_crc`` so the host can later prove the device was
+                   built from the same file it holds. Required to generate a
+                   header.
 
     Returns:
-        Dict with the passthrough preset fields plus:
-
-        ``id``
-            Identifier the host asks for over OW_PRESET_LOAD.
-        ``profile_index``
-            1-based delay profile active before the first trigger.
-        ``execution_order``
-            1-based delay profile indices the firmware cycles through.
-        ``chips``
-            One entry per TX7332, each ``{"registers": ..., "profiles": ...}``.
-            ``registers`` maps a start address to a run of consecutive values
-            for bulk writes; ``profiles`` holds one address->value dict per
-            delay profile, the registers the firmware rewrites as it rasters.
+        Dict with ``id``, the passthrough sequence fields, ``settings_crc``
+        (when ``settings_bytes`` was given), ``profile_index``,
+        ``execution_order`` and ``chips``. Each chip entry holds ``registers``
+        (start address -> run of consecutive values) and ``profiles`` (one
+        address -> value dict per delay profile, the registers the firmware
+        rewrites as it rasters).
 
     Raises:
-        ValueError: If the preset is malformed or its sequence cannot raster.
+        ValueError: If the preset has no id or is malformed.
+        LIFUError:  On any device failure, including a chip-count mismatch.
     """
     pid = preset_id if preset_id is not None else preset.get("id")
     if not pid:
         raise ValueError("preset has no 'id' and no preset_id was supplied")
 
-    delays = np.array(preset["delays"], dtype=float)
-    if delays.ndim == 1:
-        delays = delays.reshape(1, -1)
-    apodizations = np.array(preset["apodization"], dtype=float)
-    if apodizations.ndim == 1:
-        apodizations = apodizations.reshape(1, -1)
+    delays = preset["delays"]
+    apodizations = preset["apodization"]
+    execution_order = list(preset.get("order") or range(1, len(delays) + 1))
 
-    if delays.shape != apodizations.shape:
-        raise ValueError(f"delays {delays.shape} and apodization {apodizations.shape} disagree")
+    pulse = {
+        "frequency": preset["frequency_khz"] * 1e3,
+        "duration": preset["pulse_length_us"] * 1e-6,
+        "amplitude": preset.get("amplitude", DEFAULT_PULSE_AMPLITUDE),
+    }
+    sequence = {
+        "pulse_interval": preset["pulse_interval_ms"] * 1e-3,
+        "pulse_count": preset["pulse_count"],
+        "pulse_train_interval": preset.get("pulse_train_interval_s", 0),
+        "pulse_train_count": CAPTURE_PULSE_TRAIN_COUNT,
+    }
 
-    n_profiles, n_elements = delays.shape
-    if n_profiles == 0:
-        raise ValueError("At least one profile row is required")
-    if n_profiles > len(VALID_DELAY_PROFILES):
-        raise ValueError(
-            f"Too many profile rows ({n_profiles}). Max supported is {len(VALID_DELAY_PROFILES)}"
+    if txdevice is not None:
+        # Programs the device for real, then captures what it was given. A bad
+        # preset fails here rather than silently baking.
+        txdevice.set_solution(
+            pulse=pulse,
+            delays=delays,
+            apodizations=apodizations,
+            sequence=sequence,
+            profile_index=execution_order[0],
+            execution_order=execution_order,
         )
-    if n_elements % NUM_CHANNELS:
-        raise ValueError(f"{n_elements} elements is not a whole number of TX7332 chips")
+        regs = txdevice.tx_registers
+    else:
+        regs = build_solution_registers(
+            pulse,
+            delays,
+            apodizations,
+            sequence,
+            profile_index=execution_order[0],
+            execution_order=execution_order,
+        )["tx_registers"]
 
-    execution_order = list(preset.get("order") or range(1, n_profiles + 1))
-    for idx in execution_order:
-        if not isinstance(idx, int) or idx < 1 or idx > n_profiles:
-            raise ValueError(
-                f"order contains invalid profile index {idx}. Must be in 1-{n_profiles}"
-            )
-    profile_index = execution_order[0]
+    n_profiles = len(regs.configured_delay_profiles())
+    logger.info("captured '%s': %d profile(s), %d chip(s), order=%s",
+                pid, n_profiles, regs.num_transmitters, execution_order)
 
-    frequency = preset["frequency_khz"] * 1e3
-    duration = preset["pulse_length_us"] * 1e-6
-    amplitude = preset.get("amplitude", DEFAULT_PULSE_AMPLITUDE)
-
-    # Rastering is driven off the trigger, so the sequence has to leave the
-    # firmware time to switch profiles between bursts.
-    if len(execution_order) > 1:
-        pulse_count = preset["pulse_count"]
-        if pulse_count % len(execution_order):
-            raise ValueError(
-                f"pulse_count ({pulse_count}) must be divisible by the number of profiles "
-                f"in order ({len(execution_order)}), so each profile gets a whole number "
-                f"of consecutive pulses."
-            )
-        dead_time = (preset["pulse_interval_ms"] * 1e-3) - duration
-        if dead_time < MIN_PROFILE_SWITCH_INTERVAL:
-            raise ValueError(
-                f"pulse_interval ({preset['pulse_interval_ms']:.1f} ms) must exceed the pulse "
-                f"duration ({duration * 1e3:.1f} ms) by at least "
-                f"{MIN_PROFILE_SWITCH_INTERVAL * 1e6:.0f} us so the firmware can switch "
-                f"profiles after the burst ends."
-            )
-
-    regs = TxDeviceRegisters(num_transmitters=n_elements // NUM_CHANNELS)
-
-    # One pulse profile per delay profile slot: the firmware cycles the pattern
-    # selector in lockstep with the delay selector, so every slot the execution
-    # order can reach needs valid pattern RAM. The pattern itself is identical
-    # across slots, only the duty cycle tracks the loudest apodization.
-    duty_cycle = DEFAULT_PATTERN_DUTY_CYCLE * float(np.max(apodizations)) * amplitude
-    for dp in range(n_profiles):
-        regs.add_pulse_profile(Tx7332PulseProfile(
-            profile=dp + 1,
-            frequency=frequency,
-            cycles=int(duration * frequency),
-            duty_cycle=duty_cycle,
-        ))
-        regs.add_delay_profile(Tx7332DelayProfile(
-            profile=dp + 1,
-            delays=delays[dp, :],
-            apodizations=apodizations[dp, :],
-        ))
-
-    regs.activate_delay_profile(profile_index)
-    regs.activate_pulse_profile(profile_index)
-
-    logger.info(
-        "machine config '%s': %d profile(s), %d chip(s), order=%s",
-        pid, n_profiles, regs.num_transmitters, execution_order,
-    )
-
-    machine_config = {"id": pid}
+    captured = {"id": pid}
+    if settings_bytes is not None:
+        captured["settings_crc"] = zlib.crc32(settings_bytes) & 0xFFFFFFFF
     for name in PASSTHROUGH_FIELDS:
         if name in preset:
-            machine_config[name] = preset[name]
-    machine_config["profile_index"] = profile_index
-    machine_config["execution_order"] = execution_order
-    machine_config["chips"] = _chip_configs(regs, n_profiles)
-    return machine_config
+            captured[name] = preset[name]
+    captured["profile_index"] = execution_order[0]
+    captured["execution_order"] = execution_order
+    captured["chips"] = _chip_configs(regs, n_profiles)
+    return captured
 
 
-def _chip_configs(regs: TxDeviceRegisters, n_profiles: int) -> List[Dict]:
-    """Split the register model into one bakeable entry per TX7332."""
+def _chip_configs(regs, n_profiles: int) -> List[Dict]:
+    """Split the programmed register model into one bakeable entry per TX7332."""
     packed = regs.get_registers(pack=True, pack_single=True)
 
-    # Per-profile registers, gathered per chip: the delay selector and
-    # apodization the SDK computes, plus the 0-based pattern selector for both
-    # groups. These are the writes the firmware repeats as it rasters.
+    # Per-profile registers: the delay selector and apodization the device was
+    # programmed with, plus the 0-based pattern selector for both groups. These
+    # are the writes the firmware repeats as it rasters.
     per_profile = []
     for profile in range(1, n_profiles + 1):
         control = regs.get_delay_control_registers(profile)
@@ -265,12 +227,44 @@ def _flatten(registers: Dict[int, List[int]]) -> List[List[int]]:
     return pairs
 
 
+def _crc_stream(machine_config: Dict) -> bytes:
+    """The bytes regs_crc covers -- PRESET_CRC_STREAM in the firmware's presets.h.
+
+    presets_regs_crc() walks the same stream from flash, so the two must stay
+    identical: header fields, execution order, trigger timing, then per chip
+    the base pairs and each profile's pairs, exactly as generate_header emits
+    them.
+    """
+    chips = machine_config["chips"]
+    order = machine_config["execution_order"]
+    n_profiles = len(chips[0]["profiles"]) if chips else 0
+    interval_ms = float(machine_config["pulse_interval_ms"])
+    out = bytearray(struct.pack("<BBBB", len(chips), n_profiles,
+                                int(machine_config["profile_index"]), len(order)))
+    out += bytes(int(i) for i in order)
+    out += struct.pack("<III", round(1000.0 / interval_ms) if interval_ms else 0,
+                       int(machine_config["pulse_count"]),
+                       round(float(machine_config.get("pulse_train_interval_s", 0)) * 1e6))
+    for chip in chips:
+        for pairs in [_flatten(chip["registers"])] + [
+                [[a, prof[a]] for a in sorted(prof)] for prof in chip["profiles"]]:
+            out += struct.pack("<H", len(pairs))
+            for addr, value in pairs:
+                out += struct.pack("<HI", addr, value & 0xFFFFFFFF)
+    return bytes(out)
+
+
+def regs_crc(machine_config: Dict) -> int:
+    """CRC-32 the firmware will compute for this preset from its own flash."""
+    return zlib.crc32(_crc_stream(machine_config)) & 0xFFFFFFFF
+
+
 def generate_header(filename, machine_config: Dict, context: str | None = None) -> Path:
     """Write a machine config out as a C header for the firmware build.
 
     Args:
         filename:       Destination path. Parent directories are created.
-        machine_config: Result of :func:`calculate_machine_config`.
+        machine_config: Result of :func:`capture_machine_config`.
         context:        Optional preset-set name, prefixed onto the generated
                         symbols so two sets can coexist in one tree.
 
@@ -310,6 +304,14 @@ def generate_header(filename, machine_config: Dict, context: str | None = None) 
     lines.append("#define %s_TRIG_HZ %uu" % (sym, round(1000.0 / interval_ms) if interval_ms else 0))
     lines.append("#define %s_TRIG_TRAIN_US %uu"
                  % (sym, round(float(machine_config.get("pulse_train_interval_s", 0)) * 1e6)))
+
+    # What the host verifies against: the source file, and these very tables.
+    if "settings_crc" not in machine_config:
+        raise ValueError("%s has no settings_crc; pass settings_bytes to capture_machine_config"
+                         % machine_config["id"])
+    lines += ["", "// CRC-32 of the source .json, and of the tables below (PRESET_CRC_STREAM).",
+              "#define %s_SETTINGS_CRC 0x%08xu" % (sym, machine_config["settings_crc"]),
+              "#define %s_REGS_CRC 0x%08xu" % (sym, regs_crc(machine_config))]
 
     lines += ["", "// Delay profile execution order used during raster cycling.",
               "static const uint8_t %s_EXEC_ORDER[%s_EXEC_LEN] = { %s };"
@@ -353,7 +355,7 @@ def generate_preset_set(directory, presets: Sequence[Dict], context: str) -> Lis
 
     Args:
         directory: Destination directory for the generated headers.
-        presets:   Machine configs, in the order the host indexes them.
+        presets:   Captured configs, in the order the host indexes them.
         context:   Preset-set name, used in the symbols and the table guard.
 
     Returns:
@@ -391,8 +393,9 @@ def generate_preset_set(directory, presets: Sequence[Dict], context: str) -> Lis
         lines.append(
             "\t{ %s_ID, %s_BASE, %s_PROFILE_REGS, %s_EXEC_ORDER,\n"
             "\t  %s_CHIPS, %s_PROFILES, %s_PROFILE_INDEX, %s_EXEC_LEN,\n"
-            "\t  %s_TRIG_HZ, %s_TRIG_COUNT, %s_TRIG_TRAIN_US },"
-            % (sym, sym, sym, sym, sym, sym, sym, sym, sym, sym, sym)
+            "\t  %s_TRIG_HZ, %s_TRIG_COUNT, %s_TRIG_TRAIN_US,\n"
+            "\t  %s_SETTINGS_CRC, %s_REGS_CRC },"
+            % ((sym,) * 13)
         )
     lines += ["};", "", "#endif  // %s" % guard, ""]
 
@@ -406,3 +409,25 @@ def generate_preset_set(directory, presets: Sequence[Dict], context: str) -> Lis
 
 def _header_stem(machine_config: Dict, context: str) -> str:
     return ("preset_%s_%s" % (c_ident(context), c_ident(machine_config["id"]))).lower()
+
+
+def verify_preset(txdevice, index: int, machine_config: Dict) -> Dict:
+    """Prove the device's preset *index* is the one the host holds.
+
+    Asks the device (OW_PRESET_GET) and compares id, settings_crc and regs_crc
+    against *machine_config* -- captured locally with settings_bytes so both
+    CRCs are known. Returns the device's reply on success.
+
+    Raises:
+        ValueError: With every field that disagrees, if any do.
+    """
+    got = txdevice.get_preset(index)
+    want = {"id": machine_config["id"],
+            "settings_crc": machine_config["settings_crc"],
+            "regs_crc": regs_crc(machine_config)}
+    bad = ["%s: device=%s host=%s" % (k, (hex(got[k]) if isinstance(got[k], int) else got[k]),
+                                       (hex(v) if isinstance(v, int) else v))
+           for k, v in want.items() if got[k] != v]
+    if bad:
+        raise ValueError("preset %d verification failed: %s" % (index, "; ".join(bad)))
+    return got

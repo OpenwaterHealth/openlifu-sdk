@@ -54,9 +54,10 @@ class OWComponent:
 
     def __init__(self, vid: int, pid: int, supported_commands: set[int],
                  baudrate: int = 921600, timeout: float = DEFAULT_TIMEOUT,
-                 desc: str = "VCP"):
+                 desc: str = "VCP", test_mode: bool = False):
         self._uart = OWUart(vid, pid, baudrate=baudrate, timeout=timeout, desc=desc)
         self._supported_commands = supported_commands
+        self._test_mode = test_mode
 
     # -- Expose underlying OWUart attributes --------------------------
 
@@ -64,8 +65,20 @@ class OWComponent:
     def uart(self) -> OWUart:
         return self._uart
 
+    @property
+    def test_mode(self) -> bool:
+        """True when commands are answered locally instead of over the UART.
+
+        Register values computed in test mode are identical to those a real
+        device produces -- the device never contributes to them -- but nothing
+        is programmed and no reply reflects real hardware state. Release
+        artifacts are captured against hardware; test mode is for development
+        and CI, and for solutions larger than the modules on hand.
+        """
+        return self._test_mode
+
     def is_connected(self) -> bool:
-        return self._uart.is_connected
+        return self._test_mode or self._uart.is_connected
 
     @property
     def signal_connected(self) -> OWSignal:
@@ -163,6 +176,10 @@ class OWComponent:
             LIFUCommunicationError: If every attempt times out.
             LIFUDeviceError: If the device replies with ``OW_ERROR``.
         """
+        if self._test_mode:
+            return self._test_mode_reply(command, addr=addr, reserved=reserved,
+                                         data=data, packet_type=packet_type)
+
         self._require_connected()
         label = op or f"cmd 0x{command:02X}"
         total_attempts = max(1, retries + 1)
@@ -277,6 +294,28 @@ class OWComponent:
     def _require_connected(self):
         if not self.is_connected():
             raise LIFUNotConnectedError(f"{self._uart.desc} not connected")
+
+    # -- Test mode ----------------------------------------------------
+
+    def _test_mode_reply(self, command: int, addr: int = 0, reserved: int = 0,
+                         data: bytearray | None = None,
+                         packet_type: int | None = None) -> OWUartPacket:
+        """Answer a command locally, with no UART traffic.
+
+        The default is a bare acknowledgement, which is all a write-style
+        command needs. Subclasses override this to answer the handful of
+        commands whose *payload* a caller actually reads back -- see
+        :meth:`LIFUTXDevice._test_mode_reply`.
+        """
+        log.debug("%s: test mode, answering cmd 0x%02X locally", self._uart.desc, command)
+        return OWUartPacket(
+            id=0,
+            packet_type=packet_type if packet_type is not None else _CMD_TO_PKT_TYPE.get(command, OW_CMD),
+            command=command,
+            addr=addr,
+            reserved=reserved,
+            data=data if data is not None else b"",
+        )
 
     def ping(self, module: int = 0) -> bool:
         """Send a PING to the device.

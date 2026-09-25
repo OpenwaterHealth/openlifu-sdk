@@ -67,6 +67,10 @@ OW_CTRL_SET_PROFILE_CYCLE = 0x1F
 # one command->packet-type map), so these skip the 0x20-0x27 TX7332 block.
 OW_CTRL_SET_PATTERN_PROFILE = 0x28
 OW_CTRL_GET_PATTERN_PROFILE = 0x29
+# Baked-in presets, FDA_MODE firmware only. Master answers GET from its own
+# flash; LOAD is forwarded so every module checks the CRC against its tables.
+OW_PRESET_GET = 0x50   # reserved=index -> count,index,chips,profiles,settings_crc,regs_crc,id
+OW_PRESET_LOAD = 0x51  # reserved=index, data=<II train_count, regs_crc; OW_BAD_CRC on mismatch
 
 # TX7332 Commands
 OW_TX7332_STATUS = 0x20
@@ -137,6 +141,7 @@ CONTROLLER_COMMANDS = {
     OW_CTRL_SET_PATTERN_PROFILE, OW_CTRL_GET_PATTERN_PROFILE,
     OW_CTRL_SET_DELAY_PROFILE, OW_CTRL_GET_DELAY_PROFILE,
     OW_CTRL_SET_PROFILE_CYCLE,
+    OW_PRESET_GET, OW_PRESET_LOAD,
 }
 
 POWER_COMMANDS = {

@@ -26,6 +26,8 @@ from openlifu_sdk.io.LIFUConfig import (
     OW_CTRL_ENUMERATE,
     NODE_MODE_UNKNOWN,
     OW_CTRL_GET_PATTERN_PROFILE,
+    OW_PRESET_GET,
+    OW_PRESET_LOAD,
     OW_CTRL_SET_PATTERN_PROFILE,
     OW_CTRL_SET_DELAY_PROFILE,
     OW_CTRL_GET_DELAY_PROFILE,
@@ -163,7 +165,9 @@ logger = logging.getLogger(__name__)
 
 class TxDevice(OWComponent):
     def __init__(self, vid: int = OW_VID, pid: int = OW_TRANSMITTER_PID,
-                 baudrate: int = 921600, timeout: float = DEFAULT_TIMEOUT, test_mode: bool = False, module_invert: bool | list[bool] = False):
+                 baudrate: int = 921600, timeout: float = DEFAULT_TIMEOUT, test_mode: bool = False,
+                 test_chip_count: int = TRANSMITTERS_PER_MODULE,
+                 module_invert: bool | list[bool] = False):
         """
         Initialize the TxDevice.
 
@@ -172,22 +176,44 @@ class TxDevice(OWComponent):
             pid (int): USB Product ID of the device.
             baudrate (int): Baud rate for UART communication.
             timeout (float): Timeout for UART operations in seconds.
-            test_mode (bool): If True, simulates device responses without actual hardware communication.
+            test_mode (bool): If True, answers commands locally with no UART traffic.
+                Register values are computed exactly as on hardware -- the device
+                never contributes to them -- but nothing is programmed and reads do
+                not reflect real state. Use for development, CI, and solutions
+                larger than the modules on hand; capture release artifacts against
+                hardware.
+            test_chip_count (int): TX7332 chips to report from enum in test mode when
+                the caller does not state an expectation.
             module_invert (bool | list[bool]): If True or list of bools, inverts the module addressing scheme.
         """
         super().__init__(
             vid, pid,
             supported_commands=GLOBAL_COMMANDS | TX7332_COMMANDS | CONTROLLER_COMMANDS,
-            baudrate=baudrate, timeout=timeout, desc="TX",
+            baudrate=baudrate, timeout=timeout, desc="TX", test_mode=test_mode,
         )
-        
+
         register_command_packet_types(TX7332_COMMANDS, OW_TX7332)
         register_command_packet_types(CONTROLLER_COMMANDS, OW_CONTROLLER)
 
         self._tx_instances = []
         self.tx_registers = None
-        self._test_mode = test_mode
+        self._test_chip_count = test_chip_count
         self.module_invert = module_invert
+
+    def _test_mode_reply(self, command: int, addr: int = 0, reserved: int = 0,
+                         data: bytearray | None = None,
+                         packet_type: int | None = None):
+        """Answer the TX commands whose payload a caller reads back.
+
+        Only the chip count matters for building a solution: everything else
+        set_solution sends is a write, which the base acknowledgement covers.
+        The count comes from _test_chip_count, which enum_tx7332_devices sets
+        to whatever the caller expects so any solution size can be built.
+        """
+        if command == OW_TX7332_ENUM:
+            reserved = self._test_chip_count
+        return super()._test_mode_reply(command, addr=addr, reserved=reserved,
+                                        data=data, packet_type=packet_type)
 
     def __parse_ti_cfg_file(self, file_path: str) -> list[tuple[str, int, int]]:
         """Parses the given configuration file and extracts all register groups, addresses, and values."""
@@ -647,6 +673,12 @@ class TxDevice(OWComponent):
             LIFUNotConnectedError, LIFUCommunicationError, LIFUDeviceError,
             LIFUError: If the detected count does not match *num_devices*.
         """
+        # In test mode there is nothing to detect, so report what the caller
+        # expects. That lets a solution be built for more modules than are on
+        # hand -- the reason the mismatch check exists at all on hardware.
+        if self._test_mode and num_devices is not None:
+            self._test_chip_count = num_devices
+
         r = self.send_checked(packet_type=OW_TX7332, command=OW_TX7332_ENUM,
                               addr=0, op="enum_tx7332_devices")
         if r.reserved == 0:
@@ -700,6 +732,46 @@ class TxDevice(OWComponent):
         self.send_checked(packet_type=OW_TX7332, command=OW_TX7332_WREG,
                           addr=identifier, data=data, op="write_register")
         logger.debug("Wrote 0x%08X to chip %d reg 0x%04X", value, identifier, address)
+        return True
+
+    def get_preset(self, index: int) -> Dict:
+        """Describe a preset baked into an FDA_MODE image (OW_PRESET_GET).
+
+        Returns ``count``, ``index``, ``chip_count``, ``profile_count``, ``id``,
+        ``settings_crc`` (CRC-32 of the source .json) and ``regs_crc`` (CRC-32
+        the firmware just computed over its own register tables) and
+        ``baked_regs_crc`` (what the generator stored; differs only if flash is inconsistent).
+
+        Raises:
+            LIFUDeviceError: Bad index, or the image failed its own CRC check.
+        """
+        r = self.send_checked(packet_type=OW_CONTROLLER, command=OW_PRESET_GET,
+                              reserved=index, op="get_preset")
+        if r.data_len < 17:
+            raise LIFUProtocolError(f"TX: get_preset payload too short ({r.data_len} < 17)",
+                                    code=LIFU_ERR_BAD_PAYLOAD_LENGTH)
+        d = bytes(r.data)
+        count, idx, chips, profiles = d[0], d[1], d[2], d[3]
+        settings_crc, regs_crc, baked_regs_crc = struct.unpack("<III", d[4:16])
+        id_len = d[16]
+        return {"count": count, "index": idx, "chip_count": chips, "profile_count": profiles,
+                "settings_crc": settings_crc, "regs_crc": regs_crc, "baked_regs_crc": baked_regs_crc,
+                "id": d[17:17 + id_len].decode("ascii", "replace")}
+
+    def load_preset(self, index: int, regs_crc: int, train_count: int = 0) -> bool:
+        """Program every module from baked preset *index* (OW_PRESET_LOAD).
+
+        The firmware refuses the load unless *regs_crc* equals the CRC-32 it
+        computes over its own tables, so pass the value the host derived for
+        this preset (see LIFUTXPresets.regs_crc). *train_count* 0 keeps the
+        device's current run length.
+
+        Raises:
+            LIFUDeviceError: CRC mismatch (OW_BAD_CRC), bad index, or trigger running.
+        """
+        self.send_checked(packet_type=OW_CONTROLLER, command=OW_PRESET_LOAD,
+                          reserved=index, data=struct.pack("<II", train_count, regs_crc),
+                          op="load_preset")
         return True
 
     def read_register(self, identifier:int, address: int) -> int:
@@ -958,156 +1030,27 @@ class TxDevice(OWComponent):
             ValueError: If the inputs are malformed or execution_order is invalid.
             LIFUError: On any device-communication failure.
         """
-        # Validate and normalize inputs.
-        delays = np.array(delays)
-        if delays.ndim == 1:
-            delays = delays.reshape(1, -1)
-        apodizations = np.array(apodizations)
-        if apodizations.ndim == 1:
-            apodizations = apodizations.reshape(1, -1)
-        n = delays.shape[0]
-
-        if n == 0:
-            raise ValueError("At least one profile row is required")
-        if n != apodizations.shape[0]:
-            raise ValueError("Delays and apodizations must have the same number of rows")
-        if delays.shape[1] != apodizations.shape[1]:
-            raise ValueError("Delays and apodizations must have the same number of elements per row")
-
-        # Delay RAM supports 16 profile slots on TX7332.
-        if n > len(VALID_DELAY_PROFILES):
-            raise ValueError(f"Too many profile rows ({n}). Max supported is {len(VALID_DELAY_PROFILES)}")
-
-        # pulse_configs: list of unique pulse config dicts, indexed 0-based.
-        if isinstance(pulse, list):
-            pulse_configs = pulse
-        else:
-            pulse_configs = [pulse]
-        num_pulse_profiles = len(pulse_configs)
-
-        # Build pulse_profile_map: delay profile index (1-based) -> pulse profile index (1-based)
-        if pulse_profile_map is None:
-            if num_pulse_profiles == 1:
-                # Single pulse config: all delay profiles share pulse profile 1.
-                pulse_profile_map = {i + 1: 1 for i in range(n)}
-            else:
-                if num_pulse_profiles != n:
-                    raise ValueError(
-                        f"When pulse is a list without pulse_profile_map, "
-                        f"it must have one entry per delay profile row ({n}), got {num_pulse_profiles}"
-                    )
-                pulse_profile_map = {i + 1: i + 1 for i in range(n)}
-        else:
-            for dp_idx, pp_idx in pulse_profile_map.items():
-                if dp_idx < 1 or dp_idx > n:
-                    raise ValueError(f"pulse_profile_map key {dp_idx} out of range 1-{n}")
-                if pp_idx < 1 or pp_idx > num_pulse_profiles:
-                    raise ValueError(f"pulse_profile_map value {pp_idx} out of range 1-{num_pulse_profiles}")
-            for i in range(1, n + 1):
-                if i not in pulse_profile_map:
-                    raise ValueError(f"pulse_profile_map missing mapping for delay profile {i}")
-
-        # Default to sequential execution order: [1, 2, ..., n].
-        if execution_order is None:
-            execution_order = list(range(1, n + 1))
-
-        if not isinstance(execution_order, list):
-            raise ValueError("execution_order must be a list of profile indices")
-        if len(execution_order) == 0:
-            raise ValueError("execution_order cannot be empty")
-        if len(execution_order) > MAX_EXECUTION_ORDER:
-            raise ValueError(
-                f"execution_order length ({len(execution_order)}) exceeds the "
-                f"maximum of {MAX_EXECUTION_ORDER}"
-            )
-        for idx in execution_order:
-            if not isinstance(idx, int) or idx < 1 or idx > n:
-                raise ValueError(f"execution_order contains invalid profile index {idx}. Must be in 1-{n}")
-
+        # Every solution -> register decision lives in
+        # build_solution_registers() so this path and preset header generation
+        # cannot drift apart. Everything below is device I/O.
+        solution = build_solution_registers(
+            pulse,
+            delays,
+            apodizations,
+            sequence,
+            profile_index=profile_index,
+            execution_order=execution_order,
+            pulse_profile_map=pulse_profile_map,
+            module_invert=self.module_invert,
+        )
+        n = solution["num_delay_profiles"]
+        profile_index = solution["profile_index"]
+        execution_order = solution["execution_order"]
         rastering = len(execution_order) > 1
-        if not rastering and execution_order[0] != profile_index:
-            logger.info(
-                "Single-entry execution_order [%d]: activating that profile "
-                "instead of profile_index=%d.",
-                execution_order[0], profile_index,
-            )
-            profile_index = execution_order[0]
 
-        if rastering:
-            pulse_count = sequence["pulse_count"]
-            n_exec = len(execution_order)
-            if pulse_count % n_exec != 0:
-                raise ValueError(
-                    f"pulse_count ({pulse_count}) must be divisible by the number of "
-                    f"profiles in execution_order ({n_exec}). "
-                    f"Each profile gets pulse_count/n_profiles = {pulse_count}/{n_exec} consecutive pulses."
-                )
-            pulse_interval = sequence["pulse_interval"]
-            max_burst_s = max(cfg["duration"] for cfg in pulse_configs)
-            dead_time = pulse_interval - max_burst_s
-            if dead_time < MIN_PROFILE_SWITCH_INTERVAL:
-                raise ValueError(
-                    f"pulse_interval ({pulse_interval * 1e3:.1f} ms) must exceed the pulse "
-                    f"duration ({max_burst_s * 1e3:.1f} ms) by at least "
-                    f"{MIN_PROFILE_SWITCH_INTERVAL * 1e6:.0f} µs so the firmware can switch "
-                    f"profiles after the burst ends. Increase pulse_interval or shorten "
-                    f"the pulse duration."
-                )
-
-        logger.info(f"Grouped profile package system: {n} profiles, execution_order={execution_order}")
-
-        n_elements = delays.shape[1]
-        n_required_devices = int(n_elements / NUM_CHANNELS)
         # enum_tx7332_devices raises LIFUError on mismatch
-        self.enum_tx7332_devices(num_devices=n_required_devices)
-
-        # Pre-compute duty cycle per mapped pulse config: use max apodization
-        # across all delay profiles sharing the same pulse config.
-        duty_cycle_by_pulse = {}
-        for pidx in set(pulse_profile_map.values()):
-            pulse_cfg = pulse_configs[pidx - 1]
-            mapped_dps = [k for k, v in pulse_profile_map.items() if v == pidx]
-            max_apod = max(max(apodizations[dp - 1, :]) for dp in mapped_dps)
-            duty_cycle_by_pulse[pidx] = DEFAULT_PATTERN_DUTY_CYCLE * max_apod * pulse_cfg["amplitude"]
-
-        # Create one pulse profile per delay profile slot.
-        # The TX7332 firmware cycles PATTERN_SEL in lockstep with DELAY_SEL,
-        # so every delay profile slot must have valid pattern RAM data.
-        # When multiple delay profiles share the same pulse config, the
-        # pattern data is replicated across their slots.
-        for dp in range(n):
-            pidx = pulse_profile_map[dp + 1]
-            pulse_cfg = pulse_configs[pidx - 1]
-            pulse_profile = Tx7332PulseProfile(
-                profile=dp + 1,
-                frequency=pulse_cfg["frequency"],
-                cycles=int(pulse_cfg["duration"] * pulse_cfg["frequency"]),
-                duty_cycle=duty_cycle_by_pulse[pidx],
-            )
-            self.tx_registers.add_pulse_profile(pulse_profile)
-
-        # Create all delay profiles (one per row).
-        for dp in range(n):
-            delay_profile = Tx7332DelayProfile(
-                profile=dp + 1,
-                delays=delays[dp, :],
-                apodizations=apodizations[dp, :],
-            )
-            self.tx_registers.add_delay_profile(delay_profile)
-
-        if profile_index not in self.tx_registers.configured_delay_profiles():
-            raise ValueError(
-                f"profile_index={profile_index} is not configured. "
-                f"Configured delay profiles: {self.tx_registers.configured_delay_profiles()}"
-            )
-        if profile_index not in self.tx_registers.configured_pulse_profiles():
-            raise ValueError(
-                f"pulse profile {profile_index} is not configured. "
-                f"Configured pulse profiles: {self.tx_registers.configured_pulse_profiles()}"
-            )
-
-        self.tx_registers.activate_delay_profile(profile_index)
-        self.tx_registers.activate_pulse_profile(profile_index)
+        self.enum_tx7332_devices(num_devices=solution["num_transmitters"])
+        self.tx_registers = solution["tx_registers"]
 
         self.set_trigger(
             pulse_interval=sequence["pulse_interval"],
@@ -1131,14 +1074,10 @@ class TxDevice(OWComponent):
                 self.write_register(txi, ADDRESS_PATTERN_SEL_G2, (profile_index - 1) & PATTERN_PROFILE_SELECT_MASK)
 
         if rastering:
-            # Send execution_order plus per-chip apodization registers so
-            # firmware can auto-cycle profiles at pulse boundaries:
-            # apod_reg_values[profile - 1][chip] = uint32.
-            apod_reg_values = []
-            for profile in sorted(self.tx_registers.configured_delay_profiles()):
-                delay_control = self.tx_registers.get_delay_control_registers(profile)
-                apod_reg_values.append([regs[ADDRESS_APODIZATION] for regs in delay_control])
-            self._send_grouped_profile_cycle(execution_order, apod_reg_values)
+            # Send execution_order plus the per-chip apodization registers the
+            # solution already computed, so firmware can auto-cycle profiles at
+            # pulse boundaries: apod_reg_values[profile - 1][chip] = uint32.
+            self._send_grouped_profile_cycle(execution_order, solution["apodization_registers"])
 
         return True
 
@@ -2167,3 +2106,217 @@ class TxDeviceRegisters:
             )
 
         return active_profile_g1 + 1
+
+
+def build_solution_registers(pulse: Dict | List[Dict],
+                             delays: np.ndarray,
+                             apodizations: np.ndarray,
+                             sequence: Dict,
+                             profile_index: int = 1,
+                             execution_order: List[int] | None = None,
+                             pulse_profile_map: Dict[int, int] | None = None,
+                             module_invert: bool | List[bool] = False) -> Dict:
+    """Resolve a beamforming solution into TX7332 registers. No device needed.
+
+    This is the single source of the solution -> register mapping: input
+    validation, the duty cycle, how many pulse profiles exist and which delay
+    profile uses which, and the per-profile apodization the firmware needs in
+    order to raster. :meth:`TxDevice.set_solution` calls this and then programs
+    the result; preset header generation calls it and bakes the result. Neither
+    keeps a second copy, so a change here reaches both.
+
+    The chip count is derived from the element count rather than from a
+    connected device; set_solution still enumerates to check the attached
+    hardware matches.
+
+    Args:
+        pulse:              Dict (single shared pulse config) or List[Dict]
+                            (one per unique pulse profile).
+        delays:             np.ndarray of shape (N, elements) for N delay profiles.
+        apodizations:       np.ndarray of shape (N, elements), same shape as delays.
+        sequence:           Dict with trigger timing. Only read here to check
+                            that rastering fits the sequence.
+        profile_index:      Initial active delay profile (1-16).
+        execution_order:    List[int] of delay profile indices to cycle.
+                            If None, defaults to [1, 2, ..., N].
+        pulse_profile_map:  Optional delay profile index -> pulse profile index,
+                            both 1-based. When None, derived from ``pulse``.
+        module_invert:      Module inversion flags, as on TxDeviceRegisters.
+
+    Returns:
+        Dict with ``tx_registers`` (the populated model, starting profile
+        already activated), ``num_transmitters``, ``num_delay_profiles``,
+        ``profile_index`` and ``execution_order`` (both normalized),
+        ``pulse_profile_map``, and ``apodization_registers`` laid out as
+        ``[profile - 1][chip]`` -- register 0x1B per profile.
+
+    Raises:
+        ValueError: If the inputs are malformed or execution_order is invalid.
+    """
+    # Validate and normalize inputs.
+    delays = np.array(delays)
+    if delays.ndim == 1:
+        delays = delays.reshape(1, -1)
+    apodizations = np.array(apodizations)
+    if apodizations.ndim == 1:
+        apodizations = apodizations.reshape(1, -1)
+    n = delays.shape[0]
+
+    if n == 0:
+        raise ValueError("At least one profile row is required")
+    if n != apodizations.shape[0]:
+        raise ValueError("Delays and apodizations must have the same number of rows")
+    if delays.shape[1] != apodizations.shape[1]:
+        raise ValueError("Delays and apodizations must have the same number of elements per row")
+
+    # Delay RAM supports 16 profile slots on TX7332.
+    if n > len(VALID_DELAY_PROFILES):
+        raise ValueError(f"Too many profile rows ({n}). Max supported is {len(VALID_DELAY_PROFILES)}")
+
+    # pulse_configs: list of unique pulse config dicts, indexed 0-based.
+    if isinstance(pulse, list):
+        pulse_configs = pulse
+    else:
+        pulse_configs = [pulse]
+    num_pulse_profiles = len(pulse_configs)
+
+    # Build pulse_profile_map: delay profile index (1-based) -> pulse profile index (1-based)
+    if pulse_profile_map is None:
+        if num_pulse_profiles == 1:
+            # Single pulse config: all delay profiles share pulse profile 1.
+            pulse_profile_map = {i + 1: 1 for i in range(n)}
+        else:
+            if num_pulse_profiles != n:
+                raise ValueError(
+                    f"When pulse is a list without pulse_profile_map, "
+                    f"it must have one entry per delay profile row ({n}), got {num_pulse_profiles}"
+                )
+            pulse_profile_map = {i + 1: i + 1 for i in range(n)}
+    else:
+        for dp_idx, pp_idx in pulse_profile_map.items():
+            if dp_idx < 1 or dp_idx > n:
+                raise ValueError(f"pulse_profile_map key {dp_idx} out of range 1-{n}")
+            if pp_idx < 1 or pp_idx > num_pulse_profiles:
+                raise ValueError(f"pulse_profile_map value {pp_idx} out of range 1-{num_pulse_profiles}")
+        for i in range(1, n + 1):
+            if i not in pulse_profile_map:
+                raise ValueError(f"pulse_profile_map missing mapping for delay profile {i}")
+
+    # Default to sequential execution order: [1, 2, ..., n].
+    if execution_order is None:
+        execution_order = list(range(1, n + 1))
+
+    if not isinstance(execution_order, list):
+        raise ValueError("execution_order must be a list of profile indices")
+    if len(execution_order) == 0:
+        raise ValueError("execution_order cannot be empty")
+    if len(execution_order) > MAX_EXECUTION_ORDER:
+        raise ValueError(
+            f"execution_order length ({len(execution_order)}) exceeds the "
+            f"maximum of {MAX_EXECUTION_ORDER}"
+        )
+    for idx in execution_order:
+        if not isinstance(idx, int) or idx < 1 or idx > n:
+            raise ValueError(f"execution_order contains invalid profile index {idx}. Must be in 1-{n}")
+
+    rastering = len(execution_order) > 1
+    if not rastering and execution_order[0] != profile_index:
+        logger.info(
+            "Single-entry execution_order [%d]: activating that profile "
+            "instead of profile_index=%d.",
+            execution_order[0], profile_index,
+        )
+        profile_index = execution_order[0]
+
+    if rastering:
+        pulse_count = sequence["pulse_count"]
+        n_exec = len(execution_order)
+        if pulse_count % n_exec != 0:
+            raise ValueError(
+                f"pulse_count ({pulse_count}) must be divisible by the number of "
+                f"profiles in execution_order ({n_exec}). "
+                f"Each profile gets pulse_count/n_profiles = {pulse_count}/{n_exec} consecutive pulses."
+            )
+        pulse_interval = sequence["pulse_interval"]
+        max_burst_s = max(cfg["duration"] for cfg in pulse_configs)
+        dead_time = pulse_interval - max_burst_s
+        if dead_time < MIN_PROFILE_SWITCH_INTERVAL:
+            raise ValueError(
+                f"pulse_interval ({pulse_interval * 1e3:.1f} ms) must exceed the pulse "
+                f"duration ({max_burst_s * 1e3:.1f} ms) by at least "
+                f"{MIN_PROFILE_SWITCH_INTERVAL * 1e6:.0f} µs so the firmware can switch "
+                f"profiles after the burst ends. Increase pulse_interval or shorten "
+                f"the pulse duration."
+            )
+
+    logger.info(f"Grouped profile package system: {n} profiles, execution_order={execution_order}")
+
+    n_elements = delays.shape[1]
+    num_transmitters = int(n_elements / NUM_CHANNELS)
+    regs = TxDeviceRegisters(num_transmitters=num_transmitters,
+                             module_invert=module_invert)
+
+    # Pre-compute duty cycle per mapped pulse config: use max apodization
+    # across all delay profiles sharing the same pulse config.
+    duty_cycle_by_pulse = {}
+    for pidx in set(pulse_profile_map.values()):
+        pulse_cfg = pulse_configs[pidx - 1]
+        mapped_dps = [k for k, v in pulse_profile_map.items() if v == pidx]
+        max_apod = max(max(apodizations[dp - 1, :]) for dp in mapped_dps)
+        duty_cycle_by_pulse[pidx] = DEFAULT_PATTERN_DUTY_CYCLE * max_apod * pulse_cfg["amplitude"]
+
+    # Create one pulse profile per delay profile slot.
+    # The TX7332 firmware cycles PATTERN_SEL in lockstep with DELAY_SEL,
+    # so every delay profile slot must have valid pattern RAM data.
+    # When multiple delay profiles share the same pulse config, the
+    # pattern data is replicated across their slots.
+    for dp in range(n):
+        pidx = pulse_profile_map[dp + 1]
+        pulse_cfg = pulse_configs[pidx - 1]
+        pulse_profile = Tx7332PulseProfile(
+            profile=dp + 1,
+            frequency=pulse_cfg["frequency"],
+            cycles=int(pulse_cfg["duration"] * pulse_cfg["frequency"]),
+            duty_cycle=duty_cycle_by_pulse[pidx],
+        )
+        regs.add_pulse_profile(pulse_profile)
+
+    # Create all delay profiles (one per row).
+    for dp in range(n):
+        delay_profile = Tx7332DelayProfile(
+            profile=dp + 1,
+            delays=delays[dp, :],
+            apodizations=apodizations[dp, :],
+        )
+        regs.add_delay_profile(delay_profile)
+
+    if profile_index not in regs.configured_delay_profiles():
+        raise ValueError(
+            f"profile_index={profile_index} is not configured. "
+            f"Configured delay profiles: {regs.configured_delay_profiles()}"
+        )
+    if profile_index not in regs.configured_pulse_profiles():
+        raise ValueError(
+            f"pulse profile {profile_index} is not configured. "
+            f"Configured pulse profiles: {regs.configured_pulse_profiles()}"
+        )
+
+    regs.activate_delay_profile(profile_index)
+    regs.activate_pulse_profile(profile_index)
+
+    # apodization_registers[profile - 1][chip] = uint32. The firmware swaps
+    # these as it cycles profiles, so every caller needs them.
+    apodization_registers = []
+    for profile in sorted(regs.configured_delay_profiles()):
+        delay_control = regs.get_delay_control_registers(profile)
+        apodization_registers.append([chip[ADDRESS_APODIZATION] for chip in delay_control])
+
+    return {
+        "tx_registers": regs,
+        "num_transmitters": num_transmitters,
+        "num_delay_profiles": n,
+        "profile_index": profile_index,
+        "execution_order": execution_order,
+        "pulse_profile_map": pulse_profile_map,
+        "apodization_registers": apodization_registers,
+    }
