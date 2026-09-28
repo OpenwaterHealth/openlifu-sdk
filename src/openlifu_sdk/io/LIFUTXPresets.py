@@ -32,6 +32,7 @@ over the raw source .json, and ``REGS_CRC`` over the emitted tables in the order
 
 from __future__ import annotations
 
+import json
 import logging
 import re
 import struct
@@ -106,7 +107,11 @@ def capture_machine_config(txdevice, preset: Dict, preset_id: str | None = None,
 
     delays = preset["delays"]
     apodizations = preset["apodization"]
-    execution_order = list(preset.get("order") or range(1, len(delays) + 1))
+    # A missing order means sequential; leave that default to the SDK, which
+    # knows the profile count after reshaping a flat single-profile preset.
+    order = preset.get("order")
+    execution_order = [int(i) for i in order] if order else None
+    profile_index = execution_order[0] if execution_order else 1
 
     pulse = {
         "frequency": preset["frequency_khz"] * 1e3,
@@ -128,7 +133,7 @@ def capture_machine_config(txdevice, preset: Dict, preset_id: str | None = None,
             delays=delays,
             apodizations=apodizations,
             sequence=sequence,
-            profile_index=execution_order[0],
+            profile_index=profile_index,
             execution_order=execution_order,
         )
         regs = txdevice.tx_registers
@@ -138,7 +143,7 @@ def capture_machine_config(txdevice, preset: Dict, preset_id: str | None = None,
             delays,
             apodizations,
             sequence,
-            profile_index=execution_order[0],
+            profile_index=profile_index,
             execution_order=execution_order,
         )["tx_registers"]
 
@@ -152,8 +157,8 @@ def capture_machine_config(txdevice, preset: Dict, preset_id: str | None = None,
     for name in PASSTHROUGH_FIELDS:
         if name in preset:
             captured[name] = preset[name]
-    captured["profile_index"] = execution_order[0]
-    captured["execution_order"] = execution_order
+    captured["profile_index"] = profile_index
+    captured["execution_order"] = execution_order or list(range(1, n_profiles + 1))
     captured["chips"] = _chip_configs(regs, n_profiles)
     return captured
 
@@ -431,3 +436,41 @@ def verify_preset(txdevice, index: int, machine_config: Dict) -> Dict:
     if bad:
         raise ValueError("preset %d verification failed: %s" % (index, "; ".join(bad)))
     return got
+
+
+# --------------------------------------------------------------------------
+# Preset source files
+# --------------------------------------------------------------------------
+
+def preset_files(directory) -> List[Path]:
+    """The preset .json files under *directory*, in the order the image indexes them.
+
+    A preset is any JSON document carrying ``delays`` and ``apodization``,
+    found either directly in the directory or one level down -- the
+    application keeps each preset in its own folder next to its plot -- and
+    anything else there, such as a constants.json, is skipped.
+
+    Generation and the on-device test must agree on the order -- it is the
+    index the host passes to OW_PRESET_LOAD -- so both take it from here.
+    Natural order on the id: digit runs compare as numbers, so canine_5.0mm
+    sorts before canine_10.0mm.
+    """
+    directory = Path(directory)
+    found = []
+    for path in list(directory.glob("*.json")) + list(directory.glob("*/*.json")):
+        try:
+            doc = json.loads(path.read_bytes())
+        except ValueError:
+            continue
+        if isinstance(doc, dict) and "delays" in doc and "apodization" in doc:
+            found.append(path)
+
+    def key(path):
+        return [int(t) if t.isdigit() else t.lower() for t in re.split("([0-9]+)", preset_id(path))]
+    return sorted(found, key=key)
+
+
+def preset_id(path) -> str:
+    """A preset id from its file name: the stem minus any trailing ``_settings``."""
+    stem = Path(path).stem
+    return stem[:-len("_settings")] if stem.endswith("_settings") else stem
