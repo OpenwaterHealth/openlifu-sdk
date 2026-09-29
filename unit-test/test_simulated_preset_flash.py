@@ -137,3 +137,35 @@ def test_real_txdevice_set_preset_raises_not_implemented():
             tx.set_preset(preset_index=0, sequence_duration_index=0, expected_crc=0)
     finally:
         tx.stop()
+
+
+# ------------------------------------------------------------------
+# Version mutators (debug-UI hooks for firmware-compat simulation)
+# ------------------------------------------------------------------
+
+
+def test_txdevice_set_version_overrides_get_version():
+    tx = SimulatedTxDevice()
+    assert tx.get_version() == "sim-1.0.7"
+    tx.set_version("sim-0.9.0")
+    assert tx.get_version() == "sim-0.9.0"
+    # module arg is honored on both getter/setter shapes even though
+    # the impl currently ignores it (single string per device).
+    tx.set_version("sim-2.0.0", module=1)
+    assert tx.get_version(module=1) == "sim-2.0.0"
+
+
+def test_hvcontroller_set_version_overrides_get_version():
+    from openlifu_sdk.ui.simulated_interface import SimulatedHVController
+    hv = SimulatedHVController()
+    assert hv.get_version() == "sim-1.0.7"
+    hv.set_version("sim-0.5.0")
+    assert hv.get_version() == "sim-0.5.0"
+
+
+def test_interface_version_overrides_visible_through_txdevice_and_hv():
+    interface = SimulatedLIFUInterface()
+    interface.txdevice.set_version("sim-0.9.0")
+    interface.hvcontroller.set_version("sim-0.4.0")
+    assert interface.txdevice.get_version() == "sim-0.9.0"
+    assert interface.hvcontroller.get_version() == "sim-0.4.0"

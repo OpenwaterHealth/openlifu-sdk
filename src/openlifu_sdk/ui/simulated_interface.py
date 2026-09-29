@@ -175,6 +175,13 @@ class SimulatedTxDevice:
         self._loaded_preset_index: Optional[int] = None
         self._loaded_duration_index: Optional[int] = None
 
+        # Reported firmware version. Mutable so an app-side debug UI
+        # (or a test) can flip it to simulate an incompatible firmware
+        # and exercise the operator connector's compat check. Single
+        # string for all modules; if per-module version drift ever
+        # becomes worth simulating, extend this to a list.
+        self._fw_version: str = "sim-1.0.7"
+
     # ---- helpers --------------------------------------------------------
 
     def _default_user_config(self, idx: int) -> dict:
@@ -254,7 +261,18 @@ class SimulatedTxDevice:
         return self._modules[module].read_ambient()
 
     def get_version(self, module: int = 0) -> str:
-        return "sim-1.0.7"
+        return self._fw_version
+
+    def set_version(self, version: str, module: int = 0) -> None:
+        """Override the reported firmware version.
+
+        Intended for simulator debug UIs / tests that need to force
+        the operator connector's ``check_firmware_compat`` down the
+        incompatible-firmware path. Applies to all modules regardless
+        of the ``module`` arg; the arg is present only to mirror
+        :meth:`get_version`'s signature.
+        """
+        self._fw_version = str(version)
 
     def get_hardware_id(self, module: int = 0, raw_hex: bool = False) -> str:
         return f"{0xA0A1A2A3A4A5A6A7B0B1B2B3B4B5B6B7 + module:032X}"
@@ -521,6 +539,10 @@ class SimulatedHVController:
         self._rgb_state = 0
         self.uart = None  # connector reads this for FW DFU; not used here
 
+        # Reported firmware version. See
+        # :attr:`SimulatedTxDevice._fw_version` for rationale.
+        self._fw_version: str = "sim-1.0.7"
+
     def is_connected(self) -> bool:
         return self._connected
 
@@ -561,7 +583,12 @@ class SimulatedHVController:
         return self._v12_on
 
     def get_version(self) -> str:
-        return "sim-1.0.7"
+        return self._fw_version
+
+    def set_version(self, version: str) -> None:
+        """Override the reported firmware version. See
+        :meth:`SimulatedTxDevice.set_version` for rationale."""
+        self._fw_version = str(version)
 
     def get_hardware_id(self, raw_hex: bool = False) -> str:
         return "C0C1C2C3C4C5C6C7D0D1D2D3D4D5D6D7"
