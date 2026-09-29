@@ -140,7 +140,8 @@ class SimulatedTxDevice:
     the emitter for unsolicited STATUS frames during sonication.
     """
 
-    def __init__(self, num_modules: int = 1):
+    def __init__(self, num_modules: int = 1,
+                 preset_flash: Optional[List[tuple[str, int]]] = None):
         self.num_modules = max(1, int(num_modules))
         self.signal_connected = OWSignal()
         self.signal_disconnected = OWSignal()
@@ -161,6 +162,18 @@ class SimulatedTxDevice:
         }
         self._pulse = {"frequency": 400_000.0, "duration": 100e-6, "amplitude": 1.0}
         self._trigger_running = False
+
+        # Simulated flash-baked preset table (SR-002 / SR-003 host<->
+        # firmware preset-integrity handshake, per
+        # preset_pseudo_code.md). Each entry is ``(id, settings_crc)``
+        # representing what the real firmware image would carry in
+        # its machine_config header at build time. Position in the
+        # list is the ``preset_index`` used by :meth:`get_preset` /
+        # :meth:`set_preset`. Callers seed this at construction time
+        # (typically from the app's local PRESETS list).
+        self._preset_flash: List[tuple[str, int]] = list(preset_flash or [])
+        self._loaded_preset_index: Optional[int] = None
+        self._loaded_duration_index: Optional[int] = None
 
     # ---- helpers --------------------------------------------------------
 
@@ -402,6 +415,89 @@ class SimulatedTxDevice:
 
     def stop_monitoring(self):
         return None
+
+    # ---- preset flash (SR-002 / SR-003 handshake) -----------------------
+
+    def set_preset_flash(self, preset_flash: List[tuple[str, int]]) -> None:
+        """Reseed the simulated flash-baked preset table.
+
+        Typically only needed by tests -- production callers pass
+        ``preset_flash`` via the constructor. Clears any currently
+        loaded preset so callers must re-issue :meth:`set_preset`
+        after a flash reseed.
+        """
+        self._preset_flash = list(preset_flash)
+        self._loaded_preset_index = None
+        self._loaded_duration_index = None
+
+    def get_preset(self, preset_index: int) -> tuple[str, int]:
+        """Return ``(id, settings_crc)`` for the preset at
+        ``preset_index`` from simulated flash.
+
+        This is the SDK side of the SR-003 preset-integrity handshake
+        described in the operator-interface repo's
+        ``preset_pseudo_code.md``: the host computes the local CRC
+        via ``calc_crc(preset.to_bytes())`` and compares it against
+        the ``settings_crc`` returned here (which the real firmware
+        would return from its machine_config header baked at build
+        time).
+
+        Raises
+        ------
+        IndexError
+            If ``preset_index`` is negative or beyond the flash
+            table's length.
+        """
+        if not (0 <= preset_index < len(self._preset_flash)):
+            raise IndexError(
+                f"preset_index {preset_index} out of range "
+                f"(flash has {len(self._preset_flash)} entries)"
+            )
+        return self._preset_flash[preset_index]
+
+    def set_preset(self, preset_index: int, sequence_duration_index: int,
+                   expected_crc: int) -> None:
+        """Load a preset+duration selection into the simulated device.
+
+        Verifies that ``expected_crc`` matches the flash-baked
+        ``settings_crc`` for ``preset_index`` (as the real firmware
+        would). Does not push acoustic parameters -- that is the
+        job of :meth:`set_solution`, which runs against a solution
+        that was itself derived from the loaded preset.
+
+        Raises
+        ------
+        IndexError
+            From :meth:`get_preset` if ``preset_index`` is out of
+            range.
+        ValueError
+            If ``expected_crc`` does not match the flash CRC (this
+            is the CRC-mismatch fault path the operator UI must
+            annunciate per SR-003) or if
+            ``sequence_duration_index`` is negative.
+        """
+        _preset_id, flash_crc = self.get_preset(preset_index)
+        if expected_crc != flash_crc:
+            raise ValueError(
+                f"set_preset CRC mismatch: caller sent "
+                f"expected_crc=0x{expected_crc:08x} but flash has "
+                f"0x{flash_crc:08x} for preset_index={preset_index}"
+            )
+        if sequence_duration_index < 0:
+            raise ValueError(
+                f"sequence_duration_index must be >= 0, got "
+                f"{sequence_duration_index}"
+            )
+        self._loaded_preset_index = preset_index
+        self._loaded_duration_index = sequence_duration_index
+
+    def get_loaded_preset(self) -> tuple[Optional[int], Optional[int]]:
+        """Return the ``(preset_index, sequence_duration_index)``
+        currently loaded via :meth:`set_preset`, or ``(None, None)``
+        if nothing has been loaded yet or the flash was reseeded.
+        Primarily useful for tests to assert the load-preset
+        round-trip."""
+        return self._loaded_preset_index, self._loaded_duration_index
 
 
 # =============================================================================
@@ -743,6 +839,7 @@ class SimulatedLIFUInterface(QObject):
     def __init__(self, num_modules: int = 1,
                  transducer=None,
                  voltage_table_selection: Optional[str] = None,
+                 preset_flash: Optional[List[tuple[str, int]]] = None,
                  **_unused):
         # When a transducer (array) is supplied, derive num_modules from it
         # so the TX device is built with the right module count up front.
@@ -751,7 +848,10 @@ class SimulatedLIFUInterface(QObject):
             if modules_attr is not None:
                 num_modules = max(1, len(list(modules_attr)))
         super().__init__()
-        self.txdevice = SimulatedTxDevice(num_modules=num_modules)
+        self.txdevice = SimulatedTxDevice(
+            num_modules=num_modules,
+            preset_flash=preset_flash,
+        )
         self.hvcontroller = SimulatedHVController()
         self.status = LIFUInterfaceStatus.STATUS_SYS_OFF
         self._engine: Optional[_SimulatedRunEngine] = None
