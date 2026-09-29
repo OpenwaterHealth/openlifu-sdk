@@ -141,7 +141,7 @@ class SimulatedTxDevice:
     """
 
     def __init__(self, num_modules: int = 1,
-                 preset_flash: Optional[List[tuple[str, int]]] = None):
+                 preset_flash: Optional[List[tuple[dict, int]]] = None):
         self.num_modules = max(1, int(num_modules))
         self.signal_connected = OWSignal()
         self.signal_disconnected = OWSignal()
@@ -163,15 +163,20 @@ class SimulatedTxDevice:
         self._pulse = {"frequency": 400_000.0, "duration": 100e-6, "amplitude": 1.0}
         self._trigger_running = False
 
-        # Simulated flash-baked preset table (SR-002 / SR-003 host<->
-        # firmware preset-integrity handshake, per
-        # preset_pseudo_code.md). Each entry is ``(id, settings_crc)``
-        # representing what the real firmware image would carry in
-        # its machine_config header at build time. Position in the
-        # list is the ``preset_index`` used by :meth:`get_preset` /
-        # :meth:`set_preset`. Callers seed this at construction time
-        # (typically from the app's local PRESETS list).
-        self._preset_flash: List[tuple[str, int]] = list(preset_flash or [])
+        # Simulated flash-baked machine_config table (SR-002 / SR-003
+        # host<->firmware preset-integrity handshake, per
+        # preset_pseudo_code.md). Each entry is
+        # ``(machine_config_dict, machine_config_crc)`` representing
+        # what the real firmware image would carry in its
+        # machine_config header at build time. Position in the list
+        # is the ``preset_index`` used by :meth:`get_preset` /
+        # :meth:`set_preset`.
+        #
+        # The machine_config dict must include an ``id`` and a
+        # ``settings_crc`` field (:meth:`get_preset` reads these).
+        # The precomputed crc alongside is what :meth:`set_preset`
+        # compares the caller's ``expected_crc`` against.
+        self._preset_flash: List[tuple[dict, int]] = list(preset_flash or [])
         self._loaded_preset_index: Optional[int] = None
         self._loaded_duration_index: Optional[int] = None
 
@@ -421,9 +426,28 @@ class SimulatedTxDevice:
     def soft_reset(self, module: Optional[int] = None):
         return True
 
-    def update_firmware(self, *args, **kwargs):
-        # Verification tests / FW updater aren't in the simulator scope.
-        raise NotImplementedError("Firmware update not supported in simulation mode")
+    def update_firmware(self, module: int = 0, package_file: Optional[str] = None,
+                        target_version: Optional[str] = None, **_kwargs) -> str:
+        """Simulate a firmware update on the TX board.
+
+        Mirrors the shape of the real
+        :meth:`~openlifu_sdk.io.LIFUTXDevice.TxDevice.update_firmware`
+        (accepting a ``module`` and a ``package_file`` path) but
+        performs no real DFU. Instead, sets the reported firmware
+        version to ``target_version`` (default: the string
+        ``"sim-1.0.7"`` -- the simulator's original default) so a
+        subsequent ``get_version`` returns the post-update value.
+
+        Callers that want a specific post-update version (e.g. the
+        operator connector's ``MIN_TX_FIRMWARE_VERSION``) pass
+        ``target_version`` explicitly.
+
+        Returns the new version string so tests / debug UI can
+        confirm the update landed.
+        """
+        new_version = target_version or "sim-1.0.7"
+        self._fw_version = str(new_version)
+        return self._fw_version
 
     def close(self):
         self._connected = False
@@ -436,13 +460,14 @@ class SimulatedTxDevice:
 
     # ---- preset flash (SR-002 / SR-003 handshake) -----------------------
 
-    def set_preset_flash(self, preset_flash: List[tuple[str, int]]) -> None:
-        """Reseed the simulated flash-baked preset table.
+    def set_preset_flash(self, preset_flash: List[tuple[dict, int]]) -> None:
+        """Reseed the simulated flash-baked machine_config table.
 
-        Typically only needed by tests -- production callers pass
-        ``preset_flash`` via the constructor. Clears any currently
-        loaded preset so callers must re-issue :meth:`set_preset`
-        after a flash reseed.
+        Each entry is ``(machine_config_dict, machine_config_crc)``
+        -- see the constructor docstring. Typically only needed by
+        tests; production callers pass ``preset_flash`` via the
+        constructor. Clears any currently loaded preset so callers
+        must re-issue :meth:`set_preset` after a flash reseed.
         """
         self._preset_flash = list(preset_flash)
         self._loaded_preset_index = None
@@ -450,15 +475,39 @@ class SimulatedTxDevice:
 
     def get_preset(self, preset_index: int) -> tuple[str, int]:
         """Return ``(id, settings_crc)`` for the preset at
-        ``preset_index`` from simulated flash.
+        ``preset_index`` from simulated flash. Extracts them from
+        the stored machine_config's ``id`` and ``settings_crc``
+        fields.
 
-        This is the SDK side of the SR-003 preset-integrity handshake
-        described in the operator-interface repo's
-        ``preset_pseudo_code.md``: the host computes the local CRC
-        via ``calc_crc(preset.to_bytes())`` and compares it against
-        the ``settings_crc`` returned here (which the real firmware
-        would return from its machine_config header baked at build
-        time).
+        This is the SDK side of the SR-003 preset-integrity
+        verification handshake per ``preset_pseudo_code.md``: the
+        host computes the local ``calc_crc(preset.to_bytes())`` and
+        compares against the returned ``settings_crc`` (which the
+        real firmware would return from its machine_config header
+        baked at build time).
+
+        Raises
+        ------
+        IndexError
+            If ``preset_index`` is negative or beyond the flash
+            table's length.
+        KeyError
+            If the stored machine_config is missing the required
+            ``id`` or ``settings_crc`` field.
+        """
+        if not (0 <= preset_index < len(self._preset_flash)):
+            raise IndexError(
+                f"preset_index {preset_index} out of range "
+                f"(flash has {len(self._preset_flash)} entries)"
+            )
+        machine_config, _mc_crc = self._preset_flash[preset_index]
+        return machine_config["id"], machine_config["settings_crc"]
+
+    def get_machine_config(self, preset_index: int) -> tuple[dict, int]:
+        """Return ``(machine_config_dict, machine_config_crc)`` for
+        the preset at ``preset_index`` -- what would be baked into
+        the firmware image. Useful for debug UIs and for tests to
+        inspect the flash-side state.
 
         Raises
         ------
@@ -478,28 +527,35 @@ class SimulatedTxDevice:
         """Load a preset+duration selection into the simulated device.
 
         Verifies that ``expected_crc`` matches the flash-baked
-        ``settings_crc`` for ``preset_index`` (as the real firmware
-        would). Does not push acoustic parameters -- that is the
-        job of :meth:`set_solution`, which runs against a solution
-        that was itself derived from the loaded preset.
+        ``machine_config``'s CRC for ``preset_index`` (as the real
+        firmware would). This is the CRC of the full
+        machine_config -- *not* the ``settings_crc`` of the
+        underlying preset dict; that check is
+        :meth:`get_preset`-based and happens separately in
+        :func:`verify_preset` on the host.
+
+        Does not push acoustic parameters -- that is the job of
+        :meth:`set_solution`, which runs against a solution that
+        was itself derived from the loaded preset.
 
         Raises
         ------
         IndexError
-            From :meth:`get_preset` if ``preset_index`` is out of
-            range.
+            From :meth:`get_machine_config` if ``preset_index`` is
+            out of range.
         ValueError
-            If ``expected_crc`` does not match the flash CRC (this
-            is the CRC-mismatch fault path the operator UI must
-            annunciate per SR-003) or if
+            If ``expected_crc`` does not match the flash
+            machine_config's CRC (this is the CRC-mismatch fault
+            path the operator UI must annunciate per SR-003) or if
             ``sequence_duration_index`` is negative.
         """
-        _preset_id, flash_crc = self.get_preset(preset_index)
-        if expected_crc != flash_crc:
+        _machine_config, flash_mc_crc = self.get_machine_config(preset_index)
+        if expected_crc != flash_mc_crc:
             raise ValueError(
                 f"set_preset CRC mismatch: caller sent "
                 f"expected_crc=0x{expected_crc:08x} but flash has "
-                f"0x{flash_crc:08x} for preset_index={preset_index}"
+                f"machine_config_crc=0x{flash_mc_crc:08x} for "
+                f"preset_index={preset_index}"
             )
         if sequence_duration_index < 0:
             raise ValueError(
@@ -653,6 +709,14 @@ class SimulatedHVController:
 
     def enter_dfu(self):
         raise NotImplementedError("DFU not supported in simulation mode")
+
+    def update_firmware(self, package_file: Optional[str] = None,
+                        target_version: Optional[str] = None, **_kwargs) -> str:
+        """Simulate a firmware update on the HV controller. See
+        :meth:`SimulatedTxDevice.update_firmware` for the shape."""
+        new_version = target_version or "sim-1.0.7"
+        self._fw_version = str(new_version)
+        return self._fw_version
 
     def close(self):
         self._connected = False
