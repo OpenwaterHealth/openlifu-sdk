@@ -906,6 +906,60 @@ class TxDevice(OWComponent):
             "units": units,
         }
 
+    # ------------------------------------------------------------------
+    # Preset-integrity handshake (SR-002 / SR-003)
+    # ------------------------------------------------------------------
+    #
+    # The host + firmware agree on the released preset via a settings
+    # CRC baked into the firmware image's machine_config header at
+    # build time. The host recomputes the CRC from its local preset
+    # JSON at runtime and compares. See the operator-interface repo's
+    # ``preset_pseudo_code.md`` for the design.
+    #
+    # These methods are the SDK-side API the app-layer connector calls.
+    # The firmware side (packet definitions, flash reads, CRC checks in
+    # response to ``set_preset``) is PROJ-04 work. Until that lands
+    # both methods raise :exc:`NotImplementedError`; app tests should
+    # use :class:`openlifu_sdk.ui.simulated_interface.SimulatedTxDevice`
+    # which implements the same shape end-to-end.
+
+    def get_preset(self, preset_index: int) -> tuple[str, int]:
+        """Read ``(id, settings_crc)`` for the given preset index
+        from the console firmware's flash-baked machine_config.
+
+        The returned ``settings_crc`` is what the host compares
+        against ``calc_crc(local_preset.to_bytes())`` to verify the
+        released preset the host has on disk matches the one the
+        firmware was built for (SR-003).
+
+        Not yet implemented -- blocked on PROJ-04 firmware work.
+        Callers exercising this in tests should use
+        :class:`~openlifu_sdk.ui.simulated_interface.SimulatedTxDevice`,
+        which implements the same shape against an in-memory flash
+        table.
+        """
+        raise NotImplementedError(
+            "TxDevice.get_preset is not yet implemented; requires "
+            "PROJ-04 firmware work. Use SimulatedLIFUInterface for "
+            "simulated testing until the firmware side lands."
+        )
+
+    def set_preset(self, preset_index: int, sequence_duration_index: int,
+                   expected_crc: int) -> None:
+        """Send a load-preset command to the console firmware with
+        the host-computed ``expected_crc``. The firmware rejects the
+        command if its flash-baked ``settings_crc`` does not match,
+        which surfaces as a device-side error (translated to the
+        SR-003 CRC-mismatch fault path in the operator UI).
+
+        Not yet implemented -- blocked on PROJ-04 firmware work.
+        """
+        raise NotImplementedError(
+            "TxDevice.set_preset is not yet implemented; requires "
+            "PROJ-04 firmware work. Use SimulatedLIFUInterface for "
+            "simulated testing until the firmware side lands."
+        )
+
     def set_solution(self,
                      pulse: Dict | List[Dict],
                      delays: np.ndarray,
