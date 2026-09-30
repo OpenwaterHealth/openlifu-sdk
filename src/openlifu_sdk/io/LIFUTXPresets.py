@@ -1,17 +1,13 @@
-"""Capture a preset's TX7332 register mapping off connected hardware.
+"""Resolve a preset into the TX7332 register mapping a transmitter image bakes in.
 
 In FDA mode the transmitter firmware -- not the host -- programs the TX7332
-chips, so the register values have to be baked into the image. They are
-captured by programming a real transmitter: :func:`capture_machine_config`
-hands the preset to :meth:`LIFUTXDevice.set_solution`, the same call that
-configures a device for a live treatment, and then reads back the register
-model it produced.
+chips, so the register values have to be baked into the image.
+:func:`capture_machine_config` produces them for one preset .json.
 
 Nothing about the register mapping is computed here. That is the point -- the
-values come from :func:`build_solution_registers`, the same function that
-programs a live device, so there is no second implementation to drift. Pass a
-transmitter to program and capture off real hardware (how release artifacts are
-built); pass None to compute only, for development and CI.
+values come from :func:`build_solution_registers`, the same function
+:meth:`LIFUTXDevice.set_solution` programs a live device with, so there is
+no second implementation to drift. No hardware is involved.
 
 :func:`generate_header` writes a captured config out as a C header. The headers
 are generated here and copied into the firmware tree by hand, so the firmware
@@ -56,18 +52,41 @@ PASSTHROUGH_FIELDS = (
     "pulse_count",
     "pulse_interval_ms",
     "pulse_train_interval_s",
+    "pulse_train_count_selections",
 )
+
+# Most run-length choices a preset may offer (PRESET_TRAIN_SEL_MAX in the
+# firmware, which sizes its OW_PRESET_GET reply for them).
+TRAIN_SELECTIONS_MAX = 16
+
+
+def train_count_selections(machine_config: Dict) -> List[int]:
+    """The run lengths, in pulse trains, the operator may pick from.
+
+    ``pulse_train_count_selections`` from the preset .json, baked into the
+    image so OW_PRESET_LOAD can only ever select one by index. A preset
+    without the field offers a single run of one train.
+
+    Raises:
+        ValueError: Empty, more than TRAIN_SELECTIONS_MAX, or a count outside 1..2**32-1.
+    """
+    raw = machine_config.get("pulse_train_count_selections") or [1]
+    counts = [int(x) for x in raw]
+    if not 0 < len(counts) <= TRAIN_SELECTIONS_MAX or any(not 1 <= c <= 0xFFFFFFFF for c in counts):
+        raise ValueError("%s: pulse_train_count_selections must be 1..%d counts in 1..2**32-1, got %r"
+                         % (machine_config.get("id"), TRAIN_SELECTIONS_MAX, raw))
+    return counts
 
 # Amplitude scales the pattern duty cycle. Presets that do not carry one are
 # full-amplitude.
 DEFAULT_PULSE_AMPLITUDE = 1.0
 
 # Trains to configure while capturing. Run length is not preset data -- it
-# arrives with OW_PRESET_LOAD -- but set_solution needs a value for set_trigger.
+# arrives with OW_PRESET_LOAD -- but build_solution_registers still needs one.
 CAPTURE_PULSE_TRAIN_COUNT = 1
 
 
-def capture_machine_config(txdevice, preset: Dict, preset_id: str | None = None,
+def capture_machine_config(preset: Dict, preset_id: str | None = None,
                            settings_bytes: bytes | None = None) -> Dict:
     """Resolve a preset into the register mapping a TX image bakes in.
 
@@ -76,11 +95,6 @@ def capture_machine_config(txdevice, preset: Dict, preset_id: str | None = None,
     only ever one implementation to keep correct.
 
     Args:
-        txdevice:  A ``TxDevice`` to program, or None to only compute. Passing
-                   a device runs the full :meth:`set_solution` path, which
-                   programs the chips and lets the result be read back --
-                   that is how release artifacts are captured. Passing None
-                   computes the same registers with no device at all.
         preset:    Preset document (the operator-facing JSON).
         preset_id: Identifier for the generated config. Defaults to
                    ``preset["id"]``.
@@ -99,7 +113,6 @@ def capture_machine_config(txdevice, preset: Dict, preset_id: str | None = None,
 
     Raises:
         ValueError: If the preset has no id or is malformed.
-        LIFUError:  On any device failure, including a chip-count mismatch.
     """
     pid = preset_id if preset_id is not None else preset.get("id")
     if not pid:
@@ -125,30 +138,17 @@ def capture_machine_config(txdevice, preset: Dict, preset_id: str | None = None,
         "pulse_train_count": CAPTURE_PULSE_TRAIN_COUNT,
     }
 
-    if txdevice is not None:
-        # Programs the device for real, then captures what it was given. A bad
-        # preset fails here rather than silently baking.
-        txdevice.set_solution(
-            pulse=pulse,
-            delays=delays,
-            apodizations=apodizations,
-            sequence=sequence,
-            profile_index=profile_index,
-            execution_order=execution_order,
-        )
-        regs = txdevice.tx_registers
-    else:
-        regs = build_solution_registers(
-            pulse,
-            delays,
-            apodizations,
-            sequence,
-            profile_index=profile_index,
-            execution_order=execution_order,
-        )["tx_registers"]
+    regs = build_solution_registers(
+        pulse,
+        delays,
+        apodizations,
+        sequence,
+        profile_index=profile_index,
+        execution_order=execution_order,
+    )["tx_registers"]
 
     n_profiles = len(regs.configured_delay_profiles())
-    logger.info("captured '%s': %d profile(s), %d chip(s), order=%s",
+    logger.info("resolved '%s': %d profile(s), %d chip(s), order=%s",
                 pid, n_profiles, regs.num_transmitters, execution_order)
 
     captured = {"id": pid}
@@ -157,6 +157,8 @@ def capture_machine_config(txdevice, preset: Dict, preset_id: str | None = None,
     for name in PASSTHROUGH_FIELDS:
         if name in preset:
             captured[name] = preset[name]
+    if "pulse_train_count_selections" not in preset:
+        logger.warning("preset '%s' has no pulse_train_count_selections; it will offer one run length of 1 train", pid)
     captured["profile_index"] = profile_index
     captured["execution_order"] = execution_order or list(range(1, n_profiles + 1))
     captured["chips"] = _chip_configs(regs, n_profiles)
@@ -203,8 +205,8 @@ def _chip_configs(regs, n_profiles: int) -> List[Dict]:
 
 # Voltage, sensitivity and the thermal limits are deliberately not emitted: the
 # transmitter firmware has no handler for them (there is no OW_CTRL_SET_HV
-# implementation), so they would be dead weight in the image. Run length is not
-# emitted either -- it arrives with OW_PRESET_LOAD.
+# implementation), so they would be dead weight in the image. The run length is
+# emitted only as the list of choices; which one runs arrives with OW_PRESET_LOAD.
 def c_ident(text: str) -> str:
     """Upper-case C identifier for a preset id or context name."""
     ident = re.sub(r"[^0-9A-Za-z]+", "_", str(text)).strip("_").upper()
@@ -236,9 +238,9 @@ def _crc_stream(machine_config: Dict) -> bytes:
     """The bytes regs_crc covers -- PRESET_CRC_STREAM in the firmware's presets.h.
 
     presets_regs_crc() walks the same stream from flash, so the two must stay
-    identical: header fields, execution order, trigger timing, then per chip
-    the base pairs and each profile's pairs, exactly as generate_header emits
-    them.
+    identical: header fields, execution order, trigger timing, the run-length
+    choices, then per chip the base pairs and each profile's pairs, exactly
+    as generate_header emits them.
     """
     chips = machine_config["chips"]
     order = machine_config["execution_order"]
@@ -250,6 +252,8 @@ def _crc_stream(machine_config: Dict) -> bytes:
     out += struct.pack("<III", round(1000.0 / interval_ms) if interval_ms else 0,
                        int(machine_config["pulse_count"]),
                        round(float(machine_config.get("pulse_train_interval_s", 0)) * 1e6))
+    counts = train_count_selections(machine_config)
+    out += struct.pack("<B%dI" % len(counts), len(counts), *counts)
     for chip in chips:
         for pairs in [_flatten(chip["registers"])] + [
                 [[a, prof[a]] for a in sorted(prof)] for prof in chip["profiles"]]:
@@ -303,12 +307,18 @@ def generate_header(filename, machine_config: Dict, context: str | None = None) 
     ]
 
     # Trigger timing the preset defines, so loading it configures the sequence.
-    # Run length is not here: it arrives with OW_PRESET_LOAD.
     lines.append("#define %s_TRIG_COUNT %uu" % (sym, int(machine_config["pulse_count"])))
     interval_ms = float(machine_config["pulse_interval_ms"])
     lines.append("#define %s_TRIG_HZ %uu" % (sym, round(1000.0 / interval_ms) if interval_ms else 0))
     lines.append("#define %s_TRIG_TRAIN_US %uu"
                  % (sym, round(float(machine_config.get("pulse_train_interval_s", 0)) * 1e6)))
+
+    # Run lengths the operator may choose from; OW_PRESET_LOAD picks one by index.
+    counts = train_count_selections(machine_config)
+    lines += ["", "// Selectable run lengths, in pulse trains (pulse_train_count_selections).",
+              "#define %s_TRAIN_SEL_LEN %uu" % (sym, len(counts)),
+              "static const uint32_t %s_TRAIN_COUNTS[%s_TRAIN_SEL_LEN] = { %s };"
+              % (sym, sym, ", ".join("%uu" % c for c in counts))]
 
     # What the host verifies against: the source file, and these very tables.
     if "settings_crc" not in machine_config:
@@ -399,8 +409,9 @@ def generate_preset_set(directory, presets: Sequence[Dict], context: str) -> Lis
             "\t{ %s_ID, %s_BASE, %s_PROFILE_REGS, %s_EXEC_ORDER,\n"
             "\t  %s_CHIPS, %s_PROFILES, %s_PROFILE_INDEX, %s_EXEC_LEN,\n"
             "\t  %s_TRIG_HZ, %s_TRIG_COUNT, %s_TRIG_TRAIN_US,\n"
+            "\t  %s_TRAIN_COUNTS, %s_TRAIN_SEL_LEN,\n"
             "\t  %s_SETTINGS_CRC, %s_REGS_CRC },"
-            % ((sym,) * 13)
+            % ((sym,) * 15)
         )
     lines += ["};", "", "#endif  // %s" % guard, ""]
 
