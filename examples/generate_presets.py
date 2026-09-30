@@ -28,6 +28,7 @@ from openlifu_sdk.io.LIFUTXPresets import (
     preset_files,
     preset_id,
     regs_crc,
+    train_count_selections,
 )
 
 # examples/ sits one level below the repo root.
@@ -51,11 +52,11 @@ def main():
     configs = []
     for index, path in enumerate(files):
         raw = path.read_bytes()
-        mc = capture_machine_config(None, json.loads(raw), preset_id=preset_id(path), settings_bytes=raw)
+        mc = capture_machine_config(json.loads(raw), preset_id=preset_id(path), settings_bytes=raw)
         configs.append(mc)
-        print("  [%2d] %-28s settings_crc=0x%08x regs_crc=0x%08x  %d chip(s), %d profile(s)"
+        print("  [%2d] %-28s settings_crc=0x%08x regs_crc=0x%08x  %d chip(s), %d profile(s), trains %s"
               % (index, mc["id"], mc["settings_crc"], regs_crc(mc),
-                 len(mc["chips"]), len(mc["chips"][0]["profiles"])))
+                 len(mc["chips"]), len(mc["chips"][0]["profiles"]), train_count_selections(mc)))
 
     written = generate_preset_set(out, configs, context)
     print("wrote %d header(s) for set '%s' to %s" % (len(written), context, out))

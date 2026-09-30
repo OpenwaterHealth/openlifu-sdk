@@ -18,14 +18,18 @@ Against a connected transmitter running an FDA_MODE build, this proves:
 
 Operator modes. --load-preset needs no source .json: the device's own CRC is
 used unless --presets is given, in which case the host-computed CRC gates the
-load. --run is a sonication the way the application does one: HV set to the
-preset's voltage (from --presets) or --voltage, start_sonication (HV on,
-settle, trigger), then stop_sonication (trigger off, HV off) after the time.
+load. The run length is one of the preset's baked pulse_train_count_selections,
+picked with --duration IDX (default 0); a raw train count cannot be sent.
+--run is a sonication the way the application does one: HV set to the preset's
+voltage (from --presets) or --voltage, start_sonication (HV on, settle,
+trigger), and stop_sonication (trigger off, HV off) once the selected number
+of pulse trains has run -- or after SECONDS, if one is given, even if the
+sequence is longer.
 
     python examples/test_presets.py --list-presets
-    python examples/test_presets.py --load-preset canine_10.0mm_rastered
-    python examples/test_presets.py --presets <dir> --load-preset 3 --run 5     # 5 s at the preset's voltage
-    python examples/test_presets.py --load-preset 3 --run 5 --voltage 20        # index works too
+    python examples/test_presets.py --load-preset 1 --duration 1             # preset index 1, its 2nd run length
+    python examples/test_presets.py --presets <dir> --load-preset 3 --run       # all 188 trains, preset voltage
+    python examples/test_presets.py --load-preset 3 --run 5 --voltage 20        # stop after 5 s
 
 Which preset is on the chips right now, from the registers alone: every
 preset in the directory is computed on the host and compared with a readback.
@@ -34,13 +38,12 @@ preset in the directory is computed on the host and compared with a readback.
 
 Full verification against the source .json directory:
 
-    python examples/test_presets.py --presets unit-test/device_preset_outputs
-    python examples/test_presets.py --presets unit-test/device_preset_outputs --readback 3
+    python examples/test_presets.py --presets sample_json
+    python examples/test_presets.py --presets sample_json --readback 3
 """
 
 import argparse
 import json
-import math
 import struct
 import sys
 import time
@@ -49,7 +52,14 @@ from pathlib import Path
 from openlifu_sdk.io.exceptions import LIFUCommunicationError, LIFUDeviceError, LIFUNotConnectedError
 from openlifu_sdk.io.LIFUConfig import OW_CONTROLLER, OW_PRESET_LOAD
 from openlifu_sdk.io.LIFUInterface import LIFUInterface
-from openlifu_sdk.io.LIFUTXPresets import capture_machine_config, preset_files, preset_id, regs_crc, verify_preset
+from openlifu_sdk.io.LIFUTXPresets import (
+    capture_machine_config,
+    preset_files,
+    preset_id,
+    regs_crc,
+    train_count_selections,
+    verify_preset,
+)
 
 # TX7332 register 0x18 bit 30 is set by the chip itself and never written, so
 # a read-back always differs from the table there.
@@ -128,7 +138,7 @@ def load_presets(src):
         raw = p.read_bytes()
         doc = json.loads(raw)
         pid = preset_id(p)
-        out.append((pid, capture_machine_config(None, doc, preset_id=pid, settings_bytes=raw)))
+        out.append((pid, capture_machine_config(doc, preset_id=pid, settings_bytes=raw)))
         voltages[pid] = float(doc.get("voltage", 0.0))
     return out, voltages
 
@@ -146,13 +156,14 @@ def print_inventory(entries):
     if not entries:
         print("  device reports no presets -- is it running an FDA_MODE image?")
         return
-    print("  %-4s %-28s %-6s %-9s %-11s %-11s %s"
-          % ("idx", "id", "chips", "profiles", "settings", "regs(live)", "regs(baked)"))
+    print("  %-4s %-28s %-6s %-9s %-11s %-11s %-11s %s"
+          % ("idx", "id", "chips", "profiles", "settings", "regs(live)", "regs(baked)", "train counts"))
     for e in entries:
         flag = "" if e["regs_crc"] == e["baked_regs_crc"] else "  <-- live CRC != baked CRC"
-        print("  %-4d %-28s %-6d %-9d 0x%08x  0x%08x  0x%08x%s"
+        print("  %-4d %-28s %-6d %-9d 0x%08x  0x%08x  0x%08x  %s%s"
               % (e["index"], e["id"], e["chip_count"], e["profile_count"],
-                 e["settings_crc"], e["regs_crc"], e["baked_regs_crc"], flag))
+                 e["settings_crc"], e["regs_crc"], e["baked_regs_crc"],
+                 "/".join(str(c) for c in e["train_counts"]) or "-", flag))
 
 
 def silicon_addresses(mc):
@@ -171,19 +182,21 @@ def read_silicon(tx, keys):
     return {k: tx.read(*k) for k in keys}
 
 
-def find_preset(inventory, key):
-    """The device's entry for a preset id, or for an index."""
-    for e in inventory:
-        if e["id"] == key:
-            return e
-    if key.isdigit() and int(key) < len(inventory):
-        return inventory[int(key)]
-    sys.exit("no preset %r on the device -- see --list-presets" % key)
+def find_preset(inventory, index):
+    """The device's entry for a preset index."""
+    if not 0 <= index < len(inventory):
+        sys.exit("no preset %d on the device: it has %d, indices 0..%d -- see --list-presets"
+                 % (index, len(inventory), len(inventory) - 1))
+    return inventory[index]
 
 
-def load_one(tx, inventory, presets, key, train_count):
-    """CRC-gated load of one preset; the host's own CRC when --presets was given."""
-    e = find_preset(inventory, key)
+def load_one(tx, inventory, presets, index, duration_index):
+    """CRC-gated load of one preset by index; the host's own CRC when --presets was given."""
+    e = find_preset(inventory, index)
+    counts = e["train_counts"]
+    if not 0 <= duration_index < len(counts):
+        sys.exit("%s offers %d run length(s) %s; --duration %d is not one of them"
+                 % (e["id"], len(counts), counts, duration_index))
     host = dict(presets).get(e["id"])
     if host is not None:
         crc = regs_crc(host)
@@ -196,8 +209,9 @@ def load_one(tx, inventory, presets, key, train_count):
     else:
         crc = e["regs_crc"]
         source = "the device's own; no --presets to check against"
-    tx.load_preset(e["index"], crc, train_count=train_count)
-    print("  loaded [%d] %s  regs_crc 0x%08x (%s)  %d train(s)" % (e["index"], e["id"], crc, source, train_count))
+    tx.load_preset(e["index"], crc, duration_index)
+    print("  loaded [%d] %s  regs_crc 0x%08x (%s)  duration %d = %d train(s)"
+          % (e["index"], e["id"], crc, source, duration_index, counts[duration_index]))
     return e
 
 
@@ -211,29 +225,45 @@ def trigger_config(tx):
 
 def run_for(tx, seconds, voltage):
     """A sonication as the application does it: HV to *voltage*, start_sonication,
-    watch the active delay profile, stop_sonication after *seconds*."""
+    watch it, stop_sonication when the sequence (the selected pulse-train count)
+    has finished -- or after *seconds*, if given."""
     cfg, period = trigger_config(tx)
     trains = cfg["TriggerPulseTrainCount"]
+    total = trains * period
     print("  trigger: %d Hz, %d pulse(s)/train, train period %.4g s, %d train(s) = %.4g s of output"
-          % (cfg["TriggerFrequencyHz"], cfg["TriggerPulseCount"], period, trains, trains * period))
-    if trains * period < seconds:
-        print("  note: the sequence ends after %.4g s, before the %.4g s run is up" % (trains * period, seconds))
+          % (cfg["TriggerFrequencyHz"], cfg["TriggerPulseCount"], period, trains, total))
+    if seconds is None:
+        print("  running the whole sequence")
+    elif seconds < total:
+        print("  note: stopping after %.4g s of a %.4g s sequence" % (seconds, total))
+    else:
+        print("  note: the sequence ends after %.4g s, before the %.4g s run is up" % (total, seconds))
     hv = tx.iface.hvcontroller
     hv.set_voltage(voltage)
     print("  HV set to %.2f V; start_sonication (HV on, settle, trigger)" % voltage, flush=True)
-    seen = []
+    seen, finished = [], False
     t0 = time.time()
     try:
         tx.iface.start_sonication(turn_hv_on=True, wait_for_settle=True)
         t0 = time.time()
         print("  running: HV %.2f V measured" % hv.get_voltage(), flush=True)
-        while time.time() - t0 < seconds:
-            seen.append(tx.get_delay_profile(0))
-            time.sleep(0.25)
+        while seconds is None or time.time() - t0 < seconds:
+            try:
+                seen.append(tx.get_delay_profile(0))
+                if not tx.iface.is_running():
+                    finished = True
+                    break
+            except (LIFUCommunicationError, LIFUNotConnectedError) as e:
+                tx.reconnects += 1
+                print("   transport dropped (%s) -- reconnecting" % type(e).__name__, flush=True)
+                time.sleep(2.0)
+                tx.open()
+                continue
+            time.sleep(0.5)
     finally:
         tx.iface.stop_sonication(turn_hv_off=True)
-    print("  ran %.2f s; stop_sonication (trigger off, HV off: hv_on=%s); active delay profiles seen: %s"
-          % (time.time() - t0, hv.get_hv_status(), sorted(set(seen))))
+    print("  ran %.2f s, sequence %s; stop_sonication (trigger off, HV off: hv_on=%s); delay profiles seen: %s"
+          % (time.time() - t0, "finished" if finished else "stopped early", hv.get_hv_status(), sorted(set(seen))))
 
 
 def operate(tx, inventory, presets, voltages, args):
@@ -248,16 +278,9 @@ def operate(tx, inventory, presets, voltages, args):
         if not voltage:
             sys.exit("--run needs a voltage: --voltage, or --presets so the preset's own voltage is used")
     if args.load_preset is not None:
-        load_one(tx, inventory, presets, args.load_preset, train_count=1)
-        if args.run:
-            # The preset fixes the timing; the run length is the host's, so size
-            # the train count to outlast the requested run.
-            _, period = trigger_config(tx)
-            trains = int(math.ceil(args.run / period)) + 1
-            if trains > 1:
-                load_one(tx, inventory, presets, args.load_preset, train_count=trains)
+        load_one(tx, inventory, presets, args.load_preset, args.duration)
     if args.run:
-        run_for(tx, args.run, voltage)
+        run_for(tx, args.run_seconds, voltage)
     return 0
 
 
@@ -344,10 +367,11 @@ def verify(tx, inventory, presets, args):
         host_crc = regs_crc(mc)
         ok = (got["id"] == pid and got["count"] == len(presets)
               and got["settings_crc"] == mc["settings_crc"]
-              and got["regs_crc"] == got["baked_regs_crc"] == host_crc)
+              and got["regs_crc"] == got["baked_regs_crc"] == host_crc
+              and got["train_counts"] == train_count_selections(mc))
         check("get_preset[%d] %s" % (i, pid), ok,
-              "settings=0x%08x regs live=0x%08x baked=0x%08x host=0x%08x"
-              % (got["settings_crc"], got["regs_crc"], got["baked_regs_crc"], host_crc))
+              "settings=0x%08x regs live=0x%08x baked=0x%08x host=0x%08x trains=%s"
+              % (got["settings_crc"], got["regs_crc"], got["baked_regs_crc"], host_crc, got["train_counts"]))
         try:
             verify_preset(tx, i, mc)
             check("verify_preset[%d]" % i, True)
@@ -359,7 +383,9 @@ def verify(tx, inventory, presets, args):
     expect_error("load with 4-byte payload rejected", lambda: tx.send_checked(
         packet_type=OW_CONTROLLER, command=OW_PRESET_LOAD, reserved=0, data=struct.pack("<I", 1), op="bad_load"))
     expect_error("load with wrong regs_crc refused (OW_BAD_CRC)",
-                 lambda: tx.load_preset(0, regs_crc(presets[0][1]) ^ 0xDEADBEEF, 1), "0xfd")
+                 lambda: tx.load_preset(0, regs_crc(presets[0][1]) ^ 0xDEADBEEF, 0), "0xfd")
+    expect_error("load with a duration index the preset lacks refused",
+                 lambda: tx.load_preset(0, regs_crc(presets[0][1]), len(train_count_selections(presets[0][1]))))
     expect_error("host register write refused in FDA mode", lambda: tx.write_register(0, 0x1B, 0))
 
     print("\n-- load + readback --")
@@ -373,8 +399,8 @@ def verify(tx, inventory, presets, args):
     want = silicon_addresses(mc)
     before = read_silicon(tx, want)
     print("   read %d registers from the chips before the load" % len(before))
-    tx.load_preset(idx, regs_crc(mc), train_count=50)
-    check("load_preset(%d %s, correct crc)" % (idx, pid), True)
+    tx.load_preset(idx, regs_crc(mc), 0)
+    check("load_preset(%d %s, correct crc, duration 0 = %d train(s))" % (idx, pid, train_count_selections(mc)[0]), True)
     after = read_silicon(tx, want)
     bad = 0
     for (chip, addr), w in want.items():
@@ -409,9 +435,12 @@ def main():
     ap.add_argument("--presets", type=Path,
                     help="directory of preset .json files: the verification source, optional for --load-preset")
     ap.add_argument("--list-presets", action="store_true", help="show the presets on the device and exit")
-    ap.add_argument("--load-preset", metavar="ID", help="CRC-gated load of one preset, by id or index")
-    ap.add_argument("--run", type=float, metavar="SECONDS",
-                    help="sonicate for this long (HV on, trigger, HV off), after --load-preset or on whatever is loaded")
+    ap.add_argument("--load-preset", type=int, metavar="IDX", help="CRC-gated load of the preset at this index")
+    ap.add_argument("--run", nargs="?", const=float("inf"), type=float, metavar="SECONDS",
+                    help="sonicate (HV on, trigger, HV off): the whole selected pulse-train count, "
+                         "or stop after SECONDS; after --load-preset or on whatever is loaded")
+    ap.add_argument("--duration", type=int, default=0, metavar="IDX",
+                    help="which of the preset's baked pulse-train counts to run (default 0, the first)")
     ap.add_argument("--voltage", type=float, metavar="V",
                     help="HV voltage for --run (default: the preset's own voltage, which needs --presets)")
     ap.add_argument("--identify", action="store_true",
@@ -419,6 +448,8 @@ def main():
     ap.add_argument("--readback", type=int, default=1, metavar="IDX",
                     help="verification: the preset to load and read back from the chips (default 1)")
     args = ap.parse_args()
+    args.run_seconds = None if args.run == float("inf") else args.run
+    args.run = args.run is not None
 
     tx = Link()
     print("firmware:", tx.get_version(), "| chips:", tx.enum_tx7332_devices(),

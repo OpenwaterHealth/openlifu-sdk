@@ -165,9 +165,7 @@ logger = logging.getLogger(__name__)
 
 class TxDevice(OWComponent):
     def __init__(self, vid: int = OW_VID, pid: int = OW_TRANSMITTER_PID,
-                 baudrate: int = 921600, timeout: float = DEFAULT_TIMEOUT, test_mode: bool = False,
-                 test_chip_count: int = TRANSMITTERS_PER_MODULE,
-                 module_invert: bool | list[bool] = False):
+                 baudrate: int = 921600, timeout: float = DEFAULT_TIMEOUT, test_mode: bool = False, module_invert: bool | list[bool] = False):
         """
         Initialize the TxDevice.
 
@@ -176,20 +174,13 @@ class TxDevice(OWComponent):
             pid (int): USB Product ID of the device.
             baudrate (int): Baud rate for UART communication.
             timeout (float): Timeout for UART operations in seconds.
-            test_mode (bool): If True, answers commands locally with no UART traffic.
-                Register values are computed exactly as on hardware -- the device
-                never contributes to them -- but nothing is programmed and reads do
-                not reflect real state. Use for development, CI, and solutions
-                larger than the modules on hand; capture release artifacts against
-                hardware.
-            test_chip_count (int): TX7332 chips to report from enum in test mode when
-                the caller does not state an expectation.
+            test_mode (bool): If True, simulates device responses without actual hardware communication.
             module_invert (bool | list[bool]): If True or list of bools, inverts the module addressing scheme.
         """
         super().__init__(
             vid, pid,
             supported_commands=GLOBAL_COMMANDS | TX7332_COMMANDS | CONTROLLER_COMMANDS,
-            baudrate=baudrate, timeout=timeout, desc="TX", test_mode=test_mode,
+            baudrate=baudrate, timeout=timeout, desc="TX",
         )
 
         register_command_packet_types(TX7332_COMMANDS, OW_TX7332)
@@ -197,23 +188,8 @@ class TxDevice(OWComponent):
 
         self._tx_instances = []
         self.tx_registers = None
-        self._test_chip_count = test_chip_count
+        self._test_mode = test_mode
         self.module_invert = module_invert
-
-    def _test_mode_reply(self, command: int, addr: int = 0, reserved: int = 0,
-                         data: bytearray | None = None,
-                         packet_type: int | None = None):
-        """Answer the TX commands whose payload a caller reads back.
-
-        Only the chip count matters for building a solution: everything else
-        set_solution sends is a write, which the base acknowledgement covers.
-        The count comes from _test_chip_count, which enum_tx7332_devices sets
-        to whatever the caller expects so any solution size can be built.
-        """
-        if command == OW_TX7332_ENUM:
-            reserved = self._test_chip_count
-        return super()._test_mode_reply(command, addr=addr, reserved=reserved,
-                                        data=data, packet_type=packet_type)
 
     def __parse_ti_cfg_file(self, file_path: str) -> list[tuple[str, int, int]]:
         """Parses the given configuration file and extracts all register groups, addresses, and values."""
@@ -673,12 +649,6 @@ class TxDevice(OWComponent):
             LIFUNotConnectedError, LIFUCommunicationError, LIFUDeviceError,
             LIFUError: If the detected count does not match *num_devices*.
         """
-        # In test mode there is nothing to detect, so report what the caller
-        # expects. That lets a solution be built for more modules than are on
-        # hand -- the reason the mismatch check exists at all on hardware.
-        if self._test_mode and num_devices is not None:
-            self._test_chip_count = num_devices
-
         r = self.send_checked(packet_type=OW_TX7332, command=OW_TX7332_ENUM,
                               addr=0, op="enum_tx7332_devices")
         if r.reserved == 0:
@@ -738,9 +708,11 @@ class TxDevice(OWComponent):
         """Describe a preset baked into an FDA_MODE image (OW_PRESET_GET).
 
         Returns ``count``, ``index``, ``chip_count``, ``profile_count``, ``id``,
-        ``settings_crc`` (CRC-32 of the source .json) and ``regs_crc`` (CRC-32
-        the firmware just computed over its own register tables) and
-        ``baked_regs_crc`` (what the generator stored; differs only if flash is inconsistent).
+        ``settings_crc`` (CRC-32 of the source .json), ``regs_crc`` (CRC-32
+        the firmware just computed over its own register tables),
+        ``baked_regs_crc`` (what the generator stored, differs only if flash is
+        inconsistent) and ``train_counts`` (the run lengths in pulse trains
+        the preset offers).
 
         Raises:
             LIFUDeviceError: Bad index, or the image failed its own CRC check.
@@ -754,23 +726,31 @@ class TxDevice(OWComponent):
         count, idx, chips, profiles = d[0], d[1], d[2], d[3]
         settings_crc, regs_crc, baked_regs_crc = struct.unpack("<III", d[4:16])
         id_len = d[16]
+        pos = 17 + id_len
+        counts = []
+        if r.data_len > pos:
+            n = d[pos]
+            if r.data_len >= pos + 1 + 4 * n:
+                counts = list(struct.unpack("<%dI" % n, d[pos + 1:pos + 1 + 4 * n]))
         return {"count": count, "index": idx, "chip_count": chips, "profile_count": profiles,
                 "settings_crc": settings_crc, "regs_crc": regs_crc, "baked_regs_crc": baked_regs_crc,
-                "id": d[17:17 + id_len].decode("ascii", "replace")}
+                "id": d[17:17 + id_len].decode("ascii", "replace"), "train_counts": counts}
 
-    def load_preset(self, index: int, regs_crc: int, train_count: int = 0) -> bool:
+    def load_preset(self, index: int, regs_crc: int, duration_index: int = 0) -> bool:
         """Program every module from baked preset *index* (OW_PRESET_LOAD).
 
         The firmware refuses the load unless *regs_crc* equals the CRC-32 it
         computes over its own tables, so pass the value the host derived for
-        this preset (see LIFUTXPresets.regs_crc). *train_count* 0 keeps the
-        device's current run length.
+        this preset (see LIFUTXPresets.regs_crc). *duration_index* picks the
+        run length from the preset's baked pulse-train counts
+        (get_preset()["train_counts"]); a raw count cannot be sent.
 
         Raises:
-            LIFUDeviceError: CRC mismatch (OW_BAD_CRC), bad index, or trigger running.
+            LIFUDeviceError: CRC mismatch (OW_BAD_CRC), bad index, a duration
+                index the preset does not offer, or trigger running.
         """
         self.send_checked(packet_type=OW_CONTROLLER, command=OW_PRESET_LOAD,
-                          reserved=index, data=struct.pack("<II", train_count, regs_crc),
+                          reserved=index, data=struct.pack("<II", duration_index, regs_crc),
                           op="load_preset")
         return True
 
