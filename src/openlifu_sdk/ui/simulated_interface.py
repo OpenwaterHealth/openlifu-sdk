@@ -578,9 +578,17 @@ class SimulatedTxDevice:
         :meth:`get_preset`-based and happens separately in
         :func:`verify_preset` on the host.
 
-        Does not push acoustic parameters -- that is the job of
-        :meth:`set_solution`, which runs against a solution that
-        was itself derived from the loaded preset.
+        Applies the loaded machine_config's trigger parameters
+        to :attr:`_sequence` and :attr:`_pulse` so a subsequent
+        :meth:`SimulatedLIFUInterface.start_sonication` runs the
+        correct sequence. Reads these fields from the
+        machine_config: ``pulse_interval_ms``, ``pulse_count``,
+        ``pulse_train_interval_s``,
+        ``pulse_train_count_selections[sequence_duration_index]``,
+        and ``pulse_length_us``. Mirrors the real firmware model
+        where ``set_preset`` loads the firmware-baked machine_config
+        and no separate ``set_trigger`` call is required before
+        starting the sonication (per preset_pseudo_code.md).
 
         Raises
         ------
@@ -588,12 +596,14 @@ class SimulatedTxDevice:
             From :meth:`get_machine_config` if ``preset_index`` is
             out of range.
         ValueError
-            If ``expected_crc`` does not match the flash
-            machine_config's CRC (this is the CRC-mismatch fault
-            path the operator UI must annunciate per SR-003) or if
-            ``sequence_duration_index`` is negative.
+            * If ``expected_crc`` does not match the flash
+              machine_config's CRC (SR-003 CRC-mismatch fault
+              path).
+            * If ``sequence_duration_index`` is negative or
+              beyond the loaded preset's
+              ``pulse_train_count_selections`` length.
         """
-        _machine_config, flash_mc_crc = self.get_machine_config(preset_index)
+        machine_config, flash_mc_crc = self.get_machine_config(preset_index)
         if expected_crc != flash_mc_crc:
             raise ValueError(
                 f"set_preset CRC mismatch: caller sent "
@@ -606,6 +616,27 @@ class SimulatedTxDevice:
                 f"sequence_duration_index must be >= 0, got "
                 f"{sequence_duration_index}"
             )
+        selections = machine_config.get("pulse_train_count_selections", [])
+        if sequence_duration_index >= len(selections):
+            raise ValueError(
+                f"sequence_duration_index {sequence_duration_index} out "
+                f"of range for preset's pulse_train_count_selections "
+                f"(length {len(selections)})"
+            )
+
+        # Apply the loaded preset's trigger + pulse configuration
+        # so a subsequent start_sonication runs the correct
+        # sequence. Convert ms/us to seconds to match the units
+        # the engine uses.
+        self._sequence = {
+            "pulse_interval": float(machine_config.get("pulse_interval_ms", 0.0)) / 1000.0,
+            "pulse_count": int(machine_config.get("pulse_count", 1)),
+            "pulse_train_interval": float(machine_config.get("pulse_train_interval_s", 0.0)),
+            "pulse_train_count": int(selections[sequence_duration_index]),
+        }
+        pulse_length_us = float(machine_config.get("pulse_length_us", 100.0))
+        self._pulse["duration"] = pulse_length_us / 1_000_000.0
+
         self._loaded_preset_index = preset_index
         self._loaded_duration_index = sequence_duration_index
 
