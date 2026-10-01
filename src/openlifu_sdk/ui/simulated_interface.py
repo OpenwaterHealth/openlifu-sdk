@@ -162,6 +162,16 @@ class SimulatedTxDevice:
         }
         self._pulse = {"frequency": 400_000.0, "duration": 100e-6, "amplitude": 1.0}
         self._trigger_running = False
+        # Current pulse-train counter during an active sonication.
+        # Written by the engine on each tick so a polled host (via
+        # :meth:`get_trigger` / :meth:`get_trigger_json`) can read
+        # progress without subscribing to the status-frame
+        # OWSignal. Reset to 0 at engine start; left at its final
+        # value after natural completion (so a post-run poll shows
+        # train_count == pulse_train_count); unchanged by an
+        # operator-initiated stop (so the host sees how far the
+        # sonication got).
+        self._train_curr = 0
 
         # Simulated flash-baked machine_config table (SR-002 / SR-003
         # host<->firmware preset-integrity handshake, per
@@ -388,7 +398,41 @@ class SimulatedTxDevice:
         return {
             "TriggerStatus": "RUNNING" if self._trigger_running else "STOPPED",
             "TriggerMode": "SEQUENCE",
+            "TrainCount": self._train_curr,
             **self._sequence,
+        }
+
+    def get_trigger(self) -> dict:
+        """Return the current trigger state as a snake_case dict.
+
+        Mirrors the shape of
+        :meth:`openlifu_sdk.io.LIFUTXDevice.TxDevice.get_trigger`
+        so operator-interface code calling ``interface.txdevice.get_trigger()``
+        gets the same keys against the sim and real hardware.
+
+        Includes two fields the walking-skeleton polling loop needs:
+
+        * ``train_count`` -- current pulse-train counter, 0 before
+          an engine starts, incremented each train tick, equal to
+          ``pulse_train_count`` on natural completion.
+        * ``trigger_status`` -- ``"RUNNING"`` or ``"STOPPED"``;
+          flips to ``"STOPPED"`` on both operator stop and natural
+          completion so a polled host sees a single stop edge
+          either way.
+        """
+        seq = self._sequence
+        pulse_interval = seq.get("pulse_interval", 0.1)
+        return {
+            "pulse_interval": pulse_interval,
+            "pulse_count": seq.get("pulse_count", 1),
+            "pulse_width": self._pulse.get("duration", 100e-6) * 1e6,
+            "pulse_train_interval": seq.get("pulse_train_interval", 0.0),
+            "pulse_train_count": seq.get("pulse_train_count", 1),
+            "mode": "sequence",
+            "profile_index": 1,
+            "profile_increment": True,
+            "train_count": self._train_curr,
+            "trigger_status": "RUNNING" if self._trigger_running else "STOPPED",
         }
 
     def set_trigger_json(self, data) -> dict:
@@ -806,6 +850,9 @@ class _SimulatedRunEngine(QObject):
 
     def start(self):
         self._tx.start_trigger()
+        # Reset the TxDevice's running counter so a polled host sees
+        # progress starting from 0 at engine start.
+        self._tx._train_curr = 0
         # Apply heating for the very first train period as it elapses;
         # speed-clamp to avoid pegging the GUI on tiny periods.
         period_ms = max(20, int(round(self._train_period_s * 1000)))
@@ -863,6 +910,10 @@ class _SimulatedRunEngine(QObject):
         if not self.alive:
             return
         self._train_curr += 1
+        # Mirror the running counter back to the TxDevice so a
+        # polled host (:meth:`SimulatedTxDevice.get_trigger`) sees
+        # progress without subscribing to the status-frame OWSignal.
+        self._tx._train_curr = self._train_curr
         # Apply heating for this train period.
         for m in self._tx._modules:
             m.heat_step(self._voltage, self._duty, self._train_period_s)
@@ -885,6 +936,14 @@ class _SimulatedRunEngine(QObject):
             self.alive = False
             self._train_timer.stop()
             self._heartbeat.stop()
+            # Flip the TxDevice's trigger_running flag so a polled
+            # host's :meth:`get_trigger` sees ``trigger_status ==
+            # "STOPPED"`` on the natural-completion edge, matching
+            # the operator-initiated stop edge. (Pre-2026-10-01 the
+            # sim left trigger_running=True after natural end --
+            # that only mattered for callers that subscribed to the
+            # STOPPED status frame, not for a polled host.)
+            self._tx.stop_trigger()
             # Final STOPPED frame so the connector flips trigger state /
             # transitions back to READY.
             self._tx.emit_status_frame(
