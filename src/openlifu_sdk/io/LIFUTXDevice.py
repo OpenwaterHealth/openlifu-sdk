@@ -459,6 +459,8 @@ class TxDevice(OWComponent):
             "mode": mode,
             "profile_index": trigger_json["ProfileIndex"],
             "profile_increment": bool(trigger_json["ProfileIncrement"]),
+            "train_count": int(trigger_json.get("TrainCount", 0)),
+            "trigger_status": str(trigger_json.get("TriggerStatus", "UNKNOWN")),
         }
 
     def set_pattern_profile(self, profile: int, module: int | None = None) -> bool:
