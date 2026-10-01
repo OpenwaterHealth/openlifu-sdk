@@ -31,8 +31,23 @@ from openlifu_sdk.ui.simulated_interface import (
 
 def _mc(preset_id: str, settings_crc: int, **extra) -> dict:
     """Minimal machine_config for tests -- ``id`` + ``settings_crc``
-    are what ``SimulatedTxDevice.get_preset`` reads."""
-    return {"id": preset_id, "settings_crc": settings_crc, **extra}
+    are what ``SimulatedTxDevice.get_preset`` reads;
+    ``pulse_train_count_selections`` (+ supporting trigger-config
+    fields) are what ``set_preset`` reads to configure the
+    sim's ``_sequence`` so a subsequent ``start_sonication`` runs
+    the loaded preset. Overridable via ``**extra`` for tests that
+    care about specific values."""
+    base = {
+        "id": preset_id,
+        "settings_crc": settings_crc,
+        "pulse_interval_ms": 10.0,
+        "pulse_count": 1,
+        "pulse_train_interval_s": 0.0,
+        "pulse_train_count_selections": [1, 2, 3, 4, 5],
+        "pulse_length_us": 100.0,
+    }
+    base.update(extra)
+    return base
 
 
 # ------------------------------------------------------------------
