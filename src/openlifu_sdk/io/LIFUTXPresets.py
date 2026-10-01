@@ -57,7 +57,7 @@ PASSTHROUGH_FIELDS = (
 
 # Most run-length choices a preset may offer (PRESET_TRAIN_SEL_MAX in the
 # firmware, which sizes its OW_PRESET_GET reply for them).
-TRAIN_SELECTIONS_MAX = 16
+TRAIN_SELECTIONS_MAX = 255
 
 
 def train_count_selections(machine_config: Dict) -> List[int]:
