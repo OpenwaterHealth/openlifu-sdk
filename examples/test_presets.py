@@ -15,16 +15,28 @@ Against a connected transmitter running an FDA_MODE build, this proves:
   3. A CRC-gated load puts exactly the host-computed registers on the silicon
      (the chips are read before and after the load), and the delay profiles
      cycle through the preset's execution order once the trigger runs.
+  4. With the console connected: its HV table holds the same presets in the
+     same order, each with the host's id, settings_crc and exact voltage
+     (OW_POWER_PRESET_GET); set_voltage and the raw DAC commands are refused;
+     a select with the wrong settings_crc is refused and the right one is
+     taken. HV stays off throughout. --console-only runs just this part, for
+     a console checked on its own.
+
+Each preset's start_C / shutoff_C are part of what (1) compares; the gates
+they drive need presets near room temperature, see test_thermal_limits.py.
 
 Operator modes. --load-preset needs no source .json: the device's own CRC is
 used unless --presets is given, in which case the host-computed CRC gates the
 load. The run length is one of the preset's baked pulse_train_count_selections,
 picked with --duration IDX (default 0); a raw train count cannot be sent.
---run is a sonication the way the application does one: HV set to the preset's
-voltage (from --presets) or --voltage, start_sonication (HV on, settle,
-trigger), and stop_sonication (trigger off, HV off) once the selected number
-of pulse trains has run -- or after SECONDS, if one is given, even if the
-sequence is longer.
+With an FDA_MODE console, --load-preset also selects the same index on the
+console (gated on the preset's settings_crc), which is what sets the HV; the
+host never sends a voltage. With an older console the HV is set from
+--presets or --voltage instead.
+--run is a sonication the way the application does one: start_sonication (HV
+on, settle, trigger), and stop_sonication (trigger off, HV off) once the
+selected number of pulse trains has run -- or after SECONDS, if one is given,
+even if the sequence is longer.
 
     python examples/test_presets.py --list-presets
     python examples/test_presets.py --load-preset 1 --duration 1             # preset index 1, its 2nd run length
@@ -50,14 +62,21 @@ import time
 from pathlib import Path
 
 from openlifu_sdk.io.exceptions import LIFUCommunicationError, LIFUDeviceError, LIFUNotConnectedError
-from openlifu_sdk.io.LIFUConfig import OW_CONTROLLER, OW_PRESET_LOAD
+from openlifu_sdk.io.LIFUConfig import (
+    OW_CONTROLLER,
+    OW_HV_FDA_REFUSED,
+    OW_HV_NO_PRESET,
+    OW_HV_PRESET_CRC,
+    OW_PRESET_LOAD,
+)
 from openlifu_sdk.io.LIFUInterface import LIFUInterface
 from openlifu_sdk.io.LIFUTXPresets import (
-    capture_machine_config,
+    compile_preset,
     preset_files,
     preset_id,
     regs_crc,
     train_count_selections,
+    verify_console_preset,
     verify_preset,
 )
 
@@ -138,7 +157,7 @@ def load_presets(src):
         raw = p.read_bytes()
         doc = json.loads(raw)
         pid = preset_id(p)
-        out.append((pid, capture_machine_config(doc, preset_id=pid, settings_bytes=raw)))
+        out.append((pid, compile_preset(doc, preset_id=pid, settings_bytes=raw)))
         voltages[pid] = float(doc.get("voltage", 0.0))
     return out, voltages
 
@@ -152,18 +171,39 @@ def device_presets(tx):
     return [first] + [tx.get_preset(i) for i in range(1, first["count"])]
 
 
-def print_inventory(entries):
+def console_presets(tx):
+    """The console's HV table by index; None without an FDA_MODE console."""
+    if not tx.hv_connected:
+        return None
+    hv = tx.iface.hvcontroller
+    first = hv.get_preset(0)
+    if first is None:
+        return None
+    return [first] + [hv.get_preset(i) for i in range(1, first["count"])]
+
+
+def print_inventory(entries, console=None):
     if not entries:
         print("  device reports no presets -- is it running an FDA_MODE image?")
         return
-    print("  %-4s %-28s %-6s %-9s %-11s %-11s %-11s %s"
-          % ("idx", "id", "chips", "profiles", "settings", "regs(live)", "regs(baked)", "train counts"))
+    print("  %-4s %-28s %-6s %-9s %-11s %-11s %-11s %-13s %-10s %s"
+          % ("idx", "id", "chips", "profiles", "settings", "regs(live)", "regs(baked)",
+             "start/shutoff", "voltage", "train counts"))
     for e in entries:
-        flag = "" if e["regs_crc"] == e["baked_regs_crc"] else "  <-- live CRC != baked CRC"
-        print("  %-4d %-28s %-6d %-9d 0x%08x  0x%08x  0x%08x  %s%s"
+        flags = [] if e["regs_crc"] == e["baked_regs_crc"] else ["live CRC != baked CRC"]
+        thermal = "-" if e["start_c"] is None else "%g/%g C" % (e["start_c"], e["shutoff_c"])
+        # The voltage is the console's; '*' marks the index it has selected.
+        c = console[e["index"]] if console and e["index"] < len(console) else None
+        volts = "-" if c is None else "%.2f V%s" % (c["voltage"], "*" if c["selected"] == e["index"] else "")
+        if console is not None and (c is None or c["id"] != e["id"] or c["settings_crc"] != e["settings_crc"]):
+            flags.append("console holds %s here" % ("nothing" if c is None else c["id"]))
+        print("  %-4d %-28s %-6d %-9d 0x%08x  0x%08x  0x%08x  %-13s %-10s %s%s"
               % (e["index"], e["id"], e["chip_count"], e["profile_count"],
-                 e["settings_crc"], e["regs_crc"], e["baked_regs_crc"],
-                 "/".join(str(c) for c in e["train_counts"]) or "-", flag))
+                 e["settings_crc"], e["regs_crc"], e["baked_regs_crc"], thermal, volts,
+                 "/".join(str(c) for c in e["train_counts"]) or "-",
+                 "".join("  <-- " + f for f in flags)))
+    if console is None:
+        print("  (voltage: no FDA console connected)")
 
 
 def silicon_addresses(mc):
@@ -239,8 +279,12 @@ def run_for(tx, seconds, voltage):
     else:
         print("  note: the sequence ends after %.4g s, before the %.4g s run is up" % (total, seconds))
     hv = tx.iface.hvcontroller
-    hv.set_voltage(voltage)
-    print("  HV set to %.2f V; start_sonication (HV on, settle, trigger)" % voltage, flush=True)
+    if voltage is None:
+        print("  HV %.2f V from the selected console preset; start_sonication (HV on, settle, trigger)"
+              % hv.supply_voltage, flush=True)
+    else:
+        hv.set_voltage(voltage)
+        print("  HV set to %.2f V; start_sonication (HV on, settle, trigger)" % voltage, flush=True)
     seen, finished = [], False
     t0 = time.time()
     try:
@@ -268,17 +312,33 @@ def run_for(tx, seconds, voltage):
 
 def operate(tx, inventory, presets, voltages, args):
     print("\n-- load / run --")
+    hv = tx.iface.hvcontroller if tx.hv_connected else None
+    fda_console = hv is not None and hv.get_preset(0) is not None
     voltage = None
     if args.run:
-        if not tx.hv_connected:
+        if hv is None:
             sys.exit("--run needs the console (HV controller) connected")
-        voltage = args.voltage
-        if voltage is None and args.load_preset is not None:
-            voltage = voltages.get(find_preset(inventory, args.load_preset)["id"])
-        if not voltage:
-            sys.exit("--run needs a voltage: --voltage, or --presets so the preset's own voltage is used")
+        if fda_console:
+            if args.voltage is not None:
+                sys.exit("this console takes its HV from the selected preset; drop --voltage")
+            selected = hv.get_preset(0)["selected"]
+            if args.load_preset is None:
+                if selected is None:
+                    sys.exit("no preset selected on the console; use --load-preset")
+                # Selected by an earlier process: settle against its voltage.
+                hv.supply_voltage = hv.get_preset(selected)["voltage"]
+        else:
+            voltage = args.voltage
+            if voltage is None and args.load_preset is not None:
+                voltage = voltages.get(find_preset(inventory, args.load_preset)["id"])
+            if not voltage:
+                sys.exit("--run needs a voltage: --voltage, or --presets so the preset's own voltage is used")
     if args.load_preset is not None:
-        load_one(tx, inventory, presets, args.load_preset, args.duration)
+        e = load_one(tx, inventory, presets, args.load_preset, args.duration)
+        if fda_console:
+            # Same index on both, gated on the settings_crc the TX image just reported.
+            hv.select_preset(e["index"], e["settings_crc"])
+            print("  console preset [%d] selected: HV %.2f V" % (e["index"], hv.supply_voltage))
     if args.run:
         run_for(tx, args.run_seconds, voltage)
     return 0
@@ -346,6 +406,62 @@ def identify(tx, presets):
         if all(cfg.get(k) == v for k, v in BOOT_TRIGGER.items()):
             print("  the trigger holds the firmware's power-on config: the transmitter has rebooted since the last load")
     return 0 if len(full) == 1 else 1
+
+
+def verify_console(hv, configs):
+    """The console's HV table is the host's presets, index for index, and the
+    host cannot set a voltage around it. HV stays off."""
+    print("\n-- console HV presets --")
+    if hv is None:
+        print("  [SKIP] console not connected")
+        return
+    if hv.get_hv_status():
+        check("console HV off for the preset checks", False, "HV is on; not touching the setpoint")
+        return
+    first = hv.get_preset(0)
+    if first is None:
+        check("console has a preset HV table", False, "not an FDA_MODE console image")
+        return
+    check("console holds the same number of presets", first["count"] == len(configs),
+          "console %d, host %d" % (first["count"], len(configs)))
+    for i, mc in enumerate(configs[:first["count"]]):
+        try:
+            got = verify_console_preset(hv, i, mc)
+            check("console preset[%d] %s" % (i, mc["id"]), True,
+                  "%.9g V settings=0x%08x" % (got["voltage"], got["settings_crc"]))
+        except ValueError as e:
+            check("console preset[%d] %s" % (i, mc["id"]), False, str(e))
+
+    def refused(fn, code):
+        try:
+            fn()
+        except LIFUDeviceError as e:
+            return e.device_error_code == code, "-> " + str(e)[:150]
+        return False, "accepted"
+
+    for name, fn in (("set_voltage(%.2f)" % configs[0]["voltage"], lambda: hv.set_voltage(configs[0]["voltage"])),
+                     ("raw DAC write", lambda: hv.set_dacs(100, 100, 0, 0))):
+        ok, detail = refused(fn, OW_HV_FDA_REFUSED)
+        check("%s refused (OW_HV_FDA_REFUSED)" % name, ok, detail)
+    if first["selected"] is None:
+        ok, detail = refused(hv.turn_hv_on, OW_HV_NO_PRESET)
+        if not ok:
+            hv.turn_hv_off()
+        check("HV on with no preset selected refused (OW_HV_NO_PRESET)", ok, detail)
+    else:
+        print("  [SKIP] a preset is already selected; power-cycle the console to test the no-preset gate")
+    ok, detail = refused(lambda: hv.select_preset(0, configs[0]["settings_crc"] ^ 0xDEADBEEF), OW_HV_PRESET_CRC)
+    check("select with the wrong settings_crc refused (OW_HV_PRESET_CRC)", ok, detail)
+    # Lowest-voltage preset last, so the setpoint left behind is the gentlest the set has.
+    last = min(range(len(configs)), key=lambda i: configs[i]["voltage"])
+    for i in sorted({0, last}, key=lambda i: i == last):
+        try:
+            hv.select_preset(i, configs[i]["settings_crc"])
+            now = hv.get_preset(i)
+            check("select preset[%d] applies its %.9g V" % (i, now["voltage"]),
+                  now["selected"] == i and hv.supply_voltage == now["voltage"])
+        except LIFUDeviceError as e:
+            check("select preset[%d]" % i, False, str(e)[:150])
 
 
 def verify(tx, inventory, presets, args):
@@ -424,6 +540,8 @@ def verify(tx, inventory, presets, args):
     check("profiles cycle while running", set(seen) == set(order),
           "saw %s, execution order %s" % (sorted(set(seen)), order))
 
+    verify_console(tx.iface.hvcontroller if tx.hv_connected else None, [mc for _, mc in presets])
+
     n_ok = sum(results)
     print("\nFDA PRESET DEVICE TEST: %d/%d checks passed (%d transport reconnect(s))"
           % (n_ok, len(results), tx.reconnects))
@@ -447,9 +565,24 @@ def main():
                     help="read the chips and say which preset from --presets is on them")
     ap.add_argument("--readback", type=int, default=1, metavar="IDX",
                     help="verification: the preset to load and read back from the chips (default 1)")
+    ap.add_argument("--console-only", action="store_true",
+                    help="verify just the console's HV presets against --presets; no transmitter needed")
     args = ap.parse_args()
     args.run_seconds = None if args.run == float("inf") else args.run
     args.run = args.run is not None
+
+    if args.console_only:
+        if not args.presets:
+            sys.exit("--console-only needs --presets")
+        presets, _ = load_presets(args.presets)
+        with LIFUInterface(run_async=False) as iface:
+            if not iface.is_device_connected()[1]:
+                sys.exit("no console connected")
+            print("console:", iface.hvcontroller.get_version(), "| host: %d preset(s)" % len(presets))
+            verify_console(iface.hvcontroller, [mc for _, mc in presets])
+        n_ok = sum(results)
+        print("\nFDA CONSOLE PRESET TEST: %d/%d checks passed" % (n_ok, len(results)))
+        return 0 if results and n_ok == len(results) else 1
 
     tx = Link()
     print("firmware:", tx.get_version(), "| chips:", tx.enum_tx7332_devices(),
@@ -457,7 +590,7 @@ def main():
     inventory = device_presets(tx)
     if args.list_presets:
         print("\n-- presets on the device --")
-        print_inventory(inventory)
+        print_inventory(inventory, console_presets(tx))
         return 0 if inventory else 1
     if not inventory:
         sys.exit("device reports no presets -- is it running an FDA_MODE image?")

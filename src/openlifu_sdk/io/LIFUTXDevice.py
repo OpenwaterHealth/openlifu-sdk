@@ -124,6 +124,7 @@ DELAY_WIDTH = 13
 APODIZATION_CHANNEL_ORDER = [17, 19, 21, 23, 25, 27, 29, 31, 18, 20, 22, 24, 26, 28, 30, 32, 1, 3, 5, 7, 9, 11, 13, 15, 2, 4, 6, 8, 10, 12, 14, 16]
 APODIZATION_CHANNEL_ORDER_REVERSED = [33 - c for c in APODIZATION_CHANNEL_ORDER]
 DEFAULT_PATTERN_DUTY_CYCLE = 0.66
+DEFAULT_PULSE_AMPLITUDE = 1.0
 # Minimum inter-pulse dead time (seconds) required for SPI profile switching.
 # Must match MIN_PROFILE_SWITCH_US in firmware trigger.h (1000 µs).
 # Measured: ~460 µs at SPI prescaler /4 (12 MHz). Using 1 ms for safety margin.
@@ -156,6 +157,20 @@ ELASTIC_MODE_PULSE_LENGTH_ADJUST = 125e-6
 ProfileOpts = Literal['active', 'configured', 'all']
 TriggerModeOpts = Literal['sequence', 'continuous','single']
 DEFAULT_PULSE_WIDTH_US = 20
+# OW_PRESET_GET carries the run-length count as one byte and each count as a
+# u32. The firmware's PRESET_TRAIN_SEL_MAX must not be smaller than the former.
+PRESET_TRAIN_SELECTIONS_MAX = 0xFF
+PRESET_TRAIN_COUNT_MAX = 0xFFFFFFFF
+# A preset's start_C / shutoff_C travel as i16 tenths of a degree C, in the
+# preset blob and in OW_PRESET_GET.
+PRESET_TEMP_SCALE = 10
+PRESET_TEMP_RAW_MIN = -0x8000
+PRESET_TEMP_RAW_MAX = 0x7FFF
+# The preset blob: one pointer-free record per preset, laid out as PRESET_BLOB
+# in the firmware's presets.h. Its id is ASCII, at most PRESET_ID_MAX bytes.
+PRESET_BLOB_MAGIC = b"OWPR"
+PRESET_BLOB_VERSION = 1
+PRESET_ID_MAX = 64
 TEMPERATURE_DATA_LENGTH = 4
 
 if TYPE_CHECKING:
@@ -711,8 +726,9 @@ class TxDevice(OWComponent):
         ``settings_crc`` (CRC-32 of the source .json), ``regs_crc`` (CRC-32
         the firmware just computed over its own register tables),
         ``baked_regs_crc`` (what the generator stored, differs only if flash is
-        inconsistent) and ``train_counts`` (the run lengths in pulse trains
-        the preset offers).
+        inconsistent), ``train_counts`` (the run lengths in pulse trains
+        the preset offers), and ``start_c`` / ``shutoff_c`` (the thermal
+        limits the firmware enforces; None from an image that predates them).
 
         Raises:
             LIFUDeviceError: Bad index, or the image failed its own CRC check.
@@ -728,13 +744,21 @@ class TxDevice(OWComponent):
         id_len = d[16]
         pos = 17 + id_len
         counts = []
+        start_c = shutoff_c = None
         if r.data_len > pos:
             n = d[pos]
-            if r.data_len >= pos + 1 + 4 * n:
-                counts = list(struct.unpack("<%dI" % n, d[pos + 1:pos + 1 + 4 * n]))
+            pos += 1
+            if r.data_len >= pos + 4 * n:
+                counts = list(struct.unpack("<%dI" % n, d[pos:pos + 4 * n]))
+                pos += 4 * n
+                if r.data_len >= pos + 4:
+                    raw_start, raw_shutoff = struct.unpack("<hh", d[pos:pos + 4])
+                    start_c = raw_start / PRESET_TEMP_SCALE
+                    shutoff_c = raw_shutoff / PRESET_TEMP_SCALE
         return {"count": count, "index": idx, "chip_count": chips, "profile_count": profiles,
                 "settings_crc": settings_crc, "regs_crc": regs_crc, "baked_regs_crc": baked_regs_crc,
-                "id": d[17:17 + id_len].decode("ascii", "replace"), "train_counts": counts}
+                "id": d[17:17 + id_len].decode("ascii", "replace"), "train_counts": counts,
+                "start_c": start_c, "shutoff_c": shutoff_c}
 
     def load_preset(self, index: int, regs_crc: int, duration_index: int = 0) -> bool:
         """Program every module from baked preset *index* (OW_PRESET_LOAD).
@@ -744,6 +768,11 @@ class TxDevice(OWComponent):
         this preset (see LIFUTXPresets.regs_crc). *duration_index* picks the
         run length from the preset's baked pulse-train counts
         (get_preset()["train_counts"]); a raw count cannot be sent.
+
+        In FDA mode the trigger only starts once a preset is loaded, and only
+        while the TX is at or below that preset's start_C; it stops itself at
+        shutoff_C. start_trigger() reports a refusal as a LIFUDeviceError
+        carrying OW_NO_PRESET, OW_TEMP_TOO_HIGH or OW_TEMP_UNKNOWN.
 
         Raises:
             LIFUDeviceError: CRC mismatch (OW_BAD_CRC), bad index, a duration
@@ -2111,7 +2140,9 @@ def build_solution_registers(pulse: Dict | List[Dict],
 
     Args:
         pulse:              Dict (single shared pulse config) or List[Dict]
-                            (one per unique pulse profile).
+                            (one per unique pulse profile): ``frequency``,
+                            ``duration`` and optionally ``amplitude``
+                            (DEFAULT_PULSE_AMPLITUDE when absent).
         delays:             np.ndarray of shape (N, elements) for N delay profiles.
         apodizations:       np.ndarray of shape (N, elements), same shape as delays.
         sequence:           Dict with trigger timing. Only read here to check
@@ -2243,7 +2274,8 @@ def build_solution_registers(pulse: Dict | List[Dict],
         pulse_cfg = pulse_configs[pidx - 1]
         mapped_dps = [k for k, v in pulse_profile_map.items() if v == pidx]
         max_apod = max(max(apodizations[dp - 1, :]) for dp in mapped_dps)
-        duty_cycle_by_pulse[pidx] = DEFAULT_PATTERN_DUTY_CYCLE * max_apod * pulse_cfg["amplitude"]
+        duty_cycle_by_pulse[pidx] = (DEFAULT_PATTERN_DUTY_CYCLE * max_apod
+                                     * pulse_cfg.get("amplitude", DEFAULT_PULSE_AMPLITUDE))
 
     # Create one pulse profile per delay profile slot.
     # The TX7332 firmware cycles PATTERN_SEL in lockstep with DELAY_SEL,

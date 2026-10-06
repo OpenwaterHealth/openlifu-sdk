@@ -24,6 +24,13 @@ OW_ONEWIRE_RESP = 0xEC
 OW_ERROR = 0xEF
 
 OW_SUCCESS = 0x00
+# FDA mode refusals, carried in the OW_ERROR reply's reserved byte.
+OW_HV_PRESET_CRC = 0xF6    # console: select's settings_crc is not that preset's
+OW_HV_NO_PRESET = 0xF7     # console: HV on before any preset was selected
+OW_HV_FDA_REFUSED = 0xF8   # console: host-set voltage / raw DACs, or select while HV on
+OW_TEMP_UNKNOWN = 0xF9     # TX: no fresh thermistor reading
+OW_TEMP_TOO_HIGH = 0xFA    # TX: above the loaded preset's start_C
+OW_NO_PRESET = 0xFB        # TX: no preset loaded
 OW_UNKNOWN_COMMAND = 0xFC
 OW_BAD_CRC = 0xFD
 OW_INVALID_PACKET = 0xFE
@@ -106,6 +113,9 @@ OW_POWER_VMON = 0x40
 OW_POWER_RAW_DAC = 0x41
 OW_POWER_HV_ENABLE = 0x42
 OW_POWER_SET_RGB_FX = 0x43
+# FDA mode only: the console's per-preset HV table, indexed like the TX's.
+OW_POWER_PRESET_GET = 0x44     # reserved=index
+OW_POWER_PRESET_SELECT = 0x45  # reserved=index, data=settings_crc u32 LE
 
 # OW_POWER_SET_RGB_FX effect ids (payload byte 0 - see firmware common.h)
 OW_RGB_FX_STOP = 0
@@ -150,6 +160,7 @@ POWER_COMMANDS = {
     OW_POWER_GET_TEMP2, OW_POWER_SET_FAN, OW_POWER_GET_FAN, OW_POWER_SET_RGB,
     OW_POWER_GET_RGB, OW_POWER_GET_HVON, OW_POWER_GET_12VON, OW_POWER_SET_DACS,
     OW_POWER_VMON, OW_POWER_RAW_DAC, OW_POWER_HV_ENABLE, OW_POWER_SET_RGB_FX,
+    OW_POWER_PRESET_GET, OW_POWER_PRESET_SELECT,
 }
 
 TRIGGER_MODE_SEQUENCE = 0

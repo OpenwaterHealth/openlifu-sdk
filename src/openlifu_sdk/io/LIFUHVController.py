@@ -23,6 +23,8 @@ from openlifu_sdk.io.LIFUConfig import (
     OW_POWER_HV_ENABLE,
     OW_POWER_HV_OFF,
     OW_POWER_HV_ON,
+    OW_POWER_PRESET_GET,
+    OW_POWER_PRESET_SELECT,
     OW_POWER_RAW_DAC,
     OW_POWER_SET_DACS,
     OW_POWER_SET_FAN,
@@ -223,6 +225,9 @@ class HVController(OWComponent):
         Args:
             voltage: Desired output voltage (5.0 – 100.0 V).
 
+        An FDA_MODE console refuses this outright (OW_HV_FDA_REFUSED): the
+        voltage comes from the preset chosen with select_preset().
+
         Raises:
             ValueError: If *voltage* is out of range.
             LIFUNotConnectedError, LIFUCommunicationError, LIFUDeviceError.
@@ -236,6 +241,57 @@ class HVController(OWComponent):
         self.supply_voltage = voltage
         if self.is_hv_on:
             self.send_checked(packet_type=OW_POWER, command=OW_POWER_HV_ON, timeout=10.0, op="reassert_hv_on")
+        return True
+
+    def get_preset(self, index: int) -> dict | None:
+        """Describe a preset in an FDA_MODE console's HV table (OW_POWER_PRESET_GET).
+
+        The table is indexed like the transmitter image's presets, so index N
+        is the same preset on both.
+
+        Returns:
+            ``count``, ``index``, ``selected`` (the index whose voltage is
+            applied, None before any select), ``settings_crc`` (CRC-32 of the
+            source .json), ``voltage`` (float32) and ``id``; or None when the
+            console is not an FDA_MODE image and has no table.
+
+        Raises:
+            LIFUDeviceError: No such index.
+            LIFUNotConnectedError, LIFUCommunicationError,
+            LIFUProtocolError: If the payload is malformed.
+        """
+        r = self.send_checked(packet_type=OW_POWER, command=OW_POWER_PRESET_GET,
+                              reserved=index, op="get_preset")
+        if r.data_len == 0:
+            return None
+        d = bytes(r.data)
+        if len(d) < 12 or len(d) < 12 + d[11]:
+            raise LIFUProtocolError(f"HV: get_preset payload too short ({len(d)})",
+                                    code=LIFU_ERR_BAD_PAYLOAD_LENGTH)
+        settings_crc, voltage = struct.unpack("<If", d[3:11])
+        return {"count": d[0], "index": d[1], "selected": None if d[2] == 0xFF else d[2],
+                "settings_crc": settings_crc, "voltage": voltage,
+                "id": d[12:12 + d[11]].decode("ascii", "replace")}
+
+    def select_preset(self, index: int, settings_crc: int) -> bool:
+        """Apply preset *index*'s stored voltage (OW_POWER_PRESET_SELECT).
+
+        The FDA_MODE way to set the HV: the console holds one voltage per
+        preset and refuses set_voltage. *settings_crc* must be that preset's
+        (LIFUTXPresets.compile_preset gives it), so a host holding a different
+        idea of preset N is refused. Select the same index loaded into the
+        transmitter, with HV off.
+
+        Raises:
+            LIFUDeviceError: No such index, OW_HV_PRESET_CRC (wrong
+                settings_crc), or OW_HV_FDA_REFUSED (HV is on).
+            LIFUNotConnectedError, LIFUCommunicationError.
+        """
+        self.send_checked(packet_type=OW_POWER, command=OW_POWER_PRESET_SELECT,
+                          reserved=index, data=struct.pack("<I", settings_crc),
+                          op="select_preset")
+        # wait_for_settle() aims at supply_voltage, which set_voltage no longer sets.
+        self.supply_voltage = self.get_preset(index)["voltage"]
         return True
 
     def set_dacs(self, hvp: int, hvm: int, hrp: int, hrm: int) -> bool:

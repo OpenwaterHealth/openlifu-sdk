@@ -1,0 +1,303 @@
+"""
+FDA preset limit tests (no hardware)
+====================================
+The thermal limits a preset bakes into the TX image, the per-preset HV table
+the console is built with, and the device replies that report them back.
+
+    python -m pytest unit-test/test_fda_presets.py -v
+"""
+from __future__ import annotations
+
+import json
+import os
+import re
+import struct
+import sys
+import tempfile
+import unittest
+from pathlib import Path
+from unittest.mock import MagicMock
+
+_SRC = os.path.join(os.path.dirname(__file__), "..", "src")
+if _SRC not in sys.path:
+    sys.path.insert(0, _SRC)
+
+from openlifu_sdk.io.LIFUConfig import OW_RESP
+from openlifu_sdk.io.LIFUHVController import HVController
+from openlifu_sdk.io.LIFUTXDevice import TxDevice
+from openlifu_sdk.io.LIFUTXPresets import (
+    compile_preset,
+    generate_console_presets,
+    generate_header_files,
+    generate_preset_set,
+    parse_preset_blob,
+    preset_blob,
+    preset_voltage,
+    regs_crc,
+    thermal_limits,
+    verify_console_preset,
+)
+from openlifu_sdk.io.uart import OWUart
+
+
+def _preset(**overrides) -> dict:
+    """A minimal two-chip, single-profile preset with every required field."""
+    doc = {
+        "id": "unit",
+        "frequency_khz": 400.0,
+        "pulse_length_us": 20.0,
+        "pulse_interval_ms": 100.0,
+        "pulse_count": 10,
+        "pulse_train_interval_s": 0,
+        "pulse_train_count_selections": [1, 5],
+        "delays": [[0.0] * 64],
+        "apodization": [[1.0] * 64],
+        "start_C": 35,
+        "shutoff_C": 75,
+        "voltage": 20.0,
+    }
+    doc.update(overrides)
+    return doc
+
+
+def _compiled(**overrides) -> dict:
+    doc = _preset(**overrides)
+    return compile_preset(doc, settings_bytes=json.dumps(doc).encode())
+
+
+def _packet(data: bytes) -> MagicMock:
+    pkt = MagicMock()
+    pkt.packet_type = OW_RESP
+    pkt.data = bytearray(data)
+    pkt.data_len = len(data)
+    pkt.reserved = 0
+    return pkt
+
+
+def _mock_uart(component, desc: str) -> MagicMock:
+    uart = MagicMock(spec=OWUart)
+    uart.desc = desc
+    uart.demo_mode = False
+    uart.asyncMode = False
+    uart.is_connected = True
+    component._uart = uart
+    return uart
+
+
+class TestThermalLimits(unittest.TestCase):
+
+    def test_raw_tenths(self):
+        self.assertEqual(thermal_limits(_compiled(start_C=35, shutoff_C=75)), (350, 750))
+        self.assertEqual(thermal_limits(_compiled(start_C=36.5, shutoff_C=41.2)), (365, 412))
+
+    def test_missing_fields_named(self):
+        doc = _preset()
+        del doc["start_C"], doc["shutoff_C"]
+        with self.assertRaisesRegex(ValueError, "start_C, shutoff_C"):
+            compile_preset(doc)
+
+    def test_refused_rather_than_rounded(self):
+        with self.assertRaisesRegex(ValueError, "multiple of 0.1"):
+            _compiled(start_C=35.25)
+
+    def test_start_must_be_below_shutoff(self):
+        with self.assertRaisesRegex(ValueError, "below shutoff_C"):
+            _compiled(start_C=75, shutoff_C=75)
+
+    def test_not_a_number(self):
+        for bad in ("35", True, None, float("nan")):
+            with self.assertRaises(ValueError, msg=repr(bad)):
+                _compiled(start_C=bad)
+
+    def test_regs_crc_covers_them(self):
+        base = _compiled()
+        self.assertNotEqual(regs_crc(base), regs_crc(_compiled(start_C=36)))
+        self.assertNotEqual(regs_crc(base), regs_crc(_compiled(shutoff_C=74)))
+        # i16 LE pair right after the run-length choices
+        self.assertIn(struct.pack("<B2I", 2, 1, 5) + struct.pack("<hh", 350, 750), preset_blob(base))
+
+    def test_blob_carries_them(self):
+        got = parse_preset_blob(preset_blob(_compiled(start_C=36.5, shutoff_C=41)))
+        self.assertEqual((got["start_c_x10"], got["shutoff_c_x10"]), (365, 410))
+
+
+def _rastered(**overrides) -> dict:
+    """Three delay profiles cycled 1, 2, 3, 1 -- per-profile registers and a real order."""
+    return _compiled(delays=[[i * 1e-7] * 64 for i in range(3)], apodization=[[1.0] * 64] * 3,
+                     order=[1, 2, 3, 1], pulse_count=8, **overrides)
+
+
+class TestPresetBlob(unittest.TestCase):
+
+    def test_round_trip(self):
+        for mc in (_compiled(), _rastered()):
+            got = parse_preset_blob(preset_blob(mc))
+            self.assertEqual(got["chips"], mc["chips"])       # every register, run for run
+            self.assertEqual(got["execution_order"], mc["execution_order"])
+            self.assertEqual(got["profile_index"], mc["profile_index"])
+            self.assertEqual(got["train_counts"], mc["pulse_train_count_selections"])
+            self.assertEqual((got["trig_hz"], got["trig_count"], got["trig_train_us"]), (10, mc["pulse_count"], 0))
+            self.assertEqual((got["id"], got["settings_crc"]), (mc["id"], mc["settings_crc"]))
+
+    def test_regs_crc_is_the_body_crc(self):
+        mc = _rastered()
+        got = parse_preset_blob(preset_blob(mc))
+        self.assertEqual(got["regs_crc"], regs_crc(mc))
+        self.assertEqual(got["body_crc"], regs_crc(mc))
+
+    def test_id_and_source_file_are_outside_regs_crc(self):
+        a, b = _compiled(id="a"), _compiled(id="b", voltage=30)
+        self.assertEqual(regs_crc(a), regs_crc(b))
+        self.assertNotEqual(preset_blob(a), preset_blob(b))
+
+    def test_header_layout(self):
+        mc = _compiled(id="unit")
+        blob = preset_blob(mc)
+        self.assertEqual(blob[:8], b"OWPR" + bytes([1, 4, 0, 0]))
+        self.assertEqual(struct.unpack_from("<III", blob, 8), (len(blob), mc["settings_crc"], regs_crc(mc)))
+        self.assertEqual(blob[20:24], b"unit")
+
+    def test_base_registers_are_runs(self):
+        # A run costs its 4-byte header plus 4 bytes a value, against 6 a register as pairs.
+        mc = _rastered()
+        runs = sum(len(c["registers"]) for c in mc["chips"])
+        values = sum(len(v) for c in mc["chips"] for v in c["registers"].values())
+        self.assertLess(runs, values)
+        self.assertLess(4 * runs + 4 * values, 6 * values)
+
+    def test_needs_settings_crc_and_a_usable_id(self):
+        with self.assertRaisesRegex(ValueError, "settings_crc"):
+            preset_blob(compile_preset(_preset()))
+        for bad in ("x" * 65, "café", "tab\there"):
+            with self.assertRaisesRegex(ValueError, "printable ASCII", msg=repr(bad)):
+                preset_blob(_compiled(id=bad))
+
+    def test_parser_refuses_damage(self):
+        blob = preset_blob(_rastered())
+        for bad in (blob[:-1], blob + b"\0", b"XXXX" + blob[4:], blob[:4] + b"\x02" + blob[5:], blob[:40]):
+            with self.assertRaises(ValueError):
+                parse_preset_blob(bad)
+
+    def test_header_file_is_the_blob(self):
+        mc = _rastered()
+        with tempfile.TemporaryDirectory() as d:
+            text = generate_header_files(Path(d) / "p.h", mc, "set").read_text()
+        body = text[text.index("{") + 1:text.rindex("}")]
+        emitted = bytes(int(x, 16) for x in re.findall(r"0x([0-9a-f]{2}),", body))
+        self.assertEqual(emitted, preset_blob(mc))
+        self.assertIn("static const uint8_t PRESET_SET_UNIT_BLOB[%d] = {" % len(emitted), text)
+
+    def test_table_points_at_the_blobs(self):
+        presets = [_compiled(id="a"), _compiled(id="b")]
+        with tempfile.TemporaryDirectory() as d:
+            table = generate_preset_set(d, presets)[-1].read_text()
+        self.assertIn("#define PRESET_COUNT 2u", table)
+        self.assertIn("\t{ PRESET_A_BLOB, sizeof(PRESET_A_BLOB) },\n\t{ PRESET_B_BLOB, sizeof(PRESET_B_BLOB) },", table)
+
+
+def _f32(v: float) -> float:
+    return struct.unpack("<f", struct.pack("<f", v))[0]
+
+
+class TestConsolePresets(unittest.TestCase):
+
+    def test_voltage_is_float32(self):
+        self.assertEqual(preset_voltage(_compiled(voltage=47.66997571)), _f32(47.66997571))
+
+    def test_bad_voltage(self):
+        for bad in (0, -5, "20", None, float("inf")):
+            with self.assertRaises(ValueError, msg=repr(bad)):
+                _compiled(voltage=bad)
+
+    def test_table_in_index_order_with_exact_voltages(self):
+        presets = [_compiled(id="a", voltage=47.66997571), _compiled(id="b", voltage=16.96599996)]
+        with tempfile.TemporaryDirectory() as d:
+            text = generate_console_presets(d, presets, "vet").read_text()
+        rows = re.findall(r'\{ "(\w+)", (\S+)f, 0x([0-9a-f]{8})u \}', text)
+        self.assertEqual([r[0] for r in rows], ["a", "b"])
+        for (_, literal, crc), mc in zip(rows, presets):
+            # The C literal parses back to the very float32 the preset compiles to.
+            self.assertEqual(_f32(float(literal)), preset_voltage(mc))
+            self.assertEqual(int(crc, 16), mc["settings_crc"])
+        self.assertIn('#define PRESET_HV_CONTEXT_NAME "vet"', text)
+        self.assertIn("#define PRESET_HV_COUNT 2u", text)
+        self.assertNotIn("Every preset in this set uses", text)
+
+    def test_shared_voltage_called_out(self):
+        presets = [_compiled(id="a", voltage=30), _compiled(id="b", voltage=30)]
+        with tempfile.TemporaryDirectory() as d:
+            text = generate_console_presets(d, presets, "vet").read_text()
+        self.assertIn("// Every preset in this set uses 30 V.", text)
+
+    def test_needs_settings_crc(self):
+        with tempfile.TemporaryDirectory() as d, self.assertRaisesRegex(ValueError, "settings_crc"):
+            generate_console_presets(d, [compile_preset(_preset())], "vet")
+
+
+class TestDeviceReplies(unittest.TestCase):
+
+    def _get_preset_reply(self, tail: bytes) -> bytes:
+        ident = b"unit"
+        return (bytes([3, 1, 2, 1]) + struct.pack("<III", 0x11, 0x22, 0x22)
+                + bytes([len(ident)]) + ident + struct.pack("<B2I", 2, 188, 375) + tail)
+
+    def test_get_preset_thermal_tail(self):
+        tx = TxDevice()
+        uart = _mock_uart(tx, "TX")
+        uart.send_packet.return_value = _packet(self._get_preset_reply(struct.pack("<hh", 355, -12)))
+        got = tx.get_preset(1)
+        self.assertEqual((got["start_c"], got["shutoff_c"]), (35.5, -1.2))
+        self.assertEqual(got["train_counts"], [188, 375])
+
+    def test_get_preset_older_image(self):
+        tx = TxDevice()
+        uart = _mock_uart(tx, "TX")
+        uart.send_packet.return_value = _packet(self._get_preset_reply(b""))
+        got = tx.get_preset(1)
+        self.assertIsNone(got["start_c"])
+        self.assertEqual(got["train_counts"], [188, 375])
+
+    @staticmethod
+    def _console_reply(selected: int, crc: int, volts: float, ident: bytes = b"unit") -> bytes:
+        return bytes([3, 1, selected]) + struct.pack("<If", crc, volts) + bytes([len(ident)]) + ident
+
+    def test_console_get_preset(self):
+        hv = HVController()
+        uart = _mock_uart(hv, "HV")
+        uart.send_packet.return_value = _packet(self._console_reply(0xFF, 0xABCD, 47.67))
+        got = hv.get_preset(1)
+        self.assertEqual((got["count"], got["index"], got["selected"]), (3, 1, None))
+        self.assertEqual((got["settings_crc"], got["id"]), (0xABCD, "unit"))
+        self.assertEqual(got["voltage"], _f32(47.67))
+
+    def test_console_get_preset_non_fda(self):
+        hv = HVController()
+        uart = _mock_uart(hv, "HV")
+        uart.send_packet.return_value = _packet(b"")
+        self.assertIsNone(hv.get_preset(0))
+
+    def test_console_select_preset(self):
+        hv = HVController()
+        uart = _mock_uart(hv, "HV")
+        uart.send_packet.side_effect = [_packet(b""), _packet(self._console_reply(1, 0xABCD, 30.5))]
+        hv.select_preset(1, 0xABCD)
+        sent = uart.send_packet.call_args_list[0].kwargs
+        self.assertEqual((sent["reserved"], bytes(sent["data"])), (1, struct.pack("<I", 0xABCD)))
+        self.assertEqual(hv.supply_voltage, 30.5)   # wait_for_settle aims at it
+
+    def test_verify_console_preset(self):
+        mc = _compiled(id="a", voltage=47.66997571)
+        hv = MagicMock()
+        hv.get_preset.return_value = {"id": "a", "settings_crc": mc["settings_crc"],
+                                      "voltage": preset_voltage(mc), "selected": None}
+        verify_console_preset(hv, 0, mc)
+        hv.get_preset.return_value = dict(hv.get_preset.return_value, voltage=47.0)
+        with self.assertRaisesRegex(ValueError, "voltage"):
+            verify_console_preset(hv, 0, mc)
+        hv.get_preset.return_value = None
+        with self.assertRaisesRegex(ValueError, "not an FDA_MODE image"):
+            verify_console_preset(hv, 0, mc)
+
+
+if __name__ == "__main__":
+    unittest.main()
