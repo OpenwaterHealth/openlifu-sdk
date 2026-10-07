@@ -2,14 +2,14 @@
 
 Reads every preset .json in a directory, resolves each into TX7332 registers
 with the SDK's own register math, and writes one C header per preset plus
-the preset_table.h that indexes them. Copy the output into the transmitter
-firmware tree at Core/Inc/presets/ and build one of its FDA presets.
+the preset_table.h that indexes them into the transmitter firmware tree at
+Core/Inc/presets/. Build one of its FDA presets from there.
 
 It also writes the console's preset_hv_table.h: each preset's voltage, indexed
 exactly as the transmitter's presets are. An FDA_MODE console applies preset
 N's voltage when the host selects N and refuses any voltage the host sends
-itself. Copy that into the console firmware tree at Core/Inc/presets/ and
-build its FDA preset too.
+itself. That goes into the console firmware tree at Core/Inc/presets/; build
+its FDA preset too.
 
 Every preset must carry voltage, start_C and shutoff_C; the generator has no
 defaults. Presets missing any are listed together and nothing is written.
@@ -20,9 +20,12 @@ takes milliseconds and needs no transmitter.
 
     python examples/generate_presets.py --presets sample_json
 
-Output goes to generated_presets/transmitter/ and generated_presets/console/
-at the top of this repo unless --out / --console-out are given; each holds
-what belongs in that firmware's Core/Inc/presets/.
+The firmware trees are looked for beside this repo (openlifu-transmitter-fw
+and openlifu-console-fw); --out / --console-out name them if they are
+elsewhere, as the checkout or its Core/Inc. presets/ is created there if it is
+missing. A firmware tree that is not on this machine gets its headers in this
+repo instead, under presets/transmitter-presets/ or presets/console-presets/,
+to be copied into that firmware's Core/Inc/presets/.
 """
 
 import argparse
@@ -42,17 +45,43 @@ from openlifu_sdk.io.LIFUTXPresets import (
 
 # examples/ sits one level below the repo root.
 SDK_ROOT = Path(__file__).resolve().parent.parent
+# The firmware checkouts, where they sit beside this one.
+TRANSMITTER_FW = SDK_ROOT.parent / "openlifu-transmitter-fw"
+CONSOLE_FW = SDK_ROOT.parent / "openlifu-console-fw"
+# Where the headers go for a firmware tree this machine does not have.
+TRANSMITTER_FALLBACK = SDK_ROOT / "presets" / "transmitter-presets"
+CONSOLE_FALLBACK = SDK_ROOT / "presets" / "console-presets"
+
+
+def presets_dir(firmware: Path, fallback: Path) -> Path:
+    """Where one firmware's preset headers go.
+
+    firmware is its checkout or its include directory; the headers belong in
+    presets/ under that include directory. Without it on this machine they go
+    to fallback instead.
+    """
+    firmware = firmware.resolve()
+    # Given the presets/ folder itself, which may not exist yet.
+    if firmware.name == "presets":
+        firmware = firmware.parent
+    if not firmware.is_dir():
+        print("%s is not on this machine; writing to %s instead" % (firmware, fallback))
+        return fallback
+    for inc in (firmware / "Core" / "Inc", firmware / "Inc"):
+        if inc.is_dir():
+            return inc / "presets"
+    return firmware / "presets"
 
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--presets", required=True, type=Path, help="directory of preset .json files")
-    ap.add_argument("--out", type=Path,
-                    help="directory to write the transmitter headers into "
-                         "(default: generated_presets/transmitter/ in this repo)")
-    ap.add_argument("--console-out", type=Path,
-                    help="directory to write the console's preset_hv_table.h into "
-                         "(default: generated_presets/console/ in this repo)")
+    ap.add_argument("--out", type=Path, default=TRANSMITTER_FW,
+                    help="transmitter firmware checkout, or its Core/Inc; the headers go in "
+                         "presets/ there (default: openlifu-transmitter-fw beside this repo)")
+    ap.add_argument("--console-out", type=Path, default=CONSOLE_FW,
+                    help="console firmware checkout, or its Core/Inc; preset_hv_table.h goes in "
+                         "presets/ there (default: openlifu-console-fw beside this repo)")
     ap.add_argument("--context", help="optional set name prefixed onto the C symbols and header names")
     args = ap.parse_args()
 
@@ -60,8 +89,6 @@ def main():
     if not files:
         sys.exit("no .json presets in %s" % args.presets)
     context = args.context
-    out = args.out or SDK_ROOT / "generated_presets" / "transmitter"
-    console_out = args.console_out or SDK_ROOT / "generated_presets" / "console"
 
     configs, errors = [], []
     for index, path in enumerate(files):
@@ -82,9 +109,10 @@ def main():
         sys.exit("%d of %d preset(s) cannot be baked; nothing written:\n%s"
                  % (len(errors), len(files), "\n".join(errors)))
 
+    out = presets_dir(args.out, TRANSMITTER_FALLBACK)
     written = generate_preset_set(out, configs, context)
     print("wrote %d transmitter header(s) to %s" % (len(written), out))
-    path = generate_console_presets(console_out, configs, context)
+    path = generate_console_presets(presets_dir(args.console_out, CONSOLE_FALLBACK), configs, context)
     volts = sorted({mc["voltage"] for mc in configs})
     print("wrote %s: %d preset voltage(s), %s"
           % (path, len(configs), "all %g V" % volts[0] if len(volts) == 1
