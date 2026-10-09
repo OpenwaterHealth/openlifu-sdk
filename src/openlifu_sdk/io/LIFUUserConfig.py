@@ -1,8 +1,10 @@
 import struct
 import json
 from dataclasses import dataclass
-from typing import Optional, Any, Dict
+from typing import Optional, Any, Dict, Iterable
 import logging
+
+import numpy as np
 
 logger = logging.getLogger(__name__)
 
@@ -175,3 +177,23 @@ class LifuUserConfig:
     def __repr__(self) -> str:
         return (f"LifuUserConfig(seq={self.header.seq}, crc=0x{self.header.crc:04X}, "
                 f"json_len={self.header.json_len}, data={self.json_data})")
+
+
+def sensitivity_at_frequency(module_configs: Iterable[Dict[str, Any]], freq_hz: float) -> Optional[float]:
+    """Return a transmitter's sensitivity at *freq_hz* from its module user configs.
+
+    Each config's ``module.sensitivity`` is a ``[[freq_hz, sensitivity], ...]``
+    calibration table. Each module's table is linearly interpolated at
+    *freq_hz* (clamped to the table's end points); the result is the mean over
+    the modules that carry a table, or ``None`` if none do.
+    """
+    values = []
+    for config in module_configs:
+        table = (config.get("module") or {}).get("sensitivity")
+        if not table:
+            continue
+        freqs, sens = zip(*sorted((float(f), float(s)) for f, s in table))
+        values.append(float(np.interp(freq_hz, freqs, sens)))
+    if not values:
+        return None
+    return sum(values) / len(values)

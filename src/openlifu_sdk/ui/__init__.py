@@ -23,8 +23,11 @@ Public surface (loaded on first attribute access):
   :class:`~openlifu_sdk.LIFUInterface` to QML: connection-state machine
   (DISCONNECTED / CONNECTED / READY / RUNNING), connect/disconnect
   signals, and a telemetry polling thread.
-- :class:`SimulatedLIFUInterface` — in-memory fake of
-  :class:`~openlifu_sdk.LIFUInterface` for ``--simulate`` modes.
+- :class:`SimulatedDeviceInterface` — in-memory fake of the FDA-facing
+  :class:`~openlifu_sdk.io.DeviceInterface` for ``--simulate`` modes.
+- :class:`SimulatedLIFUInterface` — compatibility fake of
+  :class:`~openlifu_sdk.LIFUInterface` for research / RUO ``--simulate``
+  modes.
 - :func:`check_sdk_version` / :func:`show_incompatible_version_dialog` —
   pre-flight SDK-version check + QMessageBox helper for apps that pin
   a ``MIN_SDK_VERSION``.
@@ -40,6 +43,7 @@ import importlib
 _LAZY_SOURCES = {
     "BaseConnector": "openlifu_sdk.ui.base_connector",
     "ConnectorState": "openlifu_sdk.ui.base_connector",
+    "SimulatedDeviceInterface": "openlifu_sdk.ui.simulated_interface",
     "SimulatedHVController": "openlifu_sdk.ui.simulated_interface",
     "SimulatedLIFUInterface": "openlifu_sdk.ui.simulated_interface",
     "SimulatedTxDevice": "openlifu_sdk.ui.simulated_interface",

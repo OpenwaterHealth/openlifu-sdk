@@ -216,7 +216,14 @@ def _hw_pid_lock_file_path() -> str:
     """Path to the PID lock file used on non-Windows platforms."""
     return os.path.join(os.path.expanduser("~"), ".openlifu", "hw_interface_pid")
 
-class LIFUInterface:
+class DeviceInterface:
+    """FDA device interface: connection, preset load, and sonication control.
+
+    This is the surface FDA-mode applications program against. It loads
+    presets baked into device flash (:meth:`load_preset`) and starts / stops
+    them; it has no way to program an arbitrary solution or HV setpoint.
+    :class:`LIFUInterface` extends it with those research (RUO) endpoints.
+    """
     hvcontroller: HVController = None
     txdevice: TxDevice = None
 
@@ -228,12 +235,10 @@ class LIFUInterface:
                  timeout: float = DEFAULT_TIMEOUT,
                  TX_test_mode: bool = False,
                  HV_test_mode: bool = False,
-                 run_async: bool = False,
-                 ext_power_supply: bool = False,
-                 module_invert: bool | List[bool] = False,
-                 voltage_table_selection: Optional[str] = None) -> None:
+                 run_async: bool = False) -> None:
         """
-        Initialize the LIFUInterface with given parameters and store them in the class.
+        Initialize the interface, create the TX and HV components and, unless
+        *run_async*, connect them.
 
         Args:
             vid (int): Vendor ID of the USB device.
@@ -242,6 +247,7 @@ class LIFUInterface:
             baudrate (int): Communication baud rate.
             timeout (int): Read timeout in seconds.
             TX_test_mode (bool): Enable TX test mode.
+            HV_test_mode (bool): Enable HV test mode.
             run_async (bool): Enable asynchronous operation.
         """
         # Store parameters in instance variables
@@ -254,20 +260,8 @@ class LIFUInterface:
 
         self._claim_hw_interface_pid()
 
-        self.voltage_table = None
-        self.sequence_time = None
-        self.duty_cycles = None
-        self.voltage_table_selection = voltage_table_selection
-
-        # Create a TXDevice instance as part of the interface
-        self.txdevice = TxDevice(vid=vid, pid=tx_pid, baudrate=baudrate, timeout=timeout, test_mode=TX_test_mode, module_invert=module_invert)
-        
-        if ext_power_supply:
-            logger.debug("External power supply selected, skipping HVController initialization.")
-            self.hvcontroller = None
-        else:
-            # Create a LIFUHVController instance as part of the interface
-            self.hvcontroller = HVController(vid=vid, pid=con_pid, baudrate=baudrate, timeout=timeout, test_mode=HV_test_mode)
+        self.txdevice, self.hvcontroller = self._create_devices(
+            vid, tx_pid, con_pid, baudrate, timeout, TX_test_mode, HV_test_mode)
 
         if not self._async_mode:
             if self.txdevice is not None:
@@ -275,29 +269,13 @@ class LIFUInterface:
             if self.hvcontroller is not None:
                 self.hvcontroller.connect()
 
-    # Temporary fix for hardware variations between EVT0 and EVT2
-    def _resolve_voltage_chart(self, voltage_table: Optional[str]) -> dict:
-        """Return the voltage-table entry (``duty_cycles`` / ``sequence_times`` / ``voltages``)
-        for the requested profile.
-
-        If *voltage_table* is ``None``, the profile is inferred from the connected
-        HV controller's reported version.
-        """
-        if voltage_table is None:
-            evt_version = "evt0" if self.hvcontroller.get_version().startswith("v1.1") else "dvt"
-        else:
-            evt_version = voltage_table.lower()
-            if evt_version not in MAX_VOLTAGE_BY_DUTY_CYCLE_AND_SEQUENCE_TIME:
-                raise ValueError(f"Invalid voltage_table option '{voltage_table}'. Valid options are: {tuple(MAX_VOLTAGE_BY_DUTY_CYCLE_AND_SEQUENCE_TIME.keys())}")
-        return MAX_VOLTAGE_BY_DUTY_CYCLE_AND_SEQUENCE_TIME[evt_version]
-
-    def _load_voltage_table(self) -> None:
-        """Populate ``self.voltage_table`` / ``self.duty_cycles`` / ``self.sequence_time``
-        from the currently selected profile."""
-        entry = self._resolve_voltage_chart(self.voltage_table_selection)
-        self.duty_cycles = entry["duty_cycles"]
-        self.sequence_time = entry["sequence_times"]
-        self.voltage_table = entry["voltages"]
+    def _create_devices(self, vid: int, tx_pid: int, con_pid: int, baudrate: int,
+                        timeout: float, TX_test_mode: bool,
+                        HV_test_mode: bool) -> tuple[TxDevice, Optional[HVController]]:
+        """Construct the TX and HV components (before they connect)."""
+        txdevice = TxDevice(vid=vid, pid=tx_pid, baudrate=baudrate, timeout=timeout, test_mode=TX_test_mode)
+        hvcontroller = HVController(vid=vid, pid=con_pid, baudrate=baudrate, timeout=timeout, test_mode=HV_test_mode)
+        return txdevice, hvcontroller
 
     async def start_monitoring(self, interval: int = 1) -> None:
         """Start monitoring for USB device connections."""
@@ -327,179 +305,52 @@ class LIFUInterface:
             hv_connected = self.hvcontroller.is_connected()
         return tx_connected, hv_connected
 
-    def get_max_voltage(self, solution: Dict) -> float:
-        """
-        Get the maximum voltage for a given solution.
-
-        Args:
-            solution (Dict): The solution to check.
-
-        Returns:
-            float: The maximum voltage for the solution.
-        """
-        
-        sequence_duty_cycle = self.get_sequence_duty_cycle(solution)
-        sequence_duration = self.get_sequence_duration(solution)
-
-        # Find the index of the duty cycle in the reference list
-        duty_cycles_limits = np.array(self.duty_cycles)
-        duty_cycle_index = np.where(duty_cycles_limits >= sequence_duty_cycle)[0][0]
-
-        # Find the index of the duration in the reference list
-        duration_limits = np.array(self.sequence_time)
-        duration_index = np.where(duration_limits >= sequence_duration)[0][0]
-
-        # Return the maximum voltage for the given duty cycle and duration
-        return self.voltage_table[duty_cycle_index][duration_index]
-
-    def get_max_voltage_table(self) -> pd.DataFrame:
-        """
-        Get a table of the maximum voltages for different duty cycles and sequence times.
-
-        Returns:
-            pd.DataFrame: A DataFrame containing the maximum voltages.
-        """
-        data = {
-            "Duty Cycle (%)": [f"<={100 * dc:0.1f}%" for dc in self.duty_cycles],
-            }
-        for i, duration in enumerate(self.sequence_time):
-            col_name = f"<={duration // 60} min"
-            data[col_name] = [
-                self.voltage_table[j][i] for j in range(len(self.duty_cycles))
-            ]
-        max_voltage =  pd.DataFrame(data).set_index("Duty Cycle (%)")
-        max_voltage.Name = "Maximum Voltage (V)"
-        max_voltage.Description = "This table shows the maximum voltage for different duty cycles and sequence times."
-        return max_voltage
-
-    def check_solution(self, solution: Dict) -> None:
-        """Check that the solution is within the configured safety limits.
-
-        Raises:
-            LIFUSolutionError: If the solution exceeds any safety limit.
-        """
-        self._load_voltage_table()
-        sequence_duty_cycle = self.get_sequence_duty_cycle(solution)
-        duty_cycles_limits = np.array(self.duty_cycles)
-        if sequence_duty_cycle > duty_cycles_limits.max():
-            raise LIFUSolutionError(f"Sequence duty cycle ({100*sequence_duty_cycle:0.1f} %) exceeds maximum allowed duty cycle ({100*duty_cycles_limits.max():0.1f} %).")
-        duty_cycle_index = np.where(duty_cycles_limits >= sequence_duty_cycle)[0][0]
-
-        sequence_duration = self.get_sequence_duration(solution)
-        duration_limits = np.array(self.sequence_time)
-        if sequence_duration > duration_limits.max():
-            raise LIFUSolutionError(f"Sequence duration ({sequence_duration:0.0f} s) exceeds maximum allowed duration ({duration_limits.max()} s).")
-        duration_index = np.where(duration_limits >= sequence_duration)[0][0]
-
-        max_voltage = self.voltage_table[duty_cycle_index][duration_index]
-        if solution['voltage'] > max_voltage:
-            raise LIFUSolutionError(f"Voltage ({solution['voltage']:0.1f}V) exceeds maximum allowed voltage ({max_voltage:0.1f}V) for duty cycle ({100*sequence_duty_cycle:0.1f} <= {100*duty_cycles_limits[duty_cycle_index]}%) and sequence time ({sequence_duration:0.0f} <= {duration_limits[duration_index]}s).")
-
-    def get_sequence_duty_cycle(self, solution: Dict) -> float:
-        """
-        Get the duty cycle of the sequence in the solution.
-
-        Args:
-            solution (Dict): The solution to check.
-
-        Returns:
-            float: The duty cycle of the sequence.
-        """
-        
-
-        if solution['sequence']['pulse_train_interval'] == 0:
-            return solution['pulse']['duration'] / solution['sequence']['pulse_interval']
-        else:
-            return (solution['pulse']['duration'] * solution['sequence']['pulse_count']) / solution['sequence']['pulse_train_interval']
-
-    def get_sequence_duration(self, solution: Dict) -> float:
-        """
-        Get the duration of the sequence in the solution.
-
-        Args:
-            solution (Dict): The solution to check.
-
-        Returns:
-            float: The duration of the sequence.
-        """
-        
-
-        if solution['sequence']['pulse_train_interval'] == 0:
-            return solution['sequence']['pulse_interval'] * solution['sequence']['pulse_count'] * solution['sequence']['pulse_train_count']
-        else:
-            return solution['sequence']['pulse_train_interval'] * solution['sequence']['pulse_train_count']
-
-    def set_module_invert(self, module_invert: bool | List[bool]) -> None:
-        if self.txdevice is not None:
-            self.txdevice.set_module_invert(module_invert)
-
-    def set_solution(self,
-                     solution: Dict,
-                     profile_index:int=1,
-                     profile_increment:bool=True,
-                     trigger_mode: TriggerModeOpts = "sequence",
-                     turn_hv_on: bool = False,
-                     wait_for_settle: bool = False,
-                     _allow_unsafe_solution: bool = False
-                     ) -> bool:
-        """Load a solution to the device.
-
-        Args:
-            solution: The solution to load.
-            profile_index: The profile index to load the solution to (defaults to 1).
-            profile_increment: Increment the profile index.
-            trigger_mode: The trigger mode to use (defaults to "sequence").
-            turn_hv_on: If True, turn on HV after loading the solution.
-            wait_for_settle: If True, wait for HV to settle after turning on.
-            _allow_unsafe_solution: Skip :meth:`check_solution` if True.
-
-        Raises:
-            LIFUSolutionError: If the solution fails safety checks (unless
-                *_allow_unsafe_solution* is True).
-            LIFUError: On any device-communication failure.
-            LIFUHVSettleError: If *wait_for_settle* is requested and the HV
-                rail does not settle in time.
-        """
-        if not _allow_unsafe_solution:
-            self.check_solution(solution)
-
-        if "transducer" in solution and solution["transducer"] is not None and "module_invert" in solution["transducer"]:
-            self.txdevice.set_module_invert(solution["transducer"]["module_invert"])
-        else:
-            self.txdevice.set_module_invert(False)
-
+    def load_preset(self,
+                    preset_index: int,
+                    settings_crc: int,
+                    regs_crc: int,
+                    frequency_hz: float,
+                    duration_index: int = 0,
+                    turn_hv_on: bool = False,
+                    wait_for_settle: bool = False) -> bool:
+        """Load an FDA preset across TX and HV in one operation."""
         self.set_status(LIFUInterfaceStatus.STATUS_PROGRAMMING)
-
-        if "name" in solution:
-            solution_name = f'Solution "{solution["name"]}"'
-        else:
-            solution_name = "Solution"
-
-        voltage = solution['voltage']
-        logger.debug("Loading %s...", solution_name)
-        self.txdevice.set_solution(
-            pulse=solution['pulse'],
-            delays=solution['delays'],
-            apodizations=solution['apodizations'],
-            sequence=solution['sequence'],
-            profile_index=profile_index,
-            profile_increment=profile_increment,
-            trigger_mode=trigger_mode,
-            execution_order=solution.get('execution_order'),
-            pulse_profile_map=solution.get('pulse_profile_map'),
+        self.txdevice.load_preset(
+            preset_index,
+            regs_crc,
+            duration_index=duration_index,
         )
-        self.set_status(LIFUInterfaceStatus.STATUS_READY)
 
         if self.hvcontroller is not None:
-            self.hvcontroller.set_voltage(voltage)
-            logger.debug("Set HV to %.2f", self.hvcontroller.supply_voltage)
+            if not self.txdevice.module_user_configs:
+                self.txdevice.refresh_metadata()
+            device_sensitivity = self.txdevice.get_sensitivity_for_frequency(frequency_hz)
+            if device_sensitivity is None:
+                raise LIFUSolutionError(
+                    f"TX device sensitivity is unavailable at {frequency_hz:.3f} Hz; cannot select FDA preset on HV."
+                )
+
+            self.hvcontroller.select_preset(
+                preset_index,
+                settings_crc,
+                device_sensitivity,
+                frequency_hz,
+            )
+            logger.debug(
+                "Selected HV preset %d using TX sensitivity %.6g at %.3f Hz",
+                preset_index,
+                device_sensitivity,
+                frequency_hz,
+            )
             if turn_hv_on:
                 logger.debug("Turn ON HV")
                 self.hvcontroller.turn_hv_on()
             if self.hvcontroller.get_hv_status() and wait_for_settle:
                 logger.debug("Wait for Settle")
                 self.hvcontroller.wait_for_settle(timeout=SETTLE_TIME_HV_ON)
-        logger.info("%s loaded successfully.", solution_name)
+
+        self.set_status(LIFUInterfaceStatus.STATUS_READY)
+        logger.info("Preset %d loaded successfully.", preset_index)
         return True
 
     def start_sonication(self, async_mode: bool | None = None, turn_hv_on: bool = True, wait_for_settle: bool = True) -> bool:
@@ -680,3 +531,253 @@ class LIFUInterface:
         return getattr(
             openlifu_sdk, "__version__", None
         ) or importlib.metadata.version("openlifu-sdk")
+
+
+class LIFUInterface(DeviceInterface):
+    """Research (RUO) interface: :class:`DeviceInterface` plus endpoints that
+    program arbitrary solutions and HV setpoints, gated by the host-side
+    duty-cycle / duration voltage tables.
+    """
+
+    def __init__(self,
+                 vid: int = OW_VID,
+                 tx_pid: int = OW_TRANSMITTER_PID,
+                 con_pid: int = OW_CONSOLE_PID,
+                 baudrate: int = 921600,
+                 timeout: float = DEFAULT_TIMEOUT,
+                 TX_test_mode: bool = False,
+                 HV_test_mode: bool = False,
+                 run_async: bool = False,
+                 ext_power_supply: bool = False,
+                 module_invert: bool | List[bool] = False,
+                 voltage_table_selection: Optional[str] = None) -> None:
+        """
+        Initialize the LIFUInterface with given parameters and store them in the class.
+
+        Args:
+            vid (int): Vendor ID of the USB device.
+            tx_pid (int): Product ID for TX device.
+            con_pid (int): Product ID for console device.
+            baudrate (int): Communication baud rate.
+            timeout (int): Read timeout in seconds.
+            TX_test_mode (bool): Enable TX test mode.
+            HV_test_mode (bool): Enable HV test mode.
+            run_async (bool): Enable asynchronous operation.
+            ext_power_supply (bool): Use an external HV supply; no HV controller is created.
+            module_invert (bool | List[bool]): Initial TX module invert configuration.
+            voltage_table_selection (str | None): Voltage-table profile used by
+                :meth:`check_solution`; inferred from the HV version if None.
+        """
+        self.voltage_table = None
+        self.sequence_time = None
+        self.duty_cycles = None
+        self.voltage_table_selection = voltage_table_selection
+        self._ext_power_supply = ext_power_supply
+        self._module_invert = module_invert
+        super().__init__(vid=vid, tx_pid=tx_pid, con_pid=con_pid, baudrate=baudrate,
+                         timeout=timeout, TX_test_mode=TX_test_mode,
+                         HV_test_mode=HV_test_mode, run_async=run_async)
+
+    def _create_devices(self, vid: int, tx_pid: int, con_pid: int, baudrate: int,
+                        timeout: float, TX_test_mode: bool,
+                        HV_test_mode: bool) -> tuple[TxDevice, Optional[HVController]]:
+        txdevice = TxDevice(vid=vid, pid=tx_pid, baudrate=baudrate, timeout=timeout, test_mode=TX_test_mode, module_invert=self._module_invert)
+        if self._ext_power_supply:
+            logger.debug("External power supply selected, skipping HVController initialization.")
+            return txdevice, None
+        hvcontroller = HVController(vid=vid, pid=con_pid, baudrate=baudrate, timeout=timeout, test_mode=HV_test_mode)
+        return txdevice, hvcontroller
+
+    # Temporary fix for hardware variations between EVT0 and EVT2
+    def _resolve_voltage_chart(self, voltage_table: Optional[str]) -> dict:
+        """Return the voltage-table entry (``duty_cycles`` / ``sequence_times`` / ``voltages``)
+        for the requested profile.
+
+        If *voltage_table* is ``None``, the profile is inferred from the connected
+        HV controller's reported version.
+        """
+        if voltage_table is None:
+            evt_version = "evt0" if self.hvcontroller.get_version().startswith("v1.1") else "dvt"
+        else:
+            evt_version = voltage_table.lower()
+            if evt_version not in MAX_VOLTAGE_BY_DUTY_CYCLE_AND_SEQUENCE_TIME:
+                raise ValueError(f"Invalid voltage_table option '{voltage_table}'. Valid options are: {tuple(MAX_VOLTAGE_BY_DUTY_CYCLE_AND_SEQUENCE_TIME.keys())}")
+        return MAX_VOLTAGE_BY_DUTY_CYCLE_AND_SEQUENCE_TIME[evt_version]
+
+    def _load_voltage_table(self) -> None:
+        """Populate ``self.voltage_table`` / ``self.duty_cycles`` / ``self.sequence_time``
+        from the currently selected profile."""
+        entry = self._resolve_voltage_chart(self.voltage_table_selection)
+        self.duty_cycles = entry["duty_cycles"]
+        self.sequence_time = entry["sequence_times"]
+        self.voltage_table = entry["voltages"]
+
+    def get_max_voltage(self, solution: Dict) -> float:
+        """
+        Get the maximum voltage for a given solution.
+
+        Args:
+            solution (Dict): The solution to check.
+
+        Returns:
+            float: The maximum voltage for the solution.
+        """
+        sequence_duty_cycle = self.get_sequence_duty_cycle(solution)
+        sequence_duration = self.get_sequence_duration(solution)
+
+        # Find the index of the duty cycle in the reference list
+        duty_cycles_limits = np.array(self.duty_cycles)
+        duty_cycle_index = np.where(duty_cycles_limits >= sequence_duty_cycle)[0][0]
+
+        # Find the index of the duration in the reference list
+        duration_limits = np.array(self.sequence_time)
+        duration_index = np.where(duration_limits >= sequence_duration)[0][0]
+
+        # Return the maximum voltage for the given duty cycle and duration
+        return self.voltage_table[duty_cycle_index][duration_index]
+
+    def get_max_voltage_table(self) -> pd.DataFrame:
+        """
+        Get a table of the maximum voltages for different duty cycles and sequence times.
+
+        Returns:
+            pd.DataFrame: A DataFrame containing the maximum voltages.
+        """
+        data = {
+            "Duty Cycle (%)": [f"<={100 * dc:0.1f}%" for dc in self.duty_cycles],
+            }
+        for i, duration in enumerate(self.sequence_time):
+            col_name = f"<={duration // 60} min"
+            data[col_name] = [
+                self.voltage_table[j][i] for j in range(len(self.duty_cycles))
+            ]
+        max_voltage =  pd.DataFrame(data).set_index("Duty Cycle (%)")
+        max_voltage.Name = "Maximum Voltage (V)"
+        max_voltage.Description = "This table shows the maximum voltage for different duty cycles and sequence times."
+        return max_voltage
+
+    def check_solution(self, solution: Dict) -> None:
+        """Check that the solution is within the configured safety limits.
+
+        Raises:
+            LIFUSolutionError: If the solution exceeds any safety limit.
+        """
+        self._load_voltage_table()
+        sequence_duty_cycle = self.get_sequence_duty_cycle(solution)
+        duty_cycles_limits = np.array(self.duty_cycles)
+        if sequence_duty_cycle > duty_cycles_limits.max():
+            raise LIFUSolutionError(f"Sequence duty cycle ({100*sequence_duty_cycle:0.1f} %) exceeds maximum allowed duty cycle ({100*duty_cycles_limits.max():0.1f} %).")
+        duty_cycle_index = np.where(duty_cycles_limits >= sequence_duty_cycle)[0][0]
+
+        sequence_duration = self.get_sequence_duration(solution)
+        duration_limits = np.array(self.sequence_time)
+        if sequence_duration > duration_limits.max():
+            raise LIFUSolutionError(f"Sequence duration ({sequence_duration:0.0f} s) exceeds maximum allowed duration ({duration_limits.max()} s).")
+        duration_index = np.where(duration_limits >= sequence_duration)[0][0]
+
+        max_voltage = self.voltage_table[duty_cycle_index][duration_index]
+        if solution['voltage'] > max_voltage:
+            raise LIFUSolutionError(f"Voltage ({solution['voltage']:0.1f}V) exceeds maximum allowed voltage ({max_voltage:0.1f}V) for duty cycle ({100*sequence_duty_cycle:0.1f} <= {100*duty_cycles_limits[duty_cycle_index]}%) and sequence time ({sequence_duration:0.0f} <= {duration_limits[duration_index]}s).")
+
+    def get_sequence_duty_cycle(self, solution: Dict) -> float:
+        """
+        Get the duty cycle of the sequence in the solution.
+
+        Args:
+            solution (Dict): The solution to check.
+
+        Returns:
+            float: The duty cycle of the sequence.
+        """
+        if solution['sequence']['pulse_train_interval'] == 0:
+            return solution['pulse']['duration'] / solution['sequence']['pulse_interval']
+        else:
+            return (solution['pulse']['duration'] * solution['sequence']['pulse_count']) / solution['sequence']['pulse_train_interval']
+
+    def get_sequence_duration(self, solution: Dict) -> float:
+        """
+        Get the duration of the sequence in the solution.
+
+        Args:
+            solution (Dict): The solution to check.
+
+        Returns:
+            float: The duration of the sequence.
+        """
+        if solution['sequence']['pulse_train_interval'] == 0:
+            return solution['sequence']['pulse_interval'] * solution['sequence']['pulse_count'] * solution['sequence']['pulse_train_count']
+        else:
+            return solution['sequence']['pulse_train_interval'] * solution['sequence']['pulse_train_count']
+
+    def set_module_invert(self, module_invert: bool | List[bool]) -> None:
+        if self.txdevice is not None:
+            self.txdevice.set_module_invert(module_invert)
+
+    def set_solution(self,
+                     solution: Dict,
+                     profile_index:int=1,
+                     profile_increment:bool=True,
+                     trigger_mode: TriggerModeOpts = "sequence",
+                     turn_hv_on: bool = False,
+                     wait_for_settle: bool = False,
+                     _allow_unsafe_solution: bool = False
+                     ) -> bool:
+        """Load a solution to the device.
+
+        Args:
+            solution: The solution to load.
+            profile_index: The profile index to load the solution to (defaults to 1).
+            profile_increment: Increment the profile index.
+            trigger_mode: The trigger mode to use (defaults to "sequence").
+            turn_hv_on: If True, turn on HV after loading the solution.
+            wait_for_settle: If True, wait for HV to settle after turning on.
+            _allow_unsafe_solution: Skip :meth:`check_solution` if True.
+
+        Raises:
+            LIFUSolutionError: If the solution fails safety checks (unless
+                *_allow_unsafe_solution* is True).
+            LIFUError: On any device-communication failure.
+            LIFUHVSettleError: If *wait_for_settle* is requested and the HV
+                rail does not settle in time.
+        """
+        if not _allow_unsafe_solution:
+            self.check_solution(solution)
+
+        if "transducer" in solution and solution["transducer"] is not None and "module_invert" in solution["transducer"]:
+            self.txdevice.set_module_invert(solution["transducer"]["module_invert"])
+        else:
+            self.txdevice.set_module_invert(False)
+
+        self.set_status(LIFUInterfaceStatus.STATUS_PROGRAMMING)
+
+        if "name" in solution:
+            solution_name = f'Solution "{solution["name"]}"'
+        else:
+            solution_name = "Solution"
+
+        voltage = solution['voltage']
+        logger.debug("Loading %s...", solution_name)
+        self.txdevice.set_solution(
+            pulse=solution['pulse'],
+            delays=solution['delays'],
+            apodizations=solution['apodizations'],
+            sequence=solution['sequence'],
+            profile_index=profile_index,
+            profile_increment=profile_increment,
+            trigger_mode=trigger_mode,
+            execution_order=solution.get('execution_order'),
+            pulse_profile_map=solution.get('pulse_profile_map'),
+        )
+        self.set_status(LIFUInterfaceStatus.STATUS_READY)
+
+        if self.hvcontroller is not None:
+            self.hvcontroller.set_voltage(voltage)
+            logger.debug("Set HV to %.2f", self.hvcontroller.supply_voltage)
+            if turn_hv_on:
+                logger.debug("Turn ON HV")
+                self.hvcontroller.turn_hv_on()
+            if self.hvcontroller.get_hv_status() and wait_for_settle:
+                logger.debug("Wait for Settle")
+                self.hvcontroller.wait_for_settle(timeout=SETTLE_TIME_HV_ON)
+        logger.info("%s loaded successfully.", solution_name)
+        return True
