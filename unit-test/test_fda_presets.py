@@ -24,6 +24,7 @@ if _SRC not in sys.path:
 
 from openlifu_sdk.io.LIFUConfig import OW_RESP
 from openlifu_sdk.io.LIFUHVController import HVController
+from openlifu_sdk.io.LIFUInterface import DeviceInterface, LIFUInterface, LIFUInterfaceStatus
 from openlifu_sdk.io.LIFUTXDevice import TxDevice
 from openlifu_sdk.io.LIFUTXPresets import (
     compile_preset,
@@ -37,6 +38,7 @@ from openlifu_sdk.io.LIFUTXPresets import (
     thermal_limits,
     verify_console_preset,
 )
+from openlifu_sdk.io.LIFUUserConfig import LifuUserConfig
 from openlifu_sdk.io.uart import OWUart
 
 
@@ -285,6 +287,25 @@ class TestDeviceReplies(unittest.TestCase):
         self.assertEqual((sent["reserved"], bytes(sent["data"])), (1, struct.pack("<I", 0xABCD)))
         self.assertEqual(hv.supply_voltage, 30.5)   # wait_for_settle aims at it
 
+    def test_console_select_preset_with_device_sensitivity(self):
+        hv = HVController()
+        uart = _mock_uart(hv, "HV")
+        uart.send_packet.side_effect = [_packet(b""), _packet(self._console_reply(1, 0xABCD, 30.5))]
+        hv.select_preset(1, 0xABCD, 2720.0, 400000.0)
+        sent = uart.send_packet.call_args_list[0].kwargs
+        self.assertEqual(sent["reserved"], 1)
+        self.assertEqual(bytes(sent["data"]), struct.pack("<Iff", 0xABCD, 2720.0, 400000.0))
+        self.assertEqual(hv.supply_voltage, 30.5)
+
+    def test_console_select_preset_rejects_partial_scaling_args(self):
+        hv = HVController()
+        uart = _mock_uart(hv, "HV")
+        with self.assertRaises(ValueError):
+            hv.select_preset(1, 0xABCD, 2720.0)
+        with self.assertRaises(ValueError):
+            hv.select_preset(1, 0xABCD, frequency_hz=400000.0)
+        uart.send_packet.assert_not_called()
+
     def test_verify_console_preset(self):
         mc = _compiled(id="a", voltage=47.66997571)
         hv = MagicMock()
@@ -297,6 +318,103 @@ class TestDeviceReplies(unittest.TestCase):
         hv.get_preset.return_value = None
         with self.assertRaisesRegex(ValueError, "not an FDA_MODE image"):
             verify_console_preset(hv, 0, mc)
+
+
+class TestTxMetadata(unittest.TestCase):
+
+    def test_refresh_metadata_sets_identity_and_frequency_specific_sensitivity(self):
+        tx = TxDevice()
+        tx.get_module_count = MagicMock(return_value=2)
+        tx.read_config = MagicMock(side_effect=[
+            LifuUserConfig(json_data={
+                "sn": "SN-001",
+                "hwid": "HWID-001",
+                "module": {
+                    "frequency": 400000.0,
+                    "sensitivity": [[350000.0, 2.0], [400000.0, 4.0], [450000.0, 6.0]],
+                },
+            }),
+            LifuUserConfig(json_data={
+                "sn": "SN-002",
+                "hwid": "HWID-002",
+                "module": {
+                    "frequency": 400000.0,
+                    "sensitivity": [[350000.0, 4.0], [400000.0, 8.0], [450000.0, 10.0]],
+                },
+            }),
+        ])
+        tx.get_hardware_id = MagicMock(return_value="FALLBACK-HWID")
+
+        tx.refresh_metadata()
+
+        self.assertEqual(tx.serial_number, "SN-001")
+        self.assertEqual(tx.hwid, "HWID-001")
+        self.assertEqual(tx.hardware_id, "HWID-001")
+        self.assertEqual(len(tx.module_user_configs), 2)
+        self.assertEqual(tx.get_sensitivity_for_frequency(400000.0), 6.0)
+        self.assertEqual(tx.get_sensitivity_for_frequency(450000.0), 8.0)
+        self.assertEqual(tx.get_sensitivity_for_frequency(425000.0), 7.0)
+
+
+class TestInterfacePresetLoad(unittest.TestCase):
+
+    def test_load_preset_orchestrates_tx_and_hv(self):
+        iface = object.__new__(DeviceInterface)
+        iface.txdevice = MagicMock()
+        iface.txdevice.module_user_configs = [{"module": {"sensitivity": []}}]
+        iface.txdevice.get_sensitivity_for_frequency.return_value = 2720.0
+        iface.hvcontroller = MagicMock()
+        iface.status = LIFUInterfaceStatus.STATUS_SYS_OFF
+
+        iface.load_preset(1, 0xAABBCCDD, 0x11223344, 400000.0, duration_index=2)
+
+        iface.txdevice.load_preset.assert_called_once_with(1, 0x11223344, duration_index=2)
+        iface.txdevice.get_sensitivity_for_frequency.assert_called_once_with(400000.0)
+        iface.hvcontroller.select_preset.assert_called_once_with(1, 0xAABBCCDD, 2720.0, 400000.0)
+        self.assertEqual(iface.status, LIFUInterfaceStatus.STATUS_READY)
+
+    def test_load_preset_refreshes_missing_metadata(self):
+        iface = object.__new__(DeviceInterface)
+        iface.txdevice = MagicMock()
+        iface.txdevice.module_user_configs = []
+        iface.txdevice.get_sensitivity_for_frequency.return_value = 3000.0
+        iface.hvcontroller = MagicMock()
+        iface.status = LIFUInterfaceStatus.STATUS_SYS_OFF
+
+        iface.load_preset(0, 0xABCD, 0xDCBA, 500000.0)
+
+        iface.txdevice.refresh_metadata.assert_called_once_with()
+        iface.txdevice.get_sensitivity_for_frequency.assert_called_once_with(500000.0)
+        iface.hvcontroller.select_preset.assert_called_once_with(0, 0xABCD, 3000.0, 500000.0)
+
+
+class TestInterfaceSurface(unittest.TestCase):
+    """DeviceInterface is the FDA surface; LIFUInterface adds the RUO endpoints."""
+
+    RUO_ENDPOINTS = (
+        "set_solution", "check_solution", "set_module_invert",
+        "get_max_voltage", "get_max_voltage_table",
+        "get_sequence_duty_cycle", "get_sequence_duration",
+    )
+    FDA_ENDPOINTS = (
+        "load_preset", "start_sonication", "stop_sonication", "is_running",
+        "get_status", "is_device_connected", "start_monitoring",
+        "stop_monitoring", "close",
+    )
+
+    def test_lifu_interface_extends_device_interface(self):
+        self.assertTrue(issubclass(LIFUInterface, DeviceInterface))
+
+    def test_device_interface_has_no_ruo_endpoints(self):
+        for name in self.RUO_ENDPOINTS:
+            with self.subTest(name=name):
+                self.assertFalse(hasattr(DeviceInterface, name))
+                self.assertTrue(hasattr(LIFUInterface, name))
+
+    def test_device_interface_has_fda_endpoints(self):
+        for name in self.FDA_ENDPOINTS:
+            with self.subTest(name=name):
+                self.assertTrue(callable(getattr(DeviceInterface, name, None)))
 
 
 if __name__ == "__main__":

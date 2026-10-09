@@ -273,22 +273,38 @@ class HVController(OWComponent):
                 "settings_crc": settings_crc, "voltage": voltage,
                 "id": d[12:12 + d[11]].decode("ascii", "replace")}
 
-    def select_preset(self, index: int, settings_crc: int) -> bool:
+    def select_preset(self,
+                      index: int,
+                      settings_crc: int,
+                      device_sensitivity: float | None = None,
+                      frequency_hz: float | None = None) -> bool:
         """Apply preset *index*'s stored voltage (OW_POWER_PRESET_SELECT).
 
         The FDA_MODE way to set the HV: the console holds one voltage per
         preset and refuses set_voltage. *settings_crc* must be that preset's
         (LIFUTXPresets.compile_preset gives it), so a host holding a different
-        idea of preset N is refused. Select the same index loaded into the
+        idea of preset N is refused. When *device_sensitivity* and
+        *frequency_hz* are supplied (payload ``<Iff``), the console firmware
+        rescales from the preset's reference sensitivity to the connected TX
+        device's measured sensitivity at that frequency; otherwise the
+        payload is the bare ``<I`` CRC. Select the same index loaded into the
         transmitter, with HV off.
 
         Raises:
+            ValueError: Only one of *device_sensitivity* / *frequency_hz* given.
             LIFUDeviceError: No such index, OW_HV_PRESET_CRC (wrong
                 settings_crc), or OW_HV_FDA_REFUSED (HV is on).
             LIFUNotConnectedError, LIFUCommunicationError.
         """
+        if (device_sensitivity is None) != (frequency_hz is None):
+            raise ValueError("device_sensitivity and frequency_hz must be given together")
+        if device_sensitivity is None:
+            payload = struct.pack("<I", settings_crc)
+        else:
+            payload = struct.pack("<Iff", settings_crc,
+                                  float(device_sensitivity), float(frequency_hz))
         self.send_checked(packet_type=OW_POWER, command=OW_POWER_PRESET_SELECT,
-                          reserved=index, data=struct.pack("<I", settings_crc),
+                          reserved=index, data=payload,
                           op="select_preset")
         # wait_for_settle() aims at supply_voltage, which set_voltage no longer sets.
         self.supply_voltage = self.get_preset(index)["voltage"]

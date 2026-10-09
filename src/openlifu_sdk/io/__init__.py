@@ -11,10 +11,11 @@ from openlifu_sdk.io.exceptions import (
     LIFUSolutionError,
     LIFUSonicationError,
 )
-from openlifu_sdk.io.LIFUInterface import LIFUInterface, LIFUInterfaceStatus
+from openlifu_sdk.io.LIFUInterface import DeviceInterface, LIFUInterface, LIFUInterfaceStatus
 
 __all__ = [
     "LIFUInterface",
+    "DeviceInterface",
     "LIFUInterfaceStatus",
     "LIFUError",
     "LIFUNotConnectedError",

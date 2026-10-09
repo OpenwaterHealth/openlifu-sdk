@@ -62,6 +62,9 @@ else:
         _QT_BACKEND = "PythonQt"
 
 from openlifu_sdk.io import LIFUInterfaceStatus
+from openlifu_sdk.io.exceptions import LIFUDeviceError, LIFUSolutionError
+from openlifu_sdk.io.LIFUConfig import OW_BAD_CRC, OW_HV_PRESET_CRC
+from openlifu_sdk.io.LIFUUserConfig import sensitivity_at_frequency
 from openlifu_sdk.io.signal import OWSignal
 from openlifu_sdk.ui.status_frame import format_status_frame as _format_status_frame
 
@@ -161,6 +164,15 @@ class SimulatedTxDevice:
         }
         self._pulse = {"frequency": 400_000.0, "duration": 100e-6, "amplitude": 1.0}
         self._trigger_running = False
+        self._version = "sim-1.0.7"
+        self.serial_number: Optional[str] = None
+        self.hwid: Optional[str] = None
+        self.hardware_id: Optional[str] = None
+        self.module_user_configs: list[dict] = []
+        self._presets = [self._default_preset()]
+        self._loaded_preset_index: Optional[int] = None
+        self._loaded_duration_index = 0
+        self.refresh_metadata()
 
     # ---- helpers --------------------------------------------------------
 
@@ -197,6 +209,61 @@ class SimulatedTxDevice:
             },
             "device": {},
         }
+
+    def _default_preset(self) -> dict:
+        return {
+            "id": "sim-default",
+            "settings_crc": 0x12345678,
+            "regs_crc": 0x87654321,
+            "baked_regs_crc": 0x87654321,
+            "chip_count": self.num_modules * 2,
+            "profile_count": 1,
+            "train_counts": [int(self._sequence.get("pulse_train_count", 1))],
+            "start_c": 35.0,
+            "shutoff_c": 75.0,
+        }
+
+    def refresh_metadata(self) -> None:
+        self.module_user_configs = [dict(cfg) for cfg in self._user_configs]
+        primary = self.module_user_configs[0] if self.module_user_configs else {}
+        self.serial_number = primary.get("sn") if isinstance(primary.get("sn"), str) else None
+        hwid = primary.get("hwid") if isinstance(primary.get("hwid"), str) else None
+        self.hwid = hwid
+        self.hardware_id = hwid
+
+    def get_sensitivity_for_frequency(self, freq_hz: float) -> Optional[float]:
+        return sensitivity_at_frequency(self.module_user_configs, freq_hz)
+
+    def configure_presets(self, presets: List[dict]) -> None:
+        self._presets = [dict(preset) for preset in presets]
+
+    def get_preset(self, index: int) -> dict:
+        if not 0 <= index < len(self._presets):
+            raise LIFUDeviceError(f"TX: no preset at index {index}")
+        preset = dict(self._presets[index])
+        preset.setdefault("count", len(self._presets))
+        preset.setdefault("index", index)
+        return preset
+
+    def load_preset(self, index: int, regs_crc: int, duration_index: int = 0) -> bool:
+        preset = self.get_preset(index)
+        if int(preset.get("regs_crc", regs_crc)) != int(regs_crc):
+            raise LIFUDeviceError("TX: preset register CRC mismatch",
+                                  device_error_code=OW_BAD_CRC)
+        train_counts = list(preset.get("train_counts") or [])
+        if train_counts and not 0 <= duration_index < len(train_counts):
+            raise LIFUDeviceError(f"TX: preset has no duration index {duration_index}")
+        if train_counts:
+            self._sequence["pulse_train_count"] = int(train_counts[duration_index])
+        self._loaded_preset_index = index
+        self._loaded_duration_index = duration_index
+        self._normalize_train_interval()
+        return True
+
+    def get_loaded_preset(self) -> tuple[int, int] | None:
+        if self._loaded_preset_index is None:
+            return None
+        return (self._loaded_preset_index, self._loaded_duration_index)
 
     def is_connected(self) -> bool:
         return self._connected
@@ -241,7 +308,10 @@ class SimulatedTxDevice:
         return self._modules[module].read_ambient()
 
     def get_version(self, module: int = 0) -> str:
-        return "sim-1.0.7"
+        return self._version
+
+    def set_version(self, version: str) -> None:
+        self._version = str(version)
 
     def get_hardware_id(self, module: int = 0, raw_hex: bool = False) -> str:
         return f"{0xA0A1A2A3A4A5A6A7B0B1B2B3B4B5B6B7 + module:032X}"
@@ -256,6 +326,7 @@ class SimulatedTxDevice:
             self._user_configs[module] = json.loads(json_str)
         except Exception:
             logger.warning("SimulatedTxDevice.write_config_json: invalid json; ignored")
+        self.refresh_metadata()
         return LifuUserConfig(json_data=dict(self._user_configs[module]))
 
     def apply_simulated_transducer(self, arr) -> None:
@@ -308,6 +379,7 @@ class SimulatedTxDevice:
                 "id": getattr(arr, "id", None),
                 "name": getattr(arr, "name", None),
             }
+        self.refresh_metadata()
 
     def _normalize_train_interval(self):
         """Substitute pulse_train_interval=0 with pulse_count*pulse_interval."""
@@ -423,7 +495,22 @@ class SimulatedHVController:
         self._v12_on = True
         self._voltage_setpoint = 0.0
         self._rgb_state = 0
+        self._version = "sim-1.0.7"
         self.uart = None  # connector reads this for FW DFU; not used here
+        self.supply_voltage = 0.0
+        self.last_device_sensitivity: Optional[float] = None
+        self._selected_preset_index: Optional[int] = None
+        self._presets = [{
+            "count": 1,
+            "index": 0,
+            "selected": None,
+            "settings_crc": 0x12345678,
+            "voltage": 20.0,
+            "id": "sim-default",
+            "sensitivity_ref": None,
+            "min_voltage": 5.0,
+            "max_voltage": 100.0,
+        }]
 
     def is_connected(self) -> bool:
         return self._connected
@@ -465,7 +552,10 @@ class SimulatedHVController:
         return self._v12_on
 
     def get_version(self) -> str:
-        return "sim-1.0.7"
+        return self._version
+
+    def set_version(self, version: str) -> None:
+        self._version = str(version)
 
     def get_hardware_id(self, raw_hex: bool = False) -> str:
         return "C0C1C2C3C4C5C6C7D0D1D2D3D4D5D6D7"
@@ -478,6 +568,47 @@ class SimulatedHVController:
 
     def set_voltage(self, voltage: float) -> bool:
         self._voltage_setpoint = float(voltage)
+        self.supply_voltage = self._voltage_setpoint
+        return True
+
+    def configure_presets(self, presets: List[dict]) -> None:
+        self._presets = [dict(preset) for preset in presets]
+
+    def get_preset(self, index: int) -> dict | None:
+        if not 0 <= index < len(self._presets):
+            raise LIFUDeviceError(f"HV: no preset at index {index}")
+        preset = dict(self._presets[index])
+        preset.setdefault("count", len(self._presets))
+        preset.setdefault("index", index)
+        preset["selected"] = self._selected_preset_index
+        return preset
+
+    def select_preset(self,
+                      index: int,
+                      settings_crc: int,
+                      device_sensitivity: float | None = None,
+                      frequency_hz: float | None = None) -> bool:
+        if (device_sensitivity is None) != (frequency_hz is None):
+            raise ValueError("device_sensitivity and frequency_hz must be given together")
+        preset = self.get_preset(index)
+        if int(preset.get("settings_crc", settings_crc)) != int(settings_crc):
+            raise LIFUDeviceError("HV: preset settings CRC mismatch",
+                                  device_error_code=OW_HV_PRESET_CRC)
+        voltage = float(preset.get("voltage", 0.0))
+        ref_sensitivity = preset.get("sensitivity_ref")
+        if (
+            ref_sensitivity is not None
+            and isinstance(device_sensitivity, (int, float))
+            and float(device_sensitivity) > 0.0
+        ):
+            voltage *= float(ref_sensitivity) / float(device_sensitivity)
+        min_voltage = float(preset.get("min_voltage", voltage))
+        max_voltage = float(preset.get("max_voltage", voltage))
+        voltage = max(min_voltage, min(max_voltage, voltage))
+        self._selected_preset_index = index
+        self.last_device_sensitivity = float(device_sensitivity) if isinstance(device_sensitivity, (int, float)) else None
+        self._voltage_setpoint = voltage
+        self.supply_voltage = voltage
         return True
 
     def get_voltage(self) -> float:
@@ -729,11 +860,11 @@ class _SimulatedRunEngine(QObject):
 
 
 # =============================================================================
-# Simulated LIFUInterface (top-level fake)
+# Simulated DeviceInterface (top-level FDA fake)
 # =============================================================================
 
-class SimulatedLIFUInterface(QObject):
-    """Drop-in fake for :class:`openlifu_sdk.LIFUInterface`."""
+class SimulatedDeviceInterface(QObject):
+    """Drop-in fake for the FDA-facing :class:`openlifu_sdk.io.DeviceInterface`."""
 
     #: Class-level marker so callers can cheaply distinguish a simulated
     #: interface from a real :class:`~openlifu_sdk.io.LIFUInterface`
@@ -742,7 +873,7 @@ class SimulatedLIFUInterface(QObject):
 
     def __init__(self, num_modules: int = 1,
                  transducer=None,
-                 voltage_table_selection: Optional[str] = None,
+                 preset_flash: Optional[list[tuple[dict, int]]] = None,
                  **_unused):
         # When a transducer (array) is supplied, derive num_modules from it
         # so the TX device is built with the right module count up front.
@@ -755,11 +886,41 @@ class SimulatedLIFUInterface(QObject):
         self.hvcontroller = SimulatedHVController()
         self.status = LIFUInterfaceStatus.STATUS_SYS_OFF
         self._engine: Optional[_SimulatedRunEngine] = None
-        self.voltage_table_selection = voltage_table_selection
         self._last_solution_voltage = 0.0
         self._last_trigger_mode = "sequence"
         if transducer is not None and getattr(transducer, "modules", None) is not None:
             self.txdevice.apply_simulated_transducer(transducer)
+        if preset_flash is not None:
+            tx_presets: list[dict] = []
+            hv_presets: list[dict] = []
+            for index, (machine_config, regs_crc) in enumerate(preset_flash):
+                tx_presets.append({
+                    "count": len(preset_flash),
+                    "index": index,
+                    "chip_count": self.txdevice.num_modules * 2,
+                    "profile_count": 1,
+                    "id": machine_config.get("id", f"preset-{index}"),
+                    "settings_crc": int(machine_config.get("settings_crc", 0)),
+                    "regs_crc": int(regs_crc),
+                    "baked_regs_crc": int(regs_crc),
+                    "train_counts": list(machine_config.get("pulse_train_count_selections") or []),
+                    "start_c": machine_config.get("start_C"),
+                    "shutoff_c": machine_config.get("shutoff_C"),
+                })
+                voltage_range = machine_config.get("voltage_range") or [machine_config.get("voltage", 0.0), machine_config.get("voltage", 0.0)]
+                hv_presets.append({
+                    "count": len(preset_flash),
+                    "index": index,
+                    "selected": None,
+                    "settings_crc": int(machine_config.get("settings_crc", 0)),
+                    "voltage": float(machine_config.get("voltage", 0.0)),
+                    "id": machine_config.get("id", f"preset-{index}"),
+                    "sensitivity_ref": machine_config.get("sensitivity"),
+                    "min_voltage": float(voltage_range[0]),
+                    "max_voltage": float(voltage_range[1]),
+                })
+            self.txdevice.configure_presets(tx_presets)
+            self.hvcontroller.configure_presets(hv_presets)
 
     # ---- monitoring lifecycle -------------------------------------------
 
@@ -770,7 +931,7 @@ class SimulatedLIFUInterface(QObject):
         delay_ms = int(AUTO_CONNECT_DELAY_S * 1000)
 
         def _connect():
-            logger.info("SimulatedLIFUInterface: emitting auto-connect for HV + TX")
+            logger.info("SimulatedDeviceInterface: emitting auto-connect for HV + TX")
             self.hvcontroller.emit_connected()
             self.txdevice.emit_connected()
 
@@ -783,29 +944,32 @@ class SimulatedLIFUInterface(QObject):
     def is_device_connected(self):
         return (self.txdevice.is_connected(), self.hvcontroller.is_connected())
 
-    # ---- solution / sonication ------------------------------------------
+    # ---- FDA preset / sonication ----------------------------------------
 
-    def set_solution(self, solution, profile_index=1, profile_increment=True,
-                     trigger_mode="sequence", turn_hv_on: bool = False,
-                     wait_for_settle: bool = False,
-                     _allow_unsafe_solution: bool = False):
-        """Skip safety checks; just store the bits the run engine needs."""
-        voltage = float(solution.get("voltage", 0.0))
-        self._last_solution_voltage = voltage
-        self._last_trigger_mode = str(trigger_mode).lower()
-        self.txdevice.set_solution(
-            pulse=solution.get("pulse"),
-            sequence=solution.get("sequence"),
-            trigger_mode=trigger_mode,
+    def load_preset(self, preset_index: int, settings_crc: int, regs_crc: int,
+                    frequency_hz: float,
+                    duration_index: int = 0, turn_hv_on: bool = False,
+                    wait_for_settle: bool = False) -> bool:
+        self.txdevice.load_preset(preset_index, regs_crc, duration_index)
+        if not self.txdevice.module_user_configs:
+            self.txdevice.refresh_metadata()
+        device_sensitivity = self.txdevice.get_sensitivity_for_frequency(frequency_hz)
+        if device_sensitivity is None:
+            raise LIFUSolutionError(
+                f"TX device sensitivity is unavailable at {frequency_hz:.3f} Hz; "
+                "cannot select FDA preset on HV.")
+        self.hvcontroller.select_preset(
+            preset_index,
+            settings_crc,
+            device_sensitivity,
+            frequency_hz,
         )
-        # Real LIFUInterface.set_solution pushes the voltage setpoint
-        # down to the HV controller as part of loading the solution.
-        # Mirror that so QML's vmon plots / rail readouts track the
-        # configured value.
-        self.hvcontroller.set_voltage(voltage)
+        self._last_solution_voltage = self.hvcontroller.supply_voltage or self._last_solution_voltage
         self.set_status(LIFUInterfaceStatus.STATUS_READY)
         if turn_hv_on:
             self.hvcontroller.turn_hv_on()
+        if wait_for_settle:
+            time.sleep(0.2)
         return True
 
     def start_sonication(self, async_mode: Optional[bool] = None,
@@ -857,12 +1021,6 @@ class SimulatedLIFUInterface(QObject):
     def get_status(self) -> LIFUInterfaceStatus:
         return self.status
 
-    def check_solution(self, solution):  # always passes
-        return None
-
-    def set_module_invert(self, module_invert):
-        self.txdevice.set_module_invert(module_invert)
-
     def close(self):
         if self._engine is not None:
             self._engine.stop()
@@ -877,7 +1035,54 @@ class SimulatedLIFUInterface(QObject):
             pass
 
 
+# =============================================================================
+# Simulated LIFUInterface (backwards-compatible RUO superset)
+# =============================================================================
+
+class SimulatedLIFUInterface(SimulatedDeviceInterface):
+    """Compatibility fake for the research/RUO :class:`openlifu_sdk.LIFUInterface`."""
+
+    def __init__(self, num_modules: int = 1,
+                 transducer=None,
+                 voltage_table_selection: Optional[str] = None,
+                 preset_flash: Optional[list[tuple[dict, int]]] = None,
+                 **_unused):
+        super().__init__(num_modules=num_modules, transducer=transducer,
+                         preset_flash=preset_flash)
+        self.voltage_table_selection = voltage_table_selection
+
+    def set_module_invert(self, module_invert):
+        self.txdevice.set_module_invert(module_invert)
+
+    def set_solution(self, solution, profile_index=1, profile_increment=True,
+                     trigger_mode="sequence", turn_hv_on: bool = False,
+                     wait_for_settle: bool = False,
+                     _allow_unsafe_solution: bool = False):
+        """Skip safety checks; just store the bits the run engine needs."""
+        voltage = float(solution.get("voltage", 0.0))
+        self._last_solution_voltage = voltage
+        self._last_trigger_mode = str(trigger_mode).lower()
+        self.txdevice.set_solution(
+            pulse=solution.get("pulse"),
+            sequence=solution.get("sequence"),
+            trigger_mode=trigger_mode,
+        )
+        # Real LIFUInterface.set_solution pushes the voltage setpoint
+        # down to the HV controller as part of loading the solution.
+        # Mirror that so QML's vmon plots / rail readouts track the
+        # configured value.
+        self.hvcontroller.set_voltage(voltage)
+        self.set_status(LIFUInterfaceStatus.STATUS_READY)
+        if turn_hv_on:
+            self.hvcontroller.turn_hv_on()
+        return True
+
+    def check_solution(self, solution):  # always passes
+        return None
+
+
 __all__ = [
+    "SimulatedDeviceInterface",
     "SimulatedHVController",
     "SimulatedLIFUInterface",
     "SimulatedTxDevice",

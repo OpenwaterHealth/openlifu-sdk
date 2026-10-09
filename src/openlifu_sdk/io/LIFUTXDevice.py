@@ -5,7 +5,7 @@ import logging
 import re
 import struct
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Annotated, Dict, List, Literal
+from typing import TYPE_CHECKING, Annotated, Dict, List, Literal, Optional
 
 import numpy as np
 
@@ -53,6 +53,7 @@ from openlifu_sdk.io.LIFUConfig import (
     TRIGGER_MODE_SINGLE,
     TX7332_COMMANDS
 )
+from openlifu_sdk.io.LIFUUserConfig import sensitivity_at_frequency
 from openlifu_sdk.util.annotations import OpenLIFUFieldData
 from openlifu_sdk.util.units import getunitconversion
 
@@ -205,6 +206,35 @@ class TxDevice(OWComponent):
         self.tx_registers = None
         self._test_mode = test_mode
         self.module_invert = module_invert
+        self.serial_number: Optional[str] = None
+        self.hwid: Optional[str] = None
+        self.hardware_id: Optional[str] = None
+        self.module_user_configs: list[dict] = []
+
+    def get_sensitivity_for_frequency(self, freq_hz: float) -> Optional[float]:
+        """Return the device-level sensitivity at *freq_hz* from the cached
+        module calibration (see :func:`sensitivity_at_frequency`)."""
+        return sensitivity_at_frequency(self.module_user_configs, freq_hz)
+
+    def refresh_metadata(self) -> None:
+        """Hydrate TX identity + sensitivity fields from stored calibration."""
+        module_count = max(1, int(self.get_module_count()))
+        configs: list[dict] = []
+        for module_idx in range(module_count):
+            config = self.read_config(module=module_idx).to_dict()
+            configs.append(config)
+
+        self.module_user_configs = configs
+        primary = configs[0] if configs else {}
+        self.serial_number = primary.get("sn") if isinstance(primary.get("sn"), str) else None
+        hwid = primary.get("hwid") if isinstance(primary.get("hwid"), str) else None
+        if not hwid:
+            try:
+                hwid = self.get_hardware_id()
+            except Exception:  # noqa: BLE001
+                hwid = None
+        self.hwid = hwid
+        self.hardware_id = hwid
 
     def __parse_ti_cfg_file(self, file_path: str) -> list[tuple[str, int, int]]:
         """Parses the given configuration file and extracts all register groups, addresses, and values."""
