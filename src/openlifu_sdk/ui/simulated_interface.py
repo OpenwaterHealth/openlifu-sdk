@@ -143,7 +143,8 @@ class SimulatedTxDevice:
     the emitter for unsolicited STATUS frames during sonication.
     """
 
-    def __init__(self, num_modules: int = 1):
+    def __init__(self, num_modules: int = 1,
+                 preset_flash: Optional[List[tuple[dict, int]]] = None):
         self.num_modules = max(1, int(num_modules))
         self.signal_connected = OWSignal()
         self.signal_disconnected = OWSignal()
@@ -164,14 +165,41 @@ class SimulatedTxDevice:
         }
         self._pulse = {"frequency": 400_000.0, "duration": 100e-6, "amplitude": 1.0}
         self._trigger_running = False
-        self._version = "sim-1.0.7"
         self.serial_number: Optional[str] = None
         self.hwid: Optional[str] = None
         self.hardware_id: Optional[str] = None
         self.module_user_configs: list[dict] = []
-        self._presets = [self._default_preset()]
+
+        # Current pulse-train counter during an active sonication.
+        # Written by the engine on each tick so a polled host (via
+        # :meth:`get_trigger` / :meth:`get_trigger_json`) can read
+        # progress without subscribing to the status-frame
+        # OWSignal. Reset to 0 at engine start; left at its final
+        # value after natural completion (so a post-run poll shows
+        # train_count == pulse_train_count); unchanged by an
+        # operator-initiated stop (so the host sees how far the
+        # sonication got).
+        self._train_curr = 0
+
+        # Simulated flash-baked preset table (SR-002 / SR-003). Each
+        # entry is ``(machine_config_dict, regs_crc)`` -- what the
+        # FDA firmware image carries for that preset index. The
+        # machine_config must include ``id``, ``settings_crc`` and
+        # ``pulse_train_count_selections``. ``None`` seeds a single
+        # default preset; ``[]`` simulates an image with no presets.
+        self._preset_flash: List[tuple[dict, int]] = (
+            list(preset_flash) if preset_flash is not None
+            else [self._default_flash_entry()]
+        )
         self._loaded_preset_index: Optional[int] = None
-        self._loaded_duration_index = 0
+        self._loaded_duration_index: Optional[int] = None
+
+        # Reported firmware version. Mutable so an app-side debug UI
+        # (or a test) can flip it to simulate an incompatible firmware
+        # and exercise the operator connector's compat check. Single
+        # string for all modules; if per-module version drift ever
+        # becomes worth simulating, extend this to a list.
+        self._fw_version: str = "sim-1.0.7"
         self.refresh_metadata()
 
     # ---- helpers --------------------------------------------------------
@@ -210,18 +238,20 @@ class SimulatedTxDevice:
             "device": {},
         }
 
-    def _default_preset(self) -> dict:
-        return {
+    @staticmethod
+    def _default_flash_entry() -> tuple[dict, int]:
+        machine_config = {
             "id": "sim-default",
             "settings_crc": 0x12345678,
-            "regs_crc": 0x87654321,
-            "baked_regs_crc": 0x87654321,
-            "chip_count": self.num_modules * 2,
-            "profile_count": 1,
-            "train_counts": [int(self._sequence.get("pulse_train_count", 1))],
-            "start_c": 35.0,
-            "shutoff_c": 75.0,
+            "pulse_interval_ms": 100.0,
+            "pulse_count": 1,
+            "pulse_train_interval_s": 0.0,
+            "pulse_length_us": 100.0,
+            "pulse_train_count_selections": [1],
+            "start_C": 35.0,
+            "shutoff_C": 75.0,
         }
+        return machine_config, 0x87654321
 
     def refresh_metadata(self) -> None:
         self.module_user_configs = [dict(cfg) for cfg in self._user_configs]
@@ -234,36 +264,61 @@ class SimulatedTxDevice:
     def get_sensitivity_for_frequency(self, freq_hz: float) -> Optional[float]:
         return sensitivity_at_frequency(self.module_user_configs, freq_hz)
 
-    def configure_presets(self, presets: List[dict]) -> None:
-        self._presets = [dict(preset) for preset in presets]
+    def _flash_entry(self, index: int) -> tuple[dict, int]:
+        if not 0 <= index < len(self._preset_flash):
+            raise LIFUDeviceError(f"TX: no preset at index {index}")
+        return self._preset_flash[index]
 
     def get_preset(self, index: int) -> dict:
-        if not 0 <= index < len(self._presets):
-            raise LIFUDeviceError(f"TX: no preset at index {index}")
-        preset = dict(self._presets[index])
-        preset.setdefault("count", len(self._presets))
-        preset.setdefault("index", index)
-        return preset
+        """Same shape as :meth:`TxDevice.get_preset` (OW_PRESET_GET)."""
+        machine_config, regs_crc = self._flash_entry(index)
+        return {
+            "count": len(self._preset_flash),
+            "index": index,
+            "chip_count": self.num_modules * 2,
+            "profile_count": 1,
+            "settings_crc": int(machine_config["settings_crc"]),
+            "regs_crc": int(regs_crc),
+            "baked_regs_crc": int(regs_crc),
+            "id": machine_config["id"],
+            "train_counts": list(machine_config.get("pulse_train_count_selections") or []),
+            "start_c": machine_config.get("start_C"),
+            "shutoff_c": machine_config.get("shutoff_C"),
+        }
 
     def load_preset(self, index: int, regs_crc: int, duration_index: int = 0) -> bool:
-        preset = self.get_preset(index)
-        if int(preset.get("regs_crc", regs_crc)) != int(regs_crc):
-            raise LIFUDeviceError("TX: preset register CRC mismatch",
-                                  device_error_code=OW_BAD_CRC)
-        train_counts = list(preset.get("train_counts") or [])
-        if train_counts and not 0 <= duration_index < len(train_counts):
-            raise LIFUDeviceError(f"TX: preset has no duration index {duration_index}")
-        if train_counts:
-            self._sequence["pulse_train_count"] = int(train_counts[duration_index])
+        """Same contract as :meth:`TxDevice.load_preset` (OW_PRESET_LOAD).
+
+        Like the firmware, loading applies the preset's trigger and pulse
+        configuration, so no separate ``set_trigger`` is needed before
+        ``start_sonication``.
+        """
+        machine_config, flash_regs_crc = self._flash_entry(index)
+        if int(regs_crc) != int(flash_regs_crc):
+            raise LIFUDeviceError(
+                f"TX: regs_crc 0x{int(regs_crc):08X} does not match preset {index} "
+                f"(0x{int(flash_regs_crc):08X})",
+                device_error_code=OW_BAD_CRC,
+            )
+        selections = list(machine_config.get("pulse_train_count_selections") or [])
+        if not 0 <= duration_index < len(selections):
+            raise LIFUDeviceError(f"TX: preset {index} has no duration index {duration_index}")
+        self._sequence = {
+            "pulse_interval": float(machine_config.get("pulse_interval_ms", 0.0)) / 1000.0,
+            "pulse_count": int(machine_config.get("pulse_count", 1)),
+            "pulse_train_interval": float(machine_config.get("pulse_train_interval_s", 0.0)),
+            "pulse_train_count": int(selections[duration_index]),
+        }
+        self._pulse["duration"] = float(machine_config.get("pulse_length_us", 100.0)) / 1_000_000.0
+        self._normalize_train_interval()
         self._loaded_preset_index = index
         self._loaded_duration_index = duration_index
-        self._normalize_train_interval()
         return True
 
-    def get_loaded_preset(self) -> tuple[int, int] | None:
-        if self._loaded_preset_index is None:
-            return None
-        return (self._loaded_preset_index, self._loaded_duration_index)
+    def get_loaded_preset(self) -> tuple[Optional[int], Optional[int]]:
+        """``(preset_index, duration_index)`` of the last successful
+        :meth:`load_preset`, or ``(None, None)``. Simulator inspection only."""
+        return self._loaded_preset_index, self._loaded_duration_index
 
     def is_connected(self) -> bool:
         return self._connected
@@ -308,10 +363,18 @@ class SimulatedTxDevice:
         return self._modules[module].read_ambient()
 
     def get_version(self, module: int = 0) -> str:
-        return self._version
+        return self._fw_version
 
-    def set_version(self, version: str) -> None:
-        self._version = str(version)
+    def set_version(self, version: str, module: int = 0) -> None:
+        """Override the reported firmware version.
+
+        Intended for simulator debug UIs / tests that need to force
+        the operator connector's ``check_firmware_compat`` down the
+        incompatible-firmware path. Applies to all modules regardless
+        of the ``module`` arg; the arg is present only to mirror
+        :meth:`get_version`'s signature.
+        """
+        self._fw_version = str(version)
 
     def get_hardware_id(self, module: int = 0, raw_hex: bool = False) -> str:
         return f"{0xA0A1A2A3A4A5A6A7B0B1B2B3B4B5B6B7 + module:032X}"
@@ -424,7 +487,41 @@ class SimulatedTxDevice:
         return {
             "TriggerStatus": "RUNNING" if self._trigger_running else "STOPPED",
             "TriggerMode": "SEQUENCE",
+            "TrainCount": self._train_curr,
             **self._sequence,
+        }
+
+    def get_trigger(self) -> dict:
+        """Return the current trigger state as a snake_case dict.
+
+        Mirrors the shape of
+        :meth:`openlifu_sdk.io.LIFUTXDevice.TxDevice.get_trigger`
+        so operator-interface code calling ``interface.txdevice.get_trigger()``
+        gets the same keys against the sim and real hardware.
+
+        Includes two fields the walking-skeleton polling loop needs:
+
+        * ``train_count`` -- current pulse-train counter, 0 before
+          an engine starts, incremented each train tick, equal to
+          ``pulse_train_count`` on natural completion.
+        * ``trigger_status`` -- ``"RUNNING"`` or ``"STOPPED"``;
+          flips to ``"STOPPED"`` on both operator stop and natural
+          completion so a polled host sees a single stop edge
+          either way.
+        """
+        seq = self._sequence
+        pulse_interval = seq.get("pulse_interval", 0.1)
+        return {
+            "pulse_interval": pulse_interval,
+            "pulse_count": seq.get("pulse_count", 1),
+            "pulse_width": self._pulse.get("duration", 100e-6) * 1e6,
+            "pulse_train_interval": seq.get("pulse_train_interval", 0.0),
+            "pulse_train_count": seq.get("pulse_train_count", 1),
+            "mode": "sequence",
+            "profile_index": 1,
+            "profile_increment": True,
+            "train_count": self._train_curr,
+            "trigger_status": "RUNNING" if self._trigger_running else "STOPPED",
         }
 
     def set_trigger_json(self, data) -> dict:
@@ -462,9 +559,28 @@ class SimulatedTxDevice:
     def soft_reset(self, module: Optional[int] = None):
         return True
 
-    def update_firmware(self, *args, **kwargs):
-        # Verification tests / FW updater aren't in the simulator scope.
-        raise NotImplementedError("Firmware update not supported in simulation mode")
+    def update_firmware(self, module: int = 0, package_file: Optional[str] = None,
+                        target_version: Optional[str] = None, **_kwargs) -> str:
+        """Simulate a firmware update on the TX board.
+
+        Mirrors the shape of the real
+        :meth:`~openlifu_sdk.io.LIFUTXDevice.TxDevice.update_firmware`
+        (accepting a ``module`` and a ``package_file`` path) but
+        performs no real DFU. Instead, sets the reported firmware
+        version to ``target_version`` (default: the string
+        ``"sim-1.0.7"`` -- the simulator's original default) so a
+        subsequent ``get_version`` returns the post-update value.
+
+        Callers that want a specific post-update version (e.g. the
+        operator connector's ``MIN_TX_FIRMWARE_VERSION``) pass
+        ``target_version`` explicitly.
+
+        Returns the new version string so tests / debug UI can
+        confirm the update landed.
+        """
+        new_version = target_version or "sim-1.0.7"
+        self._fw_version = str(new_version)
+        return self._fw_version
 
     def close(self):
         self._connected = False
@@ -495,7 +611,6 @@ class SimulatedHVController:
         self._v12_on = True
         self._voltage_setpoint = 0.0
         self._rgb_state = 0
-        self._version = "sim-1.0.7"
         self.uart = None  # connector reads this for FW DFU; not used here
         self.supply_voltage = 0.0
         self.last_device_sensitivity: Optional[float] = None
@@ -511,6 +626,10 @@ class SimulatedHVController:
             "min_voltage": 5.0,
             "max_voltage": 100.0,
         }]
+
+        # Reported firmware version. See
+        # :attr:`SimulatedTxDevice._fw_version` for rationale.
+        self._fw_version: str = "sim-1.0.7"
 
     def is_connected(self) -> bool:
         return self._connected
@@ -552,10 +671,12 @@ class SimulatedHVController:
         return self._v12_on
 
     def get_version(self) -> str:
-        return self._version
+        return self._fw_version
 
     def set_version(self, version: str) -> None:
-        self._version = str(version)
+        """Override the reported firmware version. See
+        :meth:`SimulatedTxDevice.set_version` for rationale."""
+        self._fw_version = str(version)
 
     def get_hardware_id(self, raw_hex: bool = False) -> str:
         return "C0C1C2C3C4C5C6C7D0D1D2D3D4D5D6D7"
@@ -662,6 +783,14 @@ class SimulatedHVController:
     def enter_dfu(self):
         raise NotImplementedError("DFU not supported in simulation mode")
 
+    def update_firmware(self, package_file: Optional[str] = None,
+                        target_version: Optional[str] = None, **_kwargs) -> str:
+        """Simulate a firmware update on the HV controller. See
+        :meth:`SimulatedTxDevice.update_firmware` for the shape."""
+        new_version = target_version or "sim-1.0.7"
+        self._fw_version = str(new_version)
+        return self._fw_version
+
     def close(self):
         self._connected = False
 
@@ -750,6 +879,9 @@ class _SimulatedRunEngine(QObject):
 
     def start(self):
         self._tx.start_trigger()
+        # Reset the TxDevice's running counter so a polled host sees
+        # progress starting from 0 at engine start.
+        self._tx._train_curr = 0
         # Apply heating for the very first train period as it elapses;
         # speed-clamp to avoid pegging the GUI on tiny periods.
         period_ms = max(20, int(round(self._train_period_s * 1000)))
@@ -807,6 +939,10 @@ class _SimulatedRunEngine(QObject):
         if not self.alive:
             return
         self._train_curr += 1
+        # Mirror the running counter back to the TxDevice so a
+        # polled host (:meth:`SimulatedTxDevice.get_trigger`) sees
+        # progress without subscribing to the status-frame OWSignal.
+        self._tx._train_curr = self._train_curr
         # Apply heating for this train period.
         for m in self._tx._modules:
             m.heat_step(self._voltage, self._duty, self._train_period_s)
@@ -829,6 +965,14 @@ class _SimulatedRunEngine(QObject):
             self.alive = False
             self._train_timer.stop()
             self._heartbeat.stop()
+            # Flip the TxDevice's trigger_running flag so a polled
+            # host's :meth:`get_trigger` sees ``trigger_status ==
+            # "STOPPED"`` on the natural-completion edge, matching
+            # the operator-initiated stop edge. (Pre-2026-10-01 the
+            # sim left trigger_running=True after natural end --
+            # that only mattered for callers that subscribed to the
+            # STOPPED status frame, not for a polled host.)
+            self._tx.stop_trigger()
             # Final STOPPED frame so the connector flips trigger state /
             # transitions back to READY.
             self._tx.emit_status_frame(
@@ -873,7 +1017,7 @@ class SimulatedDeviceInterface(QObject):
 
     def __init__(self, num_modules: int = 1,
                  transducer=None,
-                 preset_flash: Optional[list[tuple[dict, int]]] = None,
+                 preset_flash: Optional[List[tuple[dict, int]]] = None,
                  **_unused):
         # When a transducer (array) is supplied, derive num_modules from it
         # so the TX device is built with the right module count up front.
@@ -882,7 +1026,10 @@ class SimulatedDeviceInterface(QObject):
             if modules_attr is not None:
                 num_modules = max(1, len(list(modules_attr)))
         super().__init__()
-        self.txdevice = SimulatedTxDevice(num_modules=num_modules)
+        self.txdevice = SimulatedTxDevice(
+            num_modules=num_modules,
+            preset_flash=preset_flash,
+        )
         self.hvcontroller = SimulatedHVController()
         self.status = LIFUInterfaceStatus.STATUS_SYS_OFF
         self._engine: Optional[_SimulatedRunEngine] = None
@@ -891,22 +1038,8 @@ class SimulatedDeviceInterface(QObject):
         if transducer is not None and getattr(transducer, "modules", None) is not None:
             self.txdevice.apply_simulated_transducer(transducer)
         if preset_flash is not None:
-            tx_presets: list[dict] = []
             hv_presets: list[dict] = []
-            for index, (machine_config, regs_crc) in enumerate(preset_flash):
-                tx_presets.append({
-                    "count": len(preset_flash),
-                    "index": index,
-                    "chip_count": self.txdevice.num_modules * 2,
-                    "profile_count": 1,
-                    "id": machine_config.get("id", f"preset-{index}"),
-                    "settings_crc": int(machine_config.get("settings_crc", 0)),
-                    "regs_crc": int(regs_crc),
-                    "baked_regs_crc": int(regs_crc),
-                    "train_counts": list(machine_config.get("pulse_train_count_selections") or []),
-                    "start_c": machine_config.get("start_C"),
-                    "shutoff_c": machine_config.get("shutoff_C"),
-                })
+            for index, (machine_config, _regs_crc) in enumerate(preset_flash):
                 voltage_range = machine_config.get("voltage_range") or [machine_config.get("voltage", 0.0), machine_config.get("voltage", 0.0)]
                 hv_presets.append({
                     "count": len(preset_flash),
@@ -919,7 +1052,6 @@ class SimulatedDeviceInterface(QObject):
                     "min_voltage": float(voltage_range[0]),
                     "max_voltage": float(voltage_range[1]),
                 })
-            self.txdevice.configure_presets(tx_presets)
             self.hvcontroller.configure_presets(hv_presets)
 
     # ---- monitoring lifecycle -------------------------------------------
