@@ -8,6 +8,7 @@ from openlifu_sdk.io.LIFUConfig import (
     CONTROLLER_COMMANDS,
     DEFAULT_TIMEOUT,
     GLOBAL_COMMANDS,
+    HV_FDA_COMMANDS,
     LIFU_ERR_BAD_PAYLOAD_LENGTH,
     OW_CONSOLE_PID,
     OW_POWER,
@@ -43,12 +44,23 @@ from openlifu_sdk.io.LIFUConfig import (
     OW_VID,
     POWER_COMMANDS,
 )
-from openlifu_sdk.io.component import OWComponent, register_command_packet_types
+from openlifu_sdk.io.component import (
+    LIFUComponentMixin,
+    OWComponent,
+    register_command_packet_types,
+)
 from openlifu_sdk.io.exceptions import LIFUHVSettleError, LIFUProtocolError
 
 logger = logging.getLogger(__name__)
 
 class HVController(OWComponent):
+    """FDA console component: HV on/off, preset select, and read-only
+    telemetry. :class:`LIFUHVController` adds the RUO setpoint, rail, fan,
+    LED and DAC commands.
+    """
+
+    SUPPORTED_COMMANDS = HV_FDA_COMMANDS
+
     def __init__(self,  vid: int = OW_VID, pid: int = OW_CONSOLE_PID,
                  baudrate: int = 921600, timeout: float = DEFAULT_TIMEOUT, test_mode: bool = False):
         """
@@ -59,7 +71,7 @@ class HVController(OWComponent):
         """
         super().__init__(
             vid, pid,
-            supported_commands=GLOBAL_COMMANDS | CONTROLLER_COMMANDS | POWER_COMMANDS,
+            supported_commands=self.SUPPORTED_COMMANDS,
             baudrate=baudrate, timeout=timeout, desc="HV",
         )
         
@@ -111,28 +123,6 @@ class HVController(OWComponent):
                 code=LIFU_ERR_BAD_PAYLOAD_LENGTH,
             )
         return round(struct.unpack("<f", r.data)[0], 2)
-
-    def turn_12v_off(self) -> bool:
-        """Turn off the 12V rail.
-
-        Raises:
-            LIFUNotConnectedError, LIFUCommunicationError, LIFUDeviceError.
-        """
-        self.send_checked(packet_type=OW_POWER, command=OW_POWER_12V_OFF, op="turn_12v_off")
-        logger.info("12V turned off")
-        self.is_12v_on = False
-        return True
-
-    def turn_12v_on(self) -> bool:
-        """Turn on the 12V rail.
-
-        Raises:
-            LIFUNotConnectedError, LIFUCommunicationError, LIFUDeviceError.
-        """
-        self.send_checked(packet_type=OW_POWER, command=OW_POWER_12V_ON, op="turn_12v_on")
-        logger.info("12V turned on")
-        self.is_12v_on = True
-        return True
 
     def get_12v_status(self) -> bool:
         """Return True if the 12V rail is on.
@@ -219,30 +209,6 @@ class HVController(OWComponent):
                               op="get_hv_status")
         return r.reserved == 1
 
-    def set_voltage(self, voltage: float) -> bool:
-        """Set the HV supply voltage.
-
-        Args:
-            voltage: Desired output voltage (5.0 – 100.0 V).
-
-        An FDA_MODE console refuses this outright (OW_HV_FDA_REFUSED): the
-        voltage comes from the preset chosen with select_preset().
-
-        Raises:
-            ValueError: If *voltage* is out of range.
-            LIFUNotConnectedError, LIFUCommunicationError, LIFUDeviceError.
-        """
-        if not 5.0 <= voltage <= 100.0:
-            raise ValueError("HV voltage must be between 5 and 100 V")
-        logger.debug("Setting HV to %.2f", voltage)
-        data = struct.pack('>f', voltage)
-        self.send_checked(packet_type=OW_POWER, command=OW_POWER_SET_HV,
-                          data=data, timeout=10.0, op="set_voltage")
-        self.supply_voltage = voltage
-        if self.is_hv_on:
-            self.send_checked(packet_type=OW_POWER, command=OW_POWER_HV_ON, timeout=10.0, op="reassert_hv_on")
-        return True
-
     def get_preset(self, index: int) -> dict | None:
         """Describe a preset in an FDA_MODE console's HV table (OW_POWER_PRESET_GET).
 
@@ -310,6 +276,127 @@ class HVController(OWComponent):
         self.supply_voltage = self.get_preset(index)["voltage"]
         return True
 
+    def get_voltage(self) -> float:
+        """Read the measured HV output voltage.
+
+        Raises:
+            LIFUNotConnectedError, LIFUCommunicationError, LIFUDeviceError,
+            LIFUProtocolError: If the payload length is invalid.
+        """
+        r = self.send_checked(packet_type=OW_POWER, command=OW_POWER_GET_HV,
+                              op="get_voltage")
+        if r.data_len != 4:
+            raise LIFUProtocolError(
+                f"HV: get_voltage payload length {r.data_len} != 4",
+                code=LIFU_ERR_BAD_PAYLOAD_LENGTH,
+            )
+        return round(struct.unpack("<f", r.data)[0], 2)
+
+    def get_fan_speed(self, fan_id: int = 0) -> int:
+        """Read a fan's current duty-cycle percentage.
+
+        Raises:
+            ValueError: If *fan_id* is out of range.
+            LIFUNotConnectedError, LIFUCommunicationError, LIFUDeviceError,
+            LIFUProtocolError: If the payload length is invalid.
+        """
+        if fan_id not in (0, 1):
+            raise ValueError("Invalid fan ID. Must be 0 or 1")
+        r = self.send_checked(packet_type=OW_POWER, command=OW_POWER_GET_FAN,
+                              addr=fan_id, op="get_fan_speed")
+        if r.data_len < 1:
+            raise LIFUProtocolError(
+                f"HV: get_fan_speed payload length {r.data_len} < 1",
+                code=LIFU_ERR_BAD_PAYLOAD_LENGTH,
+            )
+        return r.data[0]
+
+    def get_vmon_values(self) -> list[dict]:
+        """Retrieve the voltage-monitor readings.
+
+        Returns:
+            A list of 8 dicts (one per channel) with raw_adc, voltage,
+            and converted_voltage fields.
+
+        Raises:
+            LIFUNotConnectedError, LIFUCommunicationError, LIFUDeviceError,
+            LIFUProtocolError: If the payload length is invalid.
+        """
+        r = self.send_checked(packet_type=OW_POWER, command=OW_POWER_VMON,
+                              op="get_vmon_values")
+        if r.data_len != 80:
+            raise LIFUProtocolError(
+                f"HV: VMON payload length {r.data_len} != 80",
+                code=LIFU_ERR_BAD_PAYLOAD_LENGTH,
+            )
+        raw_values = struct.unpack_from("<8H", r.data, 0)
+        voltages = struct.unpack_from("<8f", r.data, 16)
+        converted_voltages = struct.unpack_from("<8f", r.data, 48)
+        return [
+            {
+                "channel": i,
+                "raw_adc": raw_values[i],
+                "voltage": round(voltages[i], 3),
+                "converted_voltage": round(converted_voltages[i], 3),
+            }
+            for i in range(8)
+        ]
+
+
+class LIFUHVController(LIFUComponentMixin, HVController):
+    """Research (RUO) console component: :class:`HVController` plus host-set
+    voltage, 12V rail, fan, RGB LED and raw DAC control. Created only by
+    :class:`LIFUInterface`.
+    """
+
+    SUPPORTED_COMMANDS = GLOBAL_COMMANDS | CONTROLLER_COMMANDS | POWER_COMMANDS
+
+    def turn_12v_off(self) -> bool:
+        """Turn off the 12V rail.
+
+        Raises:
+            LIFUNotConnectedError, LIFUCommunicationError, LIFUDeviceError.
+        """
+        self.send_checked(packet_type=OW_POWER, command=OW_POWER_12V_OFF, op="turn_12v_off")
+        logger.info("12V turned off")
+        self.is_12v_on = False
+        return True
+
+    def turn_12v_on(self) -> bool:
+        """Turn on the 12V rail.
+
+        Raises:
+            LIFUNotConnectedError, LIFUCommunicationError, LIFUDeviceError.
+        """
+        self.send_checked(packet_type=OW_POWER, command=OW_POWER_12V_ON, op="turn_12v_on")
+        logger.info("12V turned on")
+        self.is_12v_on = True
+        return True
+
+    def set_voltage(self, voltage: float) -> bool:
+        """Set the HV supply voltage.
+
+        Args:
+            voltage: Desired output voltage (5.0 – 100.0 V).
+
+        An FDA_MODE console refuses this outright (OW_HV_FDA_REFUSED): the
+        voltage comes from the preset chosen with select_preset().
+
+        Raises:
+            ValueError: If *voltage* is out of range.
+            LIFUNotConnectedError, LIFUCommunicationError, LIFUDeviceError.
+        """
+        if not 5.0 <= voltage <= 100.0:
+            raise ValueError("HV voltage must be between 5 and 100 V")
+        logger.debug("Setting HV to %.2f", voltage)
+        data = struct.pack('>f', voltage)
+        self.send_checked(packet_type=OW_POWER, command=OW_POWER_SET_HV,
+                          data=data, timeout=10.0, op="set_voltage")
+        self.supply_voltage = voltage
+        if self.is_hv_on:
+            self.send_checked(packet_type=OW_POWER, command=OW_POWER_HV_ON, timeout=10.0, op="reassert_hv_on")
+        return True
+
     def set_dacs(self, hvp: int, hvm: int, hrp: int, hrm: int) -> bool:
         """Set the four HV/HR DAC codes.
 
@@ -341,22 +428,6 @@ class HVController(OWComponent):
                           data=data, op="set_dacs")
         return True
 
-    def get_voltage(self) -> float:
-        """Read the measured HV output voltage.
-
-        Raises:
-            LIFUNotConnectedError, LIFUCommunicationError, LIFUDeviceError,
-            LIFUProtocolError: If the payload length is invalid.
-        """
-        r = self.send_checked(packet_type=OW_POWER, command=OW_POWER_GET_HV,
-                              op="get_voltage")
-        if r.data_len != 4:
-            raise LIFUProtocolError(
-                f"HV: get_voltage payload length {r.data_len} != 4",
-                code=LIFU_ERR_BAD_PAYLOAD_LENGTH,
-            )
-        return round(struct.unpack("<f", r.data)[0], 2)
-
     def set_fan_speed(self, fan_id: int = 0, fan_speed: int = 50) -> int:
         """Set a fan's duty-cycle percentage.
 
@@ -377,25 +448,6 @@ class HVController(OWComponent):
                           op="set_fan_speed")
         logger.info("Set fan %d speed to %d", fan_id, fan_speed)
         return fan_speed
-
-    def get_fan_speed(self, fan_id: int = 0) -> int:
-        """Read a fan's current duty-cycle percentage.
-
-        Raises:
-            ValueError: If *fan_id* is out of range.
-            LIFUNotConnectedError, LIFUCommunicationError, LIFUDeviceError,
-            LIFUProtocolError: If the payload length is invalid.
-        """
-        if fan_id not in (0, 1):
-            raise ValueError("Invalid fan ID. Must be 0 or 1")
-        r = self.send_checked(packet_type=OW_POWER, command=OW_POWER_GET_FAN,
-                              addr=fan_id, op="get_fan_speed")
-        if r.data_len < 1:
-            raise LIFUProtocolError(
-                f"HV: get_fan_speed payload length {r.data_len} < 1",
-                code=LIFU_ERR_BAD_PAYLOAD_LENGTH,
-            )
-        return r.data[0]
 
     def set_rgb_led(self, rgb_state: int) -> bool:
         """Set the RGB LED state (0 = OFF, 1 = RED, 2 = GREEN, 3 = BLUE).
@@ -534,37 +586,6 @@ class HVController(OWComponent):
             LIFUNotConnectedError, LIFUCommunicationError, LIFUDeviceError.
         """
         return self._send_rgb_fx(OW_RGB_FX_STOP, op="rgb_effect_stop")
-
-    def get_vmon_values(self) -> list[dict]:
-        """Retrieve the voltage-monitor readings.
-
-        Returns:
-            A list of 8 dicts (one per channel) with raw_adc, voltage,
-            and converted_voltage fields.
-
-        Raises:
-            LIFUNotConnectedError, LIFUCommunicationError, LIFUDeviceError,
-            LIFUProtocolError: If the payload length is invalid.
-        """
-        r = self.send_checked(packet_type=OW_POWER, command=OW_POWER_VMON,
-                              op="get_vmon_values")
-        if r.data_len != 80:
-            raise LIFUProtocolError(
-                f"HV: VMON payload length {r.data_len} != 80",
-                code=LIFU_ERR_BAD_PAYLOAD_LENGTH,
-            )
-        raw_values = struct.unpack_from("<8H", r.data, 0)
-        voltages = struct.unpack_from("<8f", r.data, 16)
-        converted_voltages = struct.unpack_from("<8f", r.data, 48)
-        return [
-            {
-                "channel": i,
-                "raw_adc": raw_values[i],
-                "voltage": round(voltages[i], 3),
-                "converted_voltage": round(converted_voltages[i], 3),
-            }
-            for i in range(8)
-        ]
 
     def set_raw_dac(self, dac_id: int = 0, dac_value: int = 0) -> int:
         """Set a raw 12-bit DAC value.

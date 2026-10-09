@@ -138,9 +138,10 @@ class _ModuleThermal:
 # =============================================================================
 
 class SimulatedTxDevice:
-    """Implements every attribute / method that a connector calls on
-    ``interface.txdevice``. Owns per-module thermal state and serves as
-    the emitter for unsolicited STATUS frames during sonication.
+    """Fake of the FDA :class:`~openlifu_sdk.io.LIFUTXDevice.TxDevice`.
+    Owns per-module thermal state and serves as the emitter for unsolicited
+    STATUS frames during sonication. :class:`SimulatedLIFUTxDevice` adds the
+    RUO methods.
     """
 
     def __init__(self, num_modules: int = 1,
@@ -152,7 +153,6 @@ class SimulatedTxDevice:
         self.signal_error = OWSignal()
 
         self._connected = False
-        self._async_mode = False
         self._modules = [_ModuleThermal(i) for i in range(self.num_modules)]
         # Per-module user_config dicts (with module.sensitivity table).
         self._user_configs = [self._default_user_config(i) for i in range(self.num_modules)]
@@ -350,9 +350,6 @@ class SimulatedTxDevice:
 
     # ---- methods called by the connector --------------------------------
 
-    def get_tx_module_count(self) -> int:
-        return self.num_modules
-
     def get_module_count(self) -> int:
         return self.num_modules
 
@@ -381,15 +378,6 @@ class SimulatedTxDevice:
 
     def read_config(self, module: int = 0):
         from openlifu_sdk.io.LIFUUserConfig import LifuUserConfig
-        return LifuUserConfig(json_data=dict(self._user_configs[module]))
-
-    def write_config_json(self, json_str: str, module: int = 0):
-        from openlifu_sdk.io.LIFUUserConfig import LifuUserConfig
-        try:
-            self._user_configs[module] = json.loads(json_str)
-        except Exception:
-            logger.warning("SimulatedTxDevice.write_config_json: invalid json; ignored")
-        self.refresh_metadata()
         return LifuUserConfig(json_data=dict(self._user_configs[module]))
 
     def apply_simulated_transducer(self, arr) -> None:
@@ -459,30 +447,6 @@ class SimulatedTxDevice:
             pi, pc = 0.0, 1
         self._sequence["pulse_train_interval"] = max(1e-3, pc * pi)
 
-    def set_solution(self, pulse=None, delays=None, apodizations=None,
-                     sequence=None, profile_index=1, profile_increment=True,
-                     trigger_mode="sequence"):
-        if pulse:
-            self._pulse = dict(pulse)
-        if sequence:
-            self._sequence = dict(sequence)
-            self._normalize_train_interval()
-        return True
-
-    def set_trigger(self, pulse_interval=None, pulse_count=None,
-                    pulse_train_interval=None, pulse_train_count=None,
-                    trigger_mode="sequence"):
-        if pulse_interval is not None:
-            self._sequence["pulse_interval"] = float(pulse_interval)
-        if pulse_count is not None:
-            self._sequence["pulse_count"] = int(pulse_count)
-        if pulse_train_interval is not None:
-            self._sequence["pulse_train_interval"] = float(pulse_train_interval)
-        if pulse_train_count is not None:
-            self._sequence["pulse_train_count"] = int(pulse_train_count)
-        self._normalize_train_interval()
-        return self.get_trigger_json()
-
     def get_trigger_json(self) -> dict:
         return {
             "TriggerStatus": "RUNNING" if self._trigger_running else "STOPPED",
@@ -524,47 +488,26 @@ class SimulatedTxDevice:
             "trigger_status": "RUNNING" if self._trigger_running else "STOPPED",
         }
 
-    def set_trigger_json(self, data) -> dict:
-        if isinstance(data, dict):
-            for k in ("pulse_interval", "pulse_count",
-                      "pulse_train_interval", "pulse_train_count"):
-                if k in data:
-                    self._sequence[k] = data[k]
-            self._normalize_train_interval()
-        return self.get_trigger_json()
-
-    def async_mode(self, enable: Optional[bool] = None) -> bool:
-        if enable is not None:
-            self._async_mode = bool(enable)
-        return self._async_mode
-
     def start_trigger(self):
         self._trigger_running = True
 
     def stop_trigger(self):
         self._trigger_running = False
 
-    def set_module_invert(self, invert):
-        return None
-
     def ping(self, module: int = 0):
-        return True
-
-    def toggle_led(self, module: int = 0):
-        return True
-
-    def echo(self, echo_data: bytes, module: int = 0):
-        return (echo_data, len(echo_data))
-
-    def soft_reset(self, module: Optional[int] = None):
         return True
 
     def update_firmware(self, module: int = 0, package_file: Optional[str] = None,
                         target_version: Optional[str] = None, **_kwargs) -> str:
         """Simulate a firmware update on the TX board.
 
+        Sim-only placeholder: the real FDA :class:`TxDevice` has no
+        firmware-update method (that lives on the RUO
+        :class:`LIFUTxDevice` until a service interface exists), but the
+        operator interface's simulated firmware-update flow drives this.
+
         Mirrors the shape of the real
-        :meth:`~openlifu_sdk.io.LIFUTXDevice.TxDevice.update_firmware`
+        :meth:`~openlifu_sdk.io.LIFUTXDevice.LIFUTxDevice.update_firmware`
         (accepting a ``module`` and a ``package_file`` path) but
         performs no real DFU. Instead, sets the reported firmware
         version to ``target_version`` (default: the string
@@ -585,6 +528,74 @@ class SimulatedTxDevice:
     def close(self):
         self._connected = False
 
+
+class SimulatedLIFUTxDevice(SimulatedTxDevice):
+    """Fake of the RUO :class:`~openlifu_sdk.io.LIFUTXDevice.LIFUTxDevice`."""
+
+    _async_mode = False
+
+    def get_tx_module_count(self) -> int:
+        return self.num_modules
+
+    def write_config_json(self, json_str: str, module: int = 0):
+        from openlifu_sdk.io.LIFUUserConfig import LifuUserConfig
+        try:
+            self._user_configs[module] = json.loads(json_str)
+        except Exception:
+            logger.warning("SimulatedLIFUTxDevice.write_config_json: invalid json; ignored")
+        self.refresh_metadata()
+        return LifuUserConfig(json_data=dict(self._user_configs[module]))
+
+    def set_solution(self, pulse=None, delays=None, apodizations=None,
+                     sequence=None, profile_index=1, profile_increment=True,
+                     trigger_mode="sequence"):
+        if pulse:
+            self._pulse = dict(pulse)
+        if sequence:
+            self._sequence = dict(sequence)
+            self._normalize_train_interval()
+        return True
+
+    def set_trigger(self, pulse_interval=None, pulse_count=None,
+                    pulse_train_interval=None, pulse_train_count=None,
+                    trigger_mode="sequence"):
+        if pulse_interval is not None:
+            self._sequence["pulse_interval"] = float(pulse_interval)
+        if pulse_count is not None:
+            self._sequence["pulse_count"] = int(pulse_count)
+        if pulse_train_interval is not None:
+            self._sequence["pulse_train_interval"] = float(pulse_train_interval)
+        if pulse_train_count is not None:
+            self._sequence["pulse_train_count"] = int(pulse_train_count)
+        self._normalize_train_interval()
+        return self.get_trigger_json()
+
+    def set_trigger_json(self, data) -> dict:
+        if isinstance(data, dict):
+            for k in ("pulse_interval", "pulse_count",
+                      "pulse_train_interval", "pulse_train_count"):
+                if k in data:
+                    self._sequence[k] = data[k]
+            self._normalize_train_interval()
+        return self.get_trigger_json()
+
+    def async_mode(self, enable: Optional[bool] = None) -> bool:
+        if enable is not None:
+            self._async_mode = bool(enable)
+        return self._async_mode
+
+    def set_module_invert(self, invert):
+        return None
+
+    def toggle_led(self, module: int = 0):
+        return True
+
+    def echo(self, echo_data: bytes, module: int = 0):
+        return (echo_data, len(echo_data))
+
+    def soft_reset(self, module: Optional[int] = None):
+        return True
+
     async def start_monitoring(self, interval: int = 1):
         return None
 
@@ -597,8 +608,8 @@ class SimulatedTxDevice:
 # =============================================================================
 
 class SimulatedHVController:
-    """Implements every attribute / method that a connector calls on
-    ``interface.hvcontroller``."""
+    """Fake of the FDA :class:`~openlifu_sdk.io.LIFUHVController.HVController`.
+    :class:`SimulatedLIFUHVController` adds the RUO methods."""
 
     def __init__(self):
         self.signal_connected = OWSignal()
@@ -610,8 +621,6 @@ class SimulatedHVController:
         self._hv_on = False
         self._v12_on = True
         self._voltage_setpoint = 0.0
-        self._rgb_state = 0
-        self.uart = None  # connector reads this for FW DFU; not used here
         self.supply_voltage = 0.0
         self.last_device_sensitivity: Optional[float] = None
         self._selected_preset_index: Optional[int] = None
@@ -659,14 +668,6 @@ class SimulatedHVController:
     def get_hv_status(self) -> bool:
         return self._hv_on
 
-    def turn_12v_on(self):
-        self._v12_on = True
-        return True
-
-    def turn_12v_off(self):
-        self._v12_on = False
-        return True
-
     def get_12v_status(self) -> bool:
         return self._v12_on
 
@@ -686,11 +687,6 @@ class SimulatedHVController:
 
     def get_temperature2(self) -> float:
         return 31.0 + 0.05 * self._voltage_setpoint + _gauss(HV_TEMP_NOISE_SIGMA)
-
-    def set_voltage(self, voltage: float) -> bool:
-        self._voltage_setpoint = float(voltage)
-        self.supply_voltage = self._voltage_setpoint
-        return True
 
     def configure_presets(self, presets: List[dict]) -> None:
         self._presets = [dict(preset) for preset in presets]
@@ -761,15 +757,46 @@ class SimulatedHVController:
             for i, cv in enumerate(converted)
         ]
 
+    def ping(self):
+        return True
+
+    def update_firmware(self, package_file: Optional[str] = None,
+                        target_version: Optional[str] = None, **_kwargs) -> str:
+        """Simulate a firmware update on the HV controller. Sim-only
+        placeholder; see :meth:`SimulatedTxDevice.update_firmware`."""
+        new_version = target_version or "sim-1.0.7"
+        self._fw_version = str(new_version)
+        return self._fw_version
+
+    def close(self):
+        self._connected = False
+
+
+class SimulatedLIFUHVController(SimulatedHVController):
+    """Fake of the RUO :class:`~openlifu_sdk.io.LIFUHVController.LIFUHVController`."""
+
+    uart = None  # connector reads this for FW DFU; not used here
+    _rgb_state = 0
+
+    def turn_12v_on(self):
+        self._v12_on = True
+        return True
+
+    def turn_12v_off(self):
+        self._v12_on = False
+        return True
+
+    def set_voltage(self, voltage: float) -> bool:
+        self._voltage_setpoint = float(voltage)
+        self.supply_voltage = self._voltage_setpoint
+        return True
+
     def set_rgb_led(self, state: int):
         self._rgb_state = int(state)
         return True
 
     def get_rgb_led(self) -> int:
         return self._rgb_state
-
-    def ping(self):
-        return True
 
     def toggle_led(self):
         return True
@@ -782,17 +809,6 @@ class SimulatedHVController:
 
     def enter_dfu(self):
         raise NotImplementedError("DFU not supported in simulation mode")
-
-    def update_firmware(self, package_file: Optional[str] = None,
-                        target_version: Optional[str] = None, **_kwargs) -> str:
-        """Simulate a firmware update on the HV controller. See
-        :meth:`SimulatedTxDevice.update_firmware` for the shape."""
-        new_version = target_version or "sim-1.0.7"
-        self._fw_version = str(new_version)
-        return self._fw_version
-
-    def close(self):
-        self._connected = False
 
     async def start_monitoring(self, interval: int = 1):
         return None
@@ -1026,11 +1042,7 @@ class SimulatedDeviceInterface(QObject):
             if modules_attr is not None:
                 num_modules = max(1, len(list(modules_attr)))
         super().__init__()
-        self.txdevice = SimulatedTxDevice(
-            num_modules=num_modules,
-            preset_flash=preset_flash,
-        )
-        self.hvcontroller = SimulatedHVController()
+        self.txdevice, self.hvcontroller = self._create_devices(num_modules, preset_flash)
         self.status = LIFUInterfaceStatus.STATUS_SYS_OFF
         self._engine: Optional[_SimulatedRunEngine] = None
         self._last_solution_voltage = 0.0
@@ -1054,24 +1066,10 @@ class SimulatedDeviceInterface(QObject):
                 })
             self.hvcontroller.configure_presets(hv_presets)
 
-    # ---- monitoring lifecycle -------------------------------------------
-
-    async def start_monitoring(self, interval: int = 1):
-        # Auto-connect both devices ~AUTO_CONNECT_DELAY_S after launch
-        # via QTimer so the connect signals are delivered on the GUI
-        # thread (mirroring the real OWSignal -> Bridge path).
-        delay_ms = int(AUTO_CONNECT_DELAY_S * 1000)
-
-        def _connect():
-            logger.info("SimulatedDeviceInterface: emitting auto-connect for HV + TX")
-            self.hvcontroller.emit_connected()
-            self.txdevice.emit_connected()
-
-        QTimer.singleShot(delay_ms, _connect)
-        return None
-
-    def stop_monitoring(self):
-        return None
+    def _create_devices(self, num_modules: int,
+                        preset_flash: Optional[List[tuple[dict, int]]]):
+        return (SimulatedTxDevice(num_modules=num_modules, preset_flash=preset_flash),
+                SimulatedHVController())
 
     def is_device_connected(self):
         return (self.txdevice.is_connected(), self.hvcontroller.is_connected())
@@ -1104,8 +1102,7 @@ class SimulatedDeviceInterface(QObject):
             time.sleep(0.2)
         return True
 
-    def start_sonication(self, async_mode: Optional[bool] = None,
-                         turn_hv_on: bool = True,
+    def start_sonication(self, turn_hv_on: bool = True,
                          wait_for_settle: bool = True) -> bool:
         if turn_hv_on:
             self.hvcontroller.turn_hv_on()
@@ -1117,7 +1114,6 @@ class SimulatedDeviceInterface(QObject):
         # rebuilds the trigger then re-calls start_sonication).
         if self._engine is not None and self._engine.alive:
             self._engine.stop()
-        self.txdevice.async_mode(True)
         self._engine = _SimulatedRunEngine(
             txdevice=self.txdevice,
             hvcontroller=self.hvcontroller,
@@ -1136,7 +1132,6 @@ class SimulatedDeviceInterface(QObject):
         if self._engine is not None:
             self._engine.stop()
             self._engine = None
-        self.txdevice.async_mode(False)
         if turn_hv_off:
             self.hvcontroller.turn_hv_off()
         self.set_status(LIFUInterfaceStatus.STATUS_READY)
@@ -1183,6 +1178,44 @@ class SimulatedLIFUInterface(SimulatedDeviceInterface):
                          preset_flash=preset_flash)
         self.voltage_table_selection = voltage_table_selection
 
+    def _create_devices(self, num_modules: int,
+                        preset_flash: Optional[List[tuple[dict, int]]]):
+        return (SimulatedLIFUTxDevice(num_modules=num_modules, preset_flash=preset_flash),
+                SimulatedLIFUHVController())
+
+    # ---- monitoring lifecycle -------------------------------------------
+
+    async def start_monitoring(self, interval: int = 1):
+        # Auto-connect both devices ~AUTO_CONNECT_DELAY_S after launch
+        # via QTimer so the connect signals are delivered on the GUI
+        # thread (mirroring the real OWSignal -> Bridge path).
+        delay_ms = int(AUTO_CONNECT_DELAY_S * 1000)
+
+        def _connect():
+            logger.info("SimulatedLIFUInterface: emitting auto-connect for HV + TX")
+            self.hvcontroller.emit_connected()
+            self.txdevice.emit_connected()
+
+        QTimer.singleShot(delay_ms, _connect)
+        return None
+
+    def stop_monitoring(self):
+        return None
+
+    def start_sonication(self, async_mode: Optional[bool] = None,
+                         turn_hv_on: bool = True,
+                         wait_for_settle: bool = True) -> bool:
+        self.txdevice.async_mode(True)
+        return super().start_sonication(turn_hv_on=turn_hv_on,
+                                        wait_for_settle=wait_for_settle)
+
+    def stop_sonication(self, turn_hv_off: bool = True,
+                        wait_for_settle: bool = False) -> bool:
+        super().stop_sonication(turn_hv_off=turn_hv_off,
+                                wait_for_settle=wait_for_settle)
+        self.txdevice.async_mode(False)
+        return True
+
     def set_module_invert(self, module_invert):
         self.txdevice.set_module_invert(module_invert)
 
@@ -1216,6 +1249,8 @@ class SimulatedLIFUInterface(SimulatedDeviceInterface):
 __all__ = [
     "SimulatedDeviceInterface",
     "SimulatedHVController",
+    "SimulatedLIFUHVController",
     "SimulatedLIFUInterface",
+    "SimulatedLIFUTxDevice",
     "SimulatedTxDevice",
 ]

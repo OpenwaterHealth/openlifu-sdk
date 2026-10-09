@@ -9,7 +9,11 @@ from typing import TYPE_CHECKING, Annotated, Dict, List, Literal, Optional
 
 import numpy as np
 
-from openlifu_sdk.io.component import OWComponent, register_command_packet_types
+from openlifu_sdk.io.component import (
+    LIFUComponentMixin,
+    OWComponent,
+    register_command_packet_types,
+)
 from openlifu_sdk.io.exceptions import LIFUError, LIFUProtocolError
 from openlifu_sdk.io.LIFUConfig import (
     CONTROLLER_COMMANDS,
@@ -51,7 +55,8 @@ from openlifu_sdk.io.LIFUConfig import (
     TRIGGER_MODE_CONTINUOUS,
     TRIGGER_MODE_SEQUENCE,
     TRIGGER_MODE_SINGLE,
-    TX7332_COMMANDS
+    TX7332_COMMANDS,
+    TX_FDA_COMMANDS,
 )
 from openlifu_sdk.io.LIFUUserConfig import sensitivity_at_frequency
 from openlifu_sdk.util.annotations import OpenLIFUFieldData
@@ -180,8 +185,15 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 class TxDevice(OWComponent):
+    """FDA transmitter component: preset load, trigger start/stop/status and
+    read-only telemetry. :class:`LIFUTxDevice` adds the RUO trigger,
+    register, solution-programming and module-service commands.
+    """
+
+    SUPPORTED_COMMANDS = TX_FDA_COMMANDS
+
     def __init__(self, vid: int = OW_VID, pid: int = OW_TRANSMITTER_PID,
-                 baudrate: int = 921600, timeout: float = DEFAULT_TIMEOUT, test_mode: bool = False, module_invert: bool | list[bool] = False):
+                 baudrate: int = 921600, timeout: float = DEFAULT_TIMEOUT, test_mode: bool = False):
         """
         Initialize the TxDevice.
 
@@ -191,21 +203,17 @@ class TxDevice(OWComponent):
             baudrate (int): Baud rate for UART communication.
             timeout (float): Timeout for UART operations in seconds.
             test_mode (bool): If True, simulates device responses without actual hardware communication.
-            module_invert (bool | list[bool]): If True or list of bools, inverts the module addressing scheme.
         """
         super().__init__(
             vid, pid,
-            supported_commands=GLOBAL_COMMANDS | TX7332_COMMANDS | CONTROLLER_COMMANDS,
+            supported_commands=self.SUPPORTED_COMMANDS,
             baudrate=baudrate, timeout=timeout, desc="TX",
         )
 
         register_command_packet_types(TX7332_COMMANDS, OW_TX7332)
         register_command_packet_types(CONTROLLER_COMMANDS, OW_CONTROLLER)
 
-        self._tx_instances = []
-        self.tx_registers = None
         self._test_mode = test_mode
-        self.module_invert = module_invert
         self.serial_number: Optional[str] = None
         self.hwid: Optional[str] = None
         self.hardware_id: Optional[str] = None
@@ -235,22 +243,6 @@ class TxDevice(OWComponent):
                 hwid = None
         self.hwid = hwid
         self.hardware_id = hwid
-
-    def __parse_ti_cfg_file(self, file_path: str) -> list[tuple[str, int, int]]:
-        """Parses the given configuration file and extracts all register groups, addresses, and values."""
-        parsed_data = []
-        pattern = re.compile(r"([\w\d\-]+)\|0x([0-9A-Fa-f]+)\t0x([0-9A-Fa-f]+)")
-
-        with open(file_path) as file:
-            for line in file:
-                match = pattern.match(line.strip())
-                if match:
-                    group_name = match.group(1)  # Capture register group name
-                    register_address = int(match.group(2), 16)  # Convert hex address to integer
-                    register_value = int(match.group(3), 16)  # Convert hex value to integer
-                    parsed_data.append((group_name, register_address, register_value))
-
-        return parsed_data
 
     def get_temperature(self, module:int=0) -> float:
         """Retrieve the core temperature reading from the TX device.
@@ -283,6 +275,205 @@ class TxDevice(OWComponent):
                 code=LIFU_ERR_BAD_PAYLOAD_LENGTH,
             )
         return round(struct.unpack('<f', r.data[:TEMPERATURE_DATA_LENGTH])[0], 2)
+
+    def get_trigger_json(self) -> dict:
+        """Read the current trigger configuration as a raw JSON dict.
+
+        Raises:
+            LIFUNotConnectedError, LIFUCommunicationError, LIFUDeviceError,
+            LIFUProtocolError: If the response payload is empty or malformed.
+        """
+        r = self.send_checked(packet_type=OW_CONTROLLER, command=OW_CTRL_GET_SWTRIG,
+                              addr=0, op="get_trigger_json")
+        if r.data_len == 0:
+            raise LIFUProtocolError(
+                "TX: get_trigger_json returned empty payload",
+                code=LIFU_ERR_EMPTY_RESPONSE,
+            )
+        try:
+            return json.loads(r.data[:r.data_len].decode("utf-8"))
+        except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+            raise LIFUProtocolError(
+                f"TX: get_trigger_json decode error: {exc}",
+                code=LIFU_ERR_BAD_PAYLOAD_FORMAT,
+            ) from exc
+
+    def get_trigger(self) -> dict:
+        """Retrieve the current trigger configuration as a canonical dict.
+
+        Raises:
+            LIFUNotConnectedError, LIFUCommunicationError, LIFUDeviceError,
+            LIFUProtocolError.
+        """
+        trigger_json = self.get_trigger_json()
+        if trigger_json["TriggerMode"] == TRIGGER_MODE_SEQUENCE:
+            mode = "sequence"
+        elif trigger_json["TriggerMode"] == TRIGGER_MODE_CONTINUOUS:
+            mode = "continuous"
+        elif trigger_json["TriggerMode"] == TRIGGER_MODE_SINGLE:
+            mode = "single"
+        else:
+            mode = "unknown"
+        return {
+            "pulse_interval": 1 / trigger_json["TriggerFrequencyHz"],
+            "pulse_count": trigger_json["TriggerPulseCount"],
+            "pulse_width": trigger_json["TriggerPulseWidthUsec"],
+            "pulse_train_interval": trigger_json["TriggerPulseTrainInterval"],
+            "pulse_train_count": trigger_json["TriggerPulseTrainCount"],
+            "mode": mode,
+            "profile_index": trigger_json["ProfileIndex"],
+            "profile_increment": bool(trigger_json["ProfileIncrement"]),
+            "train_count": int(trigger_json.get("TrainCount", 0)),
+            "trigger_status": str(trigger_json.get("TriggerStatus", "UNKNOWN")),
+        }
+
+    def start_trigger(self) -> bool:
+        """Start the software trigger on the TX device.
+
+        Raises:
+            LIFUNotConnectedError, LIFUCommunicationError, LIFUDeviceError.
+        """
+        self.send_checked(packet_type=OW_CONTROLLER, command=OW_CTRL_START_SWTRIG,
+                          addr=0, op="start_trigger")
+        return True
+
+    def stop_trigger(self) -> bool:
+        """Stop the software trigger on the TX device.
+
+        Raises:
+            LIFUNotConnectedError, LIFUCommunicationError, LIFUDeviceError.
+        """
+        r = self.send_checked(packet_type=OW_CONTROLLER, command=OW_CTRL_STOP_SWTRIG,
+                              addr=0, op="stop_trigger")
+        r.print_packet()
+        return True
+
+    def get_preset(self, index: int) -> Dict:
+        """Describe a preset baked into an FDA_MODE image (OW_PRESET_GET).
+
+        Returns ``count``, ``index``, ``chip_count``, ``profile_count``, ``id``,
+        ``settings_crc`` (CRC-32 of the source .json), ``regs_crc`` (CRC-32
+        the firmware just computed over its own register tables),
+        ``baked_regs_crc`` (what the generator stored, differs only if flash is
+        inconsistent), ``train_counts`` (the run lengths in pulse trains
+        the preset offers), and ``start_c`` / ``shutoff_c`` (the thermal
+        limits the firmware enforces; None from an image that predates them).
+
+        Raises:
+            LIFUDeviceError: Bad index, or the image failed its own CRC check.
+        """
+        r = self.send_checked(packet_type=OW_CONTROLLER, command=OW_PRESET_GET,
+                              reserved=index, op="get_preset")
+        if r.data_len < 17:
+            raise LIFUProtocolError(f"TX: get_preset payload too short ({r.data_len} < 17)",
+                                    code=LIFU_ERR_BAD_PAYLOAD_LENGTH)
+        d = bytes(r.data)
+        count, idx, chips, profiles = d[0], d[1], d[2], d[3]
+        settings_crc, regs_crc, baked_regs_crc = struct.unpack("<III", d[4:16])
+        id_len = d[16]
+        pos = 17 + id_len
+        counts = []
+        start_c = shutoff_c = None
+        if r.data_len > pos:
+            n = d[pos]
+            pos += 1
+            if r.data_len >= pos + 4 * n:
+                counts = list(struct.unpack("<%dI" % n, d[pos:pos + 4 * n]))
+                pos += 4 * n
+                if r.data_len >= pos + 4:
+                    raw_start, raw_shutoff = struct.unpack("<hh", d[pos:pos + 4])
+                    start_c = raw_start / PRESET_TEMP_SCALE
+                    shutoff_c = raw_shutoff / PRESET_TEMP_SCALE
+        return {"count": count, "index": idx, "chip_count": chips, "profile_count": profiles,
+                "settings_crc": settings_crc, "regs_crc": regs_crc, "baked_regs_crc": baked_regs_crc,
+                "id": d[17:17 + id_len].decode("ascii", "replace"), "train_counts": counts,
+                "start_c": start_c, "shutoff_c": shutoff_c}
+
+    def load_preset(self, index: int, regs_crc: int, duration_index: int = 0) -> bool:
+        """Program every module from baked preset *index* (OW_PRESET_LOAD).
+
+        The firmware refuses the load unless *regs_crc* equals the CRC-32 it
+        computes over its own tables, so pass the value the host derived for
+        this preset (see LIFUTXPresets.regs_crc). *duration_index* picks the
+        run length from the preset's baked pulse-train counts
+        (get_preset()["train_counts"]); a raw count cannot be sent.
+
+        In FDA mode the trigger only starts once a preset is loaded, and only
+        while the TX is at or below that preset's start_C; it stops itself at
+        shutoff_C. start_trigger() reports a refusal as a LIFUDeviceError
+        carrying OW_NO_PRESET, OW_TEMP_TOO_HIGH or OW_TEMP_UNKNOWN.
+
+        Raises:
+            LIFUDeviceError: CRC mismatch (OW_BAD_CRC), bad index, a duration
+                index the preset does not offer, or trigger running.
+        """
+        self.send_checked(packet_type=OW_CONTROLLER, command=OW_PRESET_LOAD,
+                          reserved=index, data=struct.pack("<II", duration_index, regs_crc),
+                          op="load_preset")
+        return True
+
+    def get_module_count(self) -> int:
+        """Return the number of connected LIFU transmitter modules.
+
+        Raises:
+            LIFUNotConnectedError, LIFUCommunicationError, LIFUDeviceError,
+            LIFUProtocolError: If the payload length is invalid.
+        """
+        try:
+            r = self.send_checked(packet_type=OW_CONTROLLER, command=OW_CTRL_GET_MODULE_COUNT,
+                                addr=0, op="get_module_count")
+        except LIFUError:
+            r = self.send_checked(packet_type=OW_TX7332, command=OW_TX7332_DEVICE_COUNT,
+                                addr=0, op="get_device_count")
+
+        if not r.data or len(r.data) < 1:
+            raise LIFUProtocolError(
+                f"TX: get_module_count payload length {r.data_len} < 1",
+                code=LIFU_ERR_BAD_PAYLOAD_LENGTH,
+            )
+        count = r.data[0]
+        logger.debug("Detected %d module(s)", count)
+        return count
+
+
+class LIFUTxDevice(LIFUComponentMixin, TxDevice):
+    """Research (RUO) transmitter component: :class:`TxDevice` plus host-set
+    trigger, async mode, TX7332 register access, solution programming and
+    module service / firmware update. Created only by :class:`LIFUInterface`.
+    """
+
+    SUPPORTED_COMMANDS = GLOBAL_COMMANDS | TX7332_COMMANDS | CONTROLLER_COMMANDS
+
+    def __init__(self, vid: int = OW_VID, pid: int = OW_TRANSMITTER_PID,
+                 baudrate: int = 921600, timeout: float = DEFAULT_TIMEOUT, test_mode: bool = False,
+                 module_invert: bool | list[bool] = False):
+        """
+        Initialize the LIFUTxDevice.
+
+        Args:
+            vid, pid, baudrate, timeout, test_mode: See :class:`TxDevice`.
+            module_invert (bool | list[bool]): If True or list of bools, inverts the module addressing scheme.
+        """
+        super().__init__(vid=vid, pid=pid, baudrate=baudrate, timeout=timeout, test_mode=test_mode)
+        self._tx_instances = []
+        self.tx_registers = None
+        self.module_invert = module_invert
+
+    def __parse_ti_cfg_file(self, file_path: str) -> list[tuple[str, int, int]]:
+        """Parses the given configuration file and extracts all register groups, addresses, and values."""
+        parsed_data = []
+        pattern = re.compile(r"([\w\d\-]+)\|0x([0-9A-Fa-f]+)\t0x([0-9A-Fa-f]+)")
+
+        with open(file_path) as file:
+            for line in file:
+                match = pattern.match(line.strip())
+                if match:
+                    group_name = match.group(1)  # Capture register group name
+                    register_address = int(match.group(2), 16)  # Convert hex address to integer
+                    register_value = int(match.group(3), 16)  # Convert hex value to integer
+                    parsed_data.append((group_name, register_address, register_value))
+
+        return parsed_data
 
     def set_trigger(self,
                     pulse_interval: float,
@@ -459,57 +650,6 @@ class TxDevice(OWComponent):
                 code=LIFU_ERR_BAD_PAYLOAD_FORMAT,
             ) from exc
 
-    def get_trigger_json(self) -> dict:
-        """Read the current trigger configuration as a raw JSON dict.
-
-        Raises:
-            LIFUNotConnectedError, LIFUCommunicationError, LIFUDeviceError,
-            LIFUProtocolError: If the response payload is empty or malformed.
-        """
-        r = self.send_checked(packet_type=OW_CONTROLLER, command=OW_CTRL_GET_SWTRIG,
-                              addr=0, op="get_trigger_json")
-        if r.data_len == 0:
-            raise LIFUProtocolError(
-                "TX: get_trigger_json returned empty payload",
-                code=LIFU_ERR_EMPTY_RESPONSE,
-            )
-        try:
-            return json.loads(r.data[:r.data_len].decode("utf-8"))
-        except (json.JSONDecodeError, UnicodeDecodeError) as exc:
-            raise LIFUProtocolError(
-                f"TX: get_trigger_json decode error: {exc}",
-                code=LIFU_ERR_BAD_PAYLOAD_FORMAT,
-            ) from exc
-
-    def get_trigger(self) -> dict:
-        """Retrieve the current trigger configuration as a canonical dict.
-
-        Raises:
-            LIFUNotConnectedError, LIFUCommunicationError, LIFUDeviceError,
-            LIFUProtocolError.
-        """
-        trigger_json = self.get_trigger_json()
-        if trigger_json["TriggerMode"] == TRIGGER_MODE_SEQUENCE:
-            mode = "sequence"
-        elif trigger_json["TriggerMode"] == TRIGGER_MODE_CONTINUOUS:
-            mode = "continuous"
-        elif trigger_json["TriggerMode"] == TRIGGER_MODE_SINGLE:
-            mode = "single"
-        else:
-            mode = "unknown"
-        return {
-            "pulse_interval": 1 / trigger_json["TriggerFrequencyHz"],
-            "pulse_count": trigger_json["TriggerPulseCount"],
-            "pulse_width": trigger_json["TriggerPulseWidthUsec"],
-            "pulse_train_interval": trigger_json["TriggerPulseTrainInterval"],
-            "pulse_train_count": trigger_json["TriggerPulseTrainCount"],
-            "mode": mode,
-            "profile_index": trigger_json["ProfileIndex"],
-            "profile_increment": bool(trigger_json["ProfileIncrement"]),
-            "train_count": int(trigger_json.get("TrainCount", 0)),
-            "trigger_status": str(trigger_json.get("TriggerStatus", "UNKNOWN")),
-        }
-
     def set_pattern_profile(self, profile: int, module: int | None = None) -> bool:
         """Set the active TX pattern profile via MCU controller command.
 
@@ -633,27 +773,6 @@ class TxDevice(OWComponent):
             )
         return profile
 
-    def start_trigger(self) -> bool:
-        """Start the software trigger on the TX device.
-
-        Raises:
-            LIFUNotConnectedError, LIFUCommunicationError, LIFUDeviceError.
-        """
-        self.send_checked(packet_type=OW_CONTROLLER, command=OW_CTRL_START_SWTRIG,
-                          addr=0, op="start_trigger")
-        return True
-
-    def stop_trigger(self) -> bool:
-        """Stop the software trigger on the TX device.
-
-        Raises:
-            LIFUNotConnectedError, LIFUCommunicationError, LIFUDeviceError.
-        """
-        r = self.send_checked(packet_type=OW_CONTROLLER, command=OW_CTRL_STOP_SWTRIG,
-                              addr=0, op="stop_trigger")
-        r.print_packet()
-        return True
-
     def async_mode(self, enable: bool | None = None) -> bool:
         """Enable, disable, or read the TX device's asynchronous mode.
 
@@ -749,70 +868,6 @@ class TxDevice(OWComponent):
         self.send_checked(packet_type=OW_TX7332, command=OW_TX7332_WREG,
                           addr=identifier, data=data, op="write_register")
         logger.debug("Wrote 0x%08X to chip %d reg 0x%04X", value, identifier, address)
-        return True
-
-    def get_preset(self, index: int) -> Dict:
-        """Describe a preset baked into an FDA_MODE image (OW_PRESET_GET).
-
-        Returns ``count``, ``index``, ``chip_count``, ``profile_count``, ``id``,
-        ``settings_crc`` (CRC-32 of the source .json), ``regs_crc`` (CRC-32
-        the firmware just computed over its own register tables),
-        ``baked_regs_crc`` (what the generator stored, differs only if flash is
-        inconsistent), ``train_counts`` (the run lengths in pulse trains
-        the preset offers), and ``start_c`` / ``shutoff_c`` (the thermal
-        limits the firmware enforces; None from an image that predates them).
-
-        Raises:
-            LIFUDeviceError: Bad index, or the image failed its own CRC check.
-        """
-        r = self.send_checked(packet_type=OW_CONTROLLER, command=OW_PRESET_GET,
-                              reserved=index, op="get_preset")
-        if r.data_len < 17:
-            raise LIFUProtocolError(f"TX: get_preset payload too short ({r.data_len} < 17)",
-                                    code=LIFU_ERR_BAD_PAYLOAD_LENGTH)
-        d = bytes(r.data)
-        count, idx, chips, profiles = d[0], d[1], d[2], d[3]
-        settings_crc, regs_crc, baked_regs_crc = struct.unpack("<III", d[4:16])
-        id_len = d[16]
-        pos = 17 + id_len
-        counts = []
-        start_c = shutoff_c = None
-        if r.data_len > pos:
-            n = d[pos]
-            pos += 1
-            if r.data_len >= pos + 4 * n:
-                counts = list(struct.unpack("<%dI" % n, d[pos:pos + 4 * n]))
-                pos += 4 * n
-                if r.data_len >= pos + 4:
-                    raw_start, raw_shutoff = struct.unpack("<hh", d[pos:pos + 4])
-                    start_c = raw_start / PRESET_TEMP_SCALE
-                    shutoff_c = raw_shutoff / PRESET_TEMP_SCALE
-        return {"count": count, "index": idx, "chip_count": chips, "profile_count": profiles,
-                "settings_crc": settings_crc, "regs_crc": regs_crc, "baked_regs_crc": baked_regs_crc,
-                "id": d[17:17 + id_len].decode("ascii", "replace"), "train_counts": counts,
-                "start_c": start_c, "shutoff_c": shutoff_c}
-
-    def load_preset(self, index: int, regs_crc: int, duration_index: int = 0) -> bool:
-        """Program every module from baked preset *index* (OW_PRESET_LOAD).
-
-        The firmware refuses the load unless *regs_crc* equals the CRC-32 it
-        computes over its own tables, so pass the value the host derived for
-        this preset (see LIFUTXPresets.regs_crc). *duration_index* picks the
-        run length from the preset's baked pulse-train counts
-        (get_preset()["train_counts"]); a raw count cannot be sent.
-
-        In FDA mode the trigger only starts once a preset is loaded, and only
-        while the TX is at or below that preset's start_C; it stops itself at
-        shutoff_C. start_trigger() reports a refusal as a LIFUDeviceError
-        carrying OW_NO_PRESET, OW_TEMP_TOO_HIGH or OW_TEMP_UNKNOWN.
-
-        Raises:
-            LIFUDeviceError: CRC mismatch (OW_BAD_CRC), bad index, a duration
-                index the preset does not offer, or trigger running.
-        """
-        self.send_checked(packet_type=OW_CONTROLLER, command=OW_PRESET_LOAD,
-                          reserved=index, data=struct.pack("<II", duration_index, regs_crc),
-                          op="load_preset")
         return True
 
     def read_register(self, identifier:int, address: int) -> int:
@@ -1231,29 +1286,6 @@ class TxDevice(OWComponent):
     # ------------------------------------------------------------------
     # Firmware update (delegates to LIFUDFU.LIFUDFUManager)
     # ------------------------------------------------------------------
-
-    def get_module_count(self) -> int:
-        """Return the number of connected LIFU transmitter modules.
-
-        Raises:
-            LIFUNotConnectedError, LIFUCommunicationError, LIFUDeviceError,
-            LIFUProtocolError: If the payload length is invalid.
-        """
-        try:
-            r = self.send_checked(packet_type=OW_CONTROLLER, command=OW_CTRL_GET_MODULE_COUNT,
-                                addr=0, op="get_module_count")
-        except LIFUError:
-            r = self.send_checked(packet_type=OW_TX7332, command=OW_TX7332_DEVICE_COUNT,
-                                addr=0, op="get_device_count")
-
-        if not r.data or len(r.data) < 1:
-            raise LIFUProtocolError(
-                f"TX: get_module_count payload length {r.data_len} < 1",
-                code=LIFU_ERR_BAD_PAYLOAD_LENGTH,
-            )
-        count = r.data[0]
-        logger.debug("Detected %d module(s)", count)
-        return count
 
     def enumerate_modules(self) -> int:
         """Re-run the master's robust enumeration (Phase 2).
@@ -2162,7 +2194,7 @@ def build_solution_registers(pulse: Dict | List[Dict],
     This is the single source of the solution -> register mapping: input
     validation, the duty cycle, how many pulse profiles exist and which delay
     profile uses which, and the per-profile apodization the firmware needs in
-    order to raster. :meth:`TxDevice.set_solution` calls this and then programs
+    order to raster. :meth:`LIFUTxDevice.set_solution` calls this and then programs
     the result; preset header generation calls it and bakes the result. Neither
     keeps a second copy, so a change here reaches both.
 

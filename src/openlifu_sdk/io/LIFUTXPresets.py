@@ -133,7 +133,7 @@ def compile_preset(preset: Dict, preset_id: str | None = None,
     """Resolve a preset into the register mapping a TX image bakes in.
 
     The mapping comes from :func:`build_solution_registers`, the same function
-    :meth:`TxDevice.set_solution` uses to program a live device, so there is
+    :meth:`LIFUTxDevice.set_solution` uses to program a live device, so there is
     only ever one implementation to keep correct.
 
     Args:
