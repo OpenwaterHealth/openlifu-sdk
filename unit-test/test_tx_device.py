@@ -31,6 +31,7 @@ if _SRC not in sys.path:
     sys.path.insert(0, _SRC)
 
 from openlifu_sdk.io.LIFUConfig import (
+    HW_ID_DATA_LENGTH,
     OW_ERROR,
     OW_RESP,
     OW_TX7332,
@@ -40,9 +41,8 @@ from openlifu_sdk.io.LIFUConfig import (
 )
 from openlifu_sdk.io.LIFUTXDevice import (
     ADDRESS_GLOBAL_MODE,
-    HW_ID_DATA_LENGTH,
     TEMPERATURE_DATA_LENGTH,
-    TxDevice,
+    LIFUTxDevice,
 )
 from openlifu_sdk.io.exceptions import (
     LIFUDeviceError,
@@ -71,10 +71,10 @@ def _make_packet(data: bytes = b"", packet_type: int = OW_RESP, reserved: int = 
 # Unit Tests  (pytest / unittest)
 # ===========================================================================
 class TestTxDeviceUnit(unittest.TestCase):
-    """Unit tests for TxDevice using a fully mocked OWUart."""
+    """Unit tests for LIFUTxDevice using a fully mocked OWUart."""
 
     def setUp(self):
-        self.tx = TxDevice()
+        self.tx = LIFUTxDevice()
         self.uart = MagicMock(spec=OWUart)
         self.uart.desc = "TX"
         self.uart.demo_mode = False
@@ -398,7 +398,7 @@ class TestTX7332Commands(unittest.TestCase):
     """
 
     def setUp(self):
-        self.tx = TxDevice()
+        self.tx = LIFUTxDevice()
         self.uart = MagicMock(spec=OWUart)
         self.uart.desc = "TX"
         self.uart.demo_mode = False
@@ -649,7 +649,7 @@ class TestTX7332Commands(unittest.TestCase):
 class TxDeviceInteractiveTests:
     """Menu-driven tests that exercise TxDevice against real connected hardware."""
 
-    def __init__(self, tx_device: TxDevice, module: int = 0,
+    def __init__(self, tx_device: LIFUTxDevice, module: int = 0,
                  module_count: int | None = None):
         self.tx = tx_device
         self.module = module                  # currently-selected TX module
@@ -1015,7 +1015,7 @@ class TxDeviceInteractiveTests:
 # ===========================================================================
 # Hardware connection helper
 # ===========================================================================
-def _connect_tx_device() -> TxDevice:
+def _connect_tx_device() -> LIFUTxDevice:
     from openlifu_sdk.io.LIFUInterface import LIFUInterface
 
     print("Connecting to LIFU TX device...")

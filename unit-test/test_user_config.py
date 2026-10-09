@@ -50,8 +50,8 @@ from openlifu_sdk.io.exceptions import (
     LIFUProtocolError,
 )
 from openlifu_sdk.io.LIFUConfig import OW_ERROR, OW_RESP
-from openlifu_sdk.io.LIFUHVController import HVController
-from openlifu_sdk.io.LIFUTXDevice import TxDevice
+from openlifu_sdk.io.LIFUHVController import LIFUHVController
+from openlifu_sdk.io.LIFUTXDevice import LIFUTxDevice
 from openlifu_sdk.io.LIFUUserConfig import (
     LIFU_MAGIC,
     LIFU_VER,
@@ -185,13 +185,13 @@ class TestLifuUserConfigWireFormat(unittest.TestCase):
 
 
 # ===========================================================================
-# Unit Tests — read_config / write_config (TxDevice path)
+# Unit Tests — read_config / write_config (LIFUTxDevice path)
 # ===========================================================================
 class TestReadWriteConfigTx(unittest.TestCase):
-    """Verify read_config / write_config behavior on a TxDevice."""
+    """Verify read_config / write_config behavior on a LIFUTxDevice."""
 
     def setUp(self):
-        self.tx = TxDevice()
+        self.tx = LIFUTxDevice()
         self.uart = _patch_component_uart(self.tx)
 
     # --- read_config --------------------------------------------------------
@@ -296,7 +296,7 @@ class TestReadWriteConfigHV(unittest.TestCase):
     """Verify read_config / write_config behavior on the HV controller."""
 
     def setUp(self):
-        self.hv = HVController()
+        self.hv = LIFUHVController()
         self.uart = _patch_component_uart(self.hv)
 
     def test_01_read_config_success(self):

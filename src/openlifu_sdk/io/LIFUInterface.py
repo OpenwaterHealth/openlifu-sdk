@@ -23,8 +23,8 @@ from openlifu_sdk.io.exceptions import (
     LIFUNoTriggerStatusError,
     LIFUSolutionError,
 )
-from openlifu_sdk.io.LIFUHVController import HVController
-from openlifu_sdk.io.LIFUTXDevice import TriggerModeOpts, TxDevice
+from openlifu_sdk.io.LIFUHVController import HVController, LIFUHVController
+from openlifu_sdk.io.LIFUTXDevice import LIFUTxDevice, TriggerModeOpts, TxDevice
 
 # Maximum-voltage lookup tables keyed by hardware/test profile.
 #
@@ -221,7 +221,10 @@ class DeviceInterface:
 
     This is the surface FDA-mode applications program against. It loads
     presets baked into device flash (:meth:`load_preset`) and starts / stops
-    them; it has no way to program an arbitrary solution or HV setpoint.
+    them; it has no way to program an arbitrary solution or HV setpoint. Its
+    components are the FDA :class:`TxDevice` / :class:`HVController`, which
+    neither define nor whitelist the RUO commands. It connects synchronously
+    and has no async / USB-monitoring mode.
     :class:`LIFUInterface` extends it with those research (RUO) endpoints.
     """
     hvcontroller: HVController = None
@@ -234,11 +237,10 @@ class DeviceInterface:
                  baudrate: int = 921600,
                  timeout: float = DEFAULT_TIMEOUT,
                  TX_test_mode: bool = False,
-                 HV_test_mode: bool = False,
-                 run_async: bool = False) -> None:
+                 HV_test_mode: bool = False) -> None:
         """
-        Initialize the interface, create the TX and HV components and, unless
-        *run_async*, connect them.
+        Initialize the interface, create the TX and HV components and connect
+        them.
 
         Args:
             vid (int): Vendor ID of the USB device.
@@ -248,10 +250,8 @@ class DeviceInterface:
             timeout (int): Read timeout in seconds.
             TX_test_mode (bool): Enable TX test mode.
             HV_test_mode (bool): Enable HV test mode.
-            run_async (bool): Enable asynchronous operation.
         """
         # Store parameters in instance variables
-        self._async_mode = run_async
         self.txdevice = None
         self.hvcontroller = None
         self.status = LIFUInterfaceStatus.STATUS_SYS_OFF
@@ -262,12 +262,7 @@ class DeviceInterface:
 
         self.txdevice, self.hvcontroller = self._create_devices(
             vid, tx_pid, con_pid, baudrate, timeout, TX_test_mode, HV_test_mode)
-
-        if not self._async_mode:
-            if self.txdevice is not None:
-                self.txdevice.connect()
-            if self.hvcontroller is not None:
-                self.hvcontroller.connect()
+        self._connect_devices()
 
     def _create_devices(self, vid: int, tx_pid: int, con_pid: int, baudrate: int,
                         timeout: float, TX_test_mode: bool,
@@ -277,19 +272,12 @@ class DeviceInterface:
         hvcontroller = HVController(vid=vid, pid=con_pid, baudrate=baudrate, timeout=timeout, test_mode=HV_test_mode)
         return txdevice, hvcontroller
 
-    async def start_monitoring(self, interval: int = 1) -> None:
-        """Start monitoring for USB device connections."""
+    def _connect_devices(self) -> None:
+        """Open the TX and HV serial links."""
         if self.txdevice is not None:
-            self.txdevice.start()
+            self.txdevice.connect()
         if self.hvcontroller is not None:
-            self.hvcontroller.start()
-        
-    def stop_monitoring(self) -> None:
-        """Stop monitoring for USB device connections."""
-        if self.txdevice is not None:
-            self.txdevice.stop()
-        if self.hvcontroller is not None:
-            self.hvcontroller.stop()
+            self.hvcontroller.connect()
 
     def is_device_connected(self) -> tuple:
         """
@@ -353,11 +341,10 @@ class DeviceInterface:
         logger.info("Preset %d loaded successfully.", preset_index)
         return True
 
-    def start_sonication(self, async_mode: bool | None = None, turn_hv_on: bool = True, wait_for_settle: bool = True) -> bool:
+    def start_sonication(self, turn_hv_on: bool = True, wait_for_settle: bool = True) -> bool:
         """Start sonication.
 
         Args:
-            async_mode: If not None, override the interface's async-mode setting.
             turn_hv_on: If True, turn on HV before starting.
             wait_for_settle: If True, wait for HV to settle before starting.
 
@@ -384,8 +371,6 @@ class DeviceInterface:
                 logger.warning("HV is OFF")
         else:
             logger.debug("No HV Controller detected, assuming external power supply. Skipping HV checks.")
-
-        self.txdevice.async_mode(async_mode if async_mode is not None else self._async_mode)
 
         logger.debug("Starting Trigger")
         self.txdevice.start_trigger()
@@ -468,19 +453,14 @@ class DeviceInterface:
         else:
             logger.debug("Using external power supply, HV will not be turned OFF.")
 
-        self.txdevice.async_mode(False)
-
         logger.info("Sonication stopped successfully.")
         self.set_status(LIFUInterfaceStatus.STATUS_FINISHED)
         return True
 
     def close(self):
-        self.stop_monitoring()
         if self.txdevice:
-            self.txdevice.stop()
             self.txdevice.close()
         if self.hvcontroller:
-            self.hvcontroller.stop()
             self.hvcontroller.close()
         self._release_hw_interface_pid()
 
@@ -536,8 +516,12 @@ class DeviceInterface:
 class LIFUInterface(DeviceInterface):
     """Research (RUO) interface: :class:`DeviceInterface` plus endpoints that
     program arbitrary solutions and HV setpoints, gated by the host-side
-    duty-cycle / duration voltage tables.
+    duty-cycle / duration voltage tables. Builds the RUO components
+    (:class:`LIFUTxDevice` / :class:`LIFUHVController`) and adds the async /
+    USB-monitoring mode.
     """
+    hvcontroller: LIFUHVController = None
+    txdevice: LIFUTxDevice = None
 
     def __init__(self,
                  vid: int = OW_VID,
@@ -574,19 +558,58 @@ class LIFUInterface(DeviceInterface):
         self.voltage_table_selection = voltage_table_selection
         self._ext_power_supply = ext_power_supply
         self._module_invert = module_invert
+        self._async_mode = run_async
         super().__init__(vid=vid, tx_pid=tx_pid, con_pid=con_pid, baudrate=baudrate,
                          timeout=timeout, TX_test_mode=TX_test_mode,
-                         HV_test_mode=HV_test_mode, run_async=run_async)
+                         HV_test_mode=HV_test_mode)
 
     def _create_devices(self, vid: int, tx_pid: int, con_pid: int, baudrate: int,
                         timeout: float, TX_test_mode: bool,
-                        HV_test_mode: bool) -> tuple[TxDevice, Optional[HVController]]:
-        txdevice = TxDevice(vid=vid, pid=tx_pid, baudrate=baudrate, timeout=timeout, test_mode=TX_test_mode, module_invert=self._module_invert)
+                        HV_test_mode: bool) -> tuple[LIFUTxDevice, Optional[LIFUHVController]]:
+        txdevice = LIFUTxDevice(vid=vid, pid=tx_pid, baudrate=baudrate, timeout=timeout, test_mode=TX_test_mode, module_invert=self._module_invert)
         if self._ext_power_supply:
             logger.debug("External power supply selected, skipping HVController initialization.")
             return txdevice, None
-        hvcontroller = HVController(vid=vid, pid=con_pid, baudrate=baudrate, timeout=timeout, test_mode=HV_test_mode)
+        hvcontroller = LIFUHVController(vid=vid, pid=con_pid, baudrate=baudrate, timeout=timeout, test_mode=HV_test_mode)
         return txdevice, hvcontroller
+
+    def _connect_devices(self) -> None:
+        # In async mode the monitor threads started by start_monitoring() open the ports.
+        if not self._async_mode:
+            super()._connect_devices()
+
+    async def start_monitoring(self, interval: int = 1) -> None:
+        """Start monitoring for USB device connections."""
+        if self.txdevice is not None:
+            self.txdevice.start()
+        if self.hvcontroller is not None:
+            self.hvcontroller.start()
+
+    def stop_monitoring(self) -> None:
+        """Stop monitoring for USB device connections."""
+        if self.txdevice is not None:
+            self.txdevice.stop()
+        if self.hvcontroller is not None:
+            self.hvcontroller.stop()
+
+    def start_sonication(self, async_mode: bool | None = None, turn_hv_on: bool = True, wait_for_settle: bool = True) -> bool:
+        """Set the TX async mode, then start sonication (see
+        :meth:`DeviceInterface.start_sonication`).
+
+        Args:
+            async_mode: If not None, override the interface's async-mode setting.
+        """
+        if not self._test_mode:
+            self.txdevice.async_mode(async_mode if async_mode is not None else self._async_mode)
+        return super().start_sonication(turn_hv_on=turn_hv_on, wait_for_settle=wait_for_settle)
+
+    def stop_sonication(self, turn_hv_off: bool = True, wait_for_settle: bool = False) -> bool:
+        """Stop sonication (see :meth:`DeviceInterface.stop_sonication`), then
+        clear the TX async mode."""
+        super().stop_sonication(turn_hv_off=turn_hv_off, wait_for_settle=wait_for_settle)
+        if not self._test_mode:
+            self.txdevice.async_mode(False)
+        return True
 
     # Temporary fix for hardware variations between EVT0 and EVT2
     def _resolve_voltage_chart(self, voltage_table: Optional[str]) -> dict:
