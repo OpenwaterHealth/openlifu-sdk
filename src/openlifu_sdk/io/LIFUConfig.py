@@ -25,6 +25,11 @@ OW_ERROR = 0xEF
 
 OW_SUCCESS = 0x00
 # FDA mode refusals, carried in the OW_ERROR reply's reserved byte.
+OW_HV_RANGE = 0xF1         # console: select's rescaled voltage is outside the FDA window
+OW_PRESET_BUSY = 0xF2      # TX: trigger running, presets cannot be stored or deleted
+OW_PRESET_NO_ROOM = 0xF3   # TX: blob needs the next slot too, and it is taken or missing
+OW_PRESET_SLOT_TAIL = 0xF4 # TX: slot holds the second half of the preset before it
+OW_PRESET_EMPTY = 0xF5     # TX: nothing stored in the slot
 OW_HV_PRESET_CRC = 0xF6    # console: select's settings_crc is not that preset's
 OW_HV_NO_PRESET = 0xF7     # console: HV on before any preset was selected
 OW_HV_FDA_REFUSED = 0xF8   # console: host-set voltage / raw DACs, or select while HV on
@@ -75,9 +80,14 @@ OW_CTRL_SET_PROFILE_CYCLE = 0x1F
 OW_CTRL_SET_PATTERN_PROFILE = 0x28
 OW_CTRL_GET_PATTERN_PROFILE = 0x29
 
-# FDA Mode only
+# FDA and preset modes
 OW_PRESET_GET = 0x50
 OW_PRESET_LOAD = 0x51  
+# Preset mode only: storing and deleting presets
+OW_PRESET_WRITE = 0x52
+OW_PRESET_COMMIT = 0x53
+OW_PRESET_DELETE = 0x54
+OW_PRESET_CAPACITY = 0x55
 
 # TX7332 Commands
 OW_TX7332_STATUS = 0x20
@@ -115,7 +125,7 @@ OW_POWER_HV_ENABLE = 0x42
 OW_POWER_SET_RGB_FX = 0x43
 # FDA mode only: the console's per-preset HV table, indexed like the TX's.
 OW_POWER_PRESET_GET = 0x44     # reserved=index
-OW_POWER_PRESET_SELECT = 0x45  # reserved=index, data=settings_crc u32 LE
+OW_POWER_PRESET_SELECT = 0x45  # reserved=index, data=settings_crc u32 + transmitter sensitivity f32 (LE)
 
 # OW_POWER_SET_RGB_FX effect ids (payload byte 0 - see firmware common.h)
 OW_RGB_FX_STOP = 0
@@ -152,6 +162,7 @@ CONTROLLER_COMMANDS = {
     OW_CTRL_SET_DELAY_PROFILE, OW_CTRL_GET_DELAY_PROFILE,
     OW_CTRL_SET_PROFILE_CYCLE,
     OW_PRESET_GET, OW_PRESET_LOAD,
+    OW_PRESET_WRITE, OW_PRESET_COMMIT, OW_PRESET_DELETE, OW_PRESET_CAPACITY,
 }
 
 POWER_COMMANDS = {

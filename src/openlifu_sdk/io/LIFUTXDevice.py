@@ -4,13 +4,19 @@ import json
 import logging
 import re
 import struct
+import zlib
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Annotated, Dict, List, Literal
 
 import numpy as np
 
 from openlifu_sdk.io.component import OWComponent, register_command_packet_types
-from openlifu_sdk.io.exceptions import LIFUError, LIFUProtocolError
+from openlifu_sdk.io.exceptions import (
+    LIFUCommunicationError,
+    LIFUDeviceError,
+    LIFUError,
+    LIFUProtocolError,
+)
 from openlifu_sdk.io.LIFUConfig import (
     CONTROLLER_COMMANDS,
     DEFAULT_TIMEOUT,
@@ -26,8 +32,14 @@ from openlifu_sdk.io.LIFUConfig import (
     OW_CTRL_ENUMERATE,
     NODE_MODE_UNKNOWN,
     OW_CTRL_GET_PATTERN_PROFILE,
+    OW_PRESET_COMMIT,
+    OW_PRESET_DELETE,
+    OW_PRESET_EMPTY,
     OW_PRESET_GET,
     OW_PRESET_LOAD,
+    OW_PRESET_SLOT_TAIL,
+    OW_PRESET_CAPACITY,
+    OW_PRESET_WRITE,
     OW_CTRL_SET_PATTERN_PROFILE,
     OW_CTRL_SET_DELAY_PROFILE,
     OW_CTRL_GET_DELAY_PROFILE,
@@ -171,6 +183,18 @@ PRESET_TEMP_RAW_MAX = 0x7FFF
 PRESET_BLOB_MAGIC = b"OWPR"
 PRESET_BLOB_VERSION = 1
 PRESET_ID_MAX = 64
+# A PRESET_MODE image keeps blobs in flash slots of one page each
+# (presets.h in the firmware); a blob over one slot takes the next too.
+# The device reports its own figures (get_preset_capacity); these are what
+# today's firmware has, for code that runs with no device.
+PRESET_SLOT_SIZE = 2048
+PRESET_SLOTS = 16
+PRESET_BLOB_MAX = 2 * PRESET_SLOT_SIZE
+# Blob bytes per OW_PRESET_WRITE: well inside every hop's packet buffer.
+PRESET_WRITE_CHUNK = 512
+# Uploads tried before a missing reply is reported. On the bench about one
+# commit in thirty stores the preset but its reply never reaches the host.
+PRESET_WRITE_ATTEMPTS = 3
 TEMPERATURE_DATA_LENGTH = 4
 
 if TYPE_CHECKING:
@@ -283,12 +307,15 @@ class TxDevice(OWComponent):
             profile_index (int): The pulse profile to use.
             profile_increment (bool): Whether to increment the pulse profile.
 
+        The timing is resolved by :func:`resolve_trigger_timing`, which preset
+        generation also bakes from.
+
         Raises:
             ValueError: If the inputs are invalid, including a nonzero
                 pulse_train_interval shorter than the on-device train
                 duration ``pulse_count * (1_000_000 // int(1/pulse_interval))``
-                microseconds (the firmware truncates fractional Hz, so its
-                train can run longer than what we calculate here).
+                microseconds (the trigger runs on whole Hz, so its train can
+                run longer than ``pulse_interval * pulse_count``).
         """
 
         trigger_mode = trigger_mode.lower()
@@ -301,104 +328,31 @@ class TxDevice(OWComponent):
         else:
             raise ValueError("Invalid trigger mode")
 
-        # Validate inputs
-        if pulse_interval <= 0:
-            raise ValueError("pulse_interval must be positive")
-        if pulse_count < 1:
-            raise ValueError("pulse_count must be at least 1")
-
-        # FW truncates Hz to int and integer-divides the period,
-        # so the train on the transmitter can be longer than what the host math says.
-        fw_freq_int = int(1.0 / pulse_interval)
-        if fw_freq_int <= 0:
-            raise ValueError(
-                f"pulse_interval {pulse_interval} s implies a trigger "
-                f"frequency below 1 Hz; the firmware parses the trigger "
-                f"frequency as an integer number of Hz and cannot represent "
-                f"this."
-            )
-        fw_period_us = 1_000_000 // fw_freq_int
-        fw_train_us = fw_period_us * pulse_count
-
-        # With only one train the spacing has no effect
-        single_train = (pulse_train_count <= 1
-                        and trigger_mode_int != TRIGGER_MODE_CONTINUOUS)
-
-        host_train_us = int(round(pulse_interval * pulse_count * 1e6))
-        interval_us = int(round(pulse_train_interval * 1e6))
-
-        if pulse_train_interval == 0 or (single_train
-                                         and interval_us < fw_train_us):
-            pulse_train_interval = 0.0
-        elif interval_us == host_train_us or interval_us == fw_train_us:
-            # If zero gap use the firmware's single-timer back-to-back path.
-            logger.info(
-                "pulse_train_interval %s s equals the train duration "
-                "(%s us on-device) -- zero inter-train gap; sending 0 to "
-                "use the firmware's native back-to-back path.",
-                pulse_train_interval, fw_train_us,
-            )
-            pulse_train_interval = 0.0
-        elif interval_us < fw_train_us:
-            raise ValueError(
-                f"pulse_train_interval {pulse_train_interval} s "
-                f"({interval_us} us) is shorter than the on-device train "
-                f"duration ({fw_train_us} us = {pulse_count} x {fw_period_us} "
-                f"us integer-truncated firmware periods). Use at least "
-                f"{fw_train_us / 1e6} s, or 0 for back-to-back trains."
-            )
-
-        # Firmware <= 2.0.3 compatibility shim.
-        #
-        # FW <= 2.0.3 rejects start_trigger with TRIGGER_STATUS_ERROR
-        # (surfaced as a LIFUDeviceError OW_ERROR NAK with no sub-code)
-        # whenever:
-        #     TriggerPulseTrainInterval > 0 AND
-        #     TriggerPulseTrainInterval <= triggerPeriodUsec
-        # where ``triggerPeriodUsec = 1_000_000 / TriggerFrequencyHz`` (the
-        # per-pulse period) and ``TriggerFrequencyHz`` is parsed as uint32
-        # (strtol, base 10) so fractional Hz get truncated. FW 2.0.7+ uses
-        # strict ``<`` and a pulse_count factor, so it always passes.
-        #
-        # When the train interval lands at or within rounding of the
-        # firmware per-pulse period we lengthen it to
-        # ``1 / (int(1/pulse_train_interval) - 1)`` -- effectively rounding
-        # the implied train frequency down by 1 Hz, which lengthens the
-        # interval just enough to clear the firmware integer period without
-        # changing pulse_interval (the user-meaningful sonication frequency).
-        train_us = int(round(pulse_train_interval * 1_000_000))
-        if train_us > 0 and pulse_interval > 0:
-            freq_int = int(1.0 / pulse_interval)
-            period_us = 1_000_000 // freq_int if freq_int > 0 else 0
-            if train_us <= period_us:
-                train_freq_int = int(1.0 / pulse_train_interval)
-                if train_freq_int > 1:
-                    new_train_s = 1.0 / (train_freq_int - 1)
-                else:
-                    new_train_s = pulse_train_interval + 1e-6
-                logger.debug(
-                    "FW <=2.0.3 compat: bumping pulse_train_interval from "
-                    "%s s (%s us) to %s s (%s us) so it exceeds the firmware "
-                    "per-pulse period (%s us).",
-                    pulse_train_interval, train_us,
-                    new_train_s, int(round(new_train_s * 1_000_000)),
-                    period_us,
-                )
-                pulse_train_interval = new_train_s
+        # Every timing decision lives in resolve_trigger_timing() so this path
+        # and preset generation cannot drift apart; the integers it returns are
+        # sent as they are.
+        timing = resolve_trigger_timing(
+            pulse_interval,
+            pulse_count=pulse_count,
+            pulse_train_interval=pulse_train_interval,
+            pulse_train_count=pulse_train_count,
+            continuous=trigger_mode_int == TRIGGER_MODE_CONTINUOUS,
+        )
 
         logger.info(f"Setting trigger with parameters: "
                         f"pulse_interval={pulse_interval}, "
+                        f"frequency_hz={timing['frequency_hz']}, "
                         f"pulse_count={pulse_count}, "
                         f"pulse_width={pulse_width}, "
-                        f"pulse_train_interval={pulse_train_interval}, "
+                        f"pulse_train_interval_us={timing['pulse_train_interval_us']}, "
                         f"pulse_train_count={pulse_train_count}, "
                         f"trigger_mode={trigger_mode}")
 
         trigger_json = {
-            "TriggerFrequencyHz": 1/pulse_interval,
+            "TriggerFrequencyHz": timing["frequency_hz"],
             "TriggerPulseCount": pulse_count,
             "TriggerPulseWidthUsec": pulse_width,
-            "TriggerPulseTrainInterval": int(round(pulse_train_interval * 1_000_000)),
+            "TriggerPulseTrainInterval": timing["pulse_train_interval_us"],
             "TriggerPulseTrainCount": pulse_train_count,
             "TriggerMode": trigger_mode_int,
             "ProfileIndex": 0,
@@ -720,15 +674,19 @@ class TxDevice(OWComponent):
         return True
 
     def get_preset(self, index: int) -> Dict:
-        """Describe a preset baked into an FDA_MODE image (OW_PRESET_GET).
+        """Describe a preset an FDA_MODE or PRESET_MODE image holds (OW_PRESET_GET).
 
         Returns ``count``, ``index``, ``chip_count``, ``profile_count``, ``id``,
         ``settings_crc`` (CRC-32 of the source .json), ``regs_crc`` (CRC-32
         the firmware just computed over its own register tables),
         ``baked_regs_crc`` (what the generator stored, differs only if flash is
         inconsistent), ``train_counts`` (the run lengths in pulse trains
-        the preset offers), and ``start_c`` / ``shutoff_c`` (the thermal
-        limits the firmware enforces; None from an image that predates them).
+        the preset offers), ``start_c`` / ``shutoff_c`` (the thermal
+        limits the firmware enforces; None from an image that predates them),
+        and ``modules`` (how many transmitter modules the preset spans: 1 for
+        a 1x, 2 for a 2x; 0 if the preset was stored before blobs recorded
+        it, None from firmware that does not report it). ``chip_count`` is
+        this module's own chips.
 
         Raises:
             LIFUDeviceError: Bad index, or the image failed its own CRC check.
@@ -744,7 +702,7 @@ class TxDevice(OWComponent):
         id_len = d[16]
         pos = 17 + id_len
         counts = []
-        start_c = shutoff_c = None
+        start_c = shutoff_c = modules = None
         if r.data_len > pos:
             n = d[pos]
             pos += 1
@@ -755,13 +713,20 @@ class TxDevice(OWComponent):
                     raw_start, raw_shutoff = struct.unpack("<hh", d[pos:pos + 4])
                     start_c = raw_start / PRESET_TEMP_SCALE
                     shutoff_c = raw_shutoff / PRESET_TEMP_SCALE
+                    pos += 4
+                    if r.data_len >= pos + 2:
+                        modules = d[pos + 1]
         return {"count": count, "index": idx, "chip_count": chips, "profile_count": profiles,
                 "settings_crc": settings_crc, "regs_crc": regs_crc, "baked_regs_crc": baked_regs_crc,
                 "id": d[17:17 + id_len].decode("ascii", "replace"), "train_counts": counts,
-                "start_c": start_c, "shutoff_c": shutoff_c}
+                "start_c": start_c, "shutoff_c": shutoff_c, "modules": modules}
 
-    def load_preset(self, index: int, regs_crc: int, duration_index: int = 0) -> bool:
-        """Program every module from baked preset *index* (OW_PRESET_LOAD).
+    def load_preset(self, index: int, regs_crc: int, duration_index: int = 0, module: int = 0) -> bool:
+        """Program one module's chips from its part of preset *index* (OW_PRESET_LOAD).
+
+        Each module holds its own part of a preset -- its own two chips --
+        with its own regs_crc, so a preset that spans modules is loaded on
+        each in turn (LIFUTXPresets.load_preset does that).
 
         The firmware refuses the load unless *regs_crc* equals the CRC-32 it
         computes over its own tables, so pass the value the host derived for
@@ -778,9 +743,103 @@ class TxDevice(OWComponent):
             LIFUDeviceError: CRC mismatch (OW_BAD_CRC), bad index, a duration
                 index the preset does not offer, or trigger running.
         """
-        self.send_checked(packet_type=OW_CONTROLLER, command=OW_PRESET_LOAD,
+        self.send_checked(packet_type=OW_CONTROLLER, command=OW_PRESET_LOAD, addr=module,
                           reserved=index, data=struct.pack("<II", duration_index, regs_crc),
                           op="load_preset")
+        return True
+
+    def get_preset_slot(self, slot: int) -> Dict:
+        """Describe one of a PRESET_MODE image's preset slots.
+
+        Returns get_preset()'s dict with ``state`` "preset"; or just ``index``
+        and ``state`` "empty", or "tail" for the second half of the preset in
+        the slot before.
+
+        Raises:
+            LIFUDeviceError: Bad slot, or what the slot holds no longer parses
+                (OW_BAD_CRC).
+        """
+        try:
+            got = self.get_preset(slot)
+        except LIFUDeviceError as e:
+            state = {OW_PRESET_EMPTY: "empty", OW_PRESET_SLOT_TAIL: "tail"}.get(e.device_error_code)
+            if state is None:
+                raise
+            return {"index": slot, "state": state}
+        return {**got, "state": "preset"}
+
+    def get_preset_capacity(self) -> Dict | None:
+        """How many presets a PRESET_MODE image can hold (OW_PRESET_CAPACITY).
+
+        Returns ``slots``, ``free`` (slots holding neither a preset nor the
+        second half of one), ``slot_size`` and ``blob_max`` (bytes), as the
+        firmware has them. None when the image has no slots to describe: an
+        FDA_MODE image, or firmware that predates the query. The answer is
+        the first module's; every module has the same slots.
+        """
+        try:
+            r = self.send_checked(packet_type=OW_CONTROLLER, command=OW_PRESET_CAPACITY, op="get_preset_capacity")
+        except LIFUDeviceError:
+            return None
+        if r.data_len < 6:
+            raise LIFUProtocolError(f"TX: get_preset_capacity payload too short ({r.data_len} < 6)",
+                                    code=LIFU_ERR_BAD_PAYLOAD_LENGTH)
+        slots, free, slot_size, blob_max = struct.unpack("<BBHH", bytes(r.data[:6]))
+        return {"slots": slots, "free": free, "slot_size": slot_size, "blob_max": blob_max}
+
+    def write_preset(self, slot: int, blob: bytes, module: int = 0) -> bool:
+        """Store a preset blob in a PRESET_MODE slot, replacing what is there.
+
+        The blob (LIFUTXPresets.preset_blob) is uploaded in parts
+        (OW_PRESET_WRITE) and then committed (OW_PRESET_COMMIT) with its
+        length and CRC-32. The firmware keeps it only if all of it arrived, it
+        is a valid blob, and it fits: one over PRESET_SLOT_SIZE also needs the
+        next slot, free or already its own. Until the commit succeeds the
+        slot is unchanged. Every module keeps its own presets, so write each.
+
+        A reply that goes missing leaves the outcome unknown, so the whole
+        upload is repeated: storing the same blob twice is harmless.
+
+        Raises:
+            ValueError: Empty blob or one over PRESET_BLOB_MAX.
+            LIFUDeviceError: Refused -- OW_BAD_CRC (damaged or not a blob),
+                OW_PRESET_SLOT_TAIL, OW_PRESET_NO_ROOM, OW_PRESET_BUSY
+                (trigger running), or not a PRESET_MODE image.
+            LIFUCommunicationError: No reply on any of PRESET_WRITE_ATTEMPTS
+                uploads.
+        """
+        blob = bytes(blob)
+        if not 0 < len(blob) <= PRESET_BLOB_MAX:
+            raise ValueError("preset blob must be 1..%d bytes, got %d" % (PRESET_BLOB_MAX, len(blob)))
+        for attempt in range(1, PRESET_WRITE_ATTEMPTS + 1):
+            try:
+                # No per-command retries: a repeated part or commit would be
+                # out of sequence. The upload as a whole is what repeats.
+                for offset in range(0, len(blob), PRESET_WRITE_CHUNK):
+                    self.send_checked(packet_type=OW_CONTROLLER, command=OW_PRESET_WRITE, addr=module,
+                                      reserved=slot,
+                                      data=struct.pack("<H", offset) + blob[offset:offset + PRESET_WRITE_CHUNK],
+                                      op="write_preset", retries=0)
+                self.send_checked(packet_type=OW_CONTROLLER, command=OW_PRESET_COMMIT, addr=module, reserved=slot,
+                                  data=struct.pack("<II", len(blob), zlib.crc32(blob) & 0xFFFFFFFF),
+                                  op="commit_preset", retries=0)
+                return True
+            except LIFUCommunicationError:
+                if attempt == PRESET_WRITE_ATTEMPTS:
+                    raise
+                logger.warning("write_preset: no reply on upload %d of %d to slot %d; uploading again",
+                               attempt, PRESET_WRITE_ATTEMPTS, slot)
+        return True
+
+    def delete_preset(self, slot: int, module: int = 0) -> bool:
+        """Empty a PRESET_MODE slot (OW_PRESET_DELETE). Already empty is fine.
+
+        Raises:
+            LIFUDeviceError: OW_PRESET_SLOT_TAIL (delete the preset in the slot
+                before instead), OW_PRESET_BUSY, or not a PRESET_MODE image.
+        """
+        self.send_checked(packet_type=OW_CONTROLLER, command=OW_PRESET_DELETE, addr=module, reserved=slot,
+                          op="delete_preset")
         return True
 
     def read_register(self, identifier:int, address: int) -> int:
@@ -890,12 +949,11 @@ class TxDevice(OWComponent):
         """Select active pattern profile (1-32) via registers 0x1F/0x1E."""
         if profile not in VALID_PATTERN_PROFILES:
             raise ValueError(f"Invalid pattern profile {profile}. Expected 1-32.")
-        profile_sel = profile - 1
 
         tx_ids = self._resolve_tx_ids(identifier)
         for tx_id in tx_ids:
-            self.write_register(tx_id, ADDRESS_PATTERN_SEL_G1, profile_sel)
-            self.write_register(tx_id, ADDRESS_PATTERN_SEL_G2, profile_sel)
+            for addr, value in pattern_select_registers(profile).items():
+                self.write_register(tx_id, addr, value)
         return True
 
     def read_block(self, identifier: int, start_address: int, count: int) -> list[int]:
@@ -1074,13 +1132,10 @@ class TxDevice(OWComponent):
 
         if n > 1:
             # Make the selected profile active for the first trigger: delay
-            # selector, apodization, and (0-based) pattern selector as a unit.
-            active_delay_groups = self.tx_registers.get_delay_control_registers(profile_index)
-            for txi, regs in enumerate(active_delay_groups):
-                self.write_register(txi, ADDRESS_DELAY_SEL, regs[ADDRESS_DELAY_SEL])
-                self.write_register(txi, ADDRESS_APODIZATION, regs[ADDRESS_APODIZATION])
-                self.write_register(txi, ADDRESS_PATTERN_SEL_G1, (profile_index - 1) & PATTERN_PROFILE_SELECT_MASK)
-                self.write_register(txi, ADDRESS_PATTERN_SEL_G2, (profile_index - 1) & PATTERN_PROFILE_SELECT_MASK)
+            # selector, apodization, and pattern selector as a unit.
+            for txi, regs in enumerate(solution["profile_registers"][profile_index - 1]):
+                for addr, value in regs.items():
+                    self.write_register(txi, addr, value)
 
         if rastering:
             # Send execution_order plus the per-chip apodization registers the
@@ -1496,6 +1551,15 @@ def get_pattern_location(period:int, profile:int=1):
     lsb_period = PATTERN_MAP[period]['lsb_period']
     return address, lsb_lvl, lsb_period
 
+def pattern_select_registers(profile: int) -> Dict[int, int]:
+    """Registers 0x1F/0x1E selecting pattern profile *profile* (1-based) for both groups.
+
+    The one place the selector value is worked out: the register model, a
+    profile switch and set_pattern_profile_select all take it from here.
+    """
+    select = (profile - 1) & PATTERN_PROFILE_SELECT_MASK
+    return {ADDRESS_PATTERN_SEL_G1: select, ADDRESS_PATTERN_SEL_G2: select}
+
 def print_regs(d):
     for addr, val in sorted(d.items()):
         if isinstance(val, list):
@@ -1751,12 +1815,9 @@ class Tx7332Registers:
         reg_repeat = set_register_value(reg_repeat, pulse_profile.tail_count, lsb=6, width=5)
         reg_repeat = set_register_value(reg_repeat, elastic_mode, lsb=11, width=1)
         reg_repeat = set_register_value(reg_repeat, elastic_repeat, lsb=12, width=16)
-        reg_pat_sel = 0
-        reg_pat_sel = set_register_value(reg_pat_sel, pulse_profile.profile-1, lsb=0, width=6)
         registers = {ADDRESS_PATTERN_MODE: reg_mode,
                      ADDRESS_PATTERN_REPEAT: reg_repeat,
-                     ADDRESS_PATTERN_SEL_G1: reg_pat_sel,
-                     ADDRESS_PATTERN_SEL_G2: reg_pat_sel}
+                     **pattern_select_registers(pulse_profile.profile)}
         return registers
 
     def get_delay_data_registers(self, profile: int | None=None, pack: bool=False, pack_single: bool=False) -> Dict[int,int]:
@@ -2117,6 +2178,122 @@ class TxDeviceRegisters:
         return active_profile_g1 + 1
 
 
+def resolve_trigger_timing(pulse_interval: float,
+                           pulse_count: int = 1,
+                           pulse_train_interval: float = 0.0,
+                           pulse_train_count: int = 1,
+                           continuous: bool = False) -> Dict:
+    """Resolve sequence timing into the integers the trigger runs on. No device needed.
+
+    This is the single source of the sequence -> trigger mapping: the whole-Hz
+    pulse rate, and whether a train interval is a real gap, back-to-back, or
+    too short to run. :meth:`TxDevice.set_trigger` calls this and sends the
+    result; preset generation calls it and bakes the result. Neither keeps a
+    second copy, so a change here reaches both.
+
+    Args:
+        pulse_interval:       Seconds between pulses.
+        pulse_count:          Pulses per train.
+        pulse_train_interval: Seconds between train starts. ``0`` and the train
+                              duration both mean back-to-back and resolve to 0.
+        pulse_train_count:    Trains in the run. With a single train the
+                              spacing has no effect.
+        continuous:           True for the continuous trigger mode, where
+                              trains repeat whatever pulse_train_count says.
+
+    Returns:
+        Dict with ``frequency_hz`` and ``pulse_train_interval_us``.
+
+    Raises:
+        ValueError: If the inputs are invalid, including a nonzero
+            pulse_train_interval shorter than the on-device train duration.
+    """
+    if pulse_interval <= 0:
+        raise ValueError("pulse_interval must be positive")
+    if pulse_count < 1:
+        raise ValueError("pulse_count must be at least 1")
+
+    # The trigger runs on whole Hz and integer-divides the period, so the
+    # train on the transmitter can be longer than what the host math says.
+    fw_freq_int = int(1.0 / pulse_interval)
+    if fw_freq_int <= 0:
+        raise ValueError(
+            f"pulse_interval {pulse_interval} s implies a trigger "
+            f"frequency below 1 Hz; the firmware parses the trigger "
+            f"frequency as an integer number of Hz and cannot represent "
+            f"this."
+        )
+    fw_period_us = 1_000_000 // fw_freq_int
+    fw_train_us = fw_period_us * pulse_count
+
+    # With only one train the spacing has no effect
+    single_train = pulse_train_count <= 1 and not continuous
+
+    host_train_us = int(round(pulse_interval * pulse_count * 1e6))
+    interval_us = int(round(pulse_train_interval * 1e6))
+
+    if pulse_train_interval == 0 or (single_train
+                                     and interval_us < fw_train_us):
+        pulse_train_interval = 0.0
+    elif interval_us == host_train_us or interval_us == fw_train_us:
+        # If zero gap use the firmware's single-timer back-to-back path.
+        logger.info(
+            "pulse_train_interval %s s equals the train duration "
+            "(%s us on-device) -- zero inter-train gap; sending 0 to "
+            "use the firmware's native back-to-back path.",
+            pulse_train_interval, fw_train_us,
+        )
+        pulse_train_interval = 0.0
+    elif interval_us < fw_train_us:
+        raise ValueError(
+            f"pulse_train_interval {pulse_train_interval} s "
+            f"({interval_us} us) is shorter than the on-device train "
+            f"duration ({fw_train_us} us = {pulse_count} x {fw_period_us} "
+            f"us integer-truncated firmware periods). Use at least "
+            f"{fw_train_us / 1e6} s, or 0 for back-to-back trains."
+        )
+
+    # Firmware <= 2.0.3 compatibility shim.
+    #
+    # FW <= 2.0.3 rejects start_trigger with TRIGGER_STATUS_ERROR
+    # (surfaced as a LIFUDeviceError OW_ERROR NAK with no sub-code)
+    # whenever:
+    #     TriggerPulseTrainInterval > 0 AND
+    #     TriggerPulseTrainInterval <= triggerPeriodUsec
+    # where ``triggerPeriodUsec = 1_000_000 / TriggerFrequencyHz`` (the
+    # per-pulse period) and ``TriggerFrequencyHz`` is parsed as uint32
+    # (strtol, base 10) so fractional Hz get truncated. FW 2.0.7+ uses
+    # strict ``<`` and a pulse_count factor, so it always passes.
+    #
+    # When the train interval lands at or within rounding of the
+    # firmware per-pulse period we lengthen it to
+    # ``1 / (int(1/pulse_train_interval) - 1)`` -- effectively rounding
+    # the implied train frequency down by 1 Hz, which lengthens the
+    # interval just enough to clear the firmware integer period without
+    # changing pulse_interval (the user-meaningful sonication frequency).
+    train_us = int(round(pulse_train_interval * 1_000_000))
+    if train_us > 0 and train_us <= fw_period_us:
+        train_freq_int = int(1.0 / pulse_train_interval)
+        if train_freq_int > 1:
+            new_train_s = 1.0 / (train_freq_int - 1)
+        else:
+            new_train_s = pulse_train_interval + 1e-6
+        logger.debug(
+            "FW <=2.0.3 compat: bumping pulse_train_interval from "
+            "%s s (%s us) to %s s (%s us) so it exceeds the firmware "
+            "per-pulse period (%s us).",
+            pulse_train_interval, train_us,
+            new_train_s, int(round(new_train_s * 1_000_000)),
+            fw_period_us,
+        )
+        pulse_train_interval = new_train_s
+
+    return {
+        "frequency_hz": fw_freq_int,
+        "pulse_train_interval_us": int(round(pulse_train_interval * 1_000_000)),
+    }
+
+
 def build_solution_registers(pulse: Dict | List[Dict],
                              delays: np.ndarray,
                              apodizations: np.ndarray,
@@ -2158,8 +2335,10 @@ def build_solution_registers(pulse: Dict | List[Dict],
         Dict with ``tx_registers`` (the populated model, starting profile
         already activated), ``num_transmitters``, ``num_delay_profiles``,
         ``profile_index`` and ``execution_order`` (both normalized),
-        ``pulse_profile_map``, and ``apodization_registers`` laid out as
-        ``[profile - 1][chip]`` -- register 0x1B per profile.
+        ``pulse_profile_map``, ``profile_registers`` laid out as
+        ``[profile - 1][chip]`` -- the address -> value writes that make a
+        profile active -- and ``apodization_registers``, register 0x1B out of
+        those, in the same layout.
 
     Raises:
         ValueError: If the inputs are malformed or execution_order is invalid.
@@ -2316,12 +2495,21 @@ def build_solution_registers(pulse: Dict | List[Dict],
     regs.activate_delay_profile(profile_index)
     regs.activate_pulse_profile(profile_index)
 
+    # profile_registers[profile - 1][chip] = {address: value}: what a switch to
+    # that profile rewrites. The pattern selector follows the delay profile,
+    # since every delay slot has its own pattern RAM.
+    profile_registers = []
+    for profile in sorted(regs.configured_delay_profiles()):
+        select = pattern_select_registers(profile)
+        profile_registers.append([
+            {**{addr: int(value) for addr, value in chip.items()}, **select}
+            for chip in regs.get_delay_control_registers(profile)
+        ])
+
     # apodization_registers[profile - 1][chip] = uint32. The firmware swaps
     # these as it cycles profiles, so every caller needs them.
-    apodization_registers = []
-    for profile in sorted(regs.configured_delay_profiles()):
-        delay_control = regs.get_delay_control_registers(profile)
-        apodization_registers.append([chip[ADDRESS_APODIZATION] for chip in delay_control])
+    apodization_registers = [[chip[ADDRESS_APODIZATION] for chip in chips]
+                             for chips in profile_registers]
 
     return {
         "tx_registers": regs,
@@ -2330,5 +2518,6 @@ def build_solution_registers(pulse: Dict | List[Dict],
         "profile_index": profile_index,
         "execution_order": execution_order,
         "pulse_profile_map": pulse_profile_map,
+        "profile_registers": profile_registers,
         "apodization_registers": apodization_registers,
     }

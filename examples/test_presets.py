@@ -1,97 +1,74 @@
-"""Verify the presets baked into a transmitter's FDA_MODE image, on the device.
+"""List, load, delete and verify the presets stored on a PRESET_MODE transmitter.
 
-Only input: the directory of preset .json files the image was generated from.
-The host computes each preset's register mapping and CRCs itself and the
-device must agree -- nothing is read from the generated headers.
-
-Against a connected transmitter running an FDA_MODE build, this proves:
-
-  1. Every preset the image reports (OW_PRESET_GET) carries the id,
-     settings_crc and regs_crc the host computes from the same source .json,
-     and the device's live CRC over its own flash tables equals what was baked.
-  2. The gates hold: an out-of-range index, a short OW_PRESET_LOAD payload, a
-     load with the wrong regs_crc (OW_BAD_CRC), and a host TX7332 register write
-     are all refused.
-  3. A CRC-gated load puts exactly the host-computed registers on the silicon
-     (the chips are read before and after the load), and the delay profiles
-     cycle through the preset's execution order once the trigger runs.
-  4. With the console connected: its HV table holds the same presets in the
-     same order, each with the host's id, settings_crc and exact voltage
-     (OW_POWER_PRESET_GET); set_voltage and the raw DAC commands are refused;
-     a select with the wrong settings_crc is refused and the right one is
-     taken. HV stays off throughout. --console-only runs just this part, for
-     a console checked on its own.
-
-Each preset's start_C / shutoff_C are part of what (1) compares; the gates
-they drive need presets near room temperature, see test_thermal_limits.py.
-
-Operator modes. --load-preset needs no source .json: the device's own CRC is
-used unless --presets is given, in which case the host-computed CRC gates the
-load. The run length is one of the preset's baked pulse_train_count_selections,
-picked with --duration IDX (default 0); a raw train count cannot be sent.
-With an FDA_MODE console, --load-preset also selects the same index on the
-console (gated on the preset's settings_crc), which is what sets the HV; the
-host never sends a voltage. With an older console the HV is set from
---presets or --voltage instead.
---run is a sonication the way the application does one: start_sonication (HV
-on, settle, trigger), and stop_sonication (trigger off, HV off) once the
-selected number of pulse trains has run -- or after SECONDS, if one is given,
-even if the sequence is longer.
+A PRESET_MODE transmitter keeps its presets in flash slots. Slot N is preset
+index N; a preset too big for one slot takes the next one as well. Only the
+transmitter is needed, and HV is never touched.
 
     python examples/test_presets.py --list-presets
-    python examples/test_presets.py --load-preset 1 --duration 1             # preset index 1, its 2nd run length
-    python examples/test_presets.py --presets <dir> --load-preset 3 --run       # all 188 trains, preset voltage
-    python examples/test_presets.py --load-preset 3 --run 5 --voltage 20        # stop after 5 s
+    python examples/test_presets.py --load-preset <preset.json>            # first available slot
+    python examples/test_presets.py --load-preset <preset.json> --slot 3   # that slot, replacing what it holds
+    python examples/test_presets.py --load-preset <folder>                 # every preset in the folder
+    python examples/test_presets.py --delete-preset 3                      # or: all
+    python examples/test_presets.py --verify-preset 3 --json-preset-directory <folder>
+    python examples/test_presets.py --verify-preset all --json-preset-directory <folder> --duration 1
 
-Which preset is on the chips right now, from the registers alone: every
-preset in the directory is computed on the host and compared with a readback.
+--load-preset puts a preset .json on the device; every write is read back
+and compared. Without --slot, a preset the device already holds (same id) is
+replaced where it is and any other goes in the first available slot.
 
-    python examples/test_presets.py --presets <dir> --identify
+--verify-preset proves a stored preset against its .json in
+--json-preset-directory, by slot, by id, or all of them:
 
-Full verification against the source .json directory:
+  1. The device reports the id, settings_crc and regs_crc the host computes
+     from the .json, with the same thermal limits and run lengths.
+  2. The device accepts a load gated on the host's CRC, with the run length
+     --duration picks from the preset's pulse_train_count_selections.
+  3. Every register the preset writes reads back from the chips as computed.
+  4. The trigger holds the preset's timing and that run length.
 
-    python examples/test_presets.py --presets sample_json
-    python examples/test_presets.py --presets sample_json --readback 3
+The last preset verified is left loaded on the chips.
+
+An FDA_MODE transmitter has its presets baked into the image instead; it is
+tested with test_fda_mode.py.
 """
 
 import argparse
 import json
-import struct
 import sys
 import time
 from pathlib import Path
 
 from openlifu_sdk.io.exceptions import LIFUCommunicationError, LIFUDeviceError, LIFUNotConnectedError
-from openlifu_sdk.io.LIFUConfig import (
-    OW_CONTROLLER,
-    OW_HV_FDA_REFUSED,
-    OW_HV_NO_PRESET,
-    OW_HV_PRESET_CRC,
-    OW_PRESET_LOAD,
-)
+from openlifu_sdk.io.LIFUConfig import OW_BAD_CRC, OW_PRESET_BUSY, OW_PRESET_NO_ROOM, OW_PRESET_SLOT_TAIL
 from openlifu_sdk.io.LIFUInterface import LIFUInterface
+from openlifu_sdk.io.LIFUTXDevice import PRESET_SLOT_SIZE, PRESET_SLOTS
 from openlifu_sdk.io.LIFUTXPresets import (
+    READBACK_MASK,
     compile_preset,
+    delete_preset,
+    load_preset,
+    loaded_registers,
+    preset_blob,
     preset_files,
     preset_id,
+    preset_modules,
+    preset_slots,
     regs_crc,
+    store_preset,
     train_count_selections,
-    verify_console_preset,
     verify_preset,
 )
 
-# TX7332 register 0x18 bit 30 is set by the chip itself and never written, so
-# a read-back always differs from the table there.
-READBACK_MASK = {0x18: 0x40000000}
+# Why a preset could not be stored or deleted, for the codes that have a plain answer.
+REFUSALS = {
+    OW_PRESET_BUSY: "the trigger is running; stop it before changing the presets",
+    OW_PRESET_NO_ROOM: "this preset needs the next slot too, and that slot is taken or does not exist",
+    OW_PRESET_SLOT_TAIL: "that slot holds the second half of the preset in the slot before it",
+    OW_BAD_CRC: "the device did not accept the preset as a valid blob",
+}
 
-# How long the trigger runs while the active delay profile is sampled.
-RASTER_SECONDS = 2.5
-
-# The trigger config the transmitter firmware programs at power-on (main.c):
-# 10 Hz, 5 pulses of 2000 us, 2 trains, continuous mode. Seeing it means the
-# device has rebooted since anything was loaded.
-BOOT_TRIGGER = {"TriggerFrequencyHz": 10, "TriggerPulseCount": 5, "TriggerPulseWidthUsec": 2000,
-                "TriggerPulseTrainCount": 2, "TriggerMode": 1}
+# Most registers TxDevice.read_block takes in one packet.
+READ_BLOCK_MAX = 62
 
 results = []
 
@@ -101,517 +78,369 @@ def check(name, ok, detail=""):
     print("  [%s] %s %s" % ("PASS" if ok else "FAIL", name, detail), flush=True)
 
 
-def expect_error(name, fn, want_sub=None):
-    try:
-        fn()
-        check(name, False, "no error raised")
-    except LIFUDeviceError as e:
-        msg = str(e)
-        check(name, want_sub is None or want_sub.lower() in msg.lower(), "-> " + msg[:110])
+# The transmitter not answering: it restarts itself under a long burst of traffic.
+DROPPED = (LIFUCommunicationError, LIFUNotConnectedError)
+# Longest wait for it to come back on USB.
+RETURN_SECONDS = 40.0
 
 
 class Link:
-    """The transmitter, reopened if the transport drops mid-run.
+    """The transmitter, reconnected when it drops out mid-run.
 
-    A few hundred back-to-back register reads can make the transmitter drop
-    off the bus; it comes straight back on a fresh connection. Reads go
-    through read(), which paces them and resumes after a reconnect, so a long
-    read-back finishes instead of aborting the test. Every reconnect is
-    printed -- it is a real event, just not a preset failure.
+    A burst of a few hundred packets can make the transmitter restart; it is
+    back on USB some seconds later with nothing loaded. recover() waits for
+    it, and every dropout is printed -- it is a real event, just not a preset
+    failure.
     """
 
     def __init__(self):
         self.iface = self.tx = None
         self.hv_connected = False
         self.reconnects = 0
-        self.open()
+        if not self.open():
+            sys.exit("no transmitter connected")
 
     def open(self):
         self.iface = LIFUInterface(run_async=False, voltage_table_selection="dvt")
         tx_ok, self.hv_connected = self.iface.is_device_connected()
-        if not tx_ok:
-            sys.exit("no transmitter connected")
         self.tx = self.iface.txdevice
+        return tx_ok
 
     def __getattr__(self, name):
         return getattr(self.tx, name)
 
-    def read(self, chip, addr):
-        for _ in range(3):
-            try:
-                value = self.tx.read_register(chip, addr)
-                time.sleep(0.01)
-                return value
-            except (LIFUCommunicationError, LIFUNotConnectedError) as e:
-                self.reconnects += 1
-                print("   transport dropped (%s) -- reconnecting and resuming" % type(e).__name__, flush=True)
-                time.sleep(2.0)
-                self.open()
-        raise RuntimeError("read_register keeps failing at chip%d 0x%04x" % (chip, addr))
+    def recover(self, err):
+        """Wait for a transmitter that has stopped answering, and reconnect to it."""
+        self.reconnects += 1
+        print("   transmitter stopped answering (%s) -- waiting for it to come back" % type(err).__name__, flush=True)
+        deadline = time.time() + RETURN_SECONDS
+        while True:
+            self.iface.close()
+            time.sleep(4.0)
+            if self.open():
+                return
+            if time.time() > deadline:
+                sys.exit("the transmitter did not come back within %d s; cycle its power" % RETURN_SECONDS)
+
+    def steady(self, step):
+        """Run a step that changes the presets; if the transmitter drops out, wait for it and run
+        the step once more -- they are all safe to repeat."""
+        try:
+            return step()
+        except DROPPED as e:
+            self.recover(e)
+            return step()
+
+    def read_registers(self, keys):
+        """{(chip, address): value} for *keys*, read a run of consecutive addresses
+        at a time: a packet per register is the burst that makes it drop out."""
+        keys, got, i = sorted(keys), {}, 0
+        while i < len(keys):
+            chip, start = keys[i]
+            n = 1
+            while i + n < len(keys) and n < READ_BLOCK_MAX and keys[i + n] == (chip, start + n):
+                n += 1
+            for k, value in enumerate(self.tx.read_block(chip, start, n)):
+                got[(chip, start + k)] = value
+            i += n
+        return got
 
 
-def load_presets(src):
-    """(id, machine_config) per preset in image order, plus each preset's voltage from its .json."""
-    out, voltages = [], {}
-    for p in preset_files(src):
-        raw = p.read_bytes()
-        doc = json.loads(raw)
-        pid = preset_id(p)
-        out.append((pid, compile_preset(doc, preset_id=pid, settings_bytes=raw)))
-        voltages[pid] = float(doc.get("voltage", 0.0))
-    return out, voltages
+def host_presets(path):
+    """Every preset .json at *path* -- one file, or a folder of them -- compiled, in id order."""
+    path = Path(path)
+    files = preset_files(path) if path.is_dir() else [path]
+    if not files:
+        sys.exit("no .json presets in %s" % path)
+    presets = []
+    for f in files:
+        raw = f.read_bytes()
+        try:
+            presets.append(compile_preset(json.loads(raw), preset_id=preset_id(f), settings_bytes=raw))
+        except ValueError as e:
+            sys.exit("%s is not a usable preset: %s" % (f, e))
+    return presets
 
 
-def device_presets(tx):
-    """Every preset the image reports, by index; [] when the image has none (not FDA_MODE)."""
+# --------------------------------------------------------------------------
+# What the device holds
+# --------------------------------------------------------------------------
+
+def slot_layout(tx):
+    """(slots, slot size) as the transmitter reports them, or the
+    SDK's own figures from firmware that predates the query."""
+    capacity = tx.get_preset_capacity()
+    return (capacity["slots"], capacity["slot_size"]) if capacity else (PRESET_SLOTS, PRESET_SLOT_SIZE)
+
+
+def device_slots(tx):
+    """Every preset index the device has, in order, as get_preset_slot() gives
+    it: all presets for a baked set; for flash slots, the empty ones and the
+    second halves of long presets too. None when the image has no presets at
+    all (neither FDA_MODE nor PRESET_MODE)."""
     try:
-        first = tx.get_preset(0)
+        first = tx.get_preset_slot(0)
     except LIFUDeviceError:
-        return []
-    return [first] + [tx.get_preset(i) for i in range(1, first["count"])]
-
-
-def console_presets(tx):
-    """The console's HV table by index; None without an FDA_MODE console."""
-    if not tx.hv_connected:
         return None
-    hv = tx.iface.hvcontroller
-    first = hv.get_preset(0)
-    if first is None:
-        return None
-    return [first] + [hv.get_preset(i) for i in range(1, first["count"])]
+    count = first.get("count") or slot_layout(tx)[0]
+    slots = [first] + [tx.get_preset_slot(i) for i in range(1, count)]
+    for e, after in zip(slots, slots[1:]):
+        if after["state"] == "tail":
+            e["slots"] = 2
+    return slots
 
 
-def print_inventory(entries, console=None):
-    if not entries:
-        print("  device reports no presets -- is it running an FDA_MODE image?")
+def print_inventory(tx, slots):
+    """One row per preset index; for flash slots, how many are free and the empty ones too."""
+    if slots is None:
+        print("  device reports no presets -- is it running a PRESET_MODE or FDA_MODE image?")
         return
-    print("  %-4s %-28s %-6s %-9s %-11s %-11s %-11s %-13s %-10s %s"
-          % ("idx", "id", "chips", "profiles", "settings", "regs(live)", "regs(baked)",
-             "start/shutoff", "voltage", "train counts"))
-    for e in entries:
-        flags = [] if e["regs_crc"] == e["baked_regs_crc"] else ["live CRC != baked CRC"]
-        thermal = "-" if e["start_c"] is None else "%g/%g C" % (e["start_c"], e["shutoff_c"])
-        # The voltage is the console's; '*' marks the index it has selected.
-        c = console[e["index"]] if console and e["index"] < len(console) else None
-        volts = "-" if c is None else "%.2f V%s" % (c["voltage"], "*" if c["selected"] == e["index"] else "")
-        if console is not None and (c is None or c["id"] != e["id"] or c["settings_crc"] != e["settings_crc"]):
-            flags.append("console holds %s here" % ("nothing" if c is None else c["id"]))
-        print("  %-4d %-28s %-6d %-9d 0x%08x  0x%08x  0x%08x  %-13s %-10s %s%s"
-              % (e["index"], e["id"], e["chip_count"], e["profile_count"],
-                 e["settings_crc"], e["regs_crc"], e["baked_regs_crc"], thermal, volts,
+    capacity = tx.get_preset_capacity()
+    if capacity is not None:
+        print("  slots: %d free of %d (%d kB each)"
+              % (capacity["free"], capacity["slots"], capacity["slot_size"] // 1024))
+    modules = tx.get_module_count()
+    if any(e["state"] == "preset" for e in slots):
+        print("  %-4s %-28s %-6s %-9s %-13s %-11s %-13s %s"
+              % ("slot", "id", "config", "profiles", "settings_crc", "regs_crc", "start/shutoff", "train counts"))
+    for e in slots:
+        if e["state"] != "preset":
+            print("  %-4d %s" % (e["index"], "(empty)" if e["state"] == "empty"
+                                else "(second half of the preset in slot %d)" % (e["index"] - 1)))
+            continue
+        flags = [] if e["regs_crc"] == e["baked_regs_crc"] else ["stored CRC is 0x%08x" % e["baked_regs_crc"]]
+        # 1x, 2x: the modules the preset was made for.
+        spans = e.get("modules")
+        if spans and spans != modules:
+            flags.append("made for %d module(s), %d connected" % (spans, modules))
+        if e.get("slots", 1) > 1:
+            flags.append("takes %d slots" % e["slots"])
+        print("  %-4d %-28s %-6s %-9d 0x%08x    0x%08x  %-13s %s%s"
+              % (e["index"], e["id"], "%dx" % spans if spans else "?", e["profile_count"],
+                 e["settings_crc"], e["regs_crc"],
+                 "-" if e["start_c"] is None else "%g/%g C" % (e["start_c"], e["shutoff_c"]),
                  "/".join(str(c) for c in e["train_counts"]) or "-",
                  "".join("  <-- " + f for f in flags)))
-    if console is None:
-        print("  (voltage: no FDA console connected)")
+    print("  settings_crc: CRC-32 of the preset's .json file; regs_crc: CRC-32 of what it was converted into")
+    unknown = {e.get("modules") for e in slots if e["state"] == "preset"} - set(range(1, 256))
+    if None in unknown:
+        print("  config ?: this transmitter firmware does not report 1x/2x")
+    elif unknown:
+        print("  config ?: stored before presets recorded 1x/2x; load the preset again to fill it in")
 
 
-def silicon_addresses(mc):
-    """(chip, addr) -> value for everything presets_load() writes: base registers, starting profile on top."""
-    want = {}
-    for chip, cfg in enumerate(mc["chips"]):
-        for start, values in cfg["registers"].items():
-            for i, v in enumerate(values):
-                want[(chip, start + i)] = v
-        for addr, v in cfg["profiles"][mc["profile_index"] - 1].items():
-            want[(chip, addr)] = v
-    return want
+# --------------------------------------------------------------------------
+# --load-preset, --delete-preset
+# --------------------------------------------------------------------------
+
+def need_slots(tx):
+    if tx.get_preset_capacity() is None:
+        sys.exit("this transmitter has no preset slots: it is not a PRESET_MODE image "
+                 "(an FDA_MODE image's presets are baked in; see test_fda_mode.py)")
 
 
-def read_silicon(tx, keys):
-    return {k: tx.read(*k) for k in keys}
+def first_free(slots, need):
+    """The first slot with *need* empty slots from it on, or None."""
+    states = [e["state"] for e in slots]
+    for i in range(len(states) - need + 1):
+        if states[i:i + need] == ["empty"] * need:
+            return i
+    return None
 
 
-def find_preset(inventory, index):
-    """The device's entry for a preset index."""
-    if not 0 <= index < len(inventory):
-        sys.exit("no preset %d on the device: it has %d, indices 0..%d -- see --list-presets"
-                 % (index, len(inventory), len(inventory) - 1))
-    return inventory[index]
+def load_presets(tx, path, slot):
+    """--load-preset: store one preset .json, or every one in a folder."""
+    need_slots(tx)
+    presets = host_presets(path)
+    if slot is not None and len(presets) > 1:
+        sys.exit("--slot places one preset; %s holds %d, which go to the first available slots" % (path, len(presets)))
+    slot_size = slot_layout(tx)[1]
+    for mc in presets:
+        need = preset_slots(mc, slot_size)
+        where, how = slot, "stored"
+        if where is None:
+            slots = device_slots(tx)
+            # Loading a preset again updates it rather than adding a second copy.
+            where = next((e["index"] for e in slots if e["state"] == "preset" and e["id"] == mc["id"]), None)
+            how = "replaced"
+            if where is None:
+                where, how = first_free(slots, need), "stored"
+            if where is None:
+                sys.exit("no room for %s: it needs %d free slot(s) in a row. Delete a preset first." % (mc["id"], need))
+        tx.steady(lambda: store_preset(tx, where, mc))
+        spans = "" if preset_modules(mc) == 1 else " on each of %d modules" % preset_modules(mc)
+        print("  [%2d] %-28s %s: %d bytes, %d slot(s)%s, regs_crc 0x%08x"
+              % (where, mc["id"], how, len(preset_blob(mc)), need, spans, regs_crc(mc)))
 
 
-def load_one(tx, inventory, presets, index, duration_index):
-    """CRC-gated load of one preset by index; the host's own CRC when --presets was given."""
-    e = find_preset(inventory, index)
-    counts = e["train_counts"]
-    if not 0 <= duration_index < len(counts):
-        sys.exit("%s offers %d run length(s) %s; --duration %d is not one of them"
-                 % (e["id"], len(counts), counts, duration_index))
-    host = dict(presets).get(e["id"])
-    if host is not None:
-        crc = regs_crc(host)
-        if crc != e["regs_crc"] or host["settings_crc"] != e["settings_crc"]:
-            sys.exit("host and device disagree on %s: regs 0x%08x vs 0x%08x, settings 0x%08x vs 0x%08x"
-                     % (e["id"], crc, e["regs_crc"], host["settings_crc"], e["settings_crc"]))
-        source = "host-computed"
-    elif presets:
-        sys.exit("%s is not among the host presets -- not loading it unverified" % e["id"])
+def delete_presets(tx, which, slot):
+    """--delete-preset: one slot, or all of them."""
+    need_slots(tx)
+    if which == "all":
+        # Back to front, so a long preset's second slot is never asked for directly.
+        held = [e["index"] for e in reversed(device_slots(tx)) if e["state"] == "preset"]
     else:
-        crc = e["regs_crc"]
-        source = "the device's own; no --presets to check against"
-    tx.load_preset(e["index"], crc, duration_index)
-    print("  loaded [%d] %s  regs_crc 0x%08x (%s)  duration %d = %d train(s)"
-          % (e["index"], e["id"], crc, source, duration_index, counts[duration_index]))
-    return e
+        if which is True and slot is None:
+            sys.exit("--delete-preset needs a slot: --delete-preset 3, or all")
+        try:
+            held = [slot if which is True else int(which)]
+        except ValueError:
+            sys.exit("--delete-preset takes a slot number or all, not %r" % which)
+    for index in held:
+        tx.steady(lambda: delete_preset(tx, index))
+        print("  [%2d] emptied" % index)
+    if not held:
+        print("  nothing stored")
 
 
-def trigger_config(tx):
-    """The device's trigger config and its train period in seconds."""
-    cfg = tx.get_trigger_json()
-    train_us = cfg["TriggerPulseTrainInterval"]
-    period = train_us * 1e-6 if train_us else cfg["TriggerPulseCount"] / float(cfg["TriggerFrequencyHz"])
-    return cfg, period
+# --------------------------------------------------------------------------
+# --verify-preset
+# --------------------------------------------------------------------------
 
-
-def run_for(tx, seconds, voltage):
-    """A sonication as the application does it: HV to *voltage*, start_sonication,
-    watch it, stop_sonication when the sequence (the selected pulse-train count)
-    has finished -- or after *seconds*, if given."""
-    cfg, period = trigger_config(tx)
-    trains = cfg["TriggerPulseTrainCount"]
-    total = trains * period
-    print("  trigger: %d Hz, %d pulse(s)/train, train period %.4g s, %d train(s) = %.4g s of output"
-          % (cfg["TriggerFrequencyHz"], cfg["TriggerPulseCount"], period, trains, total))
-    if seconds is None:
-        print("  running the whole sequence")
-    elif seconds < total:
-        print("  note: stopping after %.4g s of a %.4g s sequence" % (seconds, total))
-    else:
-        print("  note: the sequence ends after %.4g s, before the %.4g s run is up" % (total, seconds))
-    hv = tx.iface.hvcontroller
-    if voltage is None:
-        print("  HV %.2f V from the selected console preset; start_sonication (HV on, settle, trigger)"
-              % hv.supply_voltage, flush=True)
-    else:
-        hv.set_voltage(voltage)
-        print("  HV set to %.2f V; start_sonication (HV on, settle, trigger)" % voltage, flush=True)
-    seen, finished = [], False
-    t0 = time.time()
+def examine(tx, e, mc, duration):
+    """What verify_slot() finds, as (check, passed, detail) rows, and whether the
+    preset got loaded. Raises if the transmitter drops out part way."""
+    name = "[%d] %s" % (e["index"], e["id"])
+    counts = train_count_selections(mc)
     try:
-        tx.iface.start_sonication(turn_hv_on=True, wait_for_settle=True)
-        t0 = time.time()
-        print("  running: HV %.2f V measured" % hv.get_voltage(), flush=True)
-        while seconds is None or time.time() - t0 < seconds:
-            try:
-                seen.append(tx.get_delay_profile(0))
-                if not tx.iface.is_running():
-                    finished = True
-                    break
-            except (LIFUCommunicationError, LIFUNotConnectedError) as e:
-                tx.reconnects += 1
-                print("   transport dropped (%s) -- reconnecting" % type(e).__name__, flush=True)
-                time.sleep(2.0)
-                tx.open()
-                continue
-            time.sleep(0.5)
-    finally:
-        tx.iface.stop_sonication(turn_hv_off=True)
-    print("  ran %.2f s, sequence %s; stop_sonication (trigger off, HV off: hv_on=%s); delay profiles seen: %s"
-          % (time.time() - t0, "finished" if finished else "stopped early", hv.get_hv_status(), sorted(set(seen))))
+        verify_preset(tx, e["index"], mc)
+        same = (e["regs_crc"] == e["baked_regs_crc"] and e["train_counts"] == counts
+                and (e.get("modules") or preset_modules(mc)) == preset_modules(mc))
+        found = [(name + ": the device reports the .json's preset", same,
+                  "settings_crc 0x%08x, regs_crc 0x%08x, run lengths %s"
+                  % (e["settings_crc"], e["regs_crc"], e["train_counts"]))]
+    except ValueError as err:
+        return [(name + ": the device reports the .json's preset", False, str(err))], False
+    if not 0 <= duration < len(counts):
+        return found + [(name + ": --duration %d is one of its run lengths" % duration, False,
+                         "it offers %s" % counts)], False
+    try:
+        load_preset(tx, e["index"], mc, duration)
+    except LIFUDeviceError as err:
+        return found + [(name + ": loads on the host's CRC", False, str(err)[:150])], False
+    found.append((name + ": loads on the host's CRC", True,
+                  "run length %d = %d train(s)" % (duration, counts[duration])))
 
-
-def operate(tx, inventory, presets, voltages, args):
-    print("\n-- load / run --")
-    hv = tx.iface.hvcontroller if tx.hv_connected else None
-    fda_console = hv is not None and hv.get_preset(0) is not None
-    voltage = None
-    if args.run:
-        if hv is None:
-            sys.exit("--run needs the console (HV controller) connected")
-        if fda_console:
-            if args.voltage is not None:
-                sys.exit("this console takes its HV from the selected preset; drop --voltage")
-            selected = hv.get_preset(0)["selected"]
-            if args.load_preset is None:
-                if selected is None:
-                    sys.exit("no preset selected on the console; use --load-preset")
-                # Selected by an earlier process: settle against its voltage.
-                hv.supply_voltage = hv.get_preset(selected)["voltage"]
-        else:
-            voltage = args.voltage
-            if voltage is None and args.load_preset is not None:
-                voltage = voltages.get(find_preset(inventory, args.load_preset)["id"])
-            if not voltage:
-                sys.exit("--run needs a voltage: --voltage, or --presets so the preset's own voltage is used")
-    if args.load_preset is not None:
-        e = load_one(tx, inventory, presets, args.load_preset, args.duration)
-        if fda_console:
-            # Same index on both, gated on the settings_crc the TX image just reported.
-            hv.select_preset(e["index"], e["settings_crc"])
-            print("  console preset [%d] selected: HV %.2f V" % (e["index"], hv.supply_voltage))
-    if args.run:
-        run_for(tx, args.run_seconds, voltage)
-    return 0
-
-
-def preset_timing(mc):
-    """(Hz, pulses per train, train interval us) the preset bakes into the trigger."""
-    interval_ms = float(mc["pulse_interval_ms"])
-    return (round(1000.0 / interval_ms) if interval_ms else 0, int(mc["pulse_count"]),
-            round(float(mc.get("pulse_train_interval_s", 0)) * 1e6))
-
-
-def identify(tx, presets):
-    """Which host preset is on the chips: read every register any preset writes
-    plus the trigger timing, then see whose table is fully consistent with it."""
     chips = tx.enum_tx7332_devices()
-    keys = set()
-    for _, mc in presets:
-        keys |= {k for k in silicon_addresses(mc) if k[0] < chips}
-    print("  reading %d registers from %d chip(s)" % (len(keys), chips), flush=True)
-    got = read_silicon(tx, sorted(keys))
+    want = {k: v for k, v in loaded_registers(mc).items() if k[0] < chips}
+    read = tx.read_registers(want)
+    bad = ["chip%d 0x%04x host=0x%08x read=0x%08x" % (k[0], k[1], v, read[k]) for k, v in want.items()
+           if (read[k] ^ v) & ~READBACK_MASK.get(k[1], 0)]
+    short = "" if len(mc["chips"]) <= chips else ", chips 0-%d of %d" % (chips - 1, len(mc["chips"]))
+    found.append((name + ": the chips hold its registers", not bad,
+                  "%d of %d%s%s" % (len(want) - len(bad), len(want), short, "".join("; " + b for b in bad[:3]))))
+
     cfg = tx.get_trigger_json()
-    timing = (cfg["TriggerFrequencyHz"], cfg["TriggerPulseCount"], cfg["TriggerPulseTrainInterval"])
-    print("  trigger: %d Hz, %d pulse(s)/train, train interval %d us" % timing)
+    got = (cfg["TriggerFrequencyHz"], cfg["TriggerPulseCount"], cfg["TriggerPulseTrainInterval"],
+           cfg["TriggerPulseTrainCount"])
+    timing = (mc["trigger"]["frequency_hz"], int(mc["pulse_count"]), mc["trigger"]["pulse_train_interval_us"],
+              counts[duration])
+    found.append((name + ": the trigger holds its timing", got == timing,
+                  "%d Hz, %d pulse(s) per train, train interval %d us, %d train(s)" % got
+                  + ("" if got == timing else "; the .json gives %d / %d / %d / %d" % timing)))
+    return found, True
 
-    rows = []
-    for pid, mc in presets:
-        want = {k: v for k, v in silicon_addresses(mc).items() if k[0] < chips}
-        # The trigger ISR rewrites the per-profile registers as it cycles, so
-        # those may hold any of the preset's profiles, not just the starting one.
-        ctrl = {}
-        for chip, chip_cfg in enumerate(mc["chips"][:chips]):
-            for prof, regs in enumerate(chip_cfg["profiles"], start=1):
-                for addr, v in regs.items():
-                    ctrl.setdefault((chip, addr), {}).setdefault(v, prof)
-        match, active = 0, set()
-        for k, v in want.items():
-            if k in ctrl:
-                if got[k] in ctrl[k]:
-                    match += 1
-                    if k[1] == 0x16:
-                        active.add(ctrl[k][got[k]])
-            else:
-                m = READBACK_MASK.get(k[1], 0)
-                if (got[k] & ~m) == (v & ~m):
-                    match += 1
-        timing_ok = preset_timing(mc) == timing
-        rows.append((match == len(want) and timing_ok, len(want), match, timing_ok, pid, sorted(active),
-                     len(mc["chips"])))
-    rows.sort(key=lambda r: (r[0], r[2] / r[1], r[3], r[1]), reverse=True)
 
-    full = [r for r in rows if r[0]]
-    print("  %-28s %-10s %s" % ("preset", "registers", "timing"))
-    for ok, total, match, timing_ok, pid, active, nchips in rows[:len(full) + 3]:
-        note = " (chips 0-%d of %d)" % (chips - 1, nchips) if nchips > chips else ""
-        prof = ", delay profile %s active" % "/".join(map(str, active)) if ok and active else ""
-        print("  %-28s %3d/%-3d    %s%s%s" % (pid, match, total, "same" if timing_ok else "differs", prof, note))
-    if len(full) == 1:
-        print("  loaded: %s" % full[0][4])
-    elif full:
-        print("  consistent with %d presets (%s): their registers and timing coincide on these chips"
-              % (len(full), ", ".join(r[4] for r in full)))
+def verify_slot(tx, e, mc, duration):
+    """One preset on the device against its .json: what it reports, a CRC-gated
+    load, the chips read back, and the trigger. True once it has loaded it."""
+    # A transmitter that drops out comes back with nothing loaded, so the preset is examined afresh.
+    for _ in range(3):
+        try:
+            found, loaded = examine(tx, e, mc, duration)
+            break
+        except DROPPED as err:
+            tx.recover(err)
     else:
-        print("  no preset matches what is on the chips; closest is %s (%d/%d)" % (rows[0][4], rows[0][2], rows[0][1]))
-        if all(cfg.get(k) == v for k, v in BOOT_TRIGGER.items()):
-            print("  the trigger holds the firmware's power-on config: the transmitter has rebooted since the last load")
-    return 0 if len(full) == 1 else 1
+        check("[%d] %s: examined without the transmitter dropping out" % (e["index"], e["id"]), False,
+              "it dropped out on each of 3 tries")
+        return False
+    for row in found:
+        check(*row)
+    return loaded
 
 
-def verify_console(hv, configs):
-    """The console's HV table is the host's presets, index for index, and the
-    host cannot set a voltage around it. HV stays off."""
-    print("\n-- console HV presets --")
-    if hv is None:
-        print("  [SKIP] console not connected")
-        return
-    if hv.get_hv_status():
-        check("console HV off for the preset checks", False, "HV is on; not touching the setpoint")
-        return
-    first = hv.get_preset(0)
-    if first is None:
-        check("console has a preset HV table", False, "not an FDA_MODE console image")
-        return
-    check("console holds the same number of presets", first["count"] == len(configs),
-          "console %d, host %d" % (first["count"], len(configs)))
-    for i, mc in enumerate(configs[:first["count"]]):
-        try:
-            got = verify_console_preset(hv, i, mc)
-            check("console preset[%d] %s" % (i, mc["id"]), True,
-                  "%.9g V settings=0x%08x" % (got["voltage"], got["settings_crc"]))
-        except ValueError as e:
-            check("console preset[%d] %s" % (i, mc["id"]), False, str(e))
-
-    def refused(fn, code):
-        try:
-            fn()
-        except LIFUDeviceError as e:
-            return e.device_error_code == code, "-> " + str(e)[:150]
-        return False, "accepted"
-
-    for name, fn in (("set_voltage(%.2f)" % configs[0]["voltage"], lambda: hv.set_voltage(configs[0]["voltage"])),
-                     ("raw DAC write", lambda: hv.set_dacs(100, 100, 0, 0))):
-        ok, detail = refused(fn, OW_HV_FDA_REFUSED)
-        check("%s refused (OW_HV_FDA_REFUSED)" % name, ok, detail)
-    if first["selected"] is None:
-        ok, detail = refused(hv.turn_hv_on, OW_HV_NO_PRESET)
-        if not ok:
-            hv.turn_hv_off()
-        check("HV on with no preset selected refused (OW_HV_NO_PRESET)", ok, detail)
+def verify_presets(tx, which, directory, duration):
+    """--verify-preset: a slot, an id, or all, against the .json files in *directory*."""
+    if directory is None:
+        sys.exit("--verify-preset needs --json-preset-directory: the folder holding the .json it was loaded from")
+    host = host_presets(directory)
+    held = [e for e in device_slots(tx) or [] if e["state"] == "preset"]
+    if which == "all":
+        chosen = held
     else:
-        print("  [SKIP] a preset is already selected; power-cycle the console to test the no-preset gate")
-    ok, detail = refused(lambda: hv.select_preset(0, configs[0]["settings_crc"] ^ 0xDEADBEEF), OW_HV_PRESET_CRC)
-    check("select with the wrong settings_crc refused (OW_HV_PRESET_CRC)", ok, detail)
-    # Lowest-voltage preset last, so the setpoint left behind is the gentlest the set has.
-    last = min(range(len(configs)), key=lambda i: configs[i]["voltage"])
-    for i in sorted({0, last}, key=lambda i: i == last):
-        try:
-            hv.select_preset(i, configs[i]["settings_crc"])
-            now = hv.get_preset(i)
-            check("select preset[%d] applies its %.9g V" % (i, now["voltage"]),
-                  now["selected"] == i and hv.supply_voltage == now["voltage"])
-        except LIFUDeviceError as e:
-            check("select preset[%d]" % i, False, str(e)[:150])
-
-
-def verify(tx, inventory, presets, args):
-    host_ids = [pid for pid, _ in presets]
-    dev_ids = [e["id"] for e in inventory]
-    for pid in sorted(set(dev_ids) - set(host_ids)):
-        check("device preset %s exists on host" % pid, False, "not in %s" % args.presets)
-    for pid in sorted(set(host_ids) - set(dev_ids)):
-        check("host preset %s exists on device" % pid, False, "not baked into this image")
-    check("same presets in the same order", host_ids == dev_ids,
-          "%d on both" % len(dev_ids) if host_ids == dev_ids else "host %s / device %s" % (host_ids, dev_ids))
-
-    print("\n-- readback: id / settings_crc / regs_crc --")
-    for i, (pid, mc) in enumerate(presets):
-        if i >= len(inventory):
-            check("get_preset[%d] %s" % (i, pid), False, "not on the device")
+        chosen = [e for e in held if str(e["index"]) == which or e["id"] == which]
+    if not chosen:
+        sys.exit("nothing to verify: no preset %s on the device -- see --list-presets"
+                 % ("at all" if which == "all" else "in slot or with id %r" % which))
+    print("\n-- verify against %s --" % directory)
+    loaded = None
+    for e in chosen:
+        # The .json with its id, so a file edited since gets its differences reported;
+        # failing that the same file under another name.
+        mc = next((m for m in host if m["id"] == e["id"]), None) \
+            or next((m for m in host if m["settings_crc"] == e["settings_crc"]), None)
+        if mc is None:
+            check("[%d] %s: has a .json in the folder" % (e["index"], e["id"]), False, "none with its id or settings_crc")
             continue
-        got = inventory[i]
-        host_crc = regs_crc(mc)
-        ok = (got["id"] == pid and got["count"] == len(presets)
-              and got["settings_crc"] == mc["settings_crc"]
-              and got["regs_crc"] == got["baked_regs_crc"] == host_crc
-              and got["train_counts"] == train_count_selections(mc))
-        check("get_preset[%d] %s" % (i, pid), ok,
-              "settings=0x%08x regs live=0x%08x baked=0x%08x host=0x%08x trains=%s"
-              % (got["settings_crc"], got["regs_crc"], got["baked_regs_crc"], host_crc, got["train_counts"]))
-        try:
-            verify_preset(tx, i, mc)
-            check("verify_preset[%d]" % i, True)
-        except ValueError as e:
-            check("verify_preset[%d]" % i, False, str(e))
-
-    print("\n-- gates --")
-    expect_error("get_preset(%d) out of range" % len(inventory), lambda: tx.get_preset(len(inventory)))
-    expect_error("load with 4-byte payload rejected", lambda: tx.send_checked(
-        packet_type=OW_CONTROLLER, command=OW_PRESET_LOAD, reserved=0, data=struct.pack("<I", 1), op="bad_load"))
-    expect_error("load with wrong regs_crc refused (OW_BAD_CRC)",
-                 lambda: tx.load_preset(0, regs_crc(presets[0][1]) ^ 0xDEADBEEF, 0), "0xfd")
-    expect_error("load with a duration index the preset lacks refused",
-                 lambda: tx.load_preset(0, regs_crc(presets[0][1]), len(train_count_selections(presets[0][1]))))
-    expect_error("host register write refused in FDA mode", lambda: tx.write_register(0, 0x1B, 0))
-
-    print("\n-- load + readback --")
-    idx = args.readback
-    if not 0 <= idx < len(presets):
-        sys.exit("--readback %d: the host has %d preset(s)" % (idx, len(presets)))
-    pid, mc = presets[idx]
-    chips = tx.enum_tx7332_devices()
-    if len(mc["chips"]) > chips:
-        sys.exit("--readback %d: %s needs %d chips, this transmitter has %d" % (idx, pid, len(mc["chips"]), chips))
-    want = silicon_addresses(mc)
-    before = read_silicon(tx, want)
-    print("   read %d registers from the chips before the load" % len(before))
-    tx.load_preset(idx, regs_crc(mc), 0)
-    check("load_preset(%d %s, correct crc, duration 0 = %d train(s))" % (idx, pid, train_count_selections(mc)[0]), True)
-    after = read_silicon(tx, want)
-    bad = 0
-    for (chip, addr), w in want.items():
-        m = READBACK_MASK.get(addr, 0)
-        if (after[(chip, addr)] & ~m) != (w & ~m):
-            bad += 1
-            if bad <= 5:
-                print("      mismatch chip%d 0x%04x host=0x%08x read=0x%08x" % (chip, addr, w, after[(chip, addr)]))
-    check("silicon == host-computed registers after the load", bad == 0, "%d registers" % len(want))
-    print("   the load changed %d of %d registers" % (sum(1 for k in want if before[k] != after[k]), len(want)))
-
-    order = mc["execution_order"]
-    tx.start_trigger()
-    t0 = time.time()
-    seen = []
-    while time.time() - t0 < RASTER_SECONDS:
-        seen.append(tx.get_delay_profile(0))
-        time.sleep(0.03)
-    tx.stop_trigger()
-    print("   active delay profile samples:", seen)
-    check("profiles cycle while running", set(seen) == set(order),
-          "saw %s, execution order %s" % (sorted(set(seen)), order))
-
-    verify_console(tx.iface.hvcontroller if tx.hv_connected else None, [mc for _, mc in presets])
-
+        if verify_slot(tx, e, mc, duration):
+            loaded = e
+    if which == "all":
+        missing = sorted({m["id"] for m in host} - {e["id"] for e in held})
+        if missing:
+            print("  in the folder but not on the device: %s" % ", ".join(missing))
     n_ok = sum(results)
-    print("\nFDA PRESET DEVICE TEST: %d/%d checks passed (%d transport reconnect(s))"
-          % (n_ok, len(results), tx.reconnects))
+    print("\nPRESET VERIFY: %d/%d checks passed (%d transport reconnect(s))%s"
+          % (n_ok, len(results), tx.reconnects,
+             "" if loaded is None else "; [%d] %s is left loaded" % (loaded["index"], loaded["id"])))
     return 0 if n_ok == len(results) else 1
+
+
+def status(tx):
+    modules = tx.get_module_count()
+    return "firmware: %s | config: %dx (%d module%s)" % (tx.get_version(), modules, modules, "" if modules == 1 else "s")
 
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--presets", type=Path,
-                    help="directory of preset .json files: the verification source, optional for --load-preset")
-    ap.add_argument("--list-presets", action="store_true", help="show the presets on the device and exit")
-    ap.add_argument("--load-preset", type=int, metavar="IDX", help="CRC-gated load of the preset at this index")
-    ap.add_argument("--run", nargs="?", const=float("inf"), type=float, metavar="SECONDS",
-                    help="sonicate (HV on, trigger, HV off): the whole selected pulse-train count, "
-                         "or stop after SECONDS; after --load-preset or on whatever is loaded")
+    ap.add_argument("--list-presets", action="store_true", help="show what is on the device, slot by slot")
+    ap.add_argument("--json-preset-directory", type=Path, metavar="DIR",
+                    help="folder holding the preset .json file(s) --verify-preset checks against")
     ap.add_argument("--duration", type=int, default=0, metavar="IDX",
-                    help="which of the preset's baked pulse-train counts to run (default 0, the first)")
-    ap.add_argument("--voltage", type=float, metavar="V",
-                    help="HV voltage for --run (default: the preset's own voltage, which needs --presets)")
-    ap.add_argument("--identify", action="store_true",
-                    help="read the chips and say which preset from --presets is on them")
-    ap.add_argument("--readback", type=int, default=1, metavar="IDX",
-                    help="verification: the preset to load and read back from the chips (default 1)")
-    ap.add_argument("--console-only", action="store_true",
-                    help="verify just the console's HV presets against --presets; no transmitter needed")
+                    help="which of a preset's pulse_train_count_selections --verify-preset loads it with "
+                         "(default 0, the first)")
+    ap.add_argument("--load-preset", type=Path, metavar="JSON",
+                    help="store a preset .json on the device, or every preset in a folder")
+    ap.add_argument("--delete-preset", nargs="?", const=True, metavar="SLOT",
+                    help="empty a slot (or the one --slot names); all empties every slot")
+    ap.add_argument("--slot", type=int, metavar="IDX",
+                    help="slot for --load-preset (default: where the preset already is, else the first available)")
+    ap.add_argument("--verify-preset", metavar="SLOT",
+                    help="prove a stored preset against --json-preset-directory: a slot, an id, or all")
     args = ap.parse_args()
-    args.run_seconds = None if args.run == float("inf") else args.run
-    args.run = args.run is not None
-
-    if args.console_only:
-        if not args.presets:
-            sys.exit("--console-only needs --presets")
-        presets, _ = load_presets(args.presets)
-        with LIFUInterface(run_async=False) as iface:
-            if not iface.is_device_connected()[1]:
-                sys.exit("no console connected")
-            print("console:", iface.hvcontroller.get_version(), "| host: %d preset(s)" % len(presets))
-            verify_console(iface.hvcontroller, [mc for _, mc in presets])
-        n_ok = sum(results)
-        print("\nFDA CONSOLE PRESET TEST: %d/%d checks passed" % (n_ok, len(results)))
-        return 0 if results and n_ok == len(results) else 1
 
     tx = Link()
-    print("firmware:", tx.get_version(), "| chips:", tx.enum_tx7332_devices(),
-          "| console:", tx.iface.hvcontroller.get_version() if tx.hv_connected else "not connected")
-    inventory = device_presets(tx)
-    if args.list_presets:
+    print(status(tx))
+    changed = args.delete_preset is not None or args.load_preset is not None
+    try:
+        if args.delete_preset is not None:
+            print("\n-- delete --")
+            delete_presets(tx, args.delete_preset, args.slot)
+        if args.load_preset is not None:
+            print("\n-- load --")
+            load_presets(tx, args.load_preset, args.slot)
+    except LIFUDeviceError as e:
+        sys.exit("refused: %s" % REFUSALS.get(e.device_error_code, e))
+    except ValueError as e:
+        sys.exit("refused: %s" % e)
+
+    # With nothing else asked for, the list is what the script shows.
+    if args.list_presets or changed or args.verify_preset is None:
         print("\n-- presets on the device --")
-        print_inventory(inventory, console_presets(tx))
-        return 0 if inventory else 1
-    if not inventory:
-        sys.exit("device reports no presets -- is it running an FDA_MODE image?")
-    print("device: %d preset(s)" % len(inventory))
-
-    presets, voltages = load_presets(args.presets) if args.presets else ([], {})
-    if args.presets and not presets:
-        sys.exit("no .json presets in %s" % args.presets)
-    if presets:
-        print("host: %d preset(s) in %s" % (len(presets), args.presets))
-
-    if args.identify:
-        if not presets:
-            sys.exit("--identify needs --presets to compute the candidates from")
-        print("\n-- identify: what is on the chips --")
-        return identify(tx, presets)
-    if args.load_preset is not None or args.run:
-        return operate(tx, inventory, presets, voltages, args)
-    if not presets:
-        sys.exit("--presets is required to verify (or use --list-presets, --load-preset, --run)")
-    return verify(tx, inventory, presets, args)
+        print_inventory(tx, device_slots(tx))
+    if args.verify_preset is not None:
+        return verify_presets(tx, args.verify_preset, args.json_preset_directory, args.duration)
+    return 0
 
 
 if __name__ == "__main__":

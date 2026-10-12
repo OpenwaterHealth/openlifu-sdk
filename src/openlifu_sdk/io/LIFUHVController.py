@@ -252,8 +252,12 @@ class HVController(OWComponent):
         Returns:
             ``count``, ``index``, ``selected`` (the index whose voltage is
             applied, None before any select), ``settings_crc`` (CRC-32 of the
-            source .json), ``voltage`` (float32) and ``id``; or None when the
-            console is not an FDA_MODE image and has no table.
+            source .json), ``voltage`` and ``sensitivity`` (the preset's own:
+            that voltage suits a transmitter of that sensitivity),
+            ``applied_voltage`` (what the last select put on the supply,
+            None before one), ``min_voltage`` / ``max_voltage`` (the window a
+            select must land in) and ``id``; or None when the console is not
+            an FDA_MODE image and has no table.
 
         Raises:
             LIFUDeviceError: No such index.
@@ -265,34 +269,47 @@ class HVController(OWComponent):
         if r.data_len == 0:
             return None
         d = bytes(r.data)
-        if len(d) < 12 or len(d) < 12 + d[11]:
+        if len(d) < 28 or len(d) < 28 + d[27]:
             raise LIFUProtocolError(f"HV: get_preset payload too short ({len(d)})",
                                     code=LIFU_ERR_BAD_PAYLOAD_LENGTH)
-        settings_crc, voltage = struct.unpack("<If", d[3:11])
-        return {"count": d[0], "index": d[1], "selected": None if d[2] == 0xFF else d[2],
-                "settings_crc": settings_crc, "voltage": voltage,
-                "id": d[12:12 + d[11]].decode("ascii", "replace")}
+        settings_crc, voltage, sensitivity, applied, low, high = struct.unpack("<Ifffff", d[3:27])
+        selected = None if d[2] == 0xFF else d[2]
+        return {"count": d[0], "index": d[1], "selected": selected,
+                "settings_crc": settings_crc, "voltage": voltage, "sensitivity": sensitivity,
+                "applied_voltage": None if selected is None else applied,
+                "min_voltage": low, "max_voltage": high,
+                "id": d[28:28 + d[27]].decode("ascii", "replace")}
 
-    def select_preset(self, index: int, settings_crc: int) -> bool:
-        """Apply preset *index*'s stored voltage (OW_POWER_PRESET_SELECT).
+    def select_preset(self, index: int, settings_crc: int, device_sensitivity: float) -> float:
+        """Apply preset *index*'s voltage, rescaled to the connected transmitter
+        (OW_POWER_PRESET_SELECT). Returns the voltage applied.
 
-        The FDA_MODE way to set the HV: the console holds one voltage per
-        preset and refuses set_voltage. *settings_crc* must be that preset's
-        (LIFUTXPresets.compile_preset gives it), so a host holding a different
-        idea of preset N is refused. Select the same index loaded into the
-        transmitter, with HV off.
+        The FDA_MODE way to set the HV: the console holds each preset's
+        voltage and the sensitivity it suits, refuses set_voltage, and works
+        out ``voltage * preset sensitivity / device_sensitivity`` itself.
+        *settings_crc* must be that preset's (LIFUTXPresets.compile_preset
+        gives it), so a host holding a different idea of preset N is
+        refused. *device_sensitivity* is the transmitter's at the preset's
+        frequency (LIFUTXPresets.device_sensitivity). Select the same index
+        loaded into the transmitter, with HV off.
 
         Raises:
             LIFUDeviceError: No such index, OW_HV_PRESET_CRC (wrong
-                settings_crc), or OW_HV_FDA_REFUSED (HV is on).
+                settings_crc), OW_HV_RANGE (the rescaled voltage is outside
+                the console's window), a sensitivity that is not a positive
+                number, or OW_HV_FDA_REFUSED (HV is on).
             LIFUNotConnectedError, LIFUCommunicationError.
         """
-        self.send_checked(packet_type=OW_POWER, command=OW_POWER_PRESET_SELECT,
-                          reserved=index, data=struct.pack("<I", settings_crc),
-                          op="select_preset")
+        r = self.send_checked(packet_type=OW_POWER, command=OW_POWER_PRESET_SELECT,
+                              reserved=index, data=struct.pack("<If", settings_crc, device_sensitivity),
+                              op="select_preset")
+        if r.data_len < 4:
+            raise LIFUProtocolError(f"HV: select_preset payload too short ({r.data_len} < 4)",
+                                    code=LIFU_ERR_BAD_PAYLOAD_LENGTH)
+        (volts,) = struct.unpack("<f", bytes(r.data[:4]))
         # wait_for_settle() aims at supply_voltage, which set_voltage no longer sets.
-        self.supply_voltage = self.get_preset(index)["voltage"]
-        return True
+        self.supply_voltage = volts
+        return volts
 
     def set_dacs(self, hvp: int, hvm: int, hrp: int, hrm: int) -> bool:
         """Set the four HV/HR DAC codes.
