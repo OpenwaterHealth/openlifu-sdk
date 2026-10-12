@@ -24,14 +24,18 @@ if _SRC not in sys.path:
 
 from openlifu_sdk.io.LIFUConfig import OW_RESP
 from openlifu_sdk.io.LIFUHVController import HVController
-from openlifu_sdk.io.LIFUTXDevice import TxDevice
+from openlifu_sdk.io.LIFUTXDevice import TxDevice, pattern_select_registers
 from openlifu_sdk.io.LIFUTXPresets import (
+    adjusted_voltage,
     compile_preset,
+    device_sensitivity,
     generate_console_presets,
     generate_header_files,
     generate_preset_set,
     parse_preset_blob,
     preset_blob,
+    preset_modules,
+    preset_sensitivity,
     preset_voltage,
     regs_crc,
     thermal_limits,
@@ -153,7 +157,7 @@ class TestPresetBlob(unittest.TestCase):
     def test_header_layout(self):
         mc = _compiled(id="unit")
         blob = preset_blob(mc)
-        self.assertEqual(blob[:8], b"OWPR" + bytes([1, 4, 0, 0]))
+        self.assertEqual(blob[:8], b"OWPR" + bytes([1, 4, 0, 1]))   # version, id length, module 0 of 1
         self.assertEqual(struct.unpack_from("<III", blob, 8), (len(blob), mc["settings_crc"], regs_crc(mc)))
         self.assertEqual(blob[20:24], b"unit")
 
@@ -192,14 +196,89 @@ class TestPresetBlob(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             table = generate_preset_set(d, presets)[-1].read_text()
         self.assertIn("#define PRESET_COUNT 2u", table)
-        self.assertIn("\t{ PRESET_A_BLOB, sizeof(PRESET_A_BLOB) },\n\t{ PRESET_B_BLOB, sizeof(PRESET_B_BLOB) },", table)
+        self.assertIn("#define PRESET_MODULES 1u", table)
+        self.assertIn("\t{ { PRESET_A_BLOB, sizeof(PRESET_A_BLOB) } },\n"
+                      "\t{ { PRESET_B_BLOB, sizeof(PRESET_B_BLOB) } },", table)
+
+    def test_one_blob_per_module(self):
+        # A module programs only its own two chips, so it gets only those.
+        one = _compiled()
+        two = _compiled(id="wide", delays=[[0.0] * 128], apodization=[[1.0] * 128])
+        self.assertEqual((preset_modules(one), preset_modules(two)), (1, 2))
+        self.assertEqual(preset_blob(one), preset_blob(one, 0))
+        halves = [parse_preset_blob(preset_blob(two, m)) for m in (0, 1)]
+        self.assertEqual([h["chips"] for h in halves], [two["chips"][0:2], two["chips"][2:4]])
+        self.assertEqual([h["regs_crc"] for h in halves], [regs_crc(two, 0), regs_crc(two, 1)])
+        self.assertEqual(len(preset_blob(two, 0)), len(preset_blob(one)) + len("wide") - len("unit"))
+        with self.assertRaisesRegex(ValueError, "nothing for module 2"):
+            preset_blob(two, 2)
+        with self.assertRaisesRegex(ValueError, "nothing for module 1"):
+            regs_crc(one, 1)
+
+    def test_table_has_a_column_per_module(self):
+        presets = [_compiled(id="a"), _compiled(id="wide", delays=[[0.0] * 128], apodization=[[1.0] * 128])]
+        with tempfile.TemporaryDirectory() as d:
+            written = generate_preset_set(d, presets)
+            table, wide = written[-1].read_text(), written[1].read_text()
+        self.assertIn("#define PRESET_MODULES 2u", table)
+        self.assertIn("\t{ { PRESET_A_BLOB, sizeof(PRESET_A_BLOB) }, { 0, 0 } },\n"
+                      "\t{ { PRESET_WIDE_BLOB, sizeof(PRESET_WIDE_BLOB) }, "
+                      "{ PRESET_WIDE_M1_BLOB, sizeof(PRESET_WIDE_M1_BLOB) } },", table)
+        for module, name in enumerate(("PRESET_WIDE_BLOB", "PRESET_WIDE_M1_BLOB")):
+            body = wide[wide.index("static const uint8_t %s[" % name):]
+            body = body[body.index("{") + 1:body.index("};")]
+            emitted = bytes(int(x, 16) for x in re.findall(r"0x([0-9a-f]{2}),", body))
+            self.assertEqual(emitted, preset_blob(presets[1], module))
+
+
+class TestSharedWithLiveDevice(unittest.TestCase):
+    """A preset bakes what set_solution would send a live device for the same inputs."""
+
+    @staticmethod
+    def _sent(**trigger) -> dict:
+        tx = TxDevice()
+        uart = _mock_uart(tx, "TX")
+        uart.send_packet.return_value = _packet(b"{}")
+        tx.set_trigger(**trigger)
+        return json.loads(uart.send_packet.call_args.kwargs["data"].decode())
+
+    def test_trigger_is_what_set_trigger_sends(self):
+        # 6 ms is 166.67 Hz; the trigger runs on whole Hz, truncated.
+        got = parse_preset_blob(preset_blob(_compiled(pulse_interval_ms=6.0, pulse_train_interval_s=2.0)))
+        sent = self._sent(pulse_interval=6.0 * 1e-3, pulse_count=10, pulse_train_interval=2.0, pulse_train_count=5)
+        self.assertEqual((got["trig_hz"], got["trig_train_us"]), (166, 2_000_000))
+        self.assertEqual((got["trig_hz"], got["trig_train_us"]),
+                         (sent["TriggerFrequencyHz"], sent["TriggerPulseTrainInterval"]))
+
+    def test_train_interval_follows_set_trigger(self):
+        # The preset's train is 10 pulses at 10 Hz: 1 s. An interval equal to it is back-to-back.
+        self.assertEqual(_compiled(pulse_train_interval_s=1.0)["trigger"]["pulse_train_interval_us"], 0)
+        self.assertEqual(self._sent(pulse_interval=0.1, pulse_count=10, pulse_train_interval=1.0,
+                                    pulse_train_count=5)["TriggerPulseTrainInterval"], 0)
+        # Shorter than the train cannot run once more than one train is offered...
+        with self.assertRaisesRegex(ValueError, "shorter than the on-device train"):
+            _compiled(pulse_train_interval_s=0.5)
+        # ...and has no effect when only one is.
+        single = _compiled(pulse_train_interval_s=0.5, pulse_train_count_selections=[1])
+        self.assertEqual(single["trigger"]["pulse_train_interval_us"], 0)
+
+    def test_module_invert_reaches_the_registers(self):
+        base = regs_crc(_compiled())
+        self.assertEqual(regs_crc(_compiled(module_invert=False)), base)
+        self.assertNotEqual(regs_crc(_compiled(module_invert=True)), base)
+
+    def test_pattern_select_has_one_source(self):
+        self.assertEqual(pattern_select_registers(3), {0x1F: 2, 0x1E: 2})
+        for chip in _rastered()["chips"]:
+            for profile, regs in enumerate(chip["profiles"], start=1):
+                self.assertEqual({a: regs[a] for a in (0x1F, 0x1E)}, pattern_select_registers(profile))
 
 
 def _f32(v: float) -> float:
     return struct.unpack("<f", struct.pack("<f", v))[0]
 
 
-class TestConsolePresets(unittest.TestCase):
+class TestPresetVoltage(unittest.TestCase):
 
     def test_voltage_is_float32(self):
         self.assertEqual(preset_voltage(_compiled(voltage=47.66997571)), _f32(47.66997571))
@@ -209,29 +288,120 @@ class TestConsolePresets(unittest.TestCase):
             with self.assertRaises(ValueError, msg=repr(bad)):
                 _compiled(voltage=bad)
 
-    def test_table_in_index_order_with_exact_voltages(self):
-        presets = [_compiled(id="a", voltage=47.66997571), _compiled(id="b", voltage=16.96599996)]
+    @staticmethod
+    def _module(*pairs) -> dict:
+        return {"module": {"sensitivity": [list(p) for p in pairs]}}
+
+    def test_scaled_to_the_transmitters_sensitivity(self):
+        # 40 V suits a 3600 transmitter; a 3000 one needs proportionally more.
+        doc = _preset(voltage=40.0, sensitivity=3600)
+        got = adjusted_voltage(doc, [self._module((395000, 9999), (400000, 3000))])
+        self.assertEqual((got["adjusted"], got["voltage"]), (True, 48.0))
+        self.assertEqual((got["preset_voltage"], got["preset_sensitivity"], got["device_sensitivity"]),
+                         (40.0, 3600.0, 3000.0))
+        # The compiled preset carries what the calculation needs.
+        mc = _compiled(voltage=40.0, sensitivity=3600)
+        self.assertEqual(adjusted_voltage(mc, [self._module((400000, 3000))])["voltage"], 48.0)
+
+    def test_modules_are_averaged(self):
+        doc = _preset(voltage=33.0, sensitivity=3600)
+        got = adjusted_voltage(doc, [self._module((400000, 3000)), self._module((400000, 3600))])
+        self.assertEqual(got["device_sensitivity"], 3300.0)
+        self.assertAlmostEqual(got["voltage"], 36.0)
+        # A module with no entry at the frequency is left out of the mean.
+        modules = [self._module((400000, 3000)), self._module((380000, 3600)), {}]
+        self.assertEqual(device_sensitivity(doc, modules), 3000.0)
+        # None at all is no sensitivity, not a guess: an FDA console cannot be selected without one.
+        self.assertIsNone(device_sensitivity(doc, [self._module((380000, 3600)), {}]))
+
+    def test_unadjusted_says_why(self):
+        modules = [self._module((400000, 3000))]
+        got = adjusted_voltage(_preset(voltage=40.0), modules)
+        self.assertEqual((got["adjusted"], got["voltage"]), (False, 40.0))
+        self.assertIn("preset has no sensitivity", got["reason"])
+        for configs in ([], [{}], [self._module((380000, 3000))], [self._module((400000, 0))]):
+            got = adjusted_voltage(_preset(voltage=40.0, sensitivity=3600), configs)
+            self.assertEqual((got["adjusted"], got["voltage"]), (False, 40.0), configs)
+            self.assertIn("400000 Hz", got["reason"])
+
+
+class TestConsolePresets(unittest.TestCase):
+
+    def test_sensitivity_is_float32_and_required(self):
+        self.assertEqual(preset_sensitivity(_compiled(sensitivity=3600)), 3600.0)
+        self.assertEqual(preset_sensitivity(_compiled(sensitivity=2719.6)), _f32(2719.6))
+        for bad in (None, 0, -1, "3600", float("nan")):
+            with self.assertRaises(ValueError, msg=repr(bad)):
+                preset_sensitivity({"id": "x", "sensitivity": bad})
+        with self.assertRaisesRegex(ValueError, "sensitivity"):
+            preset_sensitivity(_compiled())                    # the preset has none
+
+    def test_table_in_index_order_with_exact_values(self):
+        presets = [_compiled(id="a", voltage=47.66997571, sensitivity=3600),
+                   _compiled(id="b", voltage=30, sensitivity=2719.6)]
         with tempfile.TemporaryDirectory() as d:
             text = generate_console_presets(d, presets, "vet").read_text()
-        rows = re.findall(r'\{ "(\w+)", (\S+)f, 0x([0-9a-f]{8})u \}', text)
+        rows = re.findall(r'\{ "(\w+)", (\S+)f, (\S+)f, 0x([0-9a-f]{8})u \}', text)
         self.assertEqual([r[0] for r in rows], ["a", "b"])
-        for (_, literal, crc), mc in zip(rows, presets):
-            # The C literal parses back to the very float32 the preset compiles to.
-            self.assertEqual(_f32(float(literal)), preset_voltage(mc))
+        for (_, volts, sens, crc), mc in zip(rows, presets):
+            # Each C literal parses back to the very float32 the preset compiles to,
+            # and is a float literal even for a whole number.
+            self.assertEqual(_f32(float(volts)), preset_voltage(mc))
+            self.assertEqual(_f32(float(sens)), preset_sensitivity(mc))
+            self.assertTrue("." in volts and "." in sens, (volts, sens))
             self.assertEqual(int(crc, 16), mc["settings_crc"])
         self.assertIn('#define PRESET_HV_CONTEXT_NAME "vet"', text)
         self.assertIn("#define PRESET_HV_COUNT 2u", text)
-        self.assertNotIn("Every preset in this set uses", text)
 
-    def test_shared_voltage_called_out(self):
-        presets = [_compiled(id="a", voltage=30), _compiled(id="b", voltage=30)]
+    def test_table_needs_every_field(self):
         with tempfile.TemporaryDirectory() as d:
-            text = generate_console_presets(d, presets, "vet").read_text()
-        self.assertIn("// Every preset in this set uses 30 V.", text)
+            with self.assertRaisesRegex(ValueError, "settings_crc"):
+                generate_console_presets(d, [compile_preset(_preset(sensitivity=3600))], "vet")
+            with self.assertRaisesRegex(ValueError, "sensitivity"):
+                generate_console_presets(d, [_compiled()], "vet")
 
-    def test_needs_settings_crc(self):
-        with tempfile.TemporaryDirectory() as d, self.assertRaisesRegex(ValueError, "settings_crc"):
-            generate_console_presets(d, [compile_preset(_preset())], "vet")
+    @staticmethod
+    def _reply(selected: int, crc: int, volts: float, sens: float, applied: float, ident: bytes = b"unit") -> bytes:
+        return (bytes([3, 1, selected]) + struct.pack("<Ifffff", crc, volts, sens, applied, 35.0, 45.0)
+                + bytes([len(ident)]) + ident)
+
+    def test_get_preset(self):
+        hv = HVController()
+        uart = _mock_uart(hv, "HV")
+        uart.send_packet.return_value = _packet(self._reply(0xFF, 0xABCD, 40.0, 3600.0, 0.0))
+        got = hv.get_preset(1)
+        self.assertEqual((got["count"], got["index"], got["selected"], got["applied_voltage"]), (3, 1, None, None))
+        self.assertEqual((got["settings_crc"], got["id"]), (0xABCD, "unit"))
+        self.assertEqual((got["voltage"], got["sensitivity"]), (40.0, 3600.0))
+        self.assertEqual((got["min_voltage"], got["max_voltage"]), (35.0, 45.0))
+        uart.send_packet.return_value = _packet(self._reply(1, 0xABCD, 40.0, 3600.0, 42.5))
+        self.assertEqual((hv.get_preset(1)["selected"], hv.get_preset(1)["applied_voltage"]), (1, 42.5))
+        # A console that is not an FDA build has no table.
+        uart.send_packet.return_value = _packet(b"")
+        self.assertIsNone(hv.get_preset(0))
+
+    def test_select_preset_sends_the_sensitivity_and_returns_the_voltage(self):
+        hv = HVController()
+        uart = _mock_uart(hv, "HV")
+        uart.send_packet.return_value = _packet(struct.pack("<f", 42.5))
+        self.assertEqual(hv.select_preset(1, 0xABCD, 3388.0), 42.5)
+        sent = uart.send_packet.call_args_list[0].kwargs
+        self.assertEqual((sent["reserved"], bytes(sent["data"])), (1, struct.pack("<If", 0xABCD, 3388.0)))
+        self.assertEqual(hv.supply_voltage, 42.5)   # wait_for_settle aims at it
+
+    def test_verify_console_preset(self):
+        mc = _compiled(id="a", voltage=47.66997571, sensitivity=3600)
+        hv = MagicMock()
+        hv.get_preset.return_value = {"id": "a", "settings_crc": mc["settings_crc"],
+                                      "voltage": preset_voltage(mc), "sensitivity": 3600.0, "selected": None}
+        verify_console_preset(hv, 0, mc)
+        for field, wrong in (("voltage", 47.0), ("sensitivity", 3601.0)):
+            hv.get_preset.return_value = dict(hv.get_preset.return_value, **{field: wrong})
+            with self.assertRaisesRegex(ValueError, field):
+                verify_console_preset(hv, 0, mc)
+        hv.get_preset.return_value = None
+        with self.assertRaisesRegex(ValueError, "not an FDA_MODE image"):
+            verify_console_preset(hv, 0, mc)
 
 
 class TestDeviceReplies(unittest.TestCase):
@@ -256,47 +426,6 @@ class TestDeviceReplies(unittest.TestCase):
         got = tx.get_preset(1)
         self.assertIsNone(got["start_c"])
         self.assertEqual(got["train_counts"], [188, 375])
-
-    @staticmethod
-    def _console_reply(selected: int, crc: int, volts: float, ident: bytes = b"unit") -> bytes:
-        return bytes([3, 1, selected]) + struct.pack("<If", crc, volts) + bytes([len(ident)]) + ident
-
-    def test_console_get_preset(self):
-        hv = HVController()
-        uart = _mock_uart(hv, "HV")
-        uart.send_packet.return_value = _packet(self._console_reply(0xFF, 0xABCD, 47.67))
-        got = hv.get_preset(1)
-        self.assertEqual((got["count"], got["index"], got["selected"]), (3, 1, None))
-        self.assertEqual((got["settings_crc"], got["id"]), (0xABCD, "unit"))
-        self.assertEqual(got["voltage"], _f32(47.67))
-
-    def test_console_get_preset_non_fda(self):
-        hv = HVController()
-        uart = _mock_uart(hv, "HV")
-        uart.send_packet.return_value = _packet(b"")
-        self.assertIsNone(hv.get_preset(0))
-
-    def test_console_select_preset(self):
-        hv = HVController()
-        uart = _mock_uart(hv, "HV")
-        uart.send_packet.side_effect = [_packet(b""), _packet(self._console_reply(1, 0xABCD, 30.5))]
-        hv.select_preset(1, 0xABCD)
-        sent = uart.send_packet.call_args_list[0].kwargs
-        self.assertEqual((sent["reserved"], bytes(sent["data"])), (1, struct.pack("<I", 0xABCD)))
-        self.assertEqual(hv.supply_voltage, 30.5)   # wait_for_settle aims at it
-
-    def test_verify_console_preset(self):
-        mc = _compiled(id="a", voltage=47.66997571)
-        hv = MagicMock()
-        hv.get_preset.return_value = {"id": "a", "settings_crc": mc["settings_crc"],
-                                      "voltage": preset_voltage(mc), "selected": None}
-        verify_console_preset(hv, 0, mc)
-        hv.get_preset.return_value = dict(hv.get_preset.return_value, voltage=47.0)
-        with self.assertRaisesRegex(ValueError, "voltage"):
-            verify_console_preset(hv, 0, mc)
-        hv.get_preset.return_value = None
-        with self.assertRaisesRegex(ValueError, "not an FDA_MODE image"):
-            verify_console_preset(hv, 0, mc)
 
 
 if __name__ == "__main__":
