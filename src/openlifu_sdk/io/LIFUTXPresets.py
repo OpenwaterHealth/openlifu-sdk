@@ -4,6 +4,11 @@ In FDA mode the transmitter firmware -- not the host -- programs the TX7332
 chips, so the register values have to be baked into the image.
 :func:`compile_preset` produces them for one preset .json.
 
+Each transmitter module programs its own TX7332 chips, so a preset is built
+as one blob per module it spans, each holding that module's chips and nothing
+else. A single-module preset is one blob; either way a module stores and
+loads only its own part.
+
 :func:`preset_blob` serializes a compiled preset into the one binary form the
 firmware reads: a pointer-free record (``PRESET_BLOB`` in the firmware's
 ``presets.h``) whose base registers are stored as runs of consecutive
@@ -19,9 +24,11 @@ everything the firmware executes from (the firmware recomputes that one).
 
 Each preset's ``start_C`` / ``shutoff_C`` go into its TX header: the firmware
 refuses a trigger start above the first and stops a run at the second. Its
-``voltage`` goes to the console instead, through
+``voltage`` and ``sensitivity`` go to the console instead, through
 :func:`generate_console_presets`: one entry per preset, indexed exactly as the
-TX image is, so the host selects preset N on both and never sends a voltage.
+TX image is. The host selects preset N on both and gives the console the
+connected transmitter's sensitivity (:func:`device_sensitivity`); the console
+rescales the voltage itself, and the host never sends one.
 """
 
 from __future__ import annotations
@@ -36,20 +43,18 @@ from pathlib import Path
 from typing import Dict, List, Sequence
 
 from openlifu_sdk.io.LIFUTXDevice import (
-    ADDRESS_APODIZATION,
-    ADDRESS_DELAY_SEL,
-    ADDRESS_PATTERN_SEL_G1,
-    ADDRESS_PATTERN_SEL_G2,
-    PATTERN_PROFILE_SELECT_MASK,
     PRESET_BLOB_MAGIC,
     PRESET_BLOB_VERSION,
     PRESET_ID_MAX,
+    PRESET_SLOT_SIZE,
     PRESET_TEMP_RAW_MAX,
     PRESET_TEMP_RAW_MIN,
     PRESET_TEMP_SCALE,
     PRESET_TRAIN_COUNT_MAX,
     PRESET_TRAIN_SELECTIONS_MAX,
+    TRANSMITTERS_PER_MODULE,
     build_solution_registers,
+    resolve_trigger_timing,
 )
 
 logger = logging.getLogger(__name__)
@@ -117,7 +122,8 @@ def thermal_limits(machine_config: Dict) -> tuple[int, int]:
 
 
 def preset_voltage(machine_config: Dict) -> float:
-    """The HV setpoint the console bakes for this preset: ``voltage`` as float32.
+    """The HV voltage the console bakes for this preset, as float32: what a
+    transmitter of the preset's sensitivity needs.
 
     Raises:
         ValueError: Not a positive number.
@@ -128,11 +134,89 @@ def preset_voltage(machine_config: Dict) -> float:
     return struct.unpack("<f", struct.pack("<f", v))[0]
 
 
+def preset_sensitivity(machine_config: Dict) -> float:
+    """The transmitter sensitivity the preset's voltage suits, as the console
+    bakes it: ``sensitivity`` as float32.
+
+    Raises:
+        ValueError: Missing, or not a positive number.
+    """
+    v = machine_config.get("sensitivity")
+    if isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(v) or v <= 0:
+        raise ValueError("%s: sensitivity must be a positive number, got %r" % (machine_config.get("id"), v))
+    return struct.unpack("<f", struct.pack("<f", v))[0]
+
+
+def module_sensitivity(user_config: Dict, frequency_hz: float) -> float | None:
+    """A module's calibrated sensitivity at *frequency_hz*: the matching entry of
+    ``module.sensitivity`` in its user config (pairs of Hz and value), or None."""
+    for f, v in ((user_config or {}).get("module") or {}).get("sensitivity") or []:
+        if abs(float(f) - frequency_hz) < 1e-3 and float(v) > 0:
+            return float(v)
+    return None
+
+
+def module_user_configs(txdevice) -> List[Dict]:
+    """Each connected module's user config as a dict, in module order; {} for
+    one whose config is not JSON."""
+    configs = []
+    for module in range(txdevice.get_module_count()):
+        try:
+            configs.append(json.loads(txdevice.read_config(module=module).get_json_str()))
+        except ValueError:
+            configs.append({})
+    return configs
+
+
+def device_sensitivity(preset: Dict, user_configs: Sequence[Dict]) -> float | None:
+    """The connected transmitter's sensitivity at *preset*'s frequency: the mean
+    over the modules that have an entry there (:func:`module_sensitivity`), or
+    None if none has. *user_configs* is each module's user config
+    (:func:`module_user_configs`). What HVController.select_preset is given."""
+    hz = float(preset.get("frequency_khz", 0.0)) * 1e3
+    found = [v for v in (module_sensitivity(c, hz) for c in user_configs) if v is not None]
+    return sum(found) / len(found) if found else None
+
+
+def adjusted_voltage(preset: Dict, user_configs: Sequence[Dict]) -> Dict:
+    """The HV voltage for *preset* on the connected transmitter, worked out on
+    the host: for a console that is not an FDA_MODE image and takes a voltage.
+    An FDA_MODE console does this sum itself (HVController.select_preset).
+
+    A preset's ``voltage`` is right for a transmitter of the preset's own
+    ``sensitivity``. One that is more or less sensitive needs proportionally
+    less or more: ``voltage * sensitivity / transmitter sensitivity``
+    (:func:`device_sensitivity`). *preset* is the preset document or what
+    :func:`compile_preset` made of it.
+
+    Returns ``voltage`` (what to set), ``preset_voltage`` and ``adjusted``.
+    When adjusted, also ``preset_sensitivity`` and ``device_sensitivity``.
+    When not, ``voltage`` is the preset's own and ``reason`` says what was
+    missing -- never silently.
+
+    Raises:
+        ValueError: The preset's voltage is not a positive number.
+    """
+    preset_voltage(preset)
+    raw = float(preset["voltage"])
+    out = {"voltage": raw, "preset_voltage": raw, "adjusted": False}
+    sens = preset.get("sensitivity")
+    if isinstance(sens, bool) or not isinstance(sens, (int, float)) or not sens > 0:
+        return {**out, "reason": "the preset has no sensitivity"}
+    device = device_sensitivity(preset, user_configs)
+    if device is None:
+        return {**out, "reason": "no module has a sensitivity at %g Hz"
+                                 % (float(preset.get("frequency_khz", 0.0)) * 1e3)}
+    return {"voltage": raw * float(sens) / device, "preset_voltage": raw, "adjusted": True,
+            "preset_sensitivity": float(sens), "device_sensitivity": device}
+
+
 def compile_preset(preset: Dict, preset_id: str | None = None,
                            settings_bytes: bytes | None = None) -> Dict:
     """Resolve a preset into the register mapping a TX image bakes in.
 
-    The mapping comes from :func:`build_solution_registers`, the same function
+    The mapping comes from :func:`build_solution_registers` and the trigger
+    timing from :func:`resolve_trigger_timing`, the same functions
     :meth:`TxDevice.set_solution` uses to program a live device, so there is
     only ever one implementation to keep correct.
 
@@ -147,9 +231,12 @@ def compile_preset(preset: Dict, preset_id: str | None = None,
 
     Returns:
         Dict with ``id``, the passthrough sequence fields, the limit fields
-        (``start_C``, ``shutoff_C``, ``voltage``), ``settings_crc``
-        (when ``settings_bytes`` was given), ``profile_index``,
-        ``execution_order`` and ``chips``. Each chip entry holds ``registers``
+        (``start_C``, ``shutoff_C``, ``voltage``), ``frequency_khz`` and
+        ``sensitivity`` when the preset has one, ``settings_crc``
+        (when ``settings_bytes`` was given), ``trigger`` (``frequency_hz`` and
+        ``pulse_train_interval_us``, as the device runs them),
+        ``profile_index``, ``execution_order`` and ``chips``. Each chip entry
+        holds ``registers``
         (start address -> run of consecutive values) and ``profiles`` (one
         address -> value dict per delay profile, the registers the firmware
         rewrites as it rasters).
@@ -194,6 +281,9 @@ def compile_preset(preset: Dict, preset_id: str | None = None,
     kwargs = {"execution_order": execution_order}
     if execution_order:
         kwargs["profile_index"] = execution_order[0]
+    # Module inversion goes through when the preset states it, as amplitude does.
+    if "module_invert" in preset:
+        kwargs["module_invert"] = preset["module_invert"]
     solution = build_solution_registers(pulse, delays, apodizations, sequence, **kwargs)
     regs = solution["tx_registers"]
 
@@ -206,37 +296,35 @@ def compile_preset(preset: Dict, preset_id: str | None = None,
         captured["settings_crc"] = zlib.crc32(settings_bytes) & 0xFFFFFFFF
     for name in PASSTHROUGH_FIELDS + LIMIT_FIELDS:
         captured[name] = preset[name]
+    # What adjusted_voltage() works from; a preset without a sensitivity is not adjusted.
+    captured["frequency_khz"] = preset["frequency_khz"]
+    if "sensitivity" in preset:
+        captured["sensitivity"] = preset["sensitivity"]
     # Refuse bad run lengths or limits now, not at emit time.
-    train_count_selections(captured)
+    counts = train_count_selections(captured)
     thermal_limits(captured)
     preset_voltage(captured)
+    # The timing set_trigger would send, for the longest run the preset offers.
+    captured["trigger"] = resolve_trigger_timing(
+        sequence["pulse_interval"],
+        pulse_count=sequence["pulse_count"],
+        pulse_train_interval=sequence["pulse_train_interval"],
+        pulse_train_count=max(counts),
+    )
     # The SDK's normalized values, so the image starts where set_solution would.
     captured["profile_index"] = solution["profile_index"]
     captured["execution_order"] = solution["execution_order"]
-    captured["chips"] = _chip_configs(regs, n_profiles)
+    captured["chips"] = _chip_configs(regs, solution["profile_registers"])
     return captured
 
 
-def _chip_configs(regs, n_profiles: int) -> List[Dict]:
-    """Split the programmed register model into one bakeable entry per TX7332."""
-    packed = regs.get_registers(pack=True, pack_single=True)
+def _chip_configs(regs, profile_registers: List[List[Dict]]) -> List[Dict]:
+    """Split the programmed register model into one bakeable entry per TX7332.
 
-    # Per-profile registers: the delay selector and apodization the device was
-    # programmed with, plus the 0-based pattern selector for both groups. These
-    # are the writes the firmware repeats as it rasters.
-    per_profile = []
-    for profile in range(1, n_profiles + 1):
-        control = regs.get_delay_control_registers(profile)
-        pattern_sel = (profile - 1) & PATTERN_PROFILE_SELECT_MASK
-        per_profile.append([
-            {
-                ADDRESS_DELAY_SEL: int(chip[ADDRESS_DELAY_SEL]),
-                ADDRESS_APODIZATION: int(chip[ADDRESS_APODIZATION]),
-                ADDRESS_PATTERN_SEL_G1: pattern_sel,
-                ADDRESS_PATTERN_SEL_G2: pattern_sel,
-            }
-            for chip in control
-        ])
+    profile_registers is the solution's ``[profile - 1][chip]`` set: the writes
+    the firmware repeats as it rasters.
+    """
+    packed = regs.get_registers(pack=True, pack_single=True)
 
     chips = []
     for chip_index, chip_regs in enumerate(packed):
@@ -246,7 +334,7 @@ def _chip_configs(regs, n_profiles: int) -> List[Dict]:
         }
         chips.append({
             "registers": registers,
-            "profiles": [profile[chip_index] for profile in per_profile],
+            "profiles": [dict(profile[chip_index]) for profile in profile_registers],
         })
     return chips
 
@@ -265,28 +353,37 @@ def c_ident(text: str) -> str:
     return ident
 
 
-def _trig_hz(machine_config: Dict) -> int:
-    """The integer trigger rate the image bakes for ``pulse_interval_ms``."""
-    interval_ms = float(machine_config["pulse_interval_ms"])
-    if interval_ms <= 0:
-        raise ValueError("%s: pulse_interval_ms must be positive, got %r"
-                         % (machine_config.get("id"), interval_ms))
-    return round(1000.0 / interval_ms)
-
-
 Segments = List[tuple]  # (label, bytes) pieces of a blob, in order
 
 
-def _body_segments(machine_config: Dict) -> Segments:
+def preset_modules(machine_config: Dict) -> int:
+    """Transmitter modules the preset spans: its chips, TRANSMITTERS_PER_MODULE to a module."""
+    return -(-len(machine_config["chips"]) // TRANSMITTERS_PER_MODULE)
+
+
+def _module_chips(machine_config: Dict, module: int) -> List[Dict]:
+    """The chips module *module* programs, out of the whole preset's."""
+    first = module * TRANSMITTERS_PER_MODULE
+    chips = machine_config["chips"][first:first + TRANSMITTERS_PER_MODULE] if module >= 0 else []
+    if not chips:
+        raise ValueError("%s spans %d module(s); it has nothing for module %d"
+                         % (machine_config["id"], preset_modules(machine_config), module))
+    return chips
+
+
+def _body_segments(machine_config: Dict, module: int = 0) -> Segments:
     """The blob's body, piece by labelled piece -- what regs_crc covers.
 
     Base registers go out as runs of consecutive addresses (start, count,
     values), which is how the register model already packs them; the handful
     each profile switch rewrites are scattered, so those stay address/value
-    pairs.
+    pairs. Only module *module*'s chips go in; everything else is the same
+    in every module's blob.
     """
-    chips = machine_config["chips"]
+    chips = _module_chips(machine_config, module)
+    first_chip = module * TRANSMITTERS_PER_MODULE
     order = machine_config["execution_order"]
+    trigger = machine_config["trigger"]
     n_profiles = len(chips[0]["profiles"]) if chips else 0
     counts = train_count_selections(machine_config)
     out: Segments = [
@@ -294,13 +391,13 @@ def _body_segments(machine_config: Dict) -> Segments:
          struct.pack("<BBBB", len(chips), n_profiles, int(machine_config["profile_index"]), len(order))),
         ("execution order", bytes(int(i) for i in order)),
         ("trigger: Hz, pulses per train, train interval in us",
-         struct.pack("<III", _trig_hz(machine_config), int(machine_config["pulse_count"]),
-                     round(float(machine_config["pulse_train_interval_s"]) * 1e6))),
+         struct.pack("<III", trigger["frequency_hz"], int(machine_config["pulse_count"]),
+                     trigger["pulse_train_interval_us"])),
         ("run lengths: how many, then each in pulse trains",
          struct.pack("<B%dI" % len(counts), len(counts), *counts)),
         ("start_C, shutoff_C in tenths of a degree", struct.pack("<hh", *thermal_limits(machine_config))),
     ]
-    for ci, chip in enumerate(chips):
+    for ci, chip in enumerate(chips, start=first_chip):
         runs = sorted(chip["registers"].items())
         out.append(("chip %d base registers: %d run(s)" % (ci, len(runs)), struct.pack("<H", len(runs))))
         for addr, values in runs:
@@ -315,8 +412,8 @@ def _body_segments(machine_config: Dict) -> Segments:
     return out
 
 
-def _blob_segments(machine_config: Dict) -> Segments:
-    """A whole blob as labelled pieces: the header, then :func:`_body_segments`."""
+def _blob_segments(machine_config: Dict, module: int = 0) -> Segments:
+    """One module's blob as labelled pieces: the header, then :func:`_body_segments`."""
     if "settings_crc" not in machine_config:
         raise ValueError("%s has no settings_crc; pass settings_bytes to compile_preset"
                          % machine_config["id"])
@@ -325,12 +422,13 @@ def _blob_segments(machine_config: Dict) -> Segments:
     if not 1 <= len(pid) <= PRESET_ID_MAX or any(not 0x20 <= ord(ch) <= 0x7E for ch in pid):
         raise ValueError("preset id %r must be 1..%d printable ASCII characters" % (pid, PRESET_ID_MAX))
     ident = pid.encode("ascii")
-    body = _body_segments(machine_config)
+    body = _body_segments(machine_config, module)
     body_bytes = b"".join(data for _, data in body)
     header_len = len(PRESET_BLOB_MAGIC) + 16 + len(ident)
     return [
-        ("magic, version, id length, reserved",
-         PRESET_BLOB_MAGIC + struct.pack("<BBH", PRESET_BLOB_VERSION, len(ident), 0)),
+        ("magic, version, id length, this module, modules the preset spans",
+         PRESET_BLOB_MAGIC + struct.pack("<BBBB", PRESET_BLOB_VERSION, len(ident), module,
+                                         preset_modules(machine_config))),
         ("total length, settings_crc, regs_crc",
          struct.pack("<III", header_len + len(body_bytes), machine_config["settings_crc"],
                      zlib.crc32(body_bytes) & 0xFFFFFFFF)),
@@ -338,28 +436,31 @@ def _blob_segments(machine_config: Dict) -> Segments:
     ] + body
 
 
-def preset_blob(machine_config: Dict) -> bytes:
-    """Serialize a compiled preset into the blob the firmware reads.
+def preset_blob(machine_config: Dict, module: int = 0) -> bytes:
+    """Serialize one module's part of a compiled preset into the blob the firmware reads.
 
     The layout is ``PRESET_BLOB`` in the firmware's ``presets.h``. It is
-    little-endian with no padding and no pointers.
+    little-endian with no padding and no pointers. *module* picks whose
+    chips it holds; see :func:`preset_modules` for how many there are.
 
     Raises:
         ValueError: No settings_crc (pass settings_bytes to compile_preset),
-            or an id the format cannot carry.
+            an id the format cannot carry, or a module the preset does not span.
     """
-    return b"".join(data for _, data in _blob_segments(machine_config))
+    return b"".join(data for _, data in _blob_segments(machine_config, module))
 
 
-def regs_crc(machine_config: Dict) -> int:
-    """CRC-32 the firmware will compute for this preset: over the blob's body."""
-    return zlib.crc32(b"".join(data for _, data in _body_segments(machine_config))) & 0xFFFFFFFF
+def regs_crc(machine_config: Dict, module: int = 0) -> int:
+    """CRC-32 module *module* will compute for this preset: over its blob's body."""
+    return zlib.crc32(b"".join(data for _, data in _body_segments(machine_config, module))) & 0xFFFFFFFF
 
 
 def parse_preset_blob(blob: bytes) -> Dict:
     """Decode a preset blob, the way the firmware's loader walks it.
 
-    Returns ``id``, ``settings_crc``, ``regs_crc`` (as stored), ``body_crc``
+    Returns ``id``, ``module`` and ``modules`` (whose part this is, of how
+    many; ``modules`` is 0 in a blob written before it was recorded),
+    ``settings_crc``, ``regs_crc`` (as stored), ``body_crc``
     (computed here), ``profile_index``, ``execution_order``, ``trig_hz``,
     ``trig_count``, ``trig_train_us``, ``train_counts``, ``start_c_x10``,
     ``shutoff_c_x10`` and ``chips`` in the shape :func:`compile_preset`
@@ -380,7 +481,7 @@ def parse_preset_blob(blob: bytes) -> Dict:
         pos += size
         return values
 
-    magic, version, id_len, _reserved = take("<4sBBH")
+    magic, version, id_len, module, modules = take("<4sBBBB")
     if magic != PRESET_BLOB_MAGIC or version != PRESET_BLOB_VERSION:
         raise ValueError("not a version %d preset blob (magic %r, version %d)"
                          % (PRESET_BLOB_VERSION, magic, version))
@@ -409,7 +510,8 @@ def parse_preset_blob(blob: bytes) -> Dict:
         chips.append({"registers": registers, "profiles": profiles})
     if pos != len(blob):
         raise ValueError("preset blob has %d stray byte(s) after its last chip" % (len(blob) - pos))
-    return {"id": ident.decode("ascii"), "settings_crc": settings_crc, "regs_crc": stored_crc,
+    return {"id": ident.decode("ascii"), "module": module, "modules": modules,
+            "settings_crc": settings_crc, "regs_crc": stored_crc,
             "body_crc": zlib.crc32(blob[body_start:]) & 0xFFFFFFFF,
             "profile_index": profile_index, "execution_order": order,
             "trig_hz": trig_hz, "trig_count": trig_count, "trig_train_us": trig_train_us,
@@ -417,7 +519,8 @@ def parse_preset_blob(blob: bytes) -> Dict:
 
 
 def generate_header_files(filename, machine_config: Dict, context: str | None = None) -> Path:
-    """Write a compiled preset out as a C header: its blob, as an annotated byte array.
+    """Write a compiled preset out as a C header: its blob, as an annotated byte
+    array -- one array per module the preset spans.
 
     Voltage and sensitivity stay out: the TX has no handler for them, and the
     console applies the voltage (:func:`generate_console_presets`). The run
@@ -439,8 +542,8 @@ def generate_header_files(filename, machine_config: Dict, context: str | None = 
 
     chips = machine_config["chips"]
     n_profiles = len(chips[0]["profiles"]) if chips else 0
-    segments = _blob_segments(machine_config)
-    size = sum(len(data) for _, data in segments)
+    modules = preset_modules(machine_config)
+    size = 0
 
     lines = [
         "// Generated by openlifu_sdk from preset '%s'." % machine_config["id"],
@@ -450,17 +553,25 @@ def generate_header_files(filename, machine_config: Dict, context: str | None = 
         "",
         "#include <stdint.h>",
         "",
-        "// %d chip(s), %d profile(s), start_C %g, shutoff_C %g, regs_crc 0x%08x."
-        % (len(chips), n_profiles, machine_config["start_C"], machine_config["shutoff_C"],
-           regs_crc(machine_config)),
-        "// One preset blob, laid out as PRESET_BLOB in presets.h: each comment",
-        "// names the bytes that follow it.",
-        "static const uint8_t %s_BLOB[%u] = {" % (sym, size),
     ]
-    for label, data in segments:
-        lines.append("\t// %s" % label)
-        lines += ["\t" + " ".join("0x%02x," % b for b in data[i:i + 16]) for i in range(0, len(data), 16)]
-    lines += ["};", "", "#endif  // %s" % guard, ""]
+    for module in range(modules):
+        segments = _blob_segments(machine_config, module)
+        length = sum(len(data) for _, data in segments)
+        size += length
+        lines += [
+            "// %s%d chip(s), %d profile(s), start_C %g, shutoff_C %g, regs_crc 0x%08x."
+            % ("" if modules == 1 else "Module %d of %d: " % (module, modules),
+               len(_module_chips(machine_config, module)), n_profiles,
+               machine_config["start_C"], machine_config["shutoff_C"], regs_crc(machine_config, module)),
+            "// One preset blob, laid out as PRESET_BLOB in presets.h: each comment",
+            "// names the bytes that follow it.",
+            "static const uint8_t %s[%u] = {" % (_blob_symbol(sym, module), length),
+        ]
+        for label, data in segments:
+            lines.append("\t// %s" % label)
+            lines += ["\t" + " ".join("0x%02x," % b for b in data[i:i + 16]) for i in range(0, len(data), 16)]
+        lines += ["};", ""]
+    lines += ["#endif  // %s" % guard, ""]
 
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text("\n".join(lines), encoding="utf-8")
@@ -472,7 +583,8 @@ def generate_preset_set(output_directory, presets: Sequence[Dict], context: str 
     """Write a whole preset set: one header per preset plus the table.
 
     The firmware keeps them all in Core/Inc/presets/, so the table includes
-    each header as ``presets/<name>.h``.
+    each header as ``presets/<name>.h``. It has one column per module: each
+    module takes its own part of a preset.
 
     Args:
         output_directory: Destination directory for the generated headers.
@@ -494,6 +606,7 @@ def generate_preset_set(output_directory, presets: Sequence[Dict], context: str 
     written = [generate_header_files(out / ("%s.h" % stem), mc, context)
                for stem, mc in zip(stems, presets)]
 
+    modules = max(preset_modules(mc) for mc in presets)
     guard = _table_guard("PRESET_TABLE", context)
     lines = [
         _generated_by(context),
@@ -510,13 +623,18 @@ def generate_preset_set(output_directory, presets: Sequence[Dict], context: str 
         lines.append('#define PRESET_CONTEXT_NAME "%s"' % context)
     lines += [
         "#define PRESET_COUNT %uu" % len(presets),
+        "// The most modules any preset here spans.",
+        "#define PRESET_MODULES %uu" % modules,
         "",
-        "// Index order is the order the host loads them by.",
-        "static const PresetBlob preset_table[PRESET_COUNT] = {",
+        "// Index order is the order the host loads them by. A module programs only",
+        "// its own chips, so each preset has one blob per module it spans.",
+        "static const PresetBlob preset_table[PRESET_COUNT][PRESET_MODULES] = {",
     ]
     for mc in presets:
-        sym = _symbol(mc, context)
-        lines.append("\t{ %s_BLOB, sizeof(%s_BLOB) }," % (sym, sym))
+        names = [_blob_symbol(_symbol(mc, context), m) for m in range(preset_modules(mc))]
+        cells = ["{ %s, sizeof(%s) }" % (name, name) for name in names]
+        cells += ["{ 0, 0 }"] * (modules - len(names))
+        lines.append("\t{ %s }," % ", ".join(cells))
     lines += ["};", "", "#endif  // %s" % guard, ""]
 
     table = out / "preset_table.h"
@@ -535,6 +653,11 @@ def _symbol(machine_config: Dict, context: str | None) -> str:
     return "PRESET_%s" % sym
 
 
+def _blob_symbol(symbol: str, module: int) -> str:
+    """C name of one module's blob: module 0 keeps the plain name."""
+    return "%s_BLOB" % symbol if module == 0 else "%s_M%d_BLOB" % (symbol, module)
+
+
 def _header_stem(machine_config: Dict, context: str | None) -> str:
     return _symbol(machine_config, context).lower()
 
@@ -547,14 +670,22 @@ def _generated_by(context: str | None) -> str:
     return "// Generated by openlifu_sdk%s." % (" for preset set '%s'" % context if context else "")
 
 
+def _c_float(value: float) -> str:
+    """A C float literal that parses back to exactly this float32."""
+    text = "%.9g" % value
+    # A bare integer cannot take the f suffix.
+    return (text if "." in text or "e" in text else text + ".0") + "f"
+
+
 def generate_console_presets(output_directory, presets: Sequence[Dict], context: str | None = None) -> Path:
     """Write the console's ``preset_hv_table.h`` for a preset set.
 
-    One entry per preset -- id, voltage, settings_crc -- in the same order as
-    :func:`generate_preset_set` gives the transmitter, so index N is the same
-    preset on both. An FDA_MODE console applies entry N's voltage when the
-    host selects N (with that preset's settings_crc) and refuses any voltage
-    the host sends itself. Each voltage is emitted as its exact float32.
+    One entry per preset -- id, voltage, sensitivity, settings_crc -- in the
+    same order as :func:`generate_preset_set` gives the transmitter, so index N
+    is the same preset on both. An FDA_MODE console applies entry N's voltage,
+    rescaled from its sensitivity to the connected transmitter's, when the
+    host selects N (with that preset's settings_crc), and refuses any voltage
+    the host sends itself. Each value is emitted as its exact float32.
 
     Args:
         output_directory: Destination directory, Core/Inc/presets/ in the
@@ -564,13 +695,17 @@ def generate_console_presets(output_directory, presets: Sequence[Dict], context:
 
     Returns:
         The path written.
+
+    Raises:
+        ValueError: No presets, or one without a settings_crc, voltage or
+            sensitivity.
     """
     if not presets:
         raise ValueError("a preset set needs at least one preset")
     for mc in presets:
         if "settings_crc" not in mc:
             raise ValueError("%s has no settings_crc; pass settings_bytes to compile_preset" % mc["id"])
-    volts = [preset_voltage(mc) for mc in presets]
+    rows = [(mc, preset_voltage(mc), preset_sensitivity(mc)) for mc in presets]
     guard = _table_guard("PRESET_HV_TABLE", context)
     lines = [
         _generated_by(context),
@@ -586,21 +721,44 @@ def generate_console_presets(output_directory, presets: Sequence[Dict], context:
     lines += [
         "#define PRESET_HV_COUNT %uu" % len(presets),
         "",
-        "// One HV setpoint per preset, indexed exactly as the transmitter image's",
-        "// preset_table: OW_POWER_PRESET_SELECT N applies entry N's voltage.",
+        "// Each preset's HV voltage and the transmitter sensitivity it suits, indexed",
+        "// exactly as the transmitter image's preset_table: OW_POWER_PRESET_SELECT N",
+        "// applies entry N's voltage, rescaled to the connected transmitter.",
+        "static const HvPreset hv_preset_table[PRESET_HV_COUNT] = {",
     ]
-    if len(set(volts)) == 1:
-        lines.append("// Every preset in this set uses %.9g V." % volts[0])
-    lines.append("static const HvPreset hv_preset_table[PRESET_HV_COUNT] = {")
-    lines += ['\t{ "%s", %.9gf, 0x%08xu },' % (mc["id"], v, mc["settings_crc"])
-              for mc, v in zip(presets, volts)]
+    lines += ['\t{ "%s", %s, %s, 0x%08xu },' % (mc["id"], _c_float(v), _c_float(sens), mc["settings_crc"])
+              for mc, v, sens in rows]
     lines += ["};", "", "#endif  // %s" % guard, ""]
 
     path = Path(output_directory) / "preset_hv_table.h"
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text("\n".join(lines), encoding="utf-8")
-    logger.info("wrote %s (%d preset(s), %.9g..%.9g V)", path, len(presets), min(volts), max(volts))
+    logger.info("wrote %s (%d preset(s))", path, len(presets))
     return path
+
+
+def verify_console_preset(hvcontroller, index: int, machine_config: Dict) -> Dict:
+    """Prove the console's preset *index* is the one the host holds.
+
+    Asks the console (OW_POWER_PRESET_GET) and compares id, settings_crc and
+    the exact float32 voltage and sensitivity against *machine_config*, which
+    must carry settings_crc. Returns the console's reply on success.
+
+    Raises:
+        ValueError: The console has no preset table (not an FDA_MODE image),
+            or with every field that disagrees.
+    """
+    got = hvcontroller.get_preset(index)
+    if got is None:
+        raise ValueError("console has no preset table: not an FDA_MODE image")
+    want = {"id": machine_config["id"], "settings_crc": machine_config["settings_crc"],
+            "voltage": preset_voltage(machine_config), "sensitivity": preset_sensitivity(machine_config)}
+    bad = ["%s: console=%s host=%s" % (k, (hex(got[k]) if isinstance(got[k], int) else got[k]),
+                                        (hex(v) if isinstance(v, int) else v))
+           for k, v in want.items() if got[k] != v]
+    if bad:
+        raise ValueError("console preset %d verification failed: %s" % (index, "; ".join(bad)))
+    return got
 
 
 def verify_preset(txdevice, index: int, machine_config: Dict) -> Dict:
@@ -609,7 +767,8 @@ def verify_preset(txdevice, index: int, machine_config: Dict) -> Dict:
     Asks the device (OW_PRESET_GET) and compares id, settings_crc, regs_crc
     and the thermal limits against *machine_config* -- captured locally with
     settings_bytes so both CRCs are known. Returns the device's reply on
-    success.
+    success. The reply is the first module's: the others are proven when
+    they load, which each refuses unless its own regs_crc matches.
 
     Raises:
         ValueError: With every field that disagrees, if any do.
@@ -629,29 +788,92 @@ def verify_preset(txdevice, index: int, machine_config: Dict) -> Dict:
     return got
 
 
-def verify_console_preset(hvcontroller, index: int, machine_config: Dict) -> Dict:
-    """Prove the console's preset *index* is the one the host holds.
-
-    Asks the console (OW_POWER_PRESET_GET) and compares id, settings_crc and
-    the exact float32 voltage against *machine_config*, which must carry
-    settings_crc. Returns the console's reply on success.
+def preset_slots(machine_config: Dict, slot_size: int = PRESET_SLOT_SIZE) -> int:
+    """How many of a PRESET_MODE module's slots this preset takes: 1, or
+    2 if a module's blob is over *slot_size* (pass the device's own, from
+    get_preset_capacity). A module stores only its own part, so this does not
+    grow with the number of modules.
 
     Raises:
-        ValueError: The console has no preset table (not an FDA_MODE image),
-            or with every field that disagrees.
+        ValueError: A blob is over two slots and cannot be stored.
     """
-    got = hvcontroller.get_preset(index)
-    if got is None:
-        raise ValueError("console has no preset table: not an FDA_MODE image")
-    want = {"id": machine_config["id"],
-            "settings_crc": machine_config["settings_crc"],
-            "voltage": preset_voltage(machine_config)}
-    bad = ["%s: console=%s host=%s" % (k, (hex(got[k]) if isinstance(got[k], int) else got[k]),
-                                        (hex(v) if isinstance(v, int) else v))
-           for k, v in want.items() if got[k] != v]
-    if bad:
-        raise ValueError("console preset %d verification failed: %s" % (index, "; ".join(bad)))
-    return got
+    size = max(len(preset_blob(machine_config, m)) for m in range(preset_modules(machine_config)))
+    if size > 2 * slot_size:
+        raise ValueError("%s: blob is %d bytes; a stored preset is at most %d"
+                         % (machine_config["id"], size, 2 * slot_size))
+    return 2 if size > slot_size else 1
+
+
+def store_preset(txdevice, slot: int, machine_config: Dict) -> Dict:
+    """Write a compiled preset to a PRESET_MODE slot and prove it took.
+
+    Uploads each module its own part, then reads the slot back
+    (:func:`verify_preset`), so a success means the device holds this preset
+    under index *slot*. Returns the device's description of it. A transmitter
+    with fewer modules than the preset spans gets the parts it has modules
+    for.
+
+    Raises:
+        ValueError: The blob cannot be stored, or the slot does not read back
+            as this preset.
+        LIFUDeviceError: The device refused the write (see write_preset).
+    """
+    preset_slots(machine_config)
+    for module in _device_modules(txdevice, machine_config):
+        txdevice.write_preset(slot, preset_blob(machine_config, module), module)
+    return verify_preset(txdevice, slot, machine_config)
+
+
+def load_preset(txdevice, index: int, machine_config: Dict, duration_index: int = 0) -> None:
+    """Program every module from its part of preset *index* (OW_PRESET_LOAD).
+
+    Each module is given its own regs_crc and refuses unless that is what it
+    holds, so a success means every module loaded this preset.
+
+    Raises:
+        LIFUDeviceError: A module refused (see TxDevice.load_preset).
+    """
+    for module in _device_modules(txdevice, machine_config):
+        txdevice.load_preset(index, regs_crc(machine_config, module), duration_index, module)
+
+
+def delete_preset(txdevice, slot: int) -> None:
+    """Empty a PRESET_MODE slot on every module (OW_PRESET_DELETE): each keeps its
+    own part of the preset there. Already empty is fine.
+
+    Raises:
+        LIFUDeviceError: A module refused (see TxDevice.delete_preset).
+    """
+    for module in range(txdevice.get_module_count()):
+        txdevice.delete_preset(slot, module)
+
+
+# TX7332 register 0x18 bit 30 is set by the chip itself and never written, so
+# a read-back always differs from the blob there.
+READBACK_MASK = {0x18: 0x40000000}
+
+
+def loaded_registers(machine_config: Dict) -> Dict[tuple, int]:
+    """What the chips hold once this preset is loaded: (chip, address) -> value,
+    the base registers with the starting profile's on top. Chips count across
+    the whole transmitter. Compare a read-back through READBACK_MASK."""
+    want = {}
+    for chip, cfg in enumerate(machine_config["chips"]):
+        for start, values in cfg["registers"].items():
+            for i, value in enumerate(values):
+                want[(chip, start + i)] = value
+        for addr, value in cfg["profiles"][machine_config["profile_index"] - 1].items():
+            want[(chip, addr)] = value
+    return want
+
+
+def _device_modules(txdevice, machine_config: Dict) -> range:
+    """The modules to address: the ones the preset spans that the transmitter has."""
+    wanted, present = preset_modules(machine_config), txdevice.get_module_count()
+    if present < wanted:
+        logger.warning("%s spans %d modules; this transmitter has %d, so only those get their part",
+                       machine_config["id"], wanted, present)
+    return range(min(wanted, present))
 
 
 # --------------------------------------------------------------------------

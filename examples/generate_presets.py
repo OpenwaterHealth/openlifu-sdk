@@ -5,14 +5,16 @@ with the SDK's own register math, and writes one C header per preset plus
 the preset_table.h that indexes them into the transmitter firmware tree at
 Core/Inc/presets/. Build one of its FDA presets from there.
 
-It also writes the console's preset_hv_table.h: each preset's voltage, indexed
-exactly as the transmitter's presets are. An FDA_MODE console applies preset
-N's voltage when the host selects N and refuses any voltage the host sends
-itself. That goes into the console firmware tree at Core/Inc/presets/; build
-its FDA preset too.
+It also writes the console's preset_hv_table.h: each preset's voltage and the
+transmitter sensitivity that voltage suits, indexed exactly as the
+transmitter's presets are. An FDA_MODE console applies preset N's voltage,
+rescaled to the connected transmitter's sensitivity, when the host selects N,
+and refuses any voltage the host sends itself. That goes into the console
+firmware tree at Core/Inc/presets/; build its FDA preset too.
 
-Every preset must carry voltage, start_C and shutoff_C; the generator has no
-defaults. Presets missing any are listed together and nothing is written.
+Every preset must carry voltage, sensitivity, start_C and shutoff_C; the
+generator has no defaults. Presets missing any are listed together and
+nothing is written.
 
 The registers come from the SDK's own register math (the same code
 set_solution programs a live device with); nothing is sent anywhere, so this
@@ -39,6 +41,7 @@ from openlifu_sdk.io.LIFUTXPresets import (
     generate_preset_set,
     preset_files,
     preset_id,
+    preset_sensitivity,
     regs_crc,
     train_count_selections,
 )
@@ -95,15 +98,16 @@ def main():
         raw = path.read_bytes()
         try:
             mc = compile_preset(json.loads(raw), preset_id=preset_id(path), settings_bytes=raw)
+            preset_sensitivity(mc)   # the console's table needs it
         except ValueError as e:
             errors.append("  [%2d] %s" % (index, e))
             continue
         configs.append(mc)
         print("  [%2d] %-28s settings_crc=0x%08x regs_crc=0x%08x  %d chip(s), %d profile(s), trains %s, "
-              "%g V, start %g C, shutoff %g C"
+              "%g V at sensitivity %g, start %g C, shutoff %g C"
               % (index, mc["id"], mc["settings_crc"], regs_crc(mc),
                  len(mc["chips"]), len(mc["chips"][0]["profiles"]), train_count_selections(mc),
-                 mc["voltage"], mc["start_C"], mc["shutoff_C"]))
+                 mc["voltage"], mc["sensitivity"], mc["start_C"], mc["shutoff_C"]))
     # A partial set would renumber the presets after a bad one, so write none.
     if errors:
         sys.exit("%d of %d preset(s) cannot be baked; nothing written:\n%s"
@@ -113,10 +117,7 @@ def main():
     written = generate_preset_set(out, configs, context)
     print("wrote %d transmitter header(s) to %s" % (len(written), out))
     path = generate_console_presets(presets_dir(args.console_out, CONSOLE_FALLBACK), configs, context)
-    volts = sorted({mc["voltage"] for mc in configs})
-    print("wrote %s: %d preset voltage(s), %s"
-          % (path, len(configs), "all %g V" % volts[0] if len(volts) == 1
-             else "%g..%g V" % (volts[0], volts[-1])))
+    print("wrote %s: %d preset(s)" % (path, len(configs)))
     return 0
 
 
