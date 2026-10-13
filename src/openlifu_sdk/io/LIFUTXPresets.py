@@ -217,7 +217,7 @@ def compile_preset(preset: Dict, preset_id: str | None = None,
 
     The mapping comes from :func:`build_solution_registers` and the trigger
     timing from :func:`resolve_trigger_timing`, the same functions
-    :meth:`TxDevice.set_solution` uses to program a live device, so there is
+    :meth:`LIFUTxDevice.set_solution` uses to program a live device, so there is
     only ever one implementation to keep correct.
 
     Args:

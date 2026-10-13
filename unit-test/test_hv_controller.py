@@ -39,7 +39,7 @@ from openlifu_sdk.io.LIFUConfig import (
     OW_POWER,
     OW_RESP,
 )
-from openlifu_sdk.io.LIFUHVController import HVController
+from openlifu_sdk.io.LIFUHVController import LIFUHVController
 from openlifu_sdk.io.uart import OWUart
 
 
@@ -56,9 +56,9 @@ def _make_packet(data: bytes = b"", packet_type: int = OW_RESP, reserved: int = 
     return pkt
 
 
-def _make_hv_controller() -> tuple[HVController, MagicMock]:
-    """Construct an HVController whose underlying UART is fully mocked."""
-    hv = HVController()
+def _make_hv_controller() -> tuple[LIFUHVController, MagicMock]:
+    """Construct a LIFUHVController whose underlying UART is fully mocked."""
+    hv = LIFUHVController()
     mock_uart = MagicMock(spec=OWUart)
     mock_uart.desc = "HV"
     mock_uart.demo_mode = False
@@ -383,7 +383,7 @@ class TestHVControllerUnit(unittest.TestCase):
 class HVControllerInteractiveTests:
     """Menu-driven tests that exercise HVController against real connected hardware."""
 
-    def __init__(self, hv: HVController):
+    def __init__(self, hv: LIFUHVController):
         self.hv = hv
         self.menu_items = [
             ("Ping Device",                 self.test_ping),
@@ -676,7 +676,7 @@ class HVControllerInteractiveTests:
 # ===========================================================================
 # Hardware connection helper
 # ===========================================================================
-def _connect_hv_controller() -> HVController:
+def _connect_hv_controller() -> LIFUHVController:
     from openlifu_sdk.io.LIFUInterface import LIFUInterface
 
     print("Connecting to LIFU console (HV controller)...")

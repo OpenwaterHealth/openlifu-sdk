@@ -2,6 +2,17 @@
 
 `TxDevice` is the TX-module controller that programs TX7332 chips, configures triggers, and performs firmware updates for transmitter modules.
 
+> **FDA / RUO split.** `TxDevice` is the FDA component created by
+> `DeviceInterface`: it exposes only identity, temperature, trigger
+> read/start/stop and stored-preset (`get_preset` / `load_preset`) methods,
+> and refuses any other opcode before it reaches the wire. Every other
+> method listed below (trigger/profile programming, register access,
+> `async_mode`, config writes, DFU, LED/echo/reset) lives on the RUO subclass
+> `LIFUTxDevice`, which only `LIFUInterface` creates. So do the methods that
+> list, store and delete the presets of a PRESET_MODE image
+> (`get_preset_slot` / `get_preset_capacity` / `write_preset` /
+> `delete_preset`).
+
 Constructor
 - `TxDevice(uart: LIFUUart, module_invert: bool | list[bool]=False)` — low-level transport `LIFUUart` instance is required.
 

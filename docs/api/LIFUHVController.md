@@ -2,6 +2,13 @@
 
 `HVController` manages console/HV interactions: powering, voltage control, temperature and telemetry.
 
+> **FDA / RUO split.** `HVController` is the FDA component created by
+> `DeviceInterface`: it exposes identity, HV on/off/status, preset
+> select/get, and telemetry reads, and refuses any other opcode before it
+> reaches the wire. Voltage/DAC setters, 12 V rail and fan control, RGB LED,
+> config writes, DFU and LED/echo/reset live on the RUO subclass
+> `LIFUHVController`, which only `LIFUInterface` creates.
+
 Constructor
 - `HVController(uart: LIFUUart = None)` — accepts `LIFUUart` for console communication.
 
