@@ -3,12 +3,14 @@ from __future__ import annotations
 import logging
 import struct
 import time
+from dataclasses import dataclass
 
 from openlifu_sdk.io.LIFUConfig import (
     CONTROLLER_COMMANDS,
     DEFAULT_TIMEOUT,
     GLOBAL_COMMANDS,
     LIFU_ERR_BAD_PAYLOAD_LENGTH,
+    ODO_RESET_BOTH,
     OW_CONSOLE_PID,
     OW_POWER,
     OW_POWER_12V_OFF,
@@ -17,6 +19,7 @@ from openlifu_sdk.io.LIFUConfig import (
     OW_POWER_GET_FAN,
     OW_POWER_GET_HV,
     OW_POWER_GET_HVON,
+    OW_POWER_GET_ODO,
     OW_POWER_GET_RGB,
     OW_POWER_GET_TEMP1,
     OW_POWER_GET_TEMP2,
@@ -24,6 +27,7 @@ from openlifu_sdk.io.LIFUConfig import (
     OW_POWER_HV_OFF,
     OW_POWER_HV_ON,
     OW_POWER_RAW_DAC,
+    OW_POWER_RESET_ODO,
     OW_POWER_SET_DACS,
     OW_POWER_SET_FAN,
     OW_POWER_SET_HV,
@@ -38,6 +42,7 @@ from openlifu_sdk.io.LIFUConfig import (
     OW_RGB_FX_RAINBOW,
     OW_RGB_FX_SOLID,
     OW_RGB_FX_STOP,
+    OW_UNKNOWN,
     OW_VID,
     POWER_COMMANDS,
 )
@@ -45,6 +50,16 @@ from openlifu_sdk.io.component import OWComponent, register_command_packet_types
 from openlifu_sdk.io.exceptions import LIFUHVSettleError, LIFUProtocolError
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class ConsoleOdometer:
+    """Lifetime usage counters kept by the console firmware."""
+
+    power_on_s: int
+    """Seconds the console firmware has been running."""
+    hv_on_s: int
+    """Seconds the HV supply has been enabled."""
 
 class HVController(OWComponent):
     def __init__(self,  vid: int = OW_VID, pid: int = OW_CONSOLE_PID,
@@ -216,6 +231,51 @@ class HVController(OWComponent):
         r = self.send_checked(packet_type=OW_POWER, command=OW_POWER_GET_HVON,
                               op="get_hv_status")
         return r.reserved == 1
+
+    def get_odometer(self) -> ConsoleOdometer | None:
+        """Read the console's lifetime power-on and HV-on time.
+
+        The firmware saves the counters to flash every 10 minutes and on
+        HV-off / host-disconnect, so up to that much time can be lost when
+        power is cut; the value read here is always live.
+
+        Returns:
+            ConsoleOdometer, or None when the console firmware predates the
+            odometer (it answers OW_POWER_GET_ODO as an unknown command).
+
+        Raises:
+            LIFUNotConnectedError, LIFUCommunicationError, LIFUDeviceError,
+            LIFUProtocolError: If the payload length is invalid.
+        """
+        r = self.send_checked(packet_type=OW_POWER, command=OW_POWER_GET_ODO,
+                              op="get_odometer")
+        if r.packet_type == OW_UNKNOWN:
+            logger.info("HV: console firmware has no odometer (OW_POWER_GET_ODO unsupported)")
+            return None
+        if r.data_len != 8:
+            raise LIFUProtocolError(
+                f"HV: odometer payload length {r.data_len} != 8",
+                code=LIFU_ERR_BAD_PAYLOAD_LENGTH,
+            )
+        power_on_s, hv_on_s = struct.unpack("<II", r.data)
+        return ConsoleOdometer(power_on_s=power_on_s, hv_on_s=hv_on_s)
+
+    def reset_odometer(self, target: int = ODO_RESET_BOTH) -> bool:
+        """Zero one or both odometers and save the cleared state to flash.
+
+        Args:
+            target: ODO_RESET_POWER (0), ODO_RESET_HV (1) or ODO_RESET_BOTH (2).
+
+        Raises:
+            ValueError: If *target* is not 0, 1 or 2.
+            LIFUNotConnectedError, LIFUCommunicationError, LIFUDeviceError.
+        """
+        if target not in (0, 1, 2):
+            raise ValueError(f"Odometer reset target must be 0, 1 or 2, got {target}")
+        self.send_checked(packet_type=OW_POWER, command=OW_POWER_RESET_ODO,
+                          reserved=target, op="reset_odometer")
+        logger.info("Odometer reset (target %d)", target)
+        return True
 
     def set_voltage(self, voltage: float) -> bool:
         """Set the HV supply voltage.
