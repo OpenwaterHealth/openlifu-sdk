@@ -1,15 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
 """Tests for the trigger-config application side of
-:meth:`SimulatedTxDevice.set_preset`.
+:meth:`SimulatedTxDevice.load_preset`.
 
-Mirrors the real firmware model: ``set_preset`` loads the
-flash-baked ``machine_config`` and applies its trigger +
-pulse parameters so a subsequent
-:meth:`SimulatedLIFUInterface.start_sonication` runs the
+Mirrors the real firmware model: ``load_preset`` (OW_PRESET_LOAD)
+programs the flash-baked preset, including its trigger + pulse
+parameters, so a subsequent ``start_sonication`` runs the
 correct sequence without a separate ``set_trigger`` call.
 
 Added 2026-10-01 (companion to the OI #78 smoke test
-revealing that ``set_preset`` didn't update ``_sequence``,
+revealing that loading a preset didn't update ``_sequence``,
 so an immediate ``start_sonication`` ran the default 1-train
 sequence instead of the operator's selected duration).
 """
@@ -22,6 +21,7 @@ import pytest
 
 pytest.importorskip("PyQt6")
 
+from openlifu_sdk.io.exceptions import LIFUDeviceError  # noqa: E402
 from openlifu_sdk.ui.simulated_interface import SimulatedTxDevice  # noqa: E402
 
 
@@ -73,7 +73,7 @@ def _tx_with_flash(mc_list):
 # ------------------------------------------------------------------
 
 
-def test_set_preset_updates_sequence_from_machine_config():
+def test_load_preset_updates_sequence_from_machine_config():
     mc = _build_mc(
         pulse_interval_ms=25.0,
         pulse_count=50,
@@ -81,10 +81,9 @@ def test_set_preset_updates_sequence_from_machine_config():
         pulse_train_count_selections=[10, 20, 40],
     )
     tx = _tx_with_flash([mc])
-    expected_crc = _machine_config_crc(mc)
 
     # Pick the middle duration (index 1 -> 20 trains).
-    tx.set_preset(0, sequence_duration_index=1, expected_crc=expected_crc)
+    tx.load_preset(0, _machine_config_crc(mc), duration_index=1)
 
     assert tx._sequence["pulse_interval"] == pytest.approx(0.025)
     assert tx._sequence["pulse_count"] == 50
@@ -92,16 +91,15 @@ def test_set_preset_updates_sequence_from_machine_config():
     assert tx._sequence["pulse_train_count"] == 20
 
 
-def test_set_preset_updates_pulse_duration_from_machine_config():
+def test_load_preset_updates_pulse_duration_from_machine_config():
     mc = _build_mc(pulse_length_us=75.0)
     tx = _tx_with_flash([mc])
-    tx.set_preset(0, sequence_duration_index=0,
-                  expected_crc=_machine_config_crc(mc))
+    tx.load_preset(0, _machine_config_crc(mc), duration_index=0)
     # pulse_length_us=75 -> _pulse["duration"] = 75e-6 s
     assert tx._pulse["duration"] == pytest.approx(75e-6)
 
 
-def test_set_preset_reflects_through_get_trigger():
+def test_load_preset_reflects_through_get_trigger():
     mc = _build_mc(
         pulse_interval_ms=5.0,
         pulse_count=10,
@@ -109,8 +107,7 @@ def test_set_preset_reflects_through_get_trigger():
         pulse_train_count_selections=[2, 4, 8],
     )
     tx = _tx_with_flash([mc])
-    tx.set_preset(0, sequence_duration_index=2,
-                  expected_crc=_machine_config_crc(mc))
+    tx.load_preset(0, _machine_config_crc(mc), duration_index=2)
 
     trig = tx.get_trigger()
     assert trig["pulse_interval"] == pytest.approx(0.005)
@@ -126,23 +123,15 @@ def test_set_preset_reflects_through_get_trigger():
 # ------------------------------------------------------------------
 
 
-def test_set_preset_rejects_duration_index_beyond_selections():
+@pytest.mark.parametrize("bad_duration", [-1, 5])
+def test_load_preset_rejects_bad_duration_index(bad_duration):
     mc = _build_mc(pulse_train_count_selections=[5, 10])
     tx = _tx_with_flash([mc])
-    with pytest.raises(ValueError, match="out of range"):
-        tx.set_preset(0, sequence_duration_index=5,
-                      expected_crc=_machine_config_crc(mc))
+    with pytest.raises(LIFUDeviceError, match="duration index"):
+        tx.load_preset(0, _machine_config_crc(mc), duration_index=bad_duration)
 
 
-def test_set_preset_rejects_negative_duration_index():
-    mc = _build_mc()
-    tx = _tx_with_flash([mc])
-    with pytest.raises(ValueError, match=">= 0"):
-        tx.set_preset(0, sequence_duration_index=-1,
-                      expected_crc=_machine_config_crc(mc))
-
-
-def test_set_preset_crc_mismatch_leaves_sequence_unchanged():
+def test_load_preset_crc_mismatch_leaves_sequence_unchanged():
     """SR-003 fault path: a CRC mismatch rejects the call and
     should not leak partial state into the sequence."""
     mc = _build_mc(
@@ -154,8 +143,8 @@ def test_set_preset_crc_mismatch_leaves_sequence_unchanged():
     tx = _tx_with_flash([mc])
     sequence_before = dict(tx._sequence)
     pulse_before = dict(tx._pulse)
-    with pytest.raises(ValueError, match="CRC mismatch"):
-        tx.set_preset(0, sequence_duration_index=0, expected_crc=0xDEADBEEF)
+    with pytest.raises(LIFUDeviceError):
+        tx.load_preset(0, 0xDEADBEEF, duration_index=0)
     assert tx._sequence == sequence_before
     assert tx._pulse == pulse_before
 
@@ -170,7 +159,7 @@ def test_start_sonication_runs_preset_selected_sequence(qt_app):
     engine ticks run the selected pulse_train_count, not the
     1-train default."""
     import time
-    from openlifu_sdk.ui.simulated_interface import SimulatedLIFUInterface
+    from openlifu_sdk.ui.simulated_interface import SimulatedDeviceInterface
 
     mc = _build_mc(
         pulse_interval_ms=1.0,
@@ -179,10 +168,10 @@ def test_start_sonication_runs_preset_selected_sequence(qt_app):
         pulse_train_count_selections=[5],
     )
     flash = [(mc, _machine_config_crc(mc))]
-    iface = SimulatedLIFUInterface(preset_flash=flash)
+    iface = SimulatedDeviceInterface(preset_flash=flash)
     try:
-        iface.txdevice.set_preset(0, sequence_duration_index=0,
-                                  expected_crc=_machine_config_crc(mc))
+        iface.load_preset(0, mc["settings_crc"], _machine_config_crc(mc),
+                          frequency_hz=400_000.0, duration_index=0)
         iface.start_sonication(turn_hv_on=False, wait_for_settle=False)
 
         deadline = time.monotonic() + 1.0

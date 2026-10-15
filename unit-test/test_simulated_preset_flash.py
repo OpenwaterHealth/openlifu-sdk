@@ -1,14 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Unit tests for the simulated preset-integrity handshake
-(SR-002 / SR-003).
+"""Unit tests for the simulated preset flash (SR-002 / SR-003).
 
 Exercises :meth:`SimulatedTxDevice.get_preset` /
-:meth:`SimulatedTxDevice.set_preset` and their exposure through
-:class:`SimulatedLIFUInterface`. The real
-:class:`~openlifu_sdk.io.LIFUTXDevice.TxDevice.get_preset` /
-:meth:`~openlifu_sdk.io.LIFUTXDevice.TxDevice.set_preset` are
-tested for their ``NotImplementedError`` contract only -- the
-firmware side is PROJ-04 work.
+:meth:`SimulatedTxDevice.load_preset`, which mirror the real
+``TxDevice`` OW_PRESET_GET / OW_PRESET_LOAD shapes, and the
+end-to-end :meth:`SimulatedDeviceInterface.load_preset`.
 """
 
 from __future__ import annotations
@@ -17,8 +13,10 @@ import pytest
 
 pytest.importorskip("PyQt6")
 
-from openlifu_sdk.io.LIFUTXDevice import TxDevice
+from openlifu_sdk.io.exceptions import LIFUDeviceError
+from openlifu_sdk.io.LIFUConfig import OW_BAD_CRC, OW_HV_PRESET_CRC
 from openlifu_sdk.ui.simulated_interface import (
+    SimulatedDeviceInterface,
     SimulatedLIFUInterface,
     SimulatedTxDevice,
 )
@@ -31,12 +29,9 @@ from openlifu_sdk.ui.simulated_interface import (
 
 def _mc(preset_id: str, settings_crc: int, **extra) -> dict:
     """Minimal machine_config for tests -- ``id`` + ``settings_crc``
-    are what ``SimulatedTxDevice.get_preset`` reads;
-    ``pulse_train_count_selections`` (+ supporting trigger-config
-    fields) are what ``set_preset`` reads to configure the
-    sim's ``_sequence`` so a subsequent ``start_sonication`` runs
-    the loaded preset. Overridable via ``**extra`` for tests that
-    care about specific values."""
+    are what ``get_preset`` reports; ``pulse_train_count_selections``
+    (+ supporting trigger-config fields) are what ``load_preset``
+    applies to the sim's ``_sequence``. Overridable via ``**extra``."""
     base = {
         "id": preset_id,
         "settings_crc": settings_crc,
@@ -55,148 +50,155 @@ def _mc(preset_id: str, settings_crc: int, **extra) -> dict:
 # ------------------------------------------------------------------
 
 
-def test_get_preset_returns_id_and_settings_crc_from_machine_config():
+def test_get_preset_matches_real_txdevice_shape():
     tx = SimulatedTxDevice(
         preset_flash=[
-            (_mc("preset-A", 0x11111111), 0xAAAAAAAA),
+            (_mc("preset-A", 0x11111111, start_C=30.0, shutoff_C=60.0), 0xAAAAAAAA),
             (_mc("preset-B", 0x22222222), 0xBBBBBBBB),
         ]
     )
-    assert tx.get_preset(0) == ("preset-A", 0x11111111)
-    assert tx.get_preset(1) == ("preset-B", 0x22222222)
+    a = tx.get_preset(0)
+    assert (a["id"], a["settings_crc"], a["regs_crc"]) == ("preset-A", 0x11111111, 0xAAAAAAAA)
+    assert (a["count"], a["index"]) == (2, 0)
+    assert a["train_counts"] == [1, 2, 3, 4, 5]
+    assert (a["start_c"], a["shutoff_c"]) == (30.0, 60.0)
+    # Same keys TxDevice.get_preset returns from OW_PRESET_GET.
+    assert set(a) == {"count", "index", "chip_count", "profile_count", "settings_crc",
+                      "regs_crc", "baked_regs_crc", "id", "train_counts",
+                      "start_c", "shutoff_c"}
+    assert tx.get_preset(1)["id"] == "preset-B"
 
 
-def test_get_machine_config_returns_full_dict_and_crc():
-    mc_a = _mc("preset-A", 0x11111111, voltage=40.0)
-    tx = SimulatedTxDevice(preset_flash=[(mc_a, 0xAAAAAAAA)])
-    machine_config, mc_crc = tx.get_machine_config(0)
-    assert machine_config is mc_a
-    assert mc_crc == 0xAAAAAAAA
-
-
-def test_get_preset_default_flash_is_empty():
+def test_default_flash_has_one_loadable_preset():
     tx = SimulatedTxDevice()
-    with pytest.raises(IndexError):
+    preset = tx.get_preset(0)
+    assert preset["count"] == 1
+    assert tx.load_preset(0, preset["regs_crc"], 0)
+
+
+def test_empty_flash_has_no_presets():
+    tx = SimulatedTxDevice(preset_flash=[])
+    with pytest.raises(LIFUDeviceError):
         tx.get_preset(0)
 
 
 @pytest.mark.parametrize("bad_index", [-1, 5])
 def test_get_preset_rejects_out_of_range(bad_index):
     tx = SimulatedTxDevice(preset_flash=[(_mc("only", 0xDEADBEEF), 0xC0FFEE00)])
-    with pytest.raises(IndexError):
+    with pytest.raises(LIFUDeviceError):
         tx.get_preset(bad_index)
 
 
-def test_set_preset_records_selection_on_matching_machine_config_crc():
+def test_load_preset_records_selection_on_matching_regs_crc():
     tx = SimulatedTxDevice(
         preset_flash=[
             (_mc("preset-A", 0x11111111), 0xAAAAAAAA),
             (_mc("preset-B", 0x22222222), 0xBBBBBBBB),
         ]
     )
-    tx.set_preset(preset_index=1, sequence_duration_index=3, expected_crc=0xBBBBBBBB)
+    tx.load_preset(1, 0xBBBBBBBB, duration_index=3)
     assert tx.get_loaded_preset() == (1, 3)
 
 
-def test_set_preset_rejects_crc_mismatch():
+def test_load_preset_rejects_crc_mismatch_with_ow_bad_crc():
     tx = SimulatedTxDevice(
         preset_flash=[(_mc("preset-A", 0x11111111), 0xAAAAAAAA)]
     )
-    with pytest.raises(ValueError, match="CRC mismatch"):
-        tx.set_preset(preset_index=0, sequence_duration_index=0, expected_crc=0xDEADBEEF)
+    with pytest.raises(LIFUDeviceError) as excinfo:
+        tx.load_preset(0, 0xDEADBEEF, duration_index=0)
+    assert excinfo.value.device_error_code == OW_BAD_CRC
     assert tx.get_loaded_preset() == (None, None)
 
 
-def test_set_preset_error_message_names_machine_config_crc():
-    tx = SimulatedTxDevice(
-        preset_flash=[(_mc("preset-A", 0x11111111), 0xAAAAAAAA)]
-    )
-    with pytest.raises(ValueError) as excinfo:
-        tx.set_preset(preset_index=0, sequence_duration_index=0, expected_crc=0xDEADBEEF)
-    # SR-003 fault path: caller sends machine_config_crc, not the
-    # settings_crc; the error message should surface that distinction.
-    assert "machine_config_crc" in str(excinfo.value)
-
-
-def test_set_preset_rejects_out_of_range_index():
+def test_load_preset_rejects_out_of_range_index():
     tx = SimulatedTxDevice(preset_flash=[(_mc("only", 0x1), 0x2)])
-    with pytest.raises(IndexError):
-        tx.set_preset(preset_index=1, sequence_duration_index=0, expected_crc=0x2)
+    with pytest.raises(LIFUDeviceError):
+        tx.load_preset(1, 0x2, duration_index=0)
 
 
-def test_set_preset_rejects_negative_duration_index():
+@pytest.mark.parametrize("bad_duration", [-1, 5])
+def test_load_preset_rejects_bad_duration_index(bad_duration):
     tx = SimulatedTxDevice(preset_flash=[(_mc("only", 0x1), 0x2)])
-    with pytest.raises(ValueError, match="duration_index"):
-        tx.set_preset(preset_index=0, sequence_duration_index=-1, expected_crc=0x2)
-
-
-def test_set_preset_flash_clears_loaded_selection():
-    tx = SimulatedTxDevice(
-        preset_flash=[
-            (_mc("A", 0xA1), 0xAA),
-            (_mc("B", 0xB1), 0xBB),
-        ]
-    )
-    tx.set_preset(preset_index=0, sequence_duration_index=2, expected_crc=0xAA)
-    assert tx.get_loaded_preset() == (0, 2)
-    tx.set_preset_flash([(_mc("C", 0xC1), 0xCC)])
+    with pytest.raises(LIFUDeviceError, match="duration index"):
+        tx.load_preset(0, 0x2, duration_index=bad_duration)
     assert tx.get_loaded_preset() == (None, None)
 
 
 # ------------------------------------------------------------------
-# SimulatedLIFUInterface: preset_flash forwarded to txdevice
+# SimulatedDeviceInterface: preset_flash seeds TX + HV; load_preset
 # ------------------------------------------------------------------
 
 
 def test_interface_constructor_forwards_preset_flash():
+    interface = SimulatedDeviceInterface(
+        preset_flash=[(_mc("diathermy", 0xAD813B92), 0xABBAABBA)]
+    )
+    assert interface.txdevice.get_preset(0)["id"] == "diathermy"
+    assert interface.hvcontroller.get_preset(0)["settings_crc"] == 0xAD813B92
+
+
+def test_lifu_interface_accepts_preset_flash():
     interface = SimulatedLIFUInterface(
         preset_flash=[(_mc("diathermy", 0xAD813B92), 0xABBAABBA)]
     )
-    assert interface.txdevice.get_preset(0) == ("diathermy", 0xAD813B92)
+    assert interface.txdevice.get_preset(0)["settings_crc"] == 0xAD813B92
 
 
-def test_interface_without_preset_flash_has_empty_flash():
-    interface = SimulatedLIFUInterface()
-    with pytest.raises(IndexError):
-        interface.txdevice.get_preset(0)
+def test_interface_load_preset_scales_hv_by_sensitivity_at_frequency():
+    """End-to-end FDA load: TX loads the preset, HV voltage is the
+    preset voltage scaled by ref / device sensitivity at the preset
+    frequency (the sim's default module table: 2720 @ 400 kHz,
+    2267 @ 410 kHz)."""
+    mc = _mc("preset-A", 0x11111111, voltage=12.0, sensitivity=2720.0,
+             voltage_range=[5.0, 20.0])
+    interface = SimulatedDeviceInterface(preset_flash=[(mc, 0xAAAAAAAA)])
+
+    interface.load_preset(0, 0x11111111, 0xAAAAAAAA, 400_000.0, duration_index=2)
+    assert interface.txdevice.get_loaded_preset() == (0, 2)
+    assert interface.hvcontroller.supply_voltage == pytest.approx(12.0)
+
+    interface.load_preset(0, 0x11111111, 0xAAAAAAAA, 410_000.0)
+    assert interface.hvcontroller.supply_voltage == pytest.approx(12.0 * 2720.0 / 2267.0)
 
 
-def test_interface_full_load_preset_round_trip():
-    """End-to-end: seed flash via the interface, load a preset,
-    read back the loaded selection."""
-    interface = SimulatedLIFUInterface(
-        preset_flash=[
-            (_mc("preset-A", 0x11111111), 0xAAAAAAAA),
-            (_mc("preset-B", 0x22222222), 0xBBBBBBBB),
-        ]
+def test_interface_load_preset_settings_crc_mismatch_is_refused_by_the_transmitter():
+    """A host whose preset file differs is stopped at the transmitter, before
+    the console is asked."""
+    interface = SimulatedDeviceInterface(
+        preset_flash=[(_mc("preset-A", 0x11111111), 0xAAAAAAAA)]
     )
-    interface.txdevice.set_preset(
-        preset_index=1, sequence_duration_index=2, expected_crc=0xBBBBBBBB,
+    with pytest.raises(LIFUDeviceError) as excinfo:
+        interface.load_preset(0, 0xDEADBEEF, 0xAAAAAAAA, 400_000.0)
+    assert excinfo.value.device_error_code == OW_BAD_CRC
+    assert interface.txdevice.get_loaded_preset() == (None, None)
+    assert interface.hvcontroller.get_preset(0)["selected"] is None
+
+
+def test_interface_load_preset_hv_settings_crc_mismatch():
+    """A console built from another preset file refuses, though the
+    transmitter matched."""
+    interface = SimulatedDeviceInterface(
+        preset_flash=[(_mc("preset-A", 0x11111111), 0xAAAAAAAA)]
     )
-    assert interface.txdevice.get_loaded_preset() == (1, 2)
+    console = interface.hvcontroller.get_preset(0)
+    interface.hvcontroller.configure_presets([dict(console, settings_crc=0x22222222)])
+    with pytest.raises(LIFUDeviceError) as excinfo:
+        interface.load_preset(0, 0x11111111, 0xAAAAAAAA, 400_000.0)
+    assert excinfo.value.device_error_code == OW_HV_PRESET_CRC
+    # On both or on neither: the transmitter's load is undone.
+    assert interface.txdevice.get_loaded_preset() == (None, None)
+    assert interface.hvcontroller.get_preset(0)["selected"] is None
 
 
-# ------------------------------------------------------------------
-# Real TxDevice: NotImplementedError contract until PROJ-04
-# ------------------------------------------------------------------
-
-
-def test_real_txdevice_get_preset_raises_not_implemented():
-    tx = TxDevice(test_mode=True)
-    try:
-        with pytest.raises(NotImplementedError, match="PROJ-04"):
-            tx.get_preset(0)
-    finally:
-        tx.stop()
-
-
-def test_real_txdevice_set_preset_raises_not_implemented():
-    tx = TxDevice(test_mode=True)
-    try:
-        with pytest.raises(NotImplementedError, match="PROJ-04"):
-            tx.set_preset(preset_index=0, sequence_duration_index=0, expected_crc=0)
-    finally:
-        tx.stop()
+def test_refused_select_leaves_nothing_selected():
+    interface = SimulatedDeviceInterface(
+        preset_flash=[(_mc("preset-A", 0x11111111), 0xAAAAAAAA)]
+    )
+    interface.load_preset(0, 0x11111111, 0xAAAAAAAA, 400_000.0)
+    assert interface.hvcontroller.get_preset(0)["selected"] == 0
+    with pytest.raises(LIFUDeviceError):
+        interface.hvcontroller.select_preset(0, 0xDEADBEEF, 2720.0, 400_000.0)
+    assert interface.hvcontroller.get_preset(0)["selected"] is None
 
 
 # ------------------------------------------------------------------
