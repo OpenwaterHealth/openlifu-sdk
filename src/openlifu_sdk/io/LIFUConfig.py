@@ -33,6 +33,7 @@ OW_PRESET_EMPTY = 0xF5     # TX: nothing stored in the slot
 OW_HV_PRESET_CRC = 0xF6    # console: select's settings_crc is not that preset's
 OW_HV_NO_PRESET = 0xF7     # console: HV on before any preset was selected
 OW_HV_FDA_REFUSED = 0xF8   # console: host-set voltage / raw DACs, or select while HV on
+OW_FDA_REFUSED = 0xF8      # TX: a user config write in FDA mode, where it is read-only
 OW_TEMP_UNKNOWN = 0xF9     # TX: no fresh thermistor reading
 OW_TEMP_TOO_HIGH = 0xFA    # TX: above the loaded preset's start_C
 OW_NO_PRESET = 0xFB        # TX: no preset loaded

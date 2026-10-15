@@ -161,13 +161,44 @@ def test_interface_load_preset_scales_hv_by_sensitivity_at_frequency():
     assert interface.hvcontroller.supply_voltage == pytest.approx(12.0 * 2720.0 / 2267.0)
 
 
-def test_interface_load_preset_hv_settings_crc_mismatch():
+def test_interface_load_preset_settings_crc_mismatch_is_refused_by_the_transmitter():
+    """A host whose preset file differs is stopped at the transmitter, before
+    the console is asked."""
     interface = SimulatedDeviceInterface(
         preset_flash=[(_mc("preset-A", 0x11111111), 0xAAAAAAAA)]
     )
     with pytest.raises(LIFUDeviceError) as excinfo:
         interface.load_preset(0, 0xDEADBEEF, 0xAAAAAAAA, 400_000.0)
+    assert excinfo.value.device_error_code == OW_BAD_CRC
+    assert interface.txdevice.get_loaded_preset() == (None, None)
+    assert interface.hvcontroller.get_preset(0)["selected"] is None
+
+
+def test_interface_load_preset_hv_settings_crc_mismatch():
+    """A console built from another preset file refuses, though the
+    transmitter matched."""
+    interface = SimulatedDeviceInterface(
+        preset_flash=[(_mc("preset-A", 0x11111111), 0xAAAAAAAA)]
+    )
+    console = interface.hvcontroller.get_preset(0)
+    interface.hvcontroller.configure_presets([dict(console, settings_crc=0x22222222)])
+    with pytest.raises(LIFUDeviceError) as excinfo:
+        interface.load_preset(0, 0x11111111, 0xAAAAAAAA, 400_000.0)
     assert excinfo.value.device_error_code == OW_HV_PRESET_CRC
+    # On both or on neither: the transmitter's load is undone.
+    assert interface.txdevice.get_loaded_preset() == (None, None)
+    assert interface.hvcontroller.get_preset(0)["selected"] is None
+
+
+def test_refused_select_leaves_nothing_selected():
+    interface = SimulatedDeviceInterface(
+        preset_flash=[(_mc("preset-A", 0x11111111), 0xAAAAAAAA)]
+    )
+    interface.load_preset(0, 0x11111111, 0xAAAAAAAA, 400_000.0)
+    assert interface.hvcontroller.get_preset(0)["selected"] == 0
+    with pytest.raises(LIFUDeviceError):
+        interface.hvcontroller.select_preset(0, 0xDEADBEEF, 2720.0, 400_000.0)
+    assert interface.hvcontroller.get_preset(0)["selected"] is None
 
 
 # ------------------------------------------------------------------

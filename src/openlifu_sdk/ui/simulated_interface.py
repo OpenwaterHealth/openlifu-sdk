@@ -286,18 +286,28 @@ class SimulatedTxDevice:
             "shutoff_c": machine_config.get("shutoff_C"),
         }
 
-    def load_preset(self, index: int, regs_crc: int, duration_index: int = 0) -> bool:
+    def load_preset(self, index: int, regs_crc: int, duration_index: int = 0,
+                    settings_crc: int | None = None) -> bool:
         """Same contract as :meth:`TxDevice.load_preset` (OW_PRESET_LOAD).
 
         Like the firmware, loading applies the preset's trigger and pulse
         configuration, so no separate ``set_trigger`` is needed before
-        ``start_sonication``.
+        ``start_sonication``. *settings_crc* is checked when given; the
+        firmware always requires it.
         """
+        # Like the firmware, a load that is refused leaves nothing loaded.
+        self.unload_preset()
         machine_config, flash_regs_crc = self._flash_entry(index)
         if int(regs_crc) != int(flash_regs_crc):
             raise LIFUDeviceError(
                 f"TX: regs_crc 0x{int(regs_crc):08X} does not match preset {index} "
                 f"(0x{int(flash_regs_crc):08X})",
+                device_error_code=OW_BAD_CRC,
+            )
+        if settings_crc is not None and int(settings_crc) != int(machine_config["settings_crc"]):
+            raise LIFUDeviceError(
+                f"TX: settings_crc 0x{int(settings_crc):08X} does not match preset {index} "
+                f"(0x{int(machine_config['settings_crc']):08X})",
                 device_error_code=OW_BAD_CRC,
             )
         selections = list(machine_config.get("pulse_train_count_selections") or [])
@@ -313,6 +323,12 @@ class SimulatedTxDevice:
         self._normalize_train_interval()
         self._loaded_preset_index = index
         self._loaded_duration_index = duration_index
+        return True
+
+    def unload_preset(self, module: int = 0) -> bool:
+        """Same contract as :meth:`TxDevice.unload_preset`."""
+        self._loaded_preset_index = None
+        self._loaded_duration_index = None
         return True
 
     def get_loaded_preset(self) -> tuple[Optional[int], Optional[int]]:
@@ -707,6 +723,8 @@ class SimulatedHVController:
                       frequency_hz: float | None = None) -> bool:
         if (device_sensitivity is None) != (frequency_hz is None):
             raise ValueError("device_sensitivity and frequency_hz must be given together")
+        # Like the firmware, a select that is refused leaves nothing selected.
+        self.deselect_preset()
         preset = self.get_preset(index)
         if int(preset.get("settings_crc", settings_crc)) != int(settings_crc):
             raise LIFUDeviceError("HV: preset settings CRC mismatch",
@@ -726,6 +744,11 @@ class SimulatedHVController:
         self.last_device_sensitivity = float(device_sensitivity) if isinstance(device_sensitivity, (int, float)) else None
         self._voltage_setpoint = voltage
         self.supply_voltage = voltage
+        return True
+
+    def deselect_preset(self) -> bool:
+        """Same contract as :meth:`HVController.deselect_preset`."""
+        self._selected_preset_index = None
         return True
 
     def get_voltage(self) -> float:
@@ -1076,24 +1099,35 @@ class SimulatedDeviceInterface(QObject):
 
     # ---- FDA preset / sonication ----------------------------------------
 
+    def unload_preset(self) -> None:
+        """Same contract as :meth:`DeviceInterface.unload_preset`."""
+        self.txdevice.unload_preset()
+        self.hvcontroller.turn_hv_off()
+        self.hvcontroller.deselect_preset()
+
     def load_preset(self, preset_index: int, settings_crc: int, regs_crc: int,
                     frequency_hz: float,
                     duration_index: int = 0, turn_hv_on: bool = False,
                     wait_for_settle: bool = False) -> bool:
-        self.txdevice.load_preset(preset_index, regs_crc, duration_index)
-        if not self.txdevice.module_user_configs:
-            self.txdevice.refresh_metadata()
-        device_sensitivity = self.txdevice.get_sensitivity_for_frequency(frequency_hz)
-        if device_sensitivity is None:
-            raise LIFUSolutionError(
-                f"TX device sensitivity is unavailable at {frequency_hz:.3f} Hz; "
-                "cannot select FDA preset on HV.")
-        self.hvcontroller.select_preset(
-            preset_index,
-            settings_crc,
-            device_sensitivity,
-            frequency_hz,
-        )
+        # Like DeviceInterface.load_preset: on both, or, if either refuses, on neither.
+        try:
+            self.txdevice.load_preset(preset_index, regs_crc, duration_index, settings_crc=settings_crc)
+            if not self.txdevice.module_user_configs:
+                self.txdevice.refresh_metadata()
+            device_sensitivity = self.txdevice.get_sensitivity_for_frequency(frequency_hz)
+            if device_sensitivity is None:
+                raise LIFUSolutionError(
+                    f"TX device sensitivity is unavailable at {frequency_hz:.3f} Hz; "
+                    "cannot select FDA preset on HV.")
+            self.hvcontroller.select_preset(
+                preset_index,
+                settings_crc,
+                device_sensitivity,
+                frequency_hz,
+            )
+        except Exception:
+            self.unload_preset()
+            raise
         self._last_solution_voltage = self.hvcontroller.supply_voltage or self._last_solution_voltage
         self.set_status(LIFUInterfaceStatus.STATUS_READY)
         if turn_hv_on:

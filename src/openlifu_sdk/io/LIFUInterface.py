@@ -19,6 +19,7 @@ from openlifu_sdk.io.LIFUConfig import (
     SETTLE_TIME_HV_ON
 )
 from openlifu_sdk.io.exceptions import (
+    LIFUError,
     LIFUHardwareInUseError,
     LIFUNoTriggerStatusError,
     LIFUSolutionError,
@@ -301,12 +302,55 @@ class DeviceInterface:
                     duration_index: int = 0,
                     turn_hv_on: bool = False,
                     wait_for_settle: bool = False) -> bool:
-        """Load an FDA preset across TX and HV in one operation."""
+        """Load an FDA preset across TX and HV in one operation.
+
+        The preset ends up on both or on neither: if the transmitter or the
+        console refuses it, the error is raised with the transmitter left
+        unloaded and the console with HV off and nothing selected
+        (:meth:`unload_preset`), so the trigger cannot start and HV cannot
+        come on.
+        """
         self.set_status(LIFUInterfaceStatus.STATUS_PROGRAMMING)
+        try:
+            self._load_and_select(preset_index, settings_crc, regs_crc, frequency_hz, duration_index)
+            if self.hvcontroller is not None:
+                if turn_hv_on:
+                    logger.debug("Turn ON HV")
+                    self.hvcontroller.turn_hv_on()
+                if self.hvcontroller.get_hv_status() and wait_for_settle:
+                    logger.debug("Wait for Settle")
+                    self.hvcontroller.wait_for_settle(timeout=SETTLE_TIME_HV_ON)
+        except Exception:
+            self.unload_preset()
+            raise
+
+        self.set_status(LIFUInterfaceStatus.STATUS_READY)
+        logger.info("Preset %d loaded successfully.", preset_index)
+        return True
+
+    def unload_preset(self) -> None:
+        """Leave the transmitter with nothing loaded and the console with HV off
+        and nothing selected, as far as each can be reached. Each step is
+        tried whatever the others do; a failure is logged, not raised."""
+        steps = [("transmitter unload", self.txdevice.unload_preset)]
+        if self.hvcontroller is not None:
+            steps += [("HV off", self.hvcontroller.turn_hv_off),
+                      ("console deselect", self.hvcontroller.deselect_preset)]
+        for name, step in steps:
+            try:
+                step()
+            except LIFUError as exc:
+                logger.warning("unload_preset: %s failed: %s", name, exc)
+
+    def _load_and_select(self, preset_index: int, settings_crc: int, regs_crc: int,
+                         frequency_hz: float, duration_index: int) -> None:
+        """The two halves of :meth:`load_preset`: the transmitter's load, then
+        the console's select for that transmitter."""
         self.txdevice.load_preset(
             preset_index,
             regs_crc,
             duration_index=duration_index,
+            settings_crc=settings_crc,
         )
 
         if self.hvcontroller is not None:
@@ -330,16 +374,6 @@ class DeviceInterface:
                 device_sensitivity,
                 frequency_hz,
             )
-            if turn_hv_on:
-                logger.debug("Turn ON HV")
-                self.hvcontroller.turn_hv_on()
-            if self.hvcontroller.get_hv_status() and wait_for_settle:
-                logger.debug("Wait for Settle")
-                self.hvcontroller.wait_for_settle(timeout=SETTLE_TIME_HV_ON)
-
-        self.set_status(LIFUInterfaceStatus.STATUS_READY)
-        logger.info("Preset %d loaded successfully.", preset_index)
-        return True
 
     def start_sonication(self, turn_hv_on: bool = True, wait_for_settle: bool = True) -> bool:
         """Start sonication.
@@ -349,31 +383,42 @@ class DeviceInterface:
             wait_for_settle: If True, wait for HV to settle before starting.
 
         Raises:
-            LIFUError: On any device-communication failure.
+            LIFUError: On any device-communication failure. HV is turned off
+                again if the rail does not settle or the trigger does not
+                start (a transmitter with nothing loaded refuses to).
             LIFUHVSettleError: If the HV rail does not settle in time.
         """
         if self._test_mode:
             return True
 
-        if self.hvcontroller is not None:
-            if turn_hv_on:
-                logger.debug("Turn ON HV")
-                self.hvcontroller.turn_hv_on()
-                hv_on = True
-            else:
-                hv_on = self.hvcontroller.get_hv_status()
-            if hv_on:
-                if wait_for_settle:
-                    self.hvcontroller.wait_for_settle(timeout=SETTLE_TIME_HV_ON)
+        try:
+            if self.hvcontroller is not None:
+                if turn_hv_on:
+                    logger.debug("Turn ON HV")
+                    self.hvcontroller.turn_hv_on()
+                    hv_on = True
                 else:
-                    logger.debug("HV is ON. Skipping settle wait.")
+                    hv_on = self.hvcontroller.get_hv_status()
+                if hv_on:
+                    if wait_for_settle:
+                        self.hvcontroller.wait_for_settle(timeout=SETTLE_TIME_HV_ON)
+                    else:
+                        logger.debug("HV is ON. Skipping settle wait.")
+                else:
+                    logger.warning("HV is OFF")
             else:
-                logger.warning("HV is OFF")
-        else:
-            logger.debug("No HV Controller detected, assuming external power supply. Skipping HV checks.")
+                logger.debug("No HV Controller detected, assuming external power supply. Skipping HV checks.")
 
-        logger.debug("Starting Trigger")
-        self.txdevice.start_trigger()
+            logger.debug("Starting Trigger")
+            self.txdevice.start_trigger()
+        except Exception:
+            # No trigger, no HV.
+            if self.hvcontroller is not None:
+                try:
+                    self.hvcontroller.turn_hv_off()
+                except LIFUError as exc:
+                    logger.warning("start_sonication: HV could not be turned off: %s", exc)
+            raise
         logger.info("Sonication started successfully.")
         self.set_status(LIFUInterfaceStatus.STATUS_RUNNING)
         return True

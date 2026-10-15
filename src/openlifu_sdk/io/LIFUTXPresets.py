@@ -1,7 +1,8 @@
-"""Resolve a preset into the TX7332 register mapping a transmitter image bakes in.
+"""Resolve a preset into the TX7332 register mapping a transmitter runs from.
 
-In FDA mode the transmitter firmware -- not the host -- programs the TX7332
-chips, so the register values have to be baked into the image.
+In the preset modes the transmitter firmware -- not the host -- programs the
+TX7332 chips, from presets stored in its flash pages, so the register values
+have to be on the device.
 :func:`compile_preset` produces them for one preset .json.
 
 Each transmitter module programs its own TX7332 chips, so a preset is built
@@ -12,21 +13,20 @@ loads only its own part.
 :func:`preset_blob` serializes a compiled preset into the one binary form the
 firmware reads: a pointer-free record (``PRESET_BLOB`` in the firmware's
 ``presets.h``) whose base registers are stored as runs of consecutive
-addresses. Nothing in it depends on where it is stored, so the same bytes can
-be baked into an image or written to flash.
+addresses. Nothing in it depends on where it is stored.
 
 :func:`generate_header_files` writes that blob out as an annotated C byte
-array. The headers are generated here and copied into the firmware.
+array, for reading; no firmware build uses it any more.
 
 Every blob carries two CRC-32s the host verifies against: ``settings_crc``
 over the raw source .json, and ``regs_crc`` over the blob's body, which is
 everything the firmware executes from (the firmware recomputes that one).
 
-Each preset's ``start_C`` / ``shutoff_C`` go into its TX header: the firmware
+Each preset's ``start_C`` / ``shutoff_C`` go into its blob: the firmware
 refuses a trigger start above the first and stops a run at the second. Its
 ``voltage`` and ``sensitivity`` go to the console instead, through
-:func:`generate_console_presets`: one entry per preset, indexed exactly as the
-TX image is. The host selects preset N on both and gives the console the
+:func:`generate_console_presets`: one entry per preset, indexed as the
+transmitter's presets are. The host selects preset N on both and gives the console the
 connected transmitter's sensitivity (:func:`device_sensitivity`); the console
 rescales the voltage itself, and the host never sends one.
 """
@@ -42,6 +42,7 @@ import zlib
 from pathlib import Path
 from typing import Dict, List, Sequence
 
+from openlifu_sdk.io.exceptions import LIFUError
 from openlifu_sdk.io.LIFUTXDevice import (
     PRESET_BLOB_MAGIC,
     PRESET_BLOB_VERSION,
@@ -68,7 +69,7 @@ PASSTHROUGH_FIELDS = (
     "pulse_train_count_selections",
 )
 
-# Safety limits, just as required: the thermal pair is baked into the TX image,
+# Safety limits, just as required: the thermal pair goes to the transmitter,
 # the voltage into the console's preset table.
 LIMIT_FIELDS = (
     "start_C",
@@ -80,8 +81,8 @@ LIMIT_FIELDS = (
 def train_count_selections(machine_config: Dict) -> List[int]:
     """The run lengths, in pulse trains, the operator may pick from.
 
-    ``pulse_train_count_selections`` from the preset .json, baked into the
-    image so OW_PRESET_LOAD can only ever select one by index.
+    ``pulse_train_count_selections`` from the preset .json, stored with the
+    preset so OW_PRESET_LOAD can only ever select one by index.
 
     Raises:
         ValueError: Missing, empty, more than PRESET_TRAIN_SELECTIONS_MAX, or
@@ -518,7 +519,8 @@ def parse_preset_blob(blob: bytes) -> Dict:
             "train_counts": counts, "start_c_x10": start, "shutoff_c_x10": shutoff, "chips": chips}
 
 
-def generate_header_files(filename, machine_config: Dict, context: str | None = None) -> Path:
+def generate_header_files(filename, machine_config: Dict, context: str | None = None,
+                          symbol: str | None = None, section: str | None = None) -> Path:
     """Write a compiled preset out as a C header: its blob, as an annotated byte
     array -- one array per module the preset spans.
 
@@ -532,6 +534,9 @@ def generate_header_files(filename, machine_config: Dict, context: str | None = 
         machine_config: Result of :func:`compile_preset`.
         context:        Optional preset-set name, prefixed onto the generated
                         symbols so two sets can coexist in one tree.
+        symbol:         The array's name, instead of one made from the id.
+        section:        A linker section to put the array in (``.fda_preset``
+                        for FDA mode), kept even if nothing refers to it.
 
     Returns:
         The path written.
@@ -565,7 +570,14 @@ def generate_header_files(filename, machine_config: Dict, context: str | None = 
                machine_config["start_C"], machine_config["shutoff_C"], regs_crc(machine_config, module)),
             "// One preset blob, laid out as PRESET_BLOB in presets.h: each comment",
             "// names the bytes that follow it.",
-            "static const uint8_t %s[%u] = {" % (_blob_symbol(sym, module), length),
+        ] + ([
+            "// The linker puts it at the end of the application slot (the FDA_PRESET",
+            "// region of the FDA linker scripts), so it is written with the image, the",
+            "// bootloader's signature covers it, and the firmware only reads it.",
+        ] if section else []) + [
+            "%sstatic const uint8_t %s[%u] = {"
+            % ('__attribute__((section("%s"), used))\n' % section if section else "",
+               symbol or _blob_symbol(sym, module), length),
         ]
         for label, data in segments:
             lines.append("\t// %s" % label)
@@ -737,6 +749,88 @@ def generate_console_presets(output_directory, presets: Sequence[Dict], context:
     return path
 
 
+def generate_fda_preset(output_directory, machine_config: Dict, context: str | None = None) -> Path:
+    """Write the transmitter's FDA preset header, ``fda_preset.h``: the blob as
+    ``FDA_PRESET_BLOB``, in the ``.fda_preset`` section the FDA linker scripts
+    put at the end of the application slot (pages 124-125). The image carries
+    it, so flashing or updating the image writes it, and the FDA firmware only
+    reads it. FDA mode runs one preset, on a 1x.
+
+    Raises:
+        ValueError: The preset spans more than one module, or has no settings_crc.
+    """
+    if preset_modules(machine_config) != 1:
+        raise ValueError("%s spans %d modules; FDA mode runs a 1x preset"
+                         % (machine_config["id"], preset_modules(machine_config)))
+    return generate_header_files(Path(output_directory) / "fda_preset.h", machine_config, context,
+                                 symbol="FDA_PRESET_BLOB", section=".fda_preset")
+
+
+def generate_console_fda_preset(output_directory, machine_config: Dict, context: str | None = None) -> Path:
+    """Write the console's FDA preset header, ``fda_preset.h``: the preset's HV
+    entry (:func:`console_preset_record`) as ``FDA_PRESET_HV``, in the
+    ``.fda_preset`` section the console's FDA linker scripts put at the end of
+    its application slot (page 61).
+
+    Raises:
+        ValueError: No settings_crc, voltage or sensitivity, or an unusable id.
+    """
+    record = console_preset_record(machine_config)
+    guard = "FDA_PRESET_HV_H_"
+    lines = [
+        "// Generated by openlifu_sdk from preset '%s'." % machine_config["id"],
+        "// Do not edit: regenerate with the SDK and copy the result here.",
+        "#ifndef %s" % guard,
+        "#define %s" % guard,
+        "",
+        "#include <stdint.h>",
+        "",
+        "// %g V for a transmitter of sensitivity %g, settings_crc 0x%08x. Laid out as"
+        % (preset_voltage(machine_config), preset_sensitivity(machine_config), machine_config["settings_crc"]),
+        "// PRESET_HV_RECORD in hv_presets.h.",
+        "// The linker puts it at the end of the application slot (the FDA_PRESET",
+        "// region of the FDA linker scripts), so it is written with the image, the",
+        "// bootloader's signature covers it, and the firmware only reads it.",
+        '__attribute__((section(".fda_preset"), used))',
+        "static const uint8_t FDA_PRESET_HV[%u] = {" % len(record),
+    ]
+    lines += ["\t" + " ".join("0x%02x," % b for b in record[i:i + 16]) for i in range(0, len(record), 16)]
+    lines += ["};", "", "#endif  // %s" % guard, ""]
+    path = Path(output_directory) / "fda_preset.h"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("\n".join(lines), encoding="utf-8")
+    logger.info("wrote %s (%d bytes)", path, len(record))
+    return path
+
+
+# The console's half of a preset, as its FDA image carries it.
+CONSOLE_PRESET_MAGIC = b"OWHV"
+CONSOLE_PRESET_VERSION = 1
+
+
+def console_preset_record(machine_config: Dict) -> bytes:
+    """The console's half of a preset as an FDA_MODE console reads it from flash
+    (PRESET_HV_RECORD in its hv_presets.h): the preset's voltage and the
+    sensitivity it suits, each as float32, the .json's settings_crc and the
+    id, closed by a CRC-32 of all of that. :func:`generate_console_fda_preset`
+    writes it into the console's FDA image.
+
+    Raises:
+        ValueError: No settings_crc, voltage or sensitivity, or an unusable id.
+    """
+    if "settings_crc" not in machine_config:
+        raise ValueError("%s has no settings_crc; pass settings_bytes to compile_preset"
+                         % machine_config["id"])
+    pid = str(machine_config["id"])
+    if not 1 <= len(pid) <= PRESET_ID_MAX or any(not 0x20 <= ord(ch) <= 0x7E for ch in pid):
+        raise ValueError("preset id %r must be 1..%d printable ASCII characters" % (pid, PRESET_ID_MAX))
+    head = (CONSOLE_PRESET_MAGIC + bytes([CONSOLE_PRESET_VERSION, len(pid), 0, 0])
+            + struct.pack("<Iff", machine_config["settings_crc"], preset_voltage(machine_config),
+                          preset_sensitivity(machine_config))
+            + pid.encode("ascii"))
+    return head + struct.pack("<I", zlib.crc32(head) & 0xFFFFFFFF)
+
+
 def verify_console_preset(hvcontroller, index: int, machine_config: Dict) -> Dict:
     """Prove the console's preset *index* is the one the host holds.
 
@@ -827,14 +921,30 @@ def store_preset(txdevice, slot: int, machine_config: Dict) -> Dict:
 def load_preset(txdevice, index: int, machine_config: Dict, duration_index: int = 0) -> None:
     """Program every module from its part of preset *index* (OW_PRESET_LOAD).
 
-    Each module is given its own regs_crc and refuses unless that is what it
-    holds, so a success means every module loaded this preset.
+    Each module is given its own regs_crc and the preset file's settings_crc,
+    and refuses unless both are what it holds, so a success means every
+    module loaded this preset. If one refuses, the others are unloaded again:
+    the preset is loaded on all of them or on none.
 
     Raises:
+        ValueError: *machine_config* has no settings_crc.
         LIFUDeviceError: A module refused (see TxDevice.load_preset).
     """
-    for module in _device_modules(txdevice, machine_config):
-        txdevice.load_preset(index, regs_crc(machine_config, module), duration_index, module)
+    if "settings_crc" not in machine_config:
+        raise ValueError("%s has no settings_crc; pass settings_bytes to compile_preset"
+                         % machine_config["id"])
+    modules = list(_device_modules(txdevice, machine_config))
+    try:
+        for module in modules:
+            txdevice.load_preset(index, regs_crc(machine_config, module), duration_index, module,
+                                 settings_crc=machine_config["settings_crc"])
+    except LIFUError:
+        for module in modules:
+            try:
+                txdevice.unload_preset(module)
+            except LIFUError:
+                logger.warning("load_preset: module %d could not be unloaded", module)
+        raise
 
 
 def delete_preset(txdevice, slot: int) -> None:
@@ -880,31 +990,34 @@ def _device_modules(txdevice, machine_config: Dict) -> range:
 # Preset source files
 # --------------------------------------------------------------------------
 
-def preset_files(input_directory) -> List[Path]:
-    """The preset .json files under *input_directory*, in the order the image indexes them.
+def preset_files(path) -> List[Path]:
+    """The preset .json files at *path*, in the order the image indexes them.
 
-    A preset is any JSON document carrying ``delays`` and ``apodization``,
-    found either directly in the directory or one level down -- the
-    application keeps each preset in its own folder next to its plot -- and
-    anything else there, such as a constants.json, is skipped.
+    *path* is one preset file, taken as it is, or a directory. In a directory
+    a preset is any JSON document carrying ``delays`` and ``apodization``,
+    found either directly in it or one level down -- the application keeps
+    each preset in its own folder next to its plot -- and anything else
+    there, such as a constants.json, is skipped.
 
     Generation and the on-device test must agree on the order -- it is the
     index the host passes to OW_PRESET_LOAD -- so both take it from here.
     Natural order on the id: digit runs compare as numbers, so canine_5.0mm
     sorts before canine_10.0mm.
     """
-    directory = Path(input_directory)
+    path = Path(path)
+    if path.is_file():
+        return [path]
     found = []
-    for path in list(directory.glob("*.json")) + list(directory.glob("*/*.json")):
+    for candidate in list(path.glob("*.json")) + list(path.glob("*/*.json")):
         try:
-            doc = json.loads(path.read_bytes())
+            doc = json.loads(candidate.read_bytes())
         except ValueError:
             continue
         if isinstance(doc, dict) and "delays" in doc and "apodization" in doc:
-            found.append(path)
+            found.append(candidate)
 
-    def key(path):
-        return [int(t) if t.isdigit() else t.lower() for t in re.split("([0-9]+)", preset_id(path))]
+    def key(candidate):
+        return [int(t) if t.isdigit() else t.lower() for t in re.split("([0-9]+)", preset_id(candidate))]
     return sorted(found, key=key)
 
 

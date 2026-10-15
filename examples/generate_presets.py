@@ -1,33 +1,32 @@
-"""Generate the preset headers the transmitter and console FDA_MODE images are built from.
+"""Generate the FDA preset files for the transmitter and the console.
 
-Reads every preset .json in a directory, resolves each into TX7332 registers
-with the SDK's own register math, and writes one C header per preset plus
-the preset_table.h that indexes them into the transmitter firmware tree at
-Core/Inc/presets/. Build one of its FDA presets from there.
+FDA mode runs one preset, built into each board's FDA image at the end of its
+application slot -- transmitter pages 124-125, console page 61 -- so flashing
+or updating the image writes it, the bootloader's signature covers it, and the
+firmware only reads it. This writes the two headers those images are built
+from, both named fda_preset.h:
 
-It also writes the console's preset_hv_table.h: each preset's voltage and the
-transmitter sensitivity that voltage suits, indexed exactly as the
-transmitter's presets are. An FDA_MODE console applies preset N's voltage,
-rescaled to the connected transmitter's sensitivity, when the host selects N,
-and refuses any voltage the host sends itself. That goes into the console
-firmware tree at Core/Inc/presets/; build its FDA preset too.
+  transmitter  Core/Inc/presets/fda_preset.h  the preset's blob: registers,
+               timing, run lengths, thermal limits
+  console      Core/Inc/presets/fda_preset.h  its HV entry: the voltage, the
+               transmitter sensitivity that voltage suits, the .json's
+               settings_crc
 
-Every preset must carry voltage, sensitivity, start_C and shutoff_C; the
-generator has no defaults. Presets missing any are listed together and
-nothing is written.
+Add them to the firmware branches as needed; an FDA build refuses to
+configure without its one.
 
-The registers come from the SDK's own register math (the same code
-set_solution programs a live device with); nothing is sent anywhere, so this
-takes milliseconds and needs no transmitter.
+Exactly one preset .json is taken: a file, or a folder holding just one. It
+must carry voltage, sensitivity, start_C and shutoff_C; the generator has no
+defaults. Nothing is sent anywhere and no device is needed.
 
-    python examples/generate_presets.py --presets sample_json
+    python examples/generate_presets.py --presets my_preset_settings.json
 
 The firmware trees are looked for beside this repo (openlifu-transmitter-fw
 and openlifu-console-fw); --out / --console-out name them if they are
 elsewhere, as the checkout or its Core/Inc. presets/ is created there if it is
-missing. A firmware tree that is not on this machine gets its headers in this
-repo instead, under presets/transmitter-presets/ or presets/console-presets/,
-to be copied into that firmware's Core/Inc/presets/.
+missing. A tree that is not on this machine gets its header in this repo
+instead, under presets/transmitter-presets/ or presets/console-presets/, to be
+copied into that firmware's Core/Inc/presets/.
 """
 
 import argparse
@@ -37,8 +36,8 @@ from pathlib import Path
 
 from openlifu_sdk.io.LIFUTXPresets import (
     compile_preset,
-    generate_console_presets,
-    generate_preset_set,
+    generate_console_fda_preset,
+    generate_fda_preset,
     preset_files,
     preset_id,
     preset_sensitivity,
@@ -57,10 +56,10 @@ CONSOLE_FALLBACK = SDK_ROOT / "presets" / "console-presets"
 
 
 def presets_dir(firmware: Path, fallback: Path) -> Path:
-    """Where one firmware's preset headers go.
+    """Where one firmware's preset header goes.
 
-    firmware is its checkout or its include directory; the headers belong in
-    presets/ under that include directory. Without it on this machine they go
+    firmware is its checkout or its include directory; the header belongs in
+    presets/ under that include directory. Without it on this machine it goes
     to fallback instead.
     """
     firmware = firmware.resolve()
@@ -78,46 +77,44 @@ def presets_dir(firmware: Path, fallback: Path) -> Path:
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--presets", required=True, type=Path, help="directory of preset .json files")
+    ap.add_argument("--presets", required=True, type=Path,
+                    help="the preset .json, or a folder holding just that one")
     ap.add_argument("--out", type=Path, default=TRANSMITTER_FW,
-                    help="transmitter firmware checkout, or its Core/Inc; the headers go in "
+                    help="transmitter firmware checkout, or its Core/Inc; fda_preset.h goes in "
                          "presets/ there (default: openlifu-transmitter-fw beside this repo)")
     ap.add_argument("--console-out", type=Path, default=CONSOLE_FW,
-                    help="console firmware checkout, or its Core/Inc; preset_hv_table.h goes in "
+                    help="console firmware checkout, or its Core/Inc; fda_preset.h goes in "
                          "presets/ there (default: openlifu-console-fw beside this repo)")
-    ap.add_argument("--context", help="optional set name prefixed onto the C symbols and header names")
+    ap.add_argument("--context", help="optional set name, noted in the C symbols' guard")
     args = ap.parse_args()
 
     files = preset_files(args.presets)
     if not files:
-        sys.exit("no .json presets in %s" % args.presets)
-    context = args.context
+        sys.exit("no preset .json at %s" % args.presets)
+    if len(files) != 1:
+        sys.exit("FDA mode runs one preset; %s holds %d:\n  %s"
+                 % (args.presets, len(files), "\n  ".join(str(f) for f in files)))
 
-    configs, errors = [], []
-    for index, path in enumerate(files):
-        raw = path.read_bytes()
-        try:
-            mc = compile_preset(json.loads(raw), preset_id=preset_id(path), settings_bytes=raw)
-            preset_sensitivity(mc)   # the console's table needs it
-        except ValueError as e:
-            errors.append("  [%2d] %s" % (index, e))
-            continue
-        configs.append(mc)
-        print("  [%2d] %-28s settings_crc=0x%08x regs_crc=0x%08x  %d chip(s), %d profile(s), trains %s, "
-              "%g V at sensitivity %g, start %g C, shutoff %g C"
-              % (index, mc["id"], mc["settings_crc"], regs_crc(mc),
-                 len(mc["chips"]), len(mc["chips"][0]["profiles"]), train_count_selections(mc),
-                 mc["voltage"], mc["sensitivity"], mc["start_C"], mc["shutoff_C"]))
-    # A partial set would renumber the presets after a bad one, so write none.
-    if errors:
-        sys.exit("%d of %d preset(s) cannot be baked; nothing written:\n%s"
-                 % (len(errors), len(files), "\n".join(errors)))
+    path = files[0]
+    raw = path.read_bytes()
+    try:
+        mc = compile_preset(json.loads(raw), preset_id=preset_id(path), settings_bytes=raw)
+        preset_sensitivity(mc)   # the console's entry needs it
+    except ValueError as e:
+        sys.exit("%s cannot be used; nothing written: %s" % (path, e))
+    print("  %s settings_crc=0x%08x regs_crc=0x%08x  %d chip(s), %d profile(s), trains %s, "
+          "%g V at sensitivity %g, start %g C, shutoff %g C"
+          % (mc["id"], mc["settings_crc"], regs_crc(mc),
+             len(mc["chips"]), len(mc["chips"][0]["profiles"]), train_count_selections(mc),
+             mc["voltage"], mc["sensitivity"], mc["start_C"], mc["shutoff_C"]))
 
-    out = presets_dir(args.out, TRANSMITTER_FALLBACK)
-    written = generate_preset_set(out, configs, context)
-    print("wrote %d transmitter header(s) to %s" % (len(written), out))
-    path = generate_console_presets(presets_dir(args.console_out, CONSOLE_FALLBACK), configs, context)
-    print("wrote %s: %d preset(s)" % (path, len(configs)))
+    try:
+        tx = generate_fda_preset(presets_dir(args.out, TRANSMITTER_FALLBACK), mc, args.context)
+        con = generate_console_fda_preset(presets_dir(args.console_out, CONSOLE_FALLBACK), mc, args.context)
+    except ValueError as e:
+        sys.exit("%s cannot be used; nothing written: %s" % (path, e))
+    print("wrote %s" % tx)
+    print("wrote %s" % con)
     return 0
 
 

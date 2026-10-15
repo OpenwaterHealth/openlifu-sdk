@@ -15,6 +15,7 @@ import struct
 import sys
 import tempfile
 import unittest
+import zlib
 from pathlib import Path
 from unittest.mock import MagicMock
 
@@ -22,8 +23,11 @@ _SRC = os.path.join(os.path.dirname(__file__), "..", "src")
 if _SRC not in sys.path:
     sys.path.insert(0, _SRC)
 
+from openlifu_sdk.io.exceptions import LIFUDeviceError
 from openlifu_sdk.io.LIFUConfig import (
+    OW_BAD_CRC,
     OW_CMD_ECHO,
+    OW_HV_PRESET_CRC,
     OW_POWER_PRESET_SELECT,
     OW_POWER_SET_HV,
     OW_PRESET_LOAD,
@@ -36,12 +40,16 @@ from openlifu_sdk.io.LIFUTXDevice import LIFUTxDevice, TxDevice, pattern_select_
 from openlifu_sdk.io.LIFUTXPresets import (
     adjusted_voltage,
     compile_preset,
+    console_preset_record,
     device_sensitivity,
+    generate_console_fda_preset,
     generate_console_presets,
+    generate_fda_preset,
     generate_header_files,
     generate_preset_set,
     parse_preset_blob,
     preset_blob,
+    preset_files,
     preset_modules,
     preset_sensitivity,
     preset_voltage,
@@ -224,6 +232,21 @@ class TestPresetBlob(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "nothing for module 1"):
             regs_crc(one, 1)
 
+    def test_preset_files_takes_a_file_or_a_folder(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            for name in ("b_10mm_settings.json", "b_5mm_settings.json"):
+                (root / name).write_text(json.dumps(_preset()))
+            (root / "constants.json").write_text("{}")
+            (root / "nested").mkdir()
+            (root / "nested" / "a_settings.json").write_text(json.dumps(_preset()))
+            self.assertEqual([p.name for p in preset_files(root)],
+                             ["a_settings.json", "b_5mm_settings.json", "b_10mm_settings.json"])
+            # One file is taken as it is: compiling it is what says it is not a preset.
+            for name in ("b_10mm_settings.json", "constants.json"):
+                self.assertEqual(preset_files(root / name), [root / name])
+            self.assertEqual(preset_files(root / "missing"), [])
+
     def test_table_has_a_column_per_module(self):
         presets = [_compiled(id="a"), _compiled(id="wide", delays=[[0.0] * 128], apodization=[[1.0] * 128])]
         with tempfile.TemporaryDirectory() as d:
@@ -398,6 +421,41 @@ class TestConsolePresets(unittest.TestCase):
         self.assertEqual((sent["reserved"], bytes(sent["data"])), (1, struct.pack("<If", 0xABCD, 3388.0)))
         self.assertEqual(hv.supply_voltage, 42.5)   # wait_for_settle aims at it
 
+    def test_deselect_is_a_select_with_no_payload(self):
+        hv = HVController()
+        uart = _mock_uart(hv, "HV")
+        uart.send_packet.return_value = _packet(struct.pack("<f", 42.5))
+        hv.select_preset(1, 0xABCD, 3388.0)
+        uart.send_packet.return_value = _packet(b"")
+        hv.deselect_preset()
+        sent = uart.send_packet.call_args.kwargs
+        self.assertEqual((sent["command"], bytes(sent["data"] or b"")), (OW_POWER_PRESET_SELECT, b""))
+        self.assertIsNone(hv.supply_voltage)
+
+    def test_console_record_layout(self):
+        mc = _compiled(id="diathermy", voltage=40.0, sensitivity=3728)
+        rec = console_preset_record(mc)
+        self.assertEqual(rec[:8], b"OWHV" + bytes([1, 9, 0, 0]))
+        self.assertEqual(struct.unpack("<Iff", rec[8:20]), (mc["settings_crc"], 40.0, 3728.0))
+        self.assertEqual(rec[20:29], b"diathermy")
+        self.assertEqual(struct.unpack("<I", rec[29:]), (zlib.crc32(rec[:29]) & 0xFFFFFFFF,))
+        with self.assertRaisesRegex(ValueError, "sensitivity"):
+            console_preset_record(dict(mc, sensitivity=None))
+
+    def test_fda_headers_put_the_preset_in_its_section(self):
+        mc = _compiled(id="diathermy", voltage=40.0, sensitivity=3728)
+        with tempfile.TemporaryDirectory() as d:
+            tx = generate_fda_preset(d, mc).read_text()
+            con = generate_console_fda_preset(Path(d) / "console", mc).read_text()
+        for text, symbol, data in ((tx, "FDA_PRESET_BLOB", preset_blob(mc)),
+                                   (con, "FDA_PRESET_HV", console_preset_record(mc))):
+            self.assertIn('__attribute__((section(".fda_preset"), used))\nstatic const uint8_t %s[%d] = {'
+                          % (symbol, len(data)), text)
+            body = text[text.index(symbol):]
+            self.assertEqual(bytes(int(b, 16) for b in re.findall(r"0x([0-9a-f]{2}),", body)), data)
+        with self.assertRaisesRegex(ValueError, "1x"):
+            generate_fda_preset(".", _compiled(id="wide", delays=[[0.0] * 128], apodization=[[1.0] * 128]))
+
     def test_select_preset_takes_a_frequency_but_does_not_send_it(self):
         # DeviceInterface.load_preset passes where the sensitivity was looked up; the console takes 8 bytes.
         hv = HVController()
@@ -493,7 +551,8 @@ class TestInterfacePresetLoad(unittest.TestCase):
 
         iface.load_preset(1, 0xAABBCCDD, 0x11223344, 400000.0, duration_index=2)
 
-        iface.txdevice.load_preset.assert_called_once_with(1, 0x11223344, duration_index=2)
+        iface.txdevice.load_preset.assert_called_once_with(1, 0x11223344, duration_index=2,
+                                                           settings_crc=0xAABBCCDD)
         iface.txdevice.get_sensitivity_for_frequency.assert_called_once_with(400000.0)
         iface.hvcontroller.select_preset.assert_called_once_with(1, 0xAABBCCDD, 2720.0, 400000.0)
         self.assertEqual(iface.status, LIFUInterfaceStatus.STATUS_READY)
@@ -512,9 +571,73 @@ class TestInterfacePresetLoad(unittest.TestCase):
         iface.txdevice.get_sensitivity_for_frequency.assert_called_once_with(500000.0)
         iface.hvcontroller.select_preset.assert_called_once_with(0, 0xABCD, 3000.0, 500000.0)
 
+    @staticmethod
+    def _mocked() -> DeviceInterface:
+        iface = object.__new__(DeviceInterface)
+        iface.txdevice = MagicMock()
+        iface.txdevice.module_user_configs = [{"module": {"sensitivity": []}}]
+        iface.txdevice.get_sensitivity_for_frequency.return_value = 2720.0
+        iface.hvcontroller = MagicMock()
+        iface.status = LIFUInterfaceStatus.STATUS_SYS_OFF
+        iface._test_mode = False
+        return iface
+
+    def _cleared(self, iface):
+        iface.txdevice.unload_preset.assert_called_once_with()
+        iface.hvcontroller.turn_hv_off.assert_called_once_with()
+        iface.hvcontroller.deselect_preset.assert_called_once_with()
+        self.assertNotEqual(iface.status, LIFUInterfaceStatus.STATUS_READY)
+
+    def test_transmitter_refusal_leaves_the_console_with_nothing_selected(self):
+        iface = self._mocked()
+        iface.txdevice.load_preset.side_effect = LIFUDeviceError("refused", device_error_code=OW_BAD_CRC)
+        with self.assertRaises(LIFUDeviceError) as raised:
+            iface.load_preset(0, 0xABCD, 0xDCBA, 400000.0, turn_hv_on=True)
+        self.assertEqual(raised.exception.device_error_code, OW_BAD_CRC)
+        iface.hvcontroller.select_preset.assert_not_called()
+        iface.hvcontroller.turn_hv_on.assert_not_called()
+        self._cleared(iface)
+
+    def test_console_refusal_leaves_the_transmitter_with_nothing_loaded(self):
+        iface = self._mocked()
+        iface.hvcontroller.select_preset.side_effect = LIFUDeviceError("refused",
+                                                                       device_error_code=OW_HV_PRESET_CRC)
+        with self.assertRaises(LIFUDeviceError) as raised:
+            iface.load_preset(0, 0xABCD, 0xDCBA, 400000.0, turn_hv_on=True)
+        self.assertEqual(raised.exception.device_error_code, OW_HV_PRESET_CRC)
+        iface.hvcontroller.turn_hv_on.assert_not_called()
+        self._cleared(iface)
+
+    def test_a_clear_that_fails_does_not_hide_the_refusal(self):
+        iface = self._mocked()
+        iface.txdevice.load_preset.side_effect = LIFUDeviceError("refused", device_error_code=OW_BAD_CRC)
+        iface.txdevice.unload_preset.side_effect = LIFUDeviceError("gone")
+        with self.assertRaises(LIFUDeviceError) as raised:
+            iface.load_preset(0, 0xABCD, 0xDCBA, 400000.0)
+        self.assertEqual(raised.exception.device_error_code, OW_BAD_CRC)
+        iface.hvcontroller.deselect_preset.assert_called_once_with()   # still tried
+
+    def test_no_trigger_no_hv(self):
+        # A transmitter with nothing loaded refuses to start: HV must not stay on.
+        iface = self._mocked()
+        iface.txdevice.start_trigger.side_effect = LIFUDeviceError("no preset")
+        with self.assertRaises(LIFUDeviceError):
+            iface.start_sonication()
+        iface.hvcontroller.turn_hv_on.assert_called_once_with()
+        iface.hvcontroller.turn_hv_off.assert_called_once_with()
+        self.assertNotEqual(iface.status, LIFUInterfaceStatus.STATUS_RUNNING)
+
+    def test_unload_is_a_load_with_no_payload(self):
+        tx = TxDevice()
+        uart = _mock_uart(tx, "TX")
+        uart.send_packet.return_value = _packet(b"")
+        tx.unload_preset()
+        sent = uart.send_packet.call_args.kwargs
+        self.assertEqual((sent["command"], bytes(sent["data"] or b"")), (OW_PRESET_LOAD, b""))
+
     def test_load_preset_sends_what_the_firmware_accepts(self):
         # The real FDA components under the interface: every command it needs is one they
-        # may send, and the console is given exactly settings_crc + sensitivity.
+        # may send, the transmitter is given both CRCs, the console settings_crc + sensitivity.
         iface = object.__new__(DeviceInterface)
         iface.txdevice, iface.hvcontroller = TxDevice(), HVController()
         iface.status = LIFUInterfaceStatus.STATUS_SYS_OFF
@@ -527,7 +650,7 @@ class TestInterfacePresetLoad(unittest.TestCase):
 
         sent = tx_uart.send_packet.call_args.kwargs
         self.assertEqual((sent["command"], sent["reserved"], bytes(sent["data"])),
-                         (OW_PRESET_LOAD, 0, struct.pack("<II", 2, 0x11223344)))
+                         (OW_PRESET_LOAD, 0, struct.pack("<III", 2, 0x11223344, 0xAABBCCDD)))
         sent = hv_uart.send_packet.call_args_list[0].kwargs
         self.assertEqual((sent["command"], sent["reserved"], bytes(sent["data"])),
                          (OW_POWER_PRESET_SELECT, 0, struct.pack("<If", 0xAABBCCDD, 3220.0)))

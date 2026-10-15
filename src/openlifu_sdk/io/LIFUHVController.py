@@ -260,7 +260,8 @@ class HVController(OWComponent):
         frequency (TxDevice.get_sensitivity_for_frequency). *frequency_hz*,
         where that was looked up, is accepted but not sent: the console
         firmware takes the sensitivity alone (payload ``<If``). Select the
-        same index loaded into the transmitter, with HV off.
+        same index loaded into the transmitter, with HV off. A select the
+        console refuses leaves it with nothing selected.
 
         Raises:
             LIFUDeviceError: No such index, OW_HV_PRESET_CRC (wrong
@@ -279,6 +280,20 @@ class HVController(OWComponent):
         # wait_for_settle() aims at supply_voltage, which set_voltage no longer sets.
         self.supply_voltage = volts
         return volts
+
+    def deselect_preset(self) -> bool:
+        """Leave the console with no preset selected, so HV on is refused
+        (OW_POWER_PRESET_SELECT with no payload). What a host does when the
+        other half of a load, the transmitter's load_preset, did not go
+        through.
+
+        Raises:
+            LIFUDeviceError: OW_HV_FDA_REFUSED (HV is on), or firmware from
+                before a selection could be cleared.
+        """
+        self.send_checked(packet_type=OW_POWER, command=OW_POWER_PRESET_SELECT, op="deselect_preset")
+        self.supply_voltage = None
+        return True
 
     def get_voltage(self) -> float:
         """Read the measured HV output voltage.
