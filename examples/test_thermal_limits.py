@@ -33,7 +33,7 @@ from pathlib import Path
 from openlifu_sdk.io.exceptions import LIFUDeviceError
 from openlifu_sdk.io.LIFUConfig import OW_NO_PRESET, OW_TEMP_TOO_HIGH
 from openlifu_sdk.io.LIFUInterface import LIFUInterface
-from openlifu_sdk.io.LIFUTXPresets import compile_preset, preset_files, preset_id, regs_crc, verify_preset
+from openlifu_sdk.io.LIFUTXPresets import compile_preset, load_preset, preset_files, preset_id, verify_preset
 
 results = []
 
@@ -115,7 +115,7 @@ def run_on(iface, args):
         print("  [SKIP] no preset with start_C below %.2f C" % (t - args.margin))
     else:
         i, mc = max(below, key=lambda e: e[1]["start_C"])
-        tx.load_preset(i, regs_crc(mc), 0)
+        load_preset(tx, i, mc, 0)
         code, msg = refused(tx.start_trigger)
         check("[%d] %s (start_C %g) refuses at %.2f C" % (i, mc["id"], mc["start_C"], t),
               code == OW_TEMP_TOO_HIGH and not running(tx), "-> " + msg)
@@ -126,7 +126,7 @@ def run_on(iface, args):
         return finish()
     i, mc = min(above, key=lambda e: (e[1]["start_C"], e[1]["shutoff_C"]))
     longest = len(mc["pulse_train_count_selections"]) - 1
-    tx.load_preset(i, regs_crc(mc), longest)
+    load_preset(tx, i, mc, longest)
     code, msg = refused(tx.start_trigger)
     check("[%d] %s (start_C %g, shutoff_C %g) starts at %.2f C"
           % (i, mc["id"], mc["start_C"], mc["shutoff_C"], t), code is None, msg)

@@ -28,8 +28,8 @@ replaced where it is and any other goes in the first available slot.
 
 The last preset verified is left loaded on the chips.
 
-An FDA_MODE transmitter has its presets baked into the image instead; it is
-tested with test_fda_mode.py.
+An FDA_MODE transmitter carries its one preset in its image instead
+(generate_presets.py); it is tested with test_fda_mode.py.
 """
 
 import argparse
@@ -39,7 +39,13 @@ import time
 from pathlib import Path
 
 from openlifu_sdk.io.exceptions import LIFUCommunicationError, LIFUDeviceError, LIFUNotConnectedError
-from openlifu_sdk.io.LIFUConfig import OW_BAD_CRC, OW_PRESET_BUSY, OW_PRESET_NO_ROOM, OW_PRESET_SLOT_TAIL
+from openlifu_sdk.io.LIFUConfig import (
+    OW_BAD_CRC,
+    OW_INVALID_PACKET,
+    OW_PRESET_BUSY,
+    OW_PRESET_NO_ROOM,
+    OW_PRESET_SLOT_TAIL,
+)
 from openlifu_sdk.io.LIFUInterface import LIFUInterface
 from openlifu_sdk.io.LIFUTXDevice import PRESET_SLOT_SIZE, PRESET_SLOTS
 from openlifu_sdk.io.LIFUTXPresets import (
@@ -76,6 +82,16 @@ results = []
 def check(name, ok, detail=""):
     results.append(ok)
     print("  [%s] %s %s" % ("PASS" if ok else "FAIL", name, detail), flush=True)
+
+
+def reason(err):
+    """A device's refusal in a few words: its error code, and the reason the
+    firmware sent with it when it sent one. Any other error as it is."""
+    code = getattr(err, "device_error_code", None)
+    if code is None:
+        return str(err)[:200]
+    text = (getattr(err, "device_error_data", None) or b"").rstrip(b"\0").decode("ascii", "replace")
+    return "error 0x%02X%s" % (code, ': "%s"' % text if text else "")
 
 
 # The transmitter not answering: it restarts itself under a long burst of traffic.
@@ -149,7 +165,7 @@ class Link:
 def host_presets(path):
     """Every preset .json at *path* -- one file, or a folder of them -- compiled, in id order."""
     path = Path(path)
-    files = preset_files(path) if path.is_dir() else [path]
+    files = preset_files(path)
     if not files:
         sys.exit("no .json presets in %s" % path)
     presets = []
@@ -175,15 +191,23 @@ def slot_layout(tx):
 
 def device_slots(tx):
     """Every preset index the device has, in order, as get_preset_slot() gives
-    it: all presets for a baked set; for flash slots, the empty ones and the
-    second halves of long presets too. None when the image has no presets at
-    all (neither FDA_MODE nor PRESET_MODE)."""
+    it, the empty ones and the second halves of long presets too: one for an
+    FDA_MODE image, every slot for PRESET_MODE. None when the image has no
+    presets at all (neither)."""
     try:
         first = tx.get_preset_slot(0)
     except LIFUDeviceError:
         return None
     count = first.get("count") or slot_layout(tx)[0]
-    slots = [first] + [tx.get_preset_slot(i) for i in range(1, count)]
+    slots = [first]
+    for i in range(1, count):
+        try:
+            slots.append(tx.get_preset_slot(i))
+        except LIFUDeviceError as e:
+            # Past the last index: an FDA_MODE image has one, which an empty slot 0 does not say.
+            if e.device_error_code != OW_INVALID_PACKET:
+                raise
+            break
     for e, after in zip(slots, slots[1:]):
         if after["state"] == "tail":
             e["slots"] = 2
@@ -236,7 +260,7 @@ def print_inventory(tx, slots):
 def need_slots(tx):
     if tx.get_preset_capacity() is None:
         sys.exit("this transmitter has no preset slots: it is not a PRESET_MODE image "
-                 "(an FDA_MODE image's presets are baked in; see test_fda_mode.py)")
+                 "(an FDA_MODE image's preset is read-only; store it with a PRESET_MODE image)")
 
 
 def first_free(slots, need):
@@ -317,7 +341,7 @@ def examine(tx, e, mc, duration):
     try:
         load_preset(tx, e["index"], mc, duration)
     except LIFUDeviceError as err:
-        return found + [(name + ": loads on the host's CRC", False, str(err)[:150])], False
+        return found + [(name + ": loads on the host's CRC", False, reason(err))], False
     found.append((name + ": loads on the host's CRC", True,
                   "run length %d = %d train(s)" % (duration, counts[duration])))
 
@@ -430,7 +454,7 @@ def main():
             print("\n-- load --")
             load_presets(tx, args.load_preset, args.slot)
     except LIFUDeviceError as e:
-        sys.exit("refused: %s" % REFUSALS.get(e.device_error_code, e))
+        sys.exit("refused: %s" % (REFUSALS.get(e.device_error_code) or reason(e)))
     except ValueError as e:
         sys.exit("refused: %s" % e)
 

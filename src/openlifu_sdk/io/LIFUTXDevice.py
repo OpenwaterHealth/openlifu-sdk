@@ -420,7 +420,8 @@ class TxDevice(OWComponent):
                 "id": d[17:17 + id_len].decode("ascii", "replace"), "train_counts": counts,
                 "start_c": start_c, "shutoff_c": shutoff_c, "modules": modules}
 
-    def load_preset(self, index: int, regs_crc: int, duration_index: int = 0, module: int = 0) -> bool:
+    def load_preset(self, index: int, regs_crc: int, duration_index: int = 0, module: int = 0, *,
+                    settings_crc: int) -> bool:
         """Program one module's chips from its part of preset *index* (OW_PRESET_LOAD).
 
         Each module holds its own part of a preset -- its own two chips --
@@ -428,9 +429,13 @@ class TxDevice(OWComponent):
         each in turn (LIFUTXPresets.load_preset does that).
 
         The firmware refuses the load unless *regs_crc* equals the CRC-32 it
-        computes over its own tables, so pass the value the host derived for
-        this preset (see LIFUTXPresets.regs_crc). *duration_index* picks the
-        run length from the preset's baked pulse-train counts
+        computes over its own tables and *settings_crc* is the one its preset
+        was made with, so pass the values the host derived for this preset
+        (LIFUTXPresets.regs_crc, and compile_preset's ``settings_crc``, the
+        CRC-32 of the .json file). A host whose file differs anywhere, not
+        only in what reaches the registers, is refused, and a refused load
+        leaves nothing loaded. *duration_index* picks the
+        run length from the preset's stored pulse-train counts
         (get_preset()["train_counts"]); a raw count cannot be sent.
 
         In FDA mode the trigger only starts once a preset is loaded, and only
@@ -439,12 +444,27 @@ class TxDevice(OWComponent):
         carrying OW_NO_PRESET, OW_TEMP_TOO_HIGH or OW_TEMP_UNKNOWN.
 
         Raises:
-            LIFUDeviceError: CRC mismatch (OW_BAD_CRC), bad index, a duration
-                index the preset does not offer, or trigger running.
+            LIFUDeviceError: Either CRC differs (OW_BAD_CRC), bad index, a
+                duration index the preset does not offer, trigger running, or
+                firmware from before the load took settings_crc.
         """
         self.send_checked(packet_type=OW_CONTROLLER, command=OW_PRESET_LOAD, addr=module,
-                          reserved=index, data=struct.pack("<II", duration_index, regs_crc),
+                          reserved=index,
+                          data=struct.pack("<III", duration_index, regs_crc, settings_crc),
                           op="load_preset")
+        return True
+
+    def unload_preset(self, module: int = 0) -> bool:
+        """Leave one module with no preset loaded, so the trigger will not start
+        (OW_PRESET_LOAD with no payload). What a host does when the other
+        half of a load, the console's select_preset, did not go through.
+
+        Raises:
+            LIFUDeviceError: Trigger running (OW_PRESET_BUSY), or firmware
+                from before a load could be cleared.
+        """
+        self.send_checked(packet_type=OW_CONTROLLER, command=OW_PRESET_LOAD, addr=module,
+                          op="unload_preset")
         return True
 
     def get_module_count(self) -> int:
