@@ -64,6 +64,7 @@ else:
 from openlifu_sdk.io import LIFUInterfaceStatus
 from openlifu_sdk.io.exceptions import LIFUDeviceError, LIFUSolutionError
 from openlifu_sdk.io.LIFUConfig import OW_BAD_CRC, OW_HV_PRESET_CRC
+from openlifu_sdk.io.LIFUTXPresets import preset_sensitivity
 from openlifu_sdk.io.LIFUUserConfig import sensitivity_at_frequency
 from openlifu_sdk.io.signal import OWSignal
 from openlifu_sdk.ui.status_frame import format_status_frame as _format_status_frame
@@ -647,7 +648,7 @@ class SimulatedHVController:
             "settings_crc": 0x12345678,
             "voltage": 20.0,
             "id": "sim-default",
-            "sensitivity_ref": None,
+            "sensitivity": None,
             "min_voltage": 5.0,
             "max_voltage": 100.0,
         }]
@@ -730,7 +731,7 @@ class SimulatedHVController:
             raise LIFUDeviceError("HV: preset settings CRC mismatch",
                                   device_error_code=OW_HV_PRESET_CRC)
         voltage = float(preset.get("voltage", 0.0))
-        ref_sensitivity = preset.get("sensitivity_ref")
+        ref_sensitivity = preset.get("sensitivity")
         if (
             ref_sensitivity is not None
             and isinstance(device_sensitivity, (int, float))
@@ -1083,7 +1084,9 @@ class SimulatedDeviceInterface(QObject):
                     "settings_crc": int(machine_config.get("settings_crc", 0)),
                     "voltage": float(machine_config.get("voltage", 0.0)),
                     "id": machine_config.get("id", f"preset-{index}"),
-                    "sensitivity_ref": machine_config.get("sensitivity"),
+                    # As HVController.get_preset reports it: the console bakes it as float32.
+                    "sensitivity": (preset_sensitivity(machine_config)
+                                    if machine_config.get("sensitivity") is not None else None),
                     "min_voltage": float(voltage_range[0]),
                     "max_voltage": float(voltage_range[1]),
                 })
