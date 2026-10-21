@@ -340,6 +340,12 @@ class SimulatedTxDevice:
     def is_connected(self) -> bool:
         return self._connected
 
+    def connect(self) -> bool:
+        """Same contract as :meth:`OWComponent.connect`. The simulated link
+        follows the simulated cable (:meth:`emit_connected` /
+        :meth:`emit_disconnected`), so this only reports whether it is in."""
+        return self._connected
+
     def emit_connected(self, port: str = "SIM:TX"):
         if self._connected:
             return
@@ -658,6 +664,11 @@ class SimulatedHVController:
         self._fw_version: str = "sim-1.0.7"
 
     def is_connected(self) -> bool:
+        return self._connected
+
+    def connect(self) -> bool:
+        """Same contract as :meth:`OWComponent.connect`; see
+        :meth:`SimulatedTxDevice.connect`."""
         return self._connected
 
     def emit_connected(self, port: str = "SIM:CON"):
