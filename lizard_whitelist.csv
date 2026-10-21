@@ -33,9 +33,11 @@ migrate_console_legacy
 # docstring, not nesting.
 migrate_transmitter_legacy_usb
 
-# Trigger configuration (io/LIFUTXDevice.py) — validates and packs the full
-# trigger parameter set in one place to keep the JSON payload atomic.
-set_trigger
+# Trigger timing (io/LIFUTXDevice.py) — validates the full trigger parameter
+# set and resolves the firmware's integer-Hz period, train duration and
+# back-to-back interval in one place, so set_trigger and the FDA preset
+# compiler send identical timing (moved out of set_trigger; CCN 14).
+resolve_trigger_timing
 
 # UART async sender loop and sync response reader (io/uart.py) — protocol
 # state machines; per-state dispatch kept inline to preserve the framing
@@ -43,9 +45,17 @@ set_trigger
 _sender_loop
 _read_response_sync
 
-# Beamforming solution loader (io/LIFUTXDevice.py) — programs delay profiles,
-# pulse profiles, apodization, and execution-order cycling into the TX device
-# in one atomic call; branching comes from multi-profile validation + mapping
-# logic that must stay co-located to keep the JSON payload consistent
-# (CCN 44, NLOC 145).
-set_solution
+# Beamforming solution register builder (io/LIFUTXDevice.py) — builds the
+# delay profiles, pulse profiles, apodization, and execution-order cycling for
+# the TX device in one pass; branching comes from multi-profile validation +
+# mapping logic that must stay co-located to keep the register set consistent.
+# Moved out of set_solution so the FDA preset compiler reuses it (CCN 47,
+# NLOC 149).
+build_solution_registers
+
+# FDA preset compiler (io/LIFUTXPresets.py) — resolves one preset .json into
+# the per-module register mapping a TX image bakes in: validation of each
+# released field, then the solution registers. Sequential checks, each with
+# its own error message; length from the field count + docstring (CCN 14,
+# NLOC 54, 105 lines).
+compile_preset
