@@ -15,6 +15,7 @@ pytest.importorskip("PyQt6")
 
 from openlifu_sdk.io.exceptions import LIFUDeviceError
 from openlifu_sdk.io.LIFUConfig import OW_BAD_CRC, OW_HV_PRESET_CRC
+from openlifu_sdk.io.LIFUTXPresets import preset_sensitivity
 from openlifu_sdk.ui.simulated_interface import (
     SimulatedDeviceInterface,
     SimulatedLIFUInterface,
@@ -142,6 +143,18 @@ def test_lifu_interface_accepts_preset_flash():
         preset_flash=[(_mc("diathermy", 0xAD813B92), 0xABBAABBA)]
     )
     assert interface.txdevice.get_preset(0)["settings_crc"] == 0xAD813B92
+
+
+def test_hv_get_preset_reports_sensitivity_as_the_console_does():
+    """HVController.get_preset reports the preset's ``sensitivity``, which the
+    console bakes as float32 (preset_sensitivity); the sim reports the same
+    key and value so a host can verify it."""
+    mc = _mc("preset-A", 0x11111111, voltage=12.0, sensitivity=3728.1)
+    interface = SimulatedDeviceInterface(preset_flash=[(mc, 0xAAAAAAAA)])
+    console = interface.hvcontroller.get_preset(0)
+    assert console["sensitivity"] == preset_sensitivity(mc)
+    assert console["sensitivity"] != 3728.1  # float32, not the .json's float64
+    assert "sensitivity_ref" not in console
 
 
 def test_interface_load_preset_scales_hv_by_sensitivity_at_frequency():
