@@ -1,0 +1,8 @@
+# SPDX-License-Identifier: Apache-2.0
+#
+# DCO app configuration (https://github.com/dcoapp/app).
+# Lets an author sign off their own earlier commits with an empty
+# remediation commit instead of rewriting shared history. Third-party
+# remediation stays off. See #62.
+allowRemediationCommits:
+  individual: true
