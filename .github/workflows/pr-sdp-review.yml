@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 #
-# Independent AI review of Copilot-Coding-Agent-authored PRs, per the
+# Independent AI review of coding-agent-authored PRs, per the
 # SDP peer-review requirement (P-06). Fetches the rubric and helper
 # from openlifu-diathermy-application so the artifact stays
 # single-source: any change to the rubric is a PR against diathermy
@@ -35,13 +35,16 @@ jobs:
   review:
     name: Independent AI review
     # CA PRs only. Human-authored PRs go through human peer review per
-    # the SDP; the AI is not in that loop yet. Drafts are excluded so
-    # the AI review is not spent on in-progress work.
+    # the SDP; the AI is not in that loop yet. ``openlifu-agent`` is
+    # the persistent CA identity used for coordinated multi-repo work
+    # on the FDA cycle. Drafts are excluded so the AI review is not
+    # spent on in-progress work.
     if: >-
       github.event.pull_request.draft == false && (
         startsWith(github.event.pull_request.head.ref, 'copilot/') ||
         github.event.pull_request.user.login == 'Copilot' ||
-        github.event.pull_request.user.login == 'copilot-swe-agent[bot]'
+        github.event.pull_request.user.login == 'copilot-swe-agent[bot]' ||
+        github.event.pull_request.user.login == 'openlifu-agent'
       )
     runs-on: ubuntu-latest
     steps:
