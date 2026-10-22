@@ -461,7 +461,7 @@ class SimulatedTxDevice:
         if callable(to_device_config):
             try:
                 self._user_configs[0]["device"] = to_device_config()
-            except Exception:  # noqa: BLE001
+            except Exception:  # noqa: BLE001 -- reason: to_device_config is the caller's transducer code; a failure only loses the identity block, logged
                 logger.debug("apply_simulated_transducer: to_device_config() failed", exc_info=True)
         else:
             self._user_configs[0]["device"] = {
@@ -594,7 +594,7 @@ class SimulatedLIFUTxDevice(SimulatedTxDevice):
         from openlifu_sdk.io.LIFUUserConfig import LifuUserConfig
         try:
             self._user_configs[module] = json.loads(json_str)
-        except Exception:
+        except (TypeError, ValueError):
             logger.warning("SimulatedLIFUTxDevice.write_config_json: invalid json; ignored")
         self.refresh_metadata()
         return LifuUserConfig(json_data=dict(self._user_configs[module]))
@@ -1080,7 +1080,7 @@ class _SimulatedRunEngine(QObject):
             if self._finished_cb is not None:
                 try:
                     self._finished_cb()
-                except Exception:  # noqa: BLE001
+                except Exception:  # noqa: BLE001 -- reason: the caller's callback must not stop the run engine's own completion; logged
                     logger.exception("_SimulatedRunEngine finished callback raised")
 
     def set_finished_callback(self, cb):

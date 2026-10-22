@@ -267,7 +267,7 @@ class TxDevice(OWComponent):
         if not hwid:
             try:
                 hwid = self.get_hardware_id()
-            except Exception:  # noqa: BLE001
+            except LIFUError:
                 hwid = None
         self.hwid = hwid
         self.hardware_id = hwid

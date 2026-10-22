@@ -452,7 +452,7 @@ class DeviceInterface:
 
             logger.debug("Starting Trigger")
             self.txdevice.start_trigger()
-        except Exception:
+        except Exception:  # reason: any failure, typed or not, must not leave HV on without a trigger; re-raised
             # No trigger, no HV.
             if self.hvcontroller is not None:
                 try:

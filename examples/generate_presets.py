@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """Generate the FDA preset files for the transmitter and the console.
 
 FDA mode runs one preset, built into each board's FDA image at the end of its
@@ -28,6 +29,8 @@ missing. A tree that is not on this machine gets its header in this repo
 instead, under presets/transmitter-presets/ or presets/console-presets/, to be
 copied into that firmware's Core/Inc/presets/.
 """
+
+from __future__ import annotations
 
 import argparse
 import json

@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """On-device test of the FDA thermal limits: start_C gates a trigger start, shutoff_C ends a run.
 
 Needs a transmitter running an FDA_MODE image built from --presets, and
@@ -22,6 +23,8 @@ run proves, picking presets by the temperature the TX reports right then:
 HV must be off: pulsing the TX7332s alone warms the bench board roughly
 1 C/min, enough to reach a shutoff_C one degree above the start.
 """
+
+from __future__ import annotations
 
 import argparse
 import json

@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """Resolve a preset into the TX7332 register mapping a transmitter runs from.
 
 In the preset modes the transmitter firmware -- not the host -- programs the
