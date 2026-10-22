@@ -669,6 +669,18 @@ class TestInterfacePresetLoad(unittest.TestCase):
             iface.load_preset(0, 0xABCD, [0x1111, 0x2222], 400000.0)
         self._cleared(iface, modules=2)
 
+    def test_regs_crc_accepts_any_integer_type_and_refuses_the_rest(self):
+        import numpy as np
+        iface = self._mocked()
+        iface.load_preset(0, 0xABCD, np.uint32(0xDCBA), 400000.0)
+        self.assertEqual(iface.txdevice.load_preset.call_args.args, (0, 0xDCBA))
+        for bad in (True, [], "0xDCBA", [0xDCBA, None], 1.5):
+            with self.subTest(bad=bad):
+                iface = self._mocked()
+                with self.assertRaisesRegex(TypeError, "regs_crc"):
+                    iface.load_preset(0, 0xABCD, bad, 400000.0)
+                iface.txdevice.load_preset.assert_not_called()
+
     def test_a_preset_whose_module_count_differs_is_refused_before_anything_is_loaded(self):
         # The set-preset guard: a 1x preset (64 elements, e.g. diathermy) on a 2x transmitter, or the reverse.
         for cls in (DeviceInterface, LIFUInterface):
@@ -806,7 +818,7 @@ class TestInterfacePresetLoad(unittest.TestCase):
         tx_uart, hv_uart = _mock_uart(iface.txdevice, "TX"), _mock_uart(iface.hvcontroller, "HV")
         tx_uart.send_packet.return_value = _packet(b"")
         hv_uart.send_packet.side_effect = [_packet(struct.pack("<f", 44.75)), _packet(b"")]
-        # The real module-count and calibration reads: count, load, count, the user config.
+        # The real module-count and calibration reads: count, load, then the user config.
         config = LifuUserConfig(json_data={"sn": "SN-1", "hwid": "HW-1",
                                            "module": {"sensitivity": [[400000, 3220]]}})
         tx_uart.send_packet.side_effect = [_packet(bytes([1])), _packet(b""), _packet(config.to_wire_bytes())]
@@ -998,7 +1010,8 @@ class TestCommandWhitelist(unittest.TestCase):
         tx, hv = TxDevice(), HVController()
         tx_uart, hv_uart = _mock_uart(tx, "TX"), _mock_uart(hv, "HV")
         tx_uart.send_packet.return_value = hv_uart.send_packet.return_value = _packet(b"")
-        calls = [tx.ping, tx.get_version, tx.get_hardware_id, tx.read_config, tx.get_temperature,
+        calls = [tx.ping, tx.get_version, tx.get_hardware_id, tx.read_config,
+                 lambda: tx.refresh_metadata(module_count=1), tx.get_temperature,
                  tx.get_ambient_temperature, tx.get_trigger_json, tx.start_trigger, tx.stop_trigger,
                  lambda: tx.get_preset(0), lambda: tx.load_preset(0, 1, settings_crc=2),
                  tx.unload_preset, tx.get_module_count,

@@ -37,6 +37,7 @@ from __future__ import annotations
 import json
 import logging
 import math
+import numbers
 import re
 import struct
 import zlib
@@ -135,6 +136,29 @@ def preset_voltage(machine_config: Dict) -> float:
     if isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(v) or v <= 0:
         raise ValueError("%s: voltage must be a positive number, got %r" % (machine_config.get("id"), v))
     return struct.unpack("<f", struct.pack("<f", v))[0]
+
+
+def module_regs_crcs(regs_crc) -> List[int]:
+    """*regs_crc* as given to ``DeviceInterface.load_preset``: one integer for a
+    one-module preset, or a sequence with one per module (:func:`regs_crc`
+    of each). Any integral type is accepted (``numpy.uint32`` included).
+
+    Raises:
+        TypeError: Not an integer or a non-empty sequence of integers (a
+            ``bool`` is not a CRC).
+    """
+    def integral(value) -> bool:
+        return isinstance(value, numbers.Integral) and not isinstance(value, bool)
+
+    if integral(regs_crc):
+        return [int(regs_crc)]
+    try:
+        crcs = [] if isinstance(regs_crc, (str, bytes)) else list(regs_crc)
+    except TypeError:
+        crcs = []
+    if not crcs or not all(integral(c) for c in crcs):
+        raise TypeError(f"regs_crc must be an integer or a non-empty sequence of integers, got {regs_crc!r}")
+    return [int(c) for c in crcs]
 
 
 def preset_voltage_range(machine_config: Dict) -> tuple[float, float] | None:

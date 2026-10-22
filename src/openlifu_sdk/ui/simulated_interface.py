@@ -75,7 +75,7 @@ from openlifu_sdk.io.LIFUConfig import (
     OW_NO_PRESET,
     OW_TEMP_TOO_HIGH,
 )
-from openlifu_sdk.io.LIFUTXPresets import preset_sensitivity
+from openlifu_sdk.io.LIFUTXPresets import module_regs_crcs, preset_sensitivity
 from openlifu_sdk.io.LIFUUserConfig import sensitivity_at_frequency
 from openlifu_sdk.io.signal import OWSignal
 from openlifu_sdk.ui.status_frame import format_status_frame as _format_status_frame
@@ -1239,7 +1239,7 @@ class SimulatedDeviceInterface(QObject):
         must span the modules the transmitter reports, and it ends up on
         both devices or, if either refuses, on neither."""
         self.set_status(LIFUInterfaceStatus.STATUS_PROGRAMMING)
-        regs_crcs = [regs_crc] if isinstance(regs_crc, int) else [int(c) for c in regs_crc]
+        regs_crcs = module_regs_crcs(regs_crc)
         try:
             modules = self.txdevice.get_module_count()
             if modules != len(regs_crcs):

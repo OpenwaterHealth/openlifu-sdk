@@ -26,6 +26,7 @@ from openlifu_sdk.io.exceptions import (
     LIFUSolutionError,
 )
 from openlifu_sdk.io.LIFUHVController import HVController, LIFUHVController
+from openlifu_sdk.io.LIFUTXPresets import module_regs_crcs
 from openlifu_sdk.io.LIFUTXDevice import LIFUTxDevice, TriggerModeOpts, TxDevice
 
 # Maximum-voltage lookup tables keyed by hardware/test profile.
@@ -342,7 +343,7 @@ class DeviceInterface:
                 *voltage_range* (LIFUSolutionError).
         """
         self.set_status(LIFUInterfaceStatus.STATUS_PROGRAMMING)
-        regs_crcs = [regs_crc] if isinstance(regs_crc, int) else [int(c) for c in regs_crc]
+        regs_crcs = module_regs_crcs(regs_crc)
         try:
             modules = int(self.txdevice.get_module_count())
             if modules != len(regs_crcs):
