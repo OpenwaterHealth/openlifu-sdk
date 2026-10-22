@@ -3,8 +3,7 @@ import json
 from dataclasses import dataclass
 from typing import Optional, Any, Dict, Iterable
 import logging
-
-import numpy as np
+import math
 
 logger = logging.getLogger(__name__)
 
@@ -179,21 +178,32 @@ class LifuUserConfig:
                 f"json_len={self.header.json_len}, data={self.json_data})")
 
 
+# How close a calibration table's frequency must be to count as the preset's.
+SENSITIVITY_FREQ_TOLERANCE_HZ = 1e-3
+
+
 def sensitivity_at_frequency(module_configs: Iterable[Dict[str, Any]], freq_hz: float) -> Optional[float]:
     """Return a transmitter's sensitivity at *freq_hz* from its module user configs.
 
     Each config's ``module.sensitivity`` is a ``[[freq_hz, sensitivity], ...]``
-    calibration table. Each module's table is linearly interpolated at
-    *freq_hz* (clamped to the table's end points); the result is the mean over
-    the modules that carry a table, or ``None`` if none do.
+    calibration table. A module contributes the entry whose frequency matches
+    *freq_hz* (within :data:`SENSITIVITY_FREQ_TOLERANCE_HZ`) and whose value is
+    a finite positive number -- the same exact match the preset generator uses
+    when it bakes the console record, so host and image agree. There is no
+    interpolation or extrapolation: a frequency the table does not list gives
+    nothing rather than the nearest end point's value.
+
+    Returns:
+        The mean over the modules that have a matching entry, or ``None`` if
+        none has (the caller must refuse to scale HV from it).
     """
     values = []
     for config in module_configs:
-        table = (config.get("module") or {}).get("sensitivity")
-        if not table:
-            continue
-        freqs, sens = zip(*sorted((float(f), float(s)) for f, s in table))
-        values.append(float(np.interp(freq_hz, freqs, sens)))
+        for f, v in ((config or {}).get("module") or {}).get("sensitivity") or []:
+            f, v = float(f), float(v)
+            if abs(f - freq_hz) <= SENSITIVITY_FREQ_TOLERANCE_HZ and math.isfinite(v) and v > 0:
+                values.append(v)
+                break
     if not values:
         return None
     return sum(values) / len(values)

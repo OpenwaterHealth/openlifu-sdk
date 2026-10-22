@@ -57,6 +57,7 @@ from openlifu_sdk.io.LIFUTXDevice import (
     build_solution_registers,
     resolve_trigger_timing,
 )
+from openlifu_sdk.io.LIFUUserConfig import sensitivity_at_frequency
 
 logger = logging.getLogger(__name__)
 
@@ -148,15 +149,6 @@ def preset_sensitivity(machine_config: Dict) -> float:
     return struct.unpack("<f", struct.pack("<f", v))[0]
 
 
-def module_sensitivity(user_config: Dict, frequency_hz: float) -> float | None:
-    """A module's calibrated sensitivity at *frequency_hz*: the matching entry of
-    ``module.sensitivity`` in its user config (pairs of Hz and value), or None."""
-    for f, v in ((user_config or {}).get("module") or {}).get("sensitivity") or []:
-        if abs(float(f) - frequency_hz) < 1e-3 and float(v) > 0:
-            return float(v)
-    return None
-
-
 def module_user_configs(txdevice) -> List[Dict]:
     """Each connected module's user config as a dict, in module order; {} for
     one whose config is not JSON."""
@@ -170,13 +162,12 @@ def module_user_configs(txdevice) -> List[Dict]:
 
 
 def device_sensitivity(preset: Dict, user_configs: Sequence[Dict]) -> float | None:
-    """The connected transmitter's sensitivity at *preset*'s frequency: the mean
-    over the modules that have an entry there (:func:`module_sensitivity`), or
-    None if none has. *user_configs* is each module's user config
-    (:func:`module_user_configs`). What HVController.select_preset is given."""
-    hz = float(preset.get("frequency_khz", 0.0)) * 1e3
-    found = [v for v in (module_sensitivity(c, hz) for c in user_configs) if v is not None]
-    return sum(found) / len(found) if found else None
+    """The connected transmitter's sensitivity at *preset*'s frequency
+    (:func:`~openlifu_sdk.io.LIFUUserConfig.sensitivity_at_frequency`, the one
+    lookup the SDK has), or None if no module lists that frequency.
+    *user_configs* is each module's user config (:func:`module_user_configs`).
+    What HVController.select_preset is given."""
+    return sensitivity_at_frequency(user_configs, float(preset.get("frequency_khz", 0.0)) * 1e3)
 
 
 def adjusted_voltage(preset: Dict, user_configs: Sequence[Dict]) -> Dict:

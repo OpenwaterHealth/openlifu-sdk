@@ -17,14 +17,15 @@ import tempfile
 import unittest
 import zlib
 from pathlib import Path
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 _SRC = os.path.join(os.path.dirname(__file__), "..", "src")
 if _SRC not in sys.path:
     sys.path.insert(0, _SRC)
 
-from openlifu_sdk.io.exceptions import LIFUDeviceError
+from openlifu_sdk.io.exceptions import LIFUDeviceError, LIFUError, LIFUSolutionError
 from openlifu_sdk.io.LIFUConfig import (
+    LIFU_ERR_MODULE_COUNT_MISMATCH,
     OW_BAD_CRC,
     OW_CMD_ECHO,
     OW_HV_PRESET_CRC,
@@ -57,7 +58,7 @@ from openlifu_sdk.io.LIFUTXPresets import (
     thermal_limits,
     verify_console_preset,
 )
-from openlifu_sdk.io.LIFUUserConfig import LifuUserConfig
+from openlifu_sdk.io.LIFUUserConfig import LifuUserConfig, sensitivity_at_frequency
 from openlifu_sdk.io.uart import OWUart
 
 
@@ -456,13 +457,13 @@ class TestConsolePresets(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "1x"):
             generate_fda_preset(".", _compiled(id="wide", delays=[[0.0] * 128], apodization=[[1.0] * 128]))
 
-    def test_select_preset_takes_a_frequency_but_does_not_send_it(self):
-        # DeviceInterface.load_preset passes where the sensitivity was looked up; the console takes 8 bytes.
+    def test_select_preset_takes_no_frequency(self):
+        # The console firmware (hv_presets.c) accepts exactly <If; a frequency has nowhere to go,
+        # so the method does not take one rather than accept and drop it.
         hv = HVController()
-        uart = _mock_uart(hv, "HV")
-        uart.send_packet.return_value = _packet(struct.pack("<f", 42.5))
-        self.assertEqual(hv.select_preset(1, 0xABCD, 3388.0, 400000.0), 42.5)
-        self.assertEqual(bytes(uart.send_packet.call_args.kwargs["data"]), struct.pack("<If", 0xABCD, 3388.0))
+        _mock_uart(hv, "HV")
+        with self.assertRaises(TypeError):
+            hv.select_preset(1, 0xABCD, 3388.0, 400000.0)
 
     def test_verify_console_preset(self):
         mc = _compiled(id="a", voltage=47.66997571, sensitivity=3600)
@@ -536,45 +537,47 @@ class TestTxMetadata(unittest.TestCase):
         self.assertEqual(len(tx.module_user_configs), 2)
         self.assertEqual(tx.get_sensitivity_for_frequency(400000.0), 6.0)
         self.assertEqual(tx.get_sensitivity_for_frequency(450000.0), 8.0)
-        self.assertEqual(tx.get_sensitivity_for_frequency(425000.0), 7.0)
+        # Between calibrated frequencies there is no value: no interpolation.
+        self.assertIsNone(tx.get_sensitivity_for_frequency(425000.0))
+
+
+class TestSensitivityLookup(unittest.TestCase):
+    """The SDK's one sensitivity lookup (LIFUUserConfig.sensitivity_at_frequency)."""
+
+    @staticmethod
+    def _module(*pairs):
+        return {"module": {"sensitivity": [list(p) for p in pairs]}}
+
+    def test_exact_frequency_only(self):
+        modules = [self._module((380000, 3110), (400000, 2720))]
+        self.assertEqual(sensitivity_at_frequency(modules, 400000.0), 2720.0)
+        self.assertEqual(sensitivity_at_frequency(modules, 400000.0005), 2720.0)   # within 1 mHz
+        self.assertIsNone(sensitivity_at_frequency(modules, 400000.01))
+
+    def test_outside_the_table_is_refused_not_clamped(self):
+        modules = [self._module((380000, 3110), (400000, 2720))]
+        self.assertIsNone(sensitivity_at_frequency(modules, 500000.0))
+        self.assertIsNone(sensitivity_at_frequency(modules, 300000.0))
+
+    def test_non_positive_and_non_finite_entries_are_ignored(self):
+        for bad in (0.0, -5.0, float("nan"), float("inf")):
+            with self.subTest(bad=bad):
+                self.assertIsNone(sensitivity_at_frequency([self._module((400000, bad))], 400000.0))
+
+    def test_device_sensitivity_is_the_same_lookup(self):
+        modules = [self._module((400000, 3000)), self._module((400000, 3600))]
+        doc = _preset(voltage=40.0, sensitivity=3600)
+        self.assertEqual(device_sensitivity(doc, modules),
+                         sensitivity_at_frequency(modules, float(doc["frequency_khz"]) * 1e3))
 
 
 class TestInterfacePresetLoad(unittest.TestCase):
 
-    def test_load_preset_orchestrates_tx_and_hv(self):
-        iface = object.__new__(DeviceInterface)
-        iface.txdevice = MagicMock()
-        iface.txdevice.module_user_configs = [{"module": {"sensitivity": []}}]
-        iface.txdevice.get_sensitivity_for_frequency.return_value = 2720.0
-        iface.hvcontroller = MagicMock()
-        iface.status = LIFUInterfaceStatus.STATUS_SYS_OFF
-
-        iface.load_preset(1, 0xAABBCCDD, 0x11223344, 400000.0, duration_index=2)
-
-        iface.txdevice.load_preset.assert_called_once_with(1, 0x11223344, duration_index=2,
-                                                           settings_crc=0xAABBCCDD)
-        iface.txdevice.get_sensitivity_for_frequency.assert_called_once_with(400000.0)
-        iface.hvcontroller.select_preset.assert_called_once_with(1, 0xAABBCCDD, 2720.0, 400000.0)
-        self.assertEqual(iface.status, LIFUInterfaceStatus.STATUS_READY)
-
-    def test_load_preset_refreshes_missing_metadata(self):
-        iface = object.__new__(DeviceInterface)
-        iface.txdevice = MagicMock()
-        iface.txdevice.module_user_configs = []
-        iface.txdevice.get_sensitivity_for_frequency.return_value = 3000.0
-        iface.hvcontroller = MagicMock()
-        iface.status = LIFUInterfaceStatus.STATUS_SYS_OFF
-
-        iface.load_preset(0, 0xABCD, 0xDCBA, 500000.0)
-
-        iface.txdevice.refresh_metadata.assert_called_once_with()
-        iface.txdevice.get_sensitivity_for_frequency.assert_called_once_with(500000.0)
-        iface.hvcontroller.select_preset.assert_called_once_with(0, 0xABCD, 3000.0, 500000.0)
-
     @staticmethod
-    def _mocked() -> DeviceInterface:
-        iface = object.__new__(DeviceInterface)
+    def _mocked(cls=DeviceInterface, modules: int = 1) -> DeviceInterface:
+        iface = object.__new__(cls)
         iface.txdevice = MagicMock()
+        iface.txdevice.get_module_count.return_value = modules
         iface.txdevice.module_user_configs = [{"module": {"sensitivity": []}}]
         iface.txdevice.get_sensitivity_for_frequency.return_value = 2720.0
         iface.hvcontroller = MagicMock()
@@ -586,7 +589,79 @@ class TestInterfacePresetLoad(unittest.TestCase):
         iface.txdevice.unload_preset.assert_called_once_with()
         iface.hvcontroller.turn_hv_off.assert_called_once_with()
         iface.hvcontroller.deselect_preset.assert_called_once_with()
-        self.assertNotEqual(iface.status, LIFUInterfaceStatus.STATUS_READY)
+        self.assertEqual(iface.status, LIFUInterfaceStatus.STATUS_ERROR)
+
+    def test_load_preset_orchestrates_tx_and_hv(self):
+        iface = self._mocked()
+
+        iface.load_preset(1, 0xAABBCCDD, 0x11223344, 400000.0, duration_index=2)
+
+        iface.txdevice.load_preset.assert_called_once_with(1, 0x11223344, duration_index=2,
+                                                           settings_crc=0xAABBCCDD)
+        iface.txdevice.get_sensitivity_for_frequency.assert_called_once_with(400000.0)
+        iface.hvcontroller.select_preset.assert_called_once_with(1, 0xAABBCCDD, 2720.0)
+        self.assertEqual(iface.status, LIFUInterfaceStatus.STATUS_READY)
+
+    def test_load_preset_rereads_the_calibration_every_time(self):
+        # A transmitter swapped since the last load must not inherit the old one's sensitivity.
+        iface = self._mocked()
+        iface.txdevice.get_sensitivity_for_frequency.side_effect = [3000.0, 3600.0]
+
+        iface.load_preset(0, 0xABCD, 0xDCBA, 500000.0)
+        iface.load_preset(0, 0xABCD, 0xDCBA, 500000.0)
+
+        self.assertEqual(iface.txdevice.refresh_metadata.call_count, 2)
+        self.assertEqual([c.args for c in iface.hvcontroller.select_preset.call_args_list],
+                         [(0, 0xABCD, 3000.0), (0, 0xABCD, 3600.0)])
+
+    def test_more_than_one_module_is_refused_before_the_transmitter_is_touched(self):
+        for cls in (DeviceInterface, LIFUInterface):
+            for modules in (0, 2):
+                with self.subTest(cls=cls.__name__, modules=modules):
+                    iface = self._mocked(cls, modules)
+                    with self.assertRaises(LIFUError) as raised:
+                        iface.load_preset(0, 0xABCD, 0xDCBA, 400000.0)
+                    self.assertEqual(raised.exception.code, LIFU_ERR_MODULE_COUNT_MISMATCH)
+                    iface.txdevice.load_preset.assert_not_called()
+                    iface.hvcontroller.select_preset.assert_not_called()
+
+    def test_a_frequency_the_transmitter_is_not_calibrated_at_is_refused(self):
+        iface = self._mocked()
+        iface.txdevice.get_sensitivity_for_frequency.return_value = None
+        with self.assertRaises(LIFUSolutionError):
+            iface.load_preset(0, 0xABCD, 0xDCBA, 412345.0, turn_hv_on=True)
+        iface.hvcontroller.select_preset.assert_not_called()
+        iface.hvcontroller.turn_hv_on.assert_not_called()
+        self._cleared(iface)
+
+    def test_fda_connection_to_a_multi_module_transmitter_is_refused(self):
+        tx, hv = MagicMock(), MagicMock()
+        tx.is_connected.return_value = True
+        tx.get_module_count.return_value = 2
+        with patch.object(DeviceInterface, "_claim_hw_interface_pid"), \
+                patch.object(DeviceInterface, "_release_hw_interface_pid") as release, \
+                patch.object(DeviceInterface, "_create_devices", return_value=(tx, hv)):
+            with self.assertRaises(LIFUError) as raised:
+                DeviceInterface()
+        self.assertEqual(raised.exception.code, LIFU_ERR_MODULE_COUNT_MISMATCH)
+        tx.close.assert_called_once_with()
+        hv.close.assert_called_once_with()
+        release.assert_called_once_with()
+
+    def test_fda_connection_to_one_module_is_kept(self):
+        tx, hv = MagicMock(), MagicMock()
+        tx.is_connected.return_value = True
+        tx.get_module_count.return_value = 1
+        with patch.object(DeviceInterface, "_claim_hw_interface_pid"), \
+                patch.object(DeviceInterface, "_create_devices", return_value=(tx, hv)):
+            iface = DeviceInterface()
+        self.assertIs(iface.txdevice, tx)
+        tx.close.assert_not_called()
+
+    def test_research_interface_does_not_check_at_connect(self):
+        # LIFUInterface drives multi-module research rigs; only its preset load is single-module.
+        self.assertFalse(LIFUInterface.single_module_device)
+        self.assertTrue(DeviceInterface.single_module_device)
 
     def test_transmitter_refusal_leaves_the_console_with_nothing_selected(self):
         iface = self._mocked()
@@ -644,6 +719,9 @@ class TestInterfacePresetLoad(unittest.TestCase):
         tx_uart, hv_uart = _mock_uart(iface.txdevice, "TX"), _mock_uart(iface.hvcontroller, "HV")
         tx_uart.send_packet.return_value = _packet(b"")
         hv_uart.send_packet.side_effect = [_packet(struct.pack("<f", 44.75)), _packet(b"")]
+        # Module count and calibration reads are covered elsewhere; this test is about the load wire format.
+        iface.txdevice.get_module_count = MagicMock(return_value=1)
+        iface.txdevice.refresh_metadata = MagicMock()
         iface.txdevice.module_user_configs = [{"module": {"sensitivity": [[400000, 3220]]}}]
 
         iface.load_preset(0, 0xAABBCCDD, 0x11223344, 400000.0, duration_index=2)

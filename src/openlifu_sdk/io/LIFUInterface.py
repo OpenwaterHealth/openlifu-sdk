@@ -12,6 +12,7 @@ import pandas as pd
 
 from openlifu_sdk.io.LIFUConfig import (
     DEFAULT_TIMEOUT, 
+    LIFU_ERR_MODULE_COUNT_MISMATCH,
     OW_CONSOLE_PID, 
     OW_TRANSMITTER_PID, 
     OW_VID,
@@ -230,6 +231,10 @@ class DeviceInterface:
     """
     hvcontroller: HVController = None
     txdevice: TxDevice = None
+    #: An FDA device has one transmitter module: a connection that reports
+    #: more is refused (:meth:`_require_single_module`). LIFUInterface clears
+    #: this, since research rigs may chain modules.
+    single_module_device: bool = True
 
     def __init__(self,
                  vid: int = OW_VID,
@@ -264,6 +269,12 @@ class DeviceInterface:
         self.txdevice, self.hvcontroller = self._create_devices(
             vid, tx_pid, con_pid, baudrate, timeout, TX_test_mode, HV_test_mode)
         self._connect_devices()
+        if self.single_module_device and self.txdevice.is_connected():
+            try:
+                self._require_single_module()
+            except LIFUError:
+                self.close()
+                raise
 
     def _create_devices(self, vid: int, tx_pid: int, con_pid: int, baudrate: int,
                         timeout: float, TX_test_mode: bool,
@@ -279,6 +290,24 @@ class DeviceInterface:
             self.txdevice.connect()
         if self.hvcontroller is not None:
             self.hvcontroller.connect()
+
+    def _require_single_module(self) -> None:
+        """Refuse a transmitter that reports more than one module.
+
+        FDA presets are one module's blob, and :meth:`load_preset` loads and
+        verifies module 0 only, so on more modules it would leave the rest of
+        the array running whatever it held before.
+
+        Raises:
+            LIFUError: (``LIFU_ERR_MODULE_COUNT_MISMATCH``) More than one
+                module, or none.
+        """
+        count = int(self.txdevice.get_module_count())
+        if count != 1:
+            raise LIFUError(
+                f"TX reports {count} transmitter module(s); preset load supports exactly one",
+                code=LIFU_ERR_MODULE_COUNT_MISMATCH,
+            )
 
     def is_device_connected(self) -> tuple:
         """
@@ -308,8 +337,18 @@ class DeviceInterface:
         console refuses it, the error is raised with the transmitter left
         unloaded and the console with HV off and nothing selected
         (:meth:`unload_preset`), so the trigger cannot start and HV cannot
-        come on.
+        come on, and :attr:`status` is ``STATUS_ERROR``.
+
+        Only a single-module transmitter is supported, on this class and on
+        :class:`LIFUInterface`: anything else is refused before anything is
+        sent to the transmitter.
+
+        Raises:
+            LIFUError: More than one module (``LIFU_ERR_MODULE_COUNT_MISMATCH``),
+                a refusal from either device, or a transmitter with no
+                calibrated sensitivity at *frequency_hz* (LIFUSolutionError).
         """
+        self._require_single_module()
         self.set_status(LIFUInterfaceStatus.STATUS_PROGRAMMING)
         try:
             self._load_and_select(preset_index, settings_crc, regs_crc, frequency_hz, duration_index)
@@ -320,8 +359,9 @@ class DeviceInterface:
                 if self.hvcontroller.get_hv_status() and wait_for_settle:
                     logger.debug("Wait for Settle")
                     self.hvcontroller.wait_for_settle(timeout=SETTLE_TIME_HV_ON)
-        except Exception:
+        except Exception:  # reason: any failure, typed or not, must not leave half a preset loaded; re-raised
             self.unload_preset()
+            self.set_status(LIFUInterfaceStatus.STATUS_ERROR)
             raise
 
         self.set_status(LIFUInterfaceStatus.STATUS_READY)
@@ -354,20 +394,17 @@ class DeviceInterface:
         )
 
         if self.hvcontroller is not None:
-            if not self.txdevice.module_user_configs:
-                self.txdevice.refresh_metadata()
+            # Read the calibration every load: the transmitter may have been
+            # reconnected or swapped since the last one, and its sensitivity
+            # scales the HV.
+            self.txdevice.refresh_metadata()
             device_sensitivity = self.txdevice.get_sensitivity_for_frequency(frequency_hz)
             if device_sensitivity is None:
                 raise LIFUSolutionError(
                     f"TX device sensitivity is unavailable at {frequency_hz:.3f} Hz; cannot select FDA preset on HV."
                 )
 
-            self.hvcontroller.select_preset(
-                preset_index,
-                settings_crc,
-                device_sensitivity,
-                frequency_hz,
-            )
+            self.hvcontroller.select_preset(preset_index, settings_crc, device_sensitivity)
             logger.debug(
                 "Selected HV preset %d using TX sensitivity %.6g at %.3f Hz",
                 preset_index,
@@ -567,6 +604,7 @@ class LIFUInterface(DeviceInterface):
     """
     hvcontroller: LIFUHVController = None
     txdevice: LIFUTxDevice = None
+    single_module_device = False
 
     def __init__(self,
                  vid: int = OW_VID,
