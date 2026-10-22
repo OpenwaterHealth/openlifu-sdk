@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """Resolve a preset into the TX7332 register mapping a transmitter runs from.
 
 In the preset modes the transmitter firmware -- not the host -- programs the
@@ -36,6 +37,7 @@ from __future__ import annotations
 import json
 import logging
 import math
+import numbers
 import re
 import struct
 import zlib
@@ -57,6 +59,7 @@ from openlifu_sdk.io.LIFUTXDevice import (
     build_solution_registers,
     resolve_trigger_timing,
 )
+from openlifu_sdk.io.LIFUUserConfig import sensitivity_at_frequency
 
 logger = logging.getLogger(__name__)
 
@@ -135,6 +138,56 @@ def preset_voltage(machine_config: Dict) -> float:
     return struct.unpack("<f", struct.pack("<f", v))[0]
 
 
+def module_regs_crcs(regs_crc) -> List[int]:
+    """*regs_crc* as given to ``DeviceInterface.load_preset``: one integer for a
+    one-module preset, or a sequence with one per module (:func:`regs_crc`
+    of each). Any integral type is accepted (``numpy.uint32`` included).
+
+    Raises:
+        TypeError: Not an integer or a non-empty sequence of integers (a
+            ``bool`` is not a CRC).
+    """
+    def integral(value) -> bool:
+        return isinstance(value, numbers.Integral) and not isinstance(value, bool)
+
+    if integral(regs_crc):
+        return [int(regs_crc)]
+    try:
+        crcs = [] if isinstance(regs_crc, (str, bytes)) else list(regs_crc)
+    except TypeError:
+        crcs = []
+    if not crcs or not all(integral(c) for c in crcs):
+        raise TypeError(f"regs_crc must be an integer or a non-empty sequence of integers, got {regs_crc!r}")
+    return [int(c) for c in crcs]
+
+
+def preset_voltage_range(machine_config: Dict) -> tuple[float, float] | None:
+    """The preset's own HV range, ``voltage_range`` = [low, high] volts, or
+    None if it has none.
+
+    Preset data: the range the applied (sensitivity-rescaled) voltage may
+    take for this preset. The host checks it: pass it to
+    ``DeviceInterface.load_preset(voltage_range=...)``, which refuses a select
+    whose applied voltage is outside it. No console sees it; an FDA_MODE
+    console holds every select to its own fixed 35-45 V hard stop as a
+    second line.
+
+    Raises:
+        ValueError: Not two finite positive numbers with low <= high.
+    """
+    rng = machine_config.get("voltage_range")
+    if rng is None:
+        return None
+    ok = (isinstance(rng, (list, tuple)) and len(rng) == 2
+          and all(not isinstance(v, bool) and isinstance(v, (int, float)) and math.isfinite(v) and v > 0
+                  for v in rng)
+          and rng[0] <= rng[1])
+    if not ok:
+        raise ValueError("%s: voltage_range must be [low, high] positive volts, got %r"
+                         % (machine_config.get("id"), rng))
+    return float(rng[0]), float(rng[1])
+
+
 def preset_sensitivity(machine_config: Dict) -> float:
     """The transmitter sensitivity the preset's voltage suits, as the console
     bakes it: ``sensitivity`` as float32.
@@ -146,15 +199,6 @@ def preset_sensitivity(machine_config: Dict) -> float:
     if isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(v) or v <= 0:
         raise ValueError("%s: sensitivity must be a positive number, got %r" % (machine_config.get("id"), v))
     return struct.unpack("<f", struct.pack("<f", v))[0]
-
-
-def module_sensitivity(user_config: Dict, frequency_hz: float) -> float | None:
-    """A module's calibrated sensitivity at *frequency_hz*: the matching entry of
-    ``module.sensitivity`` in its user config (pairs of Hz and value), or None."""
-    for f, v in ((user_config or {}).get("module") or {}).get("sensitivity") or []:
-        if abs(float(f) - frequency_hz) < 1e-3 and float(v) > 0:
-            return float(v)
-    return None
 
 
 def module_user_configs(txdevice) -> List[Dict]:
@@ -170,13 +214,12 @@ def module_user_configs(txdevice) -> List[Dict]:
 
 
 def device_sensitivity(preset: Dict, user_configs: Sequence[Dict]) -> float | None:
-    """The connected transmitter's sensitivity at *preset*'s frequency: the mean
-    over the modules that have an entry there (:func:`module_sensitivity`), or
-    None if none has. *user_configs* is each module's user config
-    (:func:`module_user_configs`). What HVController.select_preset is given."""
-    hz = float(preset.get("frequency_khz", 0.0)) * 1e3
-    found = [v for v in (module_sensitivity(c, hz) for c in user_configs) if v is not None]
-    return sum(found) / len(found) if found else None
+    """The connected transmitter's sensitivity at *preset*'s frequency
+    (:func:`~openlifu_sdk.io.LIFUUserConfig.sensitivity_at_frequency`, the one
+    lookup the SDK has), or None if no module lists that frequency.
+    *user_configs* is each module's user config (:func:`module_user_configs`).
+    What HVController.select_preset is given."""
+    return sensitivity_at_frequency(user_configs, float(preset.get("frequency_khz", 0.0)) * 1e3)
 
 
 def adjusted_voltage(preset: Dict, user_configs: Sequence[Dict]) -> Dict:
@@ -301,6 +344,10 @@ def compile_preset(preset: Dict, preset_id: str | None = None,
     captured["frequency_khz"] = preset["frequency_khz"]
     if "sensitivity" in preset:
         captured["sensitivity"] = preset["sensitivity"]
+    # Preset data only (not in the blob, so neither CRC changes): consoles that are not
+    # FDA images check the applied voltage against it.
+    if preset.get("voltage_range") is not None:
+        captured["voltage_range"] = list(preset_voltage_range(preset))
     # Refuse bad run lengths or limits now, not at emit time.
     counts = train_count_selections(captured)
     thermal_limits(captured)

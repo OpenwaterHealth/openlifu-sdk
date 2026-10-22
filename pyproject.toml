@@ -12,7 +12,7 @@ authors = [
 description = "Openwater LIFU SDK — hardware I/O interface library"
 readme = { file = "README.md", content-type = "text/markdown" }
 requires-python = ">=3.10"
-license = "AGPL-3.0-only"
+license = "Apache-2.0"
 license-files = ["LICENSE"]
 classifiers = [
   "Development Status :: 4 - Beta",
@@ -61,6 +61,10 @@ ui = [
 Homepage = "https://github.com/OpenwaterHealth/openlifu-sdk"
 "Bug Tracker" = "https://github.com/OpenwaterHealth/openlifu-sdk/issues"
 
+
+[tool.pytest.ini_options]
+# examples/test_*.py are bench scripts that need hardware, not tests.
+testpaths = ["unit-test"]
 
 [tool.setuptools.packages.find]
 where = ["src"]

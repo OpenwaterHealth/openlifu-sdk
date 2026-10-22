@@ -68,7 +68,9 @@ from openlifu_sdk.io.LIFUConfig import (
     TRIGGER_MODE_SEQUENCE,
     TRIGGER_MODE_SINGLE,
     TX7332_COMMANDS,
+    FDA_READ_ONLY_COMMANDS,
     TX_FDA_COMMANDS,
+    TX_FDA_PACKETS,
 )
 from openlifu_sdk.io.LIFUUserConfig import sensitivity_at_frequency
 from openlifu_sdk.util.annotations import OpenLIFUFieldData
@@ -215,6 +217,8 @@ class TxDevice(OWComponent):
     """
 
     SUPPORTED_COMMANDS = TX_FDA_COMMANDS
+    ALLOWED_PACKETS = TX_FDA_PACKETS
+    READ_ONLY_COMMANDS = FDA_READ_ONLY_COMMANDS
 
     def __init__(self, vid: int = OW_VID, pid: int = OW_TRANSMITTER_PID,
                  baudrate: int = 921600, timeout: float = DEFAULT_TIMEOUT, test_mode: bool = False):
@@ -248,9 +252,15 @@ class TxDevice(OWComponent):
         module calibration (see :func:`sensitivity_at_frequency`)."""
         return sensitivity_at_frequency(self.module_user_configs, freq_hz)
 
-    def refresh_metadata(self) -> None:
-        """Hydrate TX identity + sensitivity fields from stored calibration."""
-        module_count = max(1, int(self.get_module_count()))
+    def refresh_metadata(self, module_count: Optional[int] = None) -> None:
+        """Hydrate TX identity + sensitivity fields from stored calibration.
+
+        Reads the user config of each of *module_count* modules, or of as
+        many as the device reports when None. A caller that has just checked
+        the count passes it, so the calibration read matches the check.
+        """
+        if module_count is None:
+            module_count = max(1, int(self.get_module_count()))
         configs: list[dict] = []
         for module_idx in range(module_count):
             config = self.read_config(module=module_idx).to_dict()
@@ -263,7 +273,7 @@ class TxDevice(OWComponent):
         if not hwid:
             try:
                 hwid = self.get_hardware_id()
-            except Exception:  # noqa: BLE001
+            except LIFUError:
                 hwid = None
         self.hwid = hwid
         self.hardware_id = hwid
@@ -426,7 +436,8 @@ class TxDevice(OWComponent):
 
         Each module holds its own part of a preset -- its own two chips --
         with its own regs_crc, so a preset that spans modules is loaded on
-        each in turn (LIFUTXPresets.load_preset does that).
+        each in turn (DeviceInterface.load_preset and
+        LIFUTXPresets.load_preset do that).
 
         The firmware refuses the load unless *regs_crc* equals the CRC-32 it
         computes over its own tables and *settings_crc* is the one its preset
@@ -498,6 +509,8 @@ class LIFUTxDevice(LIFUComponentMixin, TxDevice):
     """
 
     SUPPORTED_COMMANDS = GLOBAL_COMMANDS | TX7332_COMMANDS | CONTROLLER_COMMANDS
+    ALLOWED_PACKETS = None
+    READ_ONLY_COMMANDS = frozenset()
 
     def __init__(self, vid: int = OW_VID, pid: int = OW_TRANSMITTER_PID,
                  baudrate: int = 921600, timeout: float = DEFAULT_TIMEOUT, test_mode: bool = False,
@@ -1502,8 +1515,8 @@ class LIFUTxDevice(LIFUComponentMixin, TxDevice):
         Raises:
             None
         """
-        print("TX Device Information") # noqa: T201
-        print("  UART Port:") # noqa: T201
+        print("TX Device Information") # noqa: T201 -- reason: print() is the console dump this method exists for
+        print("  UART Port:") # noqa: T201 -- reason: as above
 
 def get_delay_location(channel:int, profile:int=1):
     """
@@ -1648,9 +1661,9 @@ def print_regs(d):
     for addr, val in sorted(d.items()):
         if isinstance(val, list):
             for i, v in enumerate(val):
-                print(f'0x{addr:X}[+{i:d}]:x{v:08X}') # noqa: T201
+                print(f'0x{addr:X}[+{i:d}]:x{v:08X}') # noqa: T201 -- reason: register dump to the console, by design
         else:
-            print(f'0x{addr:X}:x{val:08X}') # noqa: T201
+            print(f'0x{addr:X}:x{val:08X}') # noqa: T201 -- reason: register dump to the console, by design
 
 def pack_registers(regs, pack_single:bool=False):
     """

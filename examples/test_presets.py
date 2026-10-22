@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """List, load, delete and verify the presets stored on a PRESET_MODE transmitter.
 
 A PRESET_MODE transmitter keeps its presets in flash slots. Slot N is preset
@@ -31,6 +32,8 @@ The last preset verified is left loaded on the chips.
 An FDA_MODE transmitter carries its one preset in its image instead
 (generate_presets.py); it is tested with test_fda_mode.py.
 """
+
+from __future__ import annotations
 
 import argparse
 import json
