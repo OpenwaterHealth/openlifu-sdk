@@ -31,7 +31,10 @@ import logging
 from enum import IntEnum
 from typing import Optional
 
-from PyQt6.QtCore import QObject, pyqtProperty, pyqtSignal, pyqtSlot
+from openlifu_sdk.ui._qt import Property as pyqtProperty
+from openlifu_sdk.ui._qt import QObject
+from openlifu_sdk.ui._qt import Signal as pyqtSignal
+from openlifu_sdk.ui._qt import Slot as pyqtSlot
 
 from openlifu_sdk.ui.telemetry_thread import TelemetryPollThread
 

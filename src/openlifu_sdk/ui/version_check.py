@@ -97,8 +97,10 @@ def show_incompatible_version_dialog(
     back to ``stderr`` if QtWidgets isn't importable.
     """
     try:
-        from PyQt6.QtWidgets import QApplication, QMessageBox
+        from openlifu_sdk.ui._qt import import_qt_module
 
+        QtWidgets = import_qt_module("QtWidgets")
+        QApplication, QMessageBox = QtWidgets.QApplication, QtWidgets.QMessageBox
         QApplication.instance() or QApplication(sys.argv)
         QMessageBox.critical(parent, title, f"{message}\n\nThe application will now exit.")
     except Exception:

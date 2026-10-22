@@ -29,7 +29,8 @@ from typing import List, Optional
 # Qt backend selection: prefer 3D Slicer's PythonQt-based ``qt`` module
 # when we're running inside Slicer, since Slicer's GUI event loop is Qt5
 # and Qt6 timers parented to that loop would never fire. Outside Slicer
-# (e.g. the openlifu desktop apps), fall back to PyQt6.
+# (e.g. the openlifu desktop apps), use the host's Qt6 binding (PyQt6 or
+# PySide6, see :mod:`openlifu_sdk.ui._qt`).
 import sys as _sys
 
 if "slicer" in _sys.modules:
@@ -46,15 +47,16 @@ if "slicer" in _sys.modules:
     _QT_BACKEND = "PythonQt"
 else:
     try:
-        from PyQt6.QtCore import QObject, QTimer, pyqtSignal  # type: ignore
-        _QT_BACKEND = "PyQt6"
+        from openlifu_sdk.ui._qt import QT_API as _QT_BACKEND
+        from openlifu_sdk.ui._qt import QObject, QTimer
+        from openlifu_sdk.ui._qt import Signal as pyqtSignal
     except ImportError:  # pragma: no cover - exercised only in Slicer
         try:
             import qt as _slicer_qt  # type: ignore
         except ImportError as _exc:  # pragma: no cover - no Qt at all
             raise ImportError(
                 "openlifu_sdk.ui.simulated_interface requires PyQt6 (install "
-                "with the 'ui' extra) or 3D Slicer's PythonQt 'qt' module."
+                "with the 'ui' extra), PySide6, or 3D Slicer's PythonQt 'qt' module."
             ) from _exc
         QObject = _slicer_qt.QObject
         QTimer = _slicer_qt.QTimer
@@ -867,9 +869,9 @@ class _SimulatedRunEngine(QObject):
 
     Use :meth:`set_finished_callback` to be notified when the run
     completes (we use a plain Python callable rather than a Qt signal
-    because this class is instantiated under either PyQt6 or Slicer's
+    because this class is instantiated under PyQt6, PySide6 or Slicer's
     PythonQt-based ``qt`` module, and class-level signal declarations
-    are not portable between the two backends).
+    are not portable between these backends).
     """
 
     def __init__(self, txdevice: SimulatedTxDevice, hvcontroller: SimulatedHVController,
