@@ -75,7 +75,7 @@ from openlifu_sdk.io.LIFUConfig import (
     OW_NO_PRESET,
     OW_TEMP_TOO_HIGH,
 )
-from openlifu_sdk.io.LIFUTXPresets import preset_sensitivity, preset_voltage_range
+from openlifu_sdk.io.LIFUTXPresets import preset_sensitivity
 from openlifu_sdk.io.LIFUUserConfig import sensitivity_at_frequency
 from openlifu_sdk.io.signal import OWSignal
 from openlifu_sdk.ui.status_frame import format_status_frame as _format_status_frame
@@ -86,8 +86,8 @@ logger.debug("openlifu_sdk.ui.simulated_interface using Qt backend: %s", _QT_BAC
 # The FDA image's second-line hard stop: the only HV setpoints an FDA_MODE
 # console's select may arrive at (FDA_HV_MIN_VOLTS / FDA_HV_MAX_VOLTS in the
 # console firmware's hv_presets.h). Fixed in that image. A preset's own
-# voltage_range is preset data: the FDA console never sees it (the host checks
-# it), while a console that is not an FDA image checks it instead.
+# voltage_range is preset data that no console sees: the host checks it
+# (DeviceInterface.load_preset(voltage_range=...)).
 FDA_HV_WINDOW_V = (35.0, 45.0)
 
 
@@ -217,6 +217,8 @@ class SimulatedTxDevice:
         )
         self._loaded_preset_index: Optional[int] = None
         self._loaded_duration_index: Optional[int] = None
+        # Modules holding a loaded part of the preset (each loads its own, as on hardware).
+        self._loaded_modules: set[int] = set()
 
         # Reported firmware version. Mutable so an app-side debug UI
         # (or a test) can flip it to simulate an incompatible firmware
@@ -295,17 +297,24 @@ class SimulatedTxDevice:
             raise LIFUDeviceError(f"TX: no preset at index {index}")
         return self._preset_flash[index]
 
+    @staticmethod
+    def _module_crcs(flash_regs_crc) -> list[int]:
+        """A flash entry's regs_crc is one int (a 1x preset) or one per module."""
+        return [int(flash_regs_crc)] if isinstance(flash_regs_crc, int) else [int(c) for c in flash_regs_crc]
+
     def get_preset(self, index: int) -> dict:
         """Same shape as :meth:`TxDevice.get_preset` (OW_PRESET_GET)."""
-        machine_config, regs_crc = self._flash_entry(index)
+        machine_config, flash_regs_crc = self._flash_entry(index)
+        crcs = self._module_crcs(flash_regs_crc)
         return {
             "count": len(self._preset_flash),
             "index": index,
-            "chip_count": self.num_modules * 2,
+            "chip_count": 2,
             "profile_count": 1,
             "settings_crc": int(machine_config["settings_crc"]),
-            "regs_crc": int(regs_crc),
-            "baked_regs_crc": int(regs_crc),
+            "regs_crc": crcs[0],   # module 0's part, as the module that answers reports
+            "baked_regs_crc": crcs[0],
+            "modules": len(crcs),
             "id": machine_config["id"],
             "train_counts": list(machine_config.get("pulse_train_count_selections") or []),
             "start_c": machine_config.get("start_C"),
@@ -313,7 +322,7 @@ class SimulatedTxDevice:
         }
 
     def load_preset(self, index: int, regs_crc: int, duration_index: int = 0,
-                    settings_crc: int | None = None) -> bool:
+                    settings_crc: int | None = None, module: int = 0) -> bool:
         """Same contract as :meth:`TxDevice.load_preset` (OW_PRESET_LOAD).
 
         Like the firmware, loading applies the preset's trigger and pulse
@@ -321,13 +330,16 @@ class SimulatedTxDevice:
         ``start_sonication``. *settings_crc* is checked when given; the
         firmware always requires it.
         """
-        # Like the firmware, a load that is refused leaves nothing loaded.
-        self.unload_preset()
+        # Like the firmware, a load that is refused leaves this module with nothing loaded.
+        self.unload_preset(module)
         machine_config, flash_regs_crc = self._flash_entry(index)
-        if int(regs_crc) != int(flash_regs_crc):
+        crcs = self._module_crcs(flash_regs_crc)
+        if not 0 <= module < min(self.num_modules, len(crcs)):
+            raise LIFUDeviceError(f"TX: module {module} holds no part of preset {index}")
+        if int(regs_crc) != crcs[module]:
             raise LIFUDeviceError(
-                f"TX: regs_crc 0x{int(regs_crc):08X} does not match preset {index} "
-                f"(0x{int(flash_regs_crc):08X})",
+                f"TX: regs_crc 0x{int(regs_crc):08X} does not match module {module}'s part of preset "
+                f"{index} (0x{crcs[module]:08X})",
                 device_error_code=OW_BAD_CRC,
             )
         if settings_crc is not None and int(settings_crc) != int(machine_config["settings_crc"]):
@@ -347,14 +359,18 @@ class SimulatedTxDevice:
         }
         self._pulse["duration"] = float(machine_config.get("pulse_length_us", 100.0)) / 1_000_000.0
         self._normalize_train_interval()
-        self._loaded_preset_index = index
-        self._loaded_duration_index = duration_index
+        self._loaded_modules.add(module)
+        if module == 0:
+            self._loaded_preset_index = index
+            self._loaded_duration_index = duration_index
         return True
 
     def unload_preset(self, module: int = 0) -> bool:
         """Same contract as :meth:`TxDevice.unload_preset`."""
-        self._loaded_preset_index = None
-        self._loaded_duration_index = None
+        self._loaded_modules.discard(module)
+        if module == 0:
+            self._loaded_preset_index = None
+            self._loaded_duration_index = None
         return True
 
     def get_loaded_preset(self) -> tuple[Optional[int], Optional[int]]:
@@ -697,7 +713,6 @@ class SimulatedHVController:
             "voltage": 40.0,
             "id": "sim-default",
             "sensitivity": 2720.0,
-            "voltage_range": None,
         }]
 
         # Reported firmware version. See
@@ -766,14 +781,14 @@ class SimulatedHVController:
 
     def configure_presets(self, presets: List[dict]) -> None:
         """Replace the simulated console's preset table: ``id``,
-        ``settings_crc``, ``voltage``, ``sensitivity`` and, as preset data,
-        ``voltage_range`` (or None).
+        ``settings_crc``, ``voltage`` and ``sensitivity``, as a console image
+        carries them.
 
         Raises:
             ValueError: A preset without a positive ``voltage`` and
                 ``sensitivity`` (a real console image always has both; the
-                generator refuses to bake one without), or a malformed
-                ``voltage_range``. Refused here rather than at select time.
+                generator refuses to bake one without). Refused here rather
+                than at select time.
         """
         for index, preset in enumerate(presets):
             for key in ("voltage", "sensitivity"):
@@ -781,7 +796,6 @@ class SimulatedHVController:
                 if isinstance(value, bool) or not isinstance(value, (int, float)) \
                         or not math.isfinite(value) or value <= 0:
                     raise ValueError(f"simulated console preset {index}: {key} must be a positive number, got {value!r}")
-            preset_voltage_range(preset)
         self._presets = [dict(preset) for preset in presets]
 
     def _select_window(self, preset: dict) -> tuple[float, float] | None:
@@ -893,14 +907,15 @@ class SimulatedLIFUHVController(SimulatedHVController):
 
     Not an FDA image, so none of the FDA image's rules: HV on and
     ``set_voltage`` are ungated, there is no 35-45 V hard stop, and the
-    selection may change with HV on. A preset select checks the preset's
-    own ``voltage_range`` (preset data) instead, when the preset has one.
+    selection may change with HV on. A select applies whatever it
+    rescales to; the preset's own ``voltage_range`` is the host's to check
+    (``load_preset(voltage_range=...)``), as on real consoles.
     """
 
     fda_image = False
 
     def _select_window(self, preset: dict) -> tuple[float, float] | None:
-        return preset_voltage_range(preset)
+        return None
 
     uart = None  # connector reads this for FW DFU; not used here
     _rgb_state = 0
@@ -1163,8 +1178,6 @@ class SimulatedDeviceInterface(QObject):
     #: interface from a real :class:`~openlifu_sdk.io.LIFUInterface`
     #: without importing the simulated class itself.
     is_simulated: bool = True
-    #: As :attr:`DeviceInterface.single_module_device`.
-    single_module_device: bool = True
 
     def __init__(self, num_modules: int = 1,
                  transducer=None,
@@ -1177,13 +1190,9 @@ class SimulatedDeviceInterface(QObject):
             if modules_attr is not None:
                 num_modules = max(1, len(list(modules_attr)))
         super().__init__()
-        if self.single_module_device and int(num_modules) != 1:
-            raise LIFUError(
-                f"TX reports {int(num_modules)} transmitter module(s); preset load supports exactly one",
-                code=LIFU_ERR_MODULE_COUNT_MISMATCH,
-            )
         self.txdevice, self.hvcontroller = self._create_devices(num_modules, preset_flash)
         self.status = LIFUInterfaceStatus.STATUS_SYS_OFF
+        self._preset_modules = 1
         self._engine: Optional[_SimulatedRunEngine] = None
         self._last_solution_voltage = 0.0
         self._last_trigger_mode = "sequence"
@@ -1201,7 +1210,6 @@ class SimulatedDeviceInterface(QObject):
                     "id": machine_config.get("id", f"preset-{index}"),
                     # As HVController.get_preset reports it: the console bakes it as float32.
                     "sensitivity": preset_sensitivity(machine_config),
-                    "voltage_range": machine_config.get("voltage_range"),
                 })
             self.hvcontroller.configure_presets(hv_presets)
 
@@ -1217,42 +1225,53 @@ class SimulatedDeviceInterface(QObject):
 
     def unload_preset(self) -> None:
         """Same contract as :meth:`DeviceInterface.unload_preset`."""
-        self.txdevice.unload_preset()
+        for module in range(self._preset_modules):
+            self.txdevice.unload_preset(module)
         self.hvcontroller.turn_hv_off()
         self.hvcontroller.deselect_preset()
 
-    def load_preset(self, preset_index: int, settings_crc: int, regs_crc: int,
+    def load_preset(self, preset_index: int, settings_crc: int, regs_crc,
                     frequency_hz: float,
                     duration_index: int = 0, turn_hv_on: bool = False,
-                    wait_for_settle: bool = False) -> bool:
-        """Same contract as :meth:`DeviceInterface.load_preset`: one module
-        only, on both devices or, if either refuses, on neither."""
+                    wait_for_settle: bool = False,
+                    voltage_range: tuple[float, float] | None = None) -> bool:
+        """Same contract as :meth:`DeviceInterface.load_preset`: the preset
+        must span the modules the transmitter reports, and it ends up on
+        both devices or, if either refuses, on neither."""
         self.set_status(LIFUInterfaceStatus.STATUS_PROGRAMMING)
+        regs_crcs = [regs_crc] if isinstance(regs_crc, int) else [int(c) for c in regs_crc]
         try:
             modules = self.txdevice.get_module_count()
-            if modules != 1:
+            if modules != len(regs_crcs):
                 raise LIFUError(
-                    f"TX reports {modules} transmitter module(s); preset load supports exactly one",
+                    f"the preset spans {len(regs_crcs)} transmitter module(s); the TX reports {modules}",
                     code=LIFU_ERR_MODULE_COUNT_MISMATCH,
                 )
-            self.txdevice.load_preset(preset_index, regs_crc, duration_index, settings_crc=settings_crc)
-            self.txdevice.refresh_metadata(module_count=1)
+            self._preset_modules = len(regs_crcs)
+            for module, crc in enumerate(regs_crcs):
+                self.txdevice.load_preset(preset_index, crc, duration_index,
+                                          settings_crc=settings_crc, module=module)
+            self.txdevice.refresh_metadata(module_count=len(regs_crcs))
             device_sensitivity = self.txdevice.get_sensitivity_for_frequency(frequency_hz)
             if device_sensitivity is None:
                 raise LIFUSolutionError(
                     f"TX device sensitivity is unavailable at {frequency_hz:.3f} Hz; "
                     "cannot select FDA preset on HV.")
-            self._last_solution_voltage = self.hvcontroller.select_preset(
-                preset_index, settings_crc, device_sensitivity)
+            applied = self.hvcontroller.select_preset(preset_index, settings_crc, device_sensitivity)
+            if voltage_range is not None and not voltage_range[0] <= applied <= voltage_range[1]:
+                raise LIFUSolutionError(
+                    f"HV {applied:.2f} V for this transmitter is outside the preset's voltage_range "
+                    f"{voltage_range[0]:g}-{voltage_range[1]:g} V")
+            self._last_solution_voltage = applied
+            if turn_hv_on:
+                self.hvcontroller.turn_hv_on()
+            if wait_for_settle:
+                time.sleep(0.2)
         except Exception:  # reason: any failure must not leave half a preset loaded; re-raised
             self.unload_preset()
             self.set_status(LIFUInterfaceStatus.STATUS_ERROR)
             raise
         self.set_status(LIFUInterfaceStatus.STATUS_READY)
-        if turn_hv_on:
-            self.hvcontroller.turn_hv_on()
-        if wait_for_settle:
-            time.sleep(0.2)
         return True
 
     def start_sonication(self, turn_hv_on: bool = True,
@@ -1313,8 +1332,10 @@ class SimulatedDeviceInterface(QObject):
         if self._engine is not None:
             self._engine.stop()
             self._engine = None
-        self.hvcontroller.close()
-        self.txdevice.close()
+        try:
+            self.hvcontroller.close()
+        finally:
+            self.txdevice.close()
 
 
 # =============================================================================
@@ -1324,7 +1345,6 @@ class SimulatedDeviceInterface(QObject):
 class SimulatedLIFUInterface(SimulatedDeviceInterface):
     """Compatibility fake for the research/RUO :class:`openlifu_sdk.LIFUInterface`."""
 
-    single_module_device = False
 
     def __init__(self, num_modules: int = 1,
                  transducer=None,

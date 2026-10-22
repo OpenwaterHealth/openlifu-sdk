@@ -24,7 +24,7 @@ _SRC = os.path.join(os.path.dirname(__file__), "..", "src")
 if _SRC not in sys.path:
     sys.path.insert(0, _SRC)
 
-from openlifu_sdk.io.exceptions import LIFUCommunicationError, LIFUDeviceError, LIFUError, LIFUSolutionError
+from openlifu_sdk.io.exceptions import LIFUDeviceError, LIFUError, LIFUSolutionError
 from openlifu_sdk.io.LIFUConfig import (
     LIFU_ERR_MODULE_COUNT_MISMATCH,
     OW_BAD_CRC,
@@ -618,8 +618,9 @@ class TestInterfacePresetLoad(unittest.TestCase):
         iface._test_mode = False
         return iface
 
-    def _cleared(self, iface):
-        iface.txdevice.unload_preset.assert_called_once_with()
+    def _cleared(self, iface, modules: int = 1):
+        self.assertEqual([c.kwargs for c in iface.txdevice.unload_preset.call_args_list],
+                         [{"module": m} for m in range(modules)])
         iface.hvcontroller.turn_hv_off.assert_called_once_with()
         iface.hvcontroller.deselect_preset.assert_called_once_with()
         self.assertEqual(iface.status, LIFUInterfaceStatus.STATUS_ERROR)
@@ -629,8 +630,9 @@ class TestInterfacePresetLoad(unittest.TestCase):
 
         iface.load_preset(1, 0xAABBCCDD, 0x11223344, 400000.0, duration_index=2)
 
-        iface.txdevice.load_preset.assert_called_once_with(1, 0x11223344, duration_index=2,
+        iface.txdevice.load_preset.assert_called_once_with(1, 0x11223344, duration_index=2, module=0,
                                                            settings_crc=0xAABBCCDD)
+        iface.txdevice.refresh_metadata.assert_called_once_with(module_count=1)
         iface.txdevice.get_sensitivity_for_frequency.assert_called_once_with(400000.0)
         iface.hvcontroller.select_preset.assert_called_once_with(1, 0xAABBCCDD, 2720.0)
         self.assertEqual(iface.status, LIFUInterfaceStatus.STATUS_READY)
@@ -647,19 +649,60 @@ class TestInterfacePresetLoad(unittest.TestCase):
         self.assertEqual([c.args for c in iface.hvcontroller.select_preset.call_args_list],
                          [(0, 0xABCD, 3000.0), (0, 0xABCD, 3600.0)])
 
-    def test_more_than_one_module_is_refused_before_anything_is_loaded(self):
+    def test_a_two_module_preset_loads_each_module_with_its_own_crc(self):
+        # The vet app has 2x presets: the SDK supports them, one regs_crc per module.
         for cls in (DeviceInterface, LIFUInterface):
-            for modules in (0, 2):
-                with self.subTest(cls=cls.__name__, modules=modules):
+            with self.subTest(cls=cls.__name__):
+                iface = self._mocked(cls, modules=2)
+                iface.load_preset(0, 0xABCD, [0x1111, 0x2222], 400000.0, duration_index=1)
+                self.assertEqual([(c.args, c.kwargs) for c in iface.txdevice.load_preset.call_args_list],
+                                 [((0, 0x1111), {"duration_index": 1, "module": 0, "settings_crc": 0xABCD}),
+                                  ((0, 0x2222), {"duration_index": 1, "module": 1, "settings_crc": 0xABCD})])
+                iface.txdevice.refresh_metadata.assert_called_once_with(module_count=2)
+                iface.hvcontroller.select_preset.assert_called_once_with(0, 0xABCD, 2720.0)
+                self.assertEqual(iface.status, LIFUInterfaceStatus.STATUS_READY)
+
+    def test_a_refused_two_module_load_unloads_every_module(self):
+        iface = self._mocked(modules=2)
+        iface.hvcontroller.select_preset.side_effect = LIFUDeviceError("refused", device_error_code=OW_HV_PRESET_CRC)
+        with self.assertRaises(LIFUDeviceError):
+            iface.load_preset(0, 0xABCD, [0x1111, 0x2222], 400000.0)
+        self._cleared(iface, modules=2)
+
+    def test_a_preset_whose_module_count_differs_is_refused_before_anything_is_loaded(self):
+        # The set-preset guard: a 1x preset (64 elements, e.g. diathermy) on a 2x transmitter, or the reverse.
+        for cls in (DeviceInterface, LIFUInterface):
+            for regs, modules in ((0xDCBA, 2), (0xDCBA, 0), ([0x1111, 0x2222], 1)):
+                with self.subTest(cls=cls.__name__, preset_modules=1 if isinstance(regs, int) else len(regs),
+                                  tx_modules=modules):
                     iface = self._mocked(cls, modules)
                     iface.status = LIFUInterfaceStatus.STATUS_READY   # an earlier load succeeded
                     with self.assertRaises(LIFUError) as raised:
-                        iface.load_preset(0, 0xABCD, 0xDCBA, 400000.0)
+                        iface.load_preset(0, 0xABCD, regs, 400000.0)
                     self.assertEqual(raised.exception.code, LIFU_ERR_MODULE_COUNT_MISMATCH)
                     iface.txdevice.load_preset.assert_not_called()
                     iface.hvcontroller.select_preset.assert_not_called()
-                    # Handled like any refusal: the earlier load is cleared, status is ERROR.
+                    # Handled like any refusal: what an earlier load left is cleared, status is ERROR.
                     self._cleared(iface)
+
+    def test_the_presets_voltage_range_is_checked_by_the_host(self):
+        # Preset data no console sees: the host holds the applied voltage to it.
+        iface = self._mocked()
+        iface.hvcontroller.select_preset.return_value = 40.0
+        iface.load_preset(0, 0xABCD, 0xDCBA, 400000.0, voltage_range=(37.0, 42.0))
+        self.assertEqual(iface.status, LIFUInterfaceStatus.STATUS_READY)
+
+        iface = self._mocked()
+        iface.hvcontroller.select_preset.return_value = 43.4
+        with self.assertRaisesRegex(LIFUSolutionError, "voltage_range"):
+            iface.load_preset(0, 0xABCD, 0xDCBA, 400000.0, voltage_range=(37.0, 42.0), turn_hv_on=True)
+        iface.hvcontroller.turn_hv_on.assert_not_called()
+        self._cleared(iface)
+
+        iface = self._mocked()   # no range given: only the device's own limits apply
+        iface.hvcontroller.select_preset.return_value = 43.4
+        iface.load_preset(0, 0xABCD, 0xDCBA, 400000.0)
+        self.assertEqual(iface.status, LIFUInterfaceStatus.STATUS_READY)
 
     def test_a_frequency_the_transmitter_is_not_calibrated_at_is_refused(self):
         iface = self._mocked()
@@ -670,79 +713,25 @@ class TestInterfacePresetLoad(unittest.TestCase):
         iface.hvcontroller.turn_hv_on.assert_not_called()
         self._cleared(iface)
 
-    def test_fda_connection_to_a_multi_module_transmitter_is_refused(self):
-        tx, hv = MagicMock(), MagicMock()
-        tx.is_connected.return_value = True
-        tx.get_module_count.return_value = 2
-        with patch.object(DeviceInterface, "_claim_hw_interface_pid"), \
-                patch.object(DeviceInterface, "_release_hw_interface_pid") as release, \
-                patch.object(DeviceInterface, "_create_devices", return_value=(tx, hv)):
-            with self.assertRaises(LIFUError) as raised:
-                DeviceInterface()
-        self.assertEqual(raised.exception.code, LIFU_ERR_MODULE_COUNT_MISMATCH)
-        tx.close.assert_called_once_with()
-        hv.close.assert_called_once_with()
-        release.assert_called_once_with()
-
-    def _construct(self, tx):
-        hv = MagicMock()
-        with patch.object(DeviceInterface, "_claim_hw_interface_pid"), \
-                patch.object(DeviceInterface, "_release_hw_interface_pid") as release, \
-                patch.object(DeviceInterface, "_create_devices", return_value=(tx, hv)):
-            return DeviceInterface(), hv, release
-
-    def test_an_unanswered_module_count_at_connect_is_checked_at_load_instead(self):
-        tx = MagicMock()
-        tx.is_connected.return_value = True
-        tx.get_module_count.side_effect = LIFUCommunicationError("TX: get_module_count timed out")
-        iface, _hv, release = self._construct(tx)
-        tx.close.assert_not_called()
-        release.assert_not_called()
-        with self.assertRaises(LIFUCommunicationError):
-            iface.load_preset(0, 0xABCD, 0xDCBA, 400000.0)
-        tx.load_preset.assert_not_called()
-
-    def test_an_unexpected_error_at_connect_closes_everything(self):
-        tx = MagicMock()
-        tx.is_connected.return_value = True
-        tx.get_module_count.side_effect = ValueError("refused by the whitelist")
-        hv = MagicMock()
-        with patch.object(DeviceInterface, "_claim_hw_interface_pid"), \
-                patch.object(DeviceInterface, "_release_hw_interface_pid") as release, \
-                patch.object(DeviceInterface, "_create_devices", return_value=(tx, hv)):
-            with self.assertRaises(ValueError):
-                DeviceInterface()
-        tx.close.assert_called_once_with()
-        hv.close.assert_called_once_with()
-        release.assert_called_once_with()
-
-    def test_load_reads_the_calibration_of_the_one_module_it_checked(self):
+    def test_load_reads_the_module_count_once(self):
         iface = self._mocked()
         iface.load_preset(0, 0xABCD, 0xDCBA, 400000.0)
-        iface.txdevice.refresh_metadata.assert_called_once_with(module_count=1)
         iface.txdevice.get_module_count.assert_called_once_with()
 
-    def test_fda_connection_to_one_module_is_kept(self):
-        tx, hv = MagicMock(), MagicMock()
-        tx.is_connected.return_value = True
-        tx.get_module_count.return_value = 1
-        with patch.object(DeviceInterface, "_claim_hw_interface_pid"), \
-                patch.object(DeviceInterface, "_create_devices", return_value=(tx, hv)):
-            iface = DeviceInterface()
-        self.assertIs(iface.txdevice, tx)
-        tx.close.assert_not_called()
-
-    def test_research_interface_connects_to_a_multi_module_transmitter(self):
-        # LIFUInterface drives multi-module research rigs; only its preset load is single-module.
-        tx, hv = MagicMock(), MagicMock()
-        tx.is_connected.return_value = True
-        tx.get_module_count.return_value = 2
-        with patch.object(LIFUInterface, "_claim_hw_interface_pid"), \
-                patch.object(LIFUInterface, "_create_devices", return_value=(tx, hv)):
-            iface = LIFUInterface()
-        self.assertIs(iface.txdevice, tx)
-        tx.connect.assert_called_once_with()
-        tx.close.assert_not_called()
+    def test_connect_does_not_check_the_module_count(self):
+        # The module guard is at set-preset; any transmitter may connect.
+        for cls in (DeviceInterface, LIFUInterface):
+            with self.subTest(cls=cls.__name__):
+                tx, hv = MagicMock(), MagicMock()
+                tx.is_connected.return_value = True
+                tx.get_module_count.return_value = 2
+                with patch.object(cls, "_claim_hw_interface_pid"), \
+                        patch.object(cls, "_create_devices", return_value=(tx, hv)):
+                    iface = cls()
+                self.assertIs(iface.txdevice, tx)
+                tx.connect.assert_called_once_with()
+                tx.get_module_count.assert_not_called()
+                tx.close.assert_not_called()
 
     def test_transmitter_refusal_leaves_the_console_with_nothing_selected(self):
         iface = self._mocked()
@@ -783,13 +772,14 @@ class TestInterfacePresetLoad(unittest.TestCase):
         iface.hvcontroller.turn_hv_off.assert_called_once_with()
         self.assertNotEqual(iface.status, LIFUInterfaceStatus.STATUS_RUNNING)
 
-    def test_fda_transmitter_loads_presets_on_module_0_only(self):
+    def test_fda_transmitter_loads_any_module(self):
+        # Multi-module presets are supported; the module-count guard is DeviceInterface.load_preset's.
         tx = TxDevice()
         uart = _mock_uart(tx, "TX")
-        for call in (lambda: tx.load_preset(0, 1, module=1, settings_crc=2), lambda: tx.unload_preset(module=1)):
-            with self.assertRaisesRegex(ValueError, "one module"):
-                call()
-        uart.send_packet.assert_not_called()
+        uart.send_packet.return_value = _packet(b"")
+        tx.load_preset(0, 1, module=1, settings_crc=2)
+        tx.unload_preset(module=1)
+        self.assertEqual([c.kwargs["addr"] for c in uart.send_packet.call_args_list], [1, 1])
 
     def test_research_transmitter_loads_presets_on_any_module(self):
         # PRESET_MODE images span modules; LIFUTXPresets.load_preset loads each in turn.

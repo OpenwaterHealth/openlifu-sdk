@@ -20,7 +20,7 @@ import pytest
 
 pytest.importorskip("PyQt6")
 
-from sr003_presets import flash_entry  # noqa: E402 -- reason: after the PyQt6 importorskip
+from sr003_presets import flash_entry, two_module_flash_entry  # noqa: E402 -- reason: after the PyQt6 importorskip
 
 from openlifu_sdk.io.exceptions import LIFUDeviceError, LIFUError, LIFUSolutionError  # noqa: E402 -- reason: after the PyQt6 importorskip
 from openlifu_sdk.io.LIFUConfig import (  # noqa: E402 -- reason: after the PyQt6 importorskip
@@ -28,6 +28,7 @@ from openlifu_sdk.io.LIFUConfig import (  # noqa: E402 -- reason: after the PyQt
     OW_HV_FDA_REFUSED,
     OW_HV_NO_PRESET,
     OW_HV_RANGE,
+    OW_BAD_CRC,
     OW_HV_DATA_ERROR,
     OW_NO_PRESET,
     OW_TEMP_TOO_HIGH,
@@ -175,20 +176,46 @@ def test_the_calibration_is_reread_on_every_load(iface):
     assert iface.hvcontroller.supply_voltage == pytest.approx(40.0 * 2720 / 2744)
 
 
-def test_fda_interface_refuses_a_multi_module_transmitter():
-    with pytest.raises(LIFUError) as excinfo:
-        SimulatedDeviceInterface(num_modules=2)
-    assert excinfo.value.code == LIFU_ERR_MODULE_COUNT_MISMATCH
-
-
-def test_research_interface_keeps_multi_module_but_not_its_preset_load():
-    mc, regs = flash_entry()
-    interface = SimulatedLIFUInterface(num_modules=2, preset_flash=[(mc, regs)])
+@pytest.mark.parametrize("interface_cls", [SimulatedDeviceInterface, SimulatedLIFUInterface])
+def test_a_two_module_preset_loads_on_a_two_module_transmitter(interface_cls):
+    mc, regs = two_module_flash_entry()
+    assert isinstance(regs, list) and len(regs) == 2
+    interface = interface_cls(num_modules=2, preset_flash=[(mc, regs)])
     try:
-        with pytest.raises(LIFUError) as excinfo:
-            interface.load_preset(0, mc["settings_crc"], regs, 400_000.0)
-        assert excinfo.value.code == LIFU_ERR_MODULE_COUNT_MISMATCH
-        assert interface.txdevice.get_loaded_preset() == (None, None)
+        interface.load_preset(0, mc["settings_crc"], regs, 400_000.0)
+        assert interface.txdevice._loaded_modules == {0, 1}
+        assert interface.get_status() == LIFUInterfaceStatus.STATUS_READY
+        interface.unload_preset()
+        assert interface.txdevice._loaded_modules == set()
+    finally:
+        interface.close()
+
+
+@pytest.mark.parametrize("interface_cls", [SimulatedDeviceInterface, SimulatedLIFUInterface])
+def test_a_preset_whose_module_count_differs_from_the_transmitter_is_refused(interface_cls):
+    # The set-preset guard: the diathermy preset (64 elements, 1x) on a 2x transmitter, and the reverse.
+    one, one_regs = flash_entry()
+    two, two_regs = two_module_flash_entry()
+    for modules, (mc, regs) in ((2, (one, one_regs)), (1, (two, two_regs))):
+        interface = interface_cls(num_modules=modules, preset_flash=[(mc, regs)])
+        try:
+            with pytest.raises(LIFUError) as excinfo:
+                interface.load_preset(0, mc["settings_crc"], regs, 400_000.0)
+            assert excinfo.value.code == LIFU_ERR_MODULE_COUNT_MISMATCH
+            assert interface.txdevice._loaded_modules == set()
+            assert interface.get_status() == LIFUInterfaceStatus.STATUS_ERROR
+        finally:
+            interface.close()
+
+
+def test_a_module_crc_from_another_preset_is_refused_by_that_module():
+    mc, regs = two_module_flash_entry()
+    interface = SimulatedDeviceInterface(num_modules=2, preset_flash=[(mc, regs)])
+    try:
+        with pytest.raises(LIFUDeviceError) as excinfo:
+            interface.load_preset(0, mc["settings_crc"], [regs[0], regs[0]], 400_000.0)
+        assert _code(excinfo) == OW_BAD_CRC
+        assert interface.txdevice._loaded_modules == set()   # on both or on neither
     finally:
         interface.close()
 
@@ -218,20 +245,23 @@ def test_preset_37_42_loads_within_its_range(interface_cls):
         interface.close()
 
 
-def test_non_fda_console_holds_a_select_to_the_presets_own_range():
-    # 43.4 V: inside the FDA hard stop, outside this preset's [37, 42].
+@pytest.mark.parametrize("interface_cls", [SimulatedDeviceInterface, SimulatedLIFUInterface])
+def test_the_host_holds_a_load_to_the_presets_own_range(interface_cls):
+    # Calibration 2507 at 400 kHz: 43.4 V, inside the FDA hard stop, outside this preset's [37, 42].
     mc, regs = flash_entry(voltage_range=[37.0, 42.0])
-    ruo = SimulatedLIFUInterface(preset_flash=[(mc, regs)])
-    fda = SimulatedDeviceInterface(preset_flash=[(mc, regs)])
+    interface = interface_cls(preset_flash=[(mc, regs)])
     try:
-        with pytest.raises(LIFUDeviceError) as excinfo:
-            ruo.hvcontroller.select_preset(0, mc["settings_crc"], 2507.0)
-        assert _code(excinfo) == OW_HV_RANGE
-        # The FDA image never sees the preset's range (the host checks it): only its hard stop applies.
-        assert fda.hvcontroller.select_preset(0, mc["settings_crc"], 2507.0) == pytest.approx(43.4, abs=0.01)
+        interface.txdevice._user_configs[0]["module"]["sensitivity"] = [[400000, 2507]]
+        with pytest.raises(LIFUSolutionError, match="voltage_range"):
+            interface.load_preset(0, mc["settings_crc"], regs, 400_000.0,
+                                  voltage_range=tuple(mc["voltage_range"]), turn_hv_on=True)
+        assert interface.hvcontroller.get_hv_status() is False
+        assert interface.txdevice.get_loaded_preset() == (None, None)
+        # The consoles themselves never see the range: without it, the same load goes through.
+        interface.load_preset(0, mc["settings_crc"], regs, 400_000.0)
+        assert interface.hvcontroller.supply_voltage == pytest.approx(43.4, abs=0.01)
     finally:
-        ruo.close()
-        fda.close()
+        interface.close()
 
 
 def test_preset_35_55_works_unless_the_fda_hard_stop_is_crossed():

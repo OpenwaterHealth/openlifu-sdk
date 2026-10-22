@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import json
 
-from openlifu_sdk.io.LIFUTXPresets import compile_preset, regs_crc
+from openlifu_sdk.io.LIFUTXPresets import compile_preset, preset_modules, regs_crc
 
 # The simulated transmitter's default calibration is 2720 at 400 kHz, so this
 # preset's 40 V applies unscaled, inside the console's 35-45 V FDA window.
@@ -32,10 +32,22 @@ DEFAULTS = {
 }
 
 
-def flash_entry(**overrides) -> tuple[dict, int]:
+def flash_entry(**overrides) -> tuple[dict, int | list[int]]:
     """``(machine_config, regs_crc)`` for a preset file holding DEFAULTS with
-    *overrides*: what ``preset_flash`` takes. ``machine_config["settings_crc"]``
-    is the file's CRC."""
+    *overrides*: what ``preset_flash`` takes, and what ``load_preset`` is
+    given. ``regs_crc`` is one int for a 1x preset (64 elements) and one per
+    module for a preset that spans more (128 elements: 2x).
+    ``machine_config["settings_crc"]`` is the file's CRC."""
     doc = dict(DEFAULTS, **overrides)
     machine_config = compile_preset(doc, settings_bytes=json.dumps(doc).encode())
-    return machine_config, regs_crc(machine_config)
+    modules = preset_modules(machine_config)
+    if modules == 1:
+        return machine_config, regs_crc(machine_config)
+    return machine_config, [regs_crc(machine_config, m) for m in range(modules)]
+
+
+def two_module_flash_entry(**overrides) -> tuple[dict, list[int]]:
+    """A 2x preset (128 elements), as the vet app ships. Its delays differ per
+    element, so each module's part of the preset (and its regs_crc) differs."""
+    parts = {"delays": [[i * 1e-8 for i in range(128)]], "apodization": [[1.0] * 128]}
+    return flash_entry(**{**parts, **overrides})

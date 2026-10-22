@@ -68,7 +68,8 @@ def test_get_preset_matches_real_txdevice_shape():
     # Same keys TxDevice.get_preset returns from OW_PRESET_GET.
     assert set(a) == {"count", "index", "chip_count", "profile_count", "settings_crc",
                       "regs_crc", "baked_regs_crc", "id", "train_counts",
-                      "start_c", "shutoff_c"}
+                      "start_c", "shutoff_c", "modules"}
+    assert (a["chip_count"], a["modules"]) == (2, 1)   # this module's chips; a 1x preset
     assert tx.get_preset(1)["id"] == "preset-B"
 
 

@@ -142,9 +142,11 @@ def preset_voltage_range(machine_config: Dict) -> tuple[float, float] | None:
     None if it has none.
 
     Preset data: the range the applied (sensitivity-rescaled) voltage may
-    take for this preset. An FDA_MODE console does not see it -- its image
-    only carries a fixed 35-45 V hard stop -- so on FDA hardware it is the
-    host's to check; consoles that are not FDA images check it themselves.
+    take for this preset. The host checks it: pass it to
+    ``DeviceInterface.load_preset(voltage_range=...)``, which refuses a select
+    whose applied voltage is outside it. No console sees it; an FDA_MODE
+    console holds every select to its own fixed 35-45 V hard stop as a
+    second line.
 
     Raises:
         ValueError: Not two finite positive numbers with low <= high.

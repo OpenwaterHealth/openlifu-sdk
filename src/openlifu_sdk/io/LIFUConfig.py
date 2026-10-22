@@ -42,6 +42,9 @@ OW_UNKNOWN_COMMAND = 0xFC
 OW_BAD_CRC = 0xFD
 OW_INVALID_PACKET = 0xFE
 OW_HV_DATA_ERROR = 0xFE     # console: malformed select (e.g. a sensitivity that is not positive); TX calls 0xFE OW_INVALID_PACKET
+# Console firmware names (hv_presets.c / common.h on feature/fda-hv-presets): OW_HV_RANGE = OW_CODE_HV_RANGE,
+# OW_HV_PRESET_CRC = OW_CODE_PRESET_CRC, OW_HV_NO_PRESET = OW_CODE_NO_PRESET,
+# OW_HV_FDA_REFUSED = OW_CODE_FDA_REFUSED, OW_HV_DATA_ERROR = OW_CODE_DATA_ERROR.
 OW_UNKNOWN_ERROR = 0xFF
 
 # Global Commands
