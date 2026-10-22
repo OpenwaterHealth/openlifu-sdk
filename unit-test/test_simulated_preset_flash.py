@@ -13,8 +13,10 @@ import pytest
 
 pytest.importorskip("PyQt6")
 
-from openlifu_sdk.io.exceptions import LIFUDeviceError
-from openlifu_sdk.io.LIFUConfig import OW_BAD_CRC, OW_HV_PRESET_CRC
+from sr003_presets import flash_entry  # noqa: E402 -- reason: after the PyQt6 importorskip
+
+from openlifu_sdk.io.exceptions import LIFUDeviceError  # noqa: E402 -- reason: after the PyQt6 importorskip
+from openlifu_sdk.io.LIFUConfig import OW_BAD_CRC, OW_HV_PRESET_CRC  # noqa: E402 -- reason: after the PyQt6 importorskip
 from openlifu_sdk.io.LIFUTXPresets import preset_sensitivity
 from openlifu_sdk.ui.simulated_interface import (
     SimulatedDeviceInterface,
@@ -158,20 +160,21 @@ def test_hv_get_preset_reports_sensitivity_as_the_console_does():
 
 
 def test_interface_load_preset_scales_hv_by_sensitivity_at_frequency():
-    """End-to-end FDA load: TX loads the preset, HV voltage is the
-    preset voltage scaled by ref / device sensitivity at the preset
-    frequency (the sim's default module table: 2720 @ 400 kHz,
-    2267 @ 410 kHz)."""
-    mc = _mc("preset-A", 0x11111111, voltage=12.0, sensitivity=2720.0,
-             voltage_range=[5.0, 20.0])
-    interface = SimulatedDeviceInterface(preset_flash=[(mc, 0xAAAAAAAA)])
+    """End-to-end FDA load with the SR-003 CRCs: TX loads the preset, HV
+    voltage is the preset voltage scaled by preset / device sensitivity at
+    the preset frequency (the sim's default module table: 2720 @ 400 kHz,
+    2744 @ 395 kHz)."""
+    mc, regs = flash_entry(pulse_train_count_selections=[1, 2, 3])
+    interface = SimulatedDeviceInterface(preset_flash=[(mc, regs)])
 
-    interface.load_preset(0, 0x11111111, 0xAAAAAAAA, 400_000.0, duration_index=2)
+    interface.load_preset(0, mc["settings_crc"], regs, 400_000.0, duration_index=2)
     assert interface.txdevice.get_loaded_preset() == (0, 2)
-    assert interface.hvcontroller.supply_voltage == pytest.approx(12.0)
+    assert interface.hvcontroller.supply_voltage == pytest.approx(40.0)
 
-    interface.load_preset(0, 0x11111111, 0xAAAAAAAA, 410_000.0)
-    assert interface.hvcontroller.supply_voltage == pytest.approx(12.0 * 2720.0 / 2267.0)
+    mc395, regs395 = flash_entry(frequency_khz=395.0)
+    interface = SimulatedDeviceInterface(preset_flash=[(mc395, regs395)])
+    interface.load_preset(0, mc395["settings_crc"], regs395, 395_000.0)
+    assert interface.hvcontroller.supply_voltage == pytest.approx(40.0 * 2720.0 / 2744.0)
 
 
 def test_interface_load_preset_settings_crc_mismatch_is_refused_by_the_transmitter():
@@ -204,13 +207,13 @@ def test_interface_load_preset_hv_settings_crc_mismatch():
 
 
 def test_refused_select_leaves_nothing_selected():
-    interface = SimulatedDeviceInterface(
-        preset_flash=[(_mc("preset-A", 0x11111111), 0xAAAAAAAA)]
-    )
-    interface.load_preset(0, 0x11111111, 0xAAAAAAAA, 400_000.0)
+    mc, regs = flash_entry()
+    interface = SimulatedDeviceInterface(preset_flash=[(mc, regs)])
+    interface.load_preset(0, mc["settings_crc"], regs, 400_000.0)
     assert interface.hvcontroller.get_preset(0)["selected"] == 0
-    with pytest.raises(LIFUDeviceError):
-        interface.hvcontroller.select_preset(0, 0xDEADBEEF, 2720.0, 400_000.0)
+    with pytest.raises(LIFUDeviceError) as excinfo:
+        interface.hvcontroller.select_preset(0, mc["settings_crc"] ^ 0xDEADBEEF, 2720.0)
+    assert excinfo.value.device_error_code == OW_HV_PRESET_CRC
     assert interface.hvcontroller.get_preset(0)["selected"] is None
 
 

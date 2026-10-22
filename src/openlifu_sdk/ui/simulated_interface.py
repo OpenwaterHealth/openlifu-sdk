@@ -62,8 +62,18 @@ else:
         _QT_BACKEND = "PythonQt"
 
 from openlifu_sdk.io import LIFUInterfaceStatus
-from openlifu_sdk.io.exceptions import LIFUDeviceError, LIFUSolutionError
-from openlifu_sdk.io.LIFUConfig import OW_BAD_CRC, OW_HV_PRESET_CRC
+from openlifu_sdk.io.exceptions import LIFUDeviceError, LIFUError, LIFUSolutionError
+from openlifu_sdk.io.LIFUConfig import (
+    LIFU_ERR_MODULE_COUNT_MISMATCH,
+    OW_BAD_CRC,
+    OW_HV_FDA_REFUSED,
+    OW_HV_NO_PRESET,
+    OW_HV_PRESET_CRC,
+    OW_HV_RANGE,
+    OW_INVALID_PACKET,
+    OW_NO_PRESET,
+    OW_TEMP_TOO_HIGH,
+)
 from openlifu_sdk.io.LIFUTXPresets import preset_sensitivity
 from openlifu_sdk.io.LIFUUserConfig import sensitivity_at_frequency
 from openlifu_sdk.io.signal import OWSignal
@@ -71,6 +81,11 @@ from openlifu_sdk.ui.status_frame import format_status_frame as _format_status_f
 
 logger = logging.getLogger(__name__)
 logger.debug("openlifu_sdk.ui.simulated_interface using Qt backend: %s", _QT_BACKEND)
+
+# The only HV setpoints an FDA_MODE console's select may arrive at
+# (FDA_HV_MIN_VOLTS / FDA_HV_MAX_VOLTS in the console firmware's hv_presets.h).
+# Fixed in the firmware: a preset's voltage_range never reaches the console.
+FDA_HV_WINDOW_V = (35.0, 45.0)
 
 # k chosen so 45 V * 0.25 duty * 600 s -> 50 deg C
 TX_HEATING_K = 50.0 / (45.0 * 45.0 * 0.25 * 600.0)
@@ -512,6 +527,16 @@ class SimulatedTxDevice:
         }
 
     def start_trigger(self):
+        """Same refusals as an FDA_MODE transmitter (presets_start_check in
+        the firmware): nothing loaded, or module 0 above the loaded preset's
+        start_C. The simulator always has a temperature reading, so it never
+        reports OW_TEMP_UNKNOWN."""
+        if self._loaded_preset_index is None:
+            raise LIFUDeviceError("TX: no preset loaded", device_error_code=OW_NO_PRESET)
+        start_c = self._preset_flash[self._loaded_preset_index][0].get("start_C")
+        if start_c is not None and self._modules[0].read_temp() > float(start_c):
+            raise LIFUDeviceError(f"TX above start_C {float(start_c):.1f} C",
+                                  device_error_code=OW_TEMP_TOO_HIGH)
         self._trigger_running = True
 
     def stop_trigger(self):
@@ -556,6 +581,11 @@ class SimulatedLIFUTxDevice(SimulatedTxDevice):
     """Fake of the RUO :class:`~openlifu_sdk.io.LIFUTXDevice.LIFUTxDevice`."""
 
     _async_mode = False
+
+    def start_trigger(self):
+        """An RUO image starts whatever solution was programmed; there is no
+        preset gate."""
+        self._trigger_running = True
 
     def get_tx_module_count(self) -> int:
         return self.num_modules
@@ -647,16 +677,18 @@ class SimulatedHVController:
         self.supply_voltage = 0.0
         self.last_device_sensitivity: Optional[float] = None
         self._selected_preset_index: Optional[int] = None
+        # Matches SimulatedTxDevice's default preset; its sensitivity equals the
+        # default transmitter calibration at 400 kHz, so a select applies 40 V.
         self._presets = [{
             "count": 1,
             "index": 0,
             "selected": None,
             "settings_crc": 0x12345678,
-            "voltage": 20.0,
+            "voltage": 40.0,
             "id": "sim-default",
-            "sensitivity": None,
-            "min_voltage": 5.0,
-            "max_voltage": 100.0,
+            "sensitivity": 2720.0,
+            "min_voltage": FDA_HV_WINDOW_V[0],
+            "max_voltage": FDA_HV_WINDOW_V[1],
         }]
 
         # Reported firmware version. See
@@ -686,6 +718,9 @@ class SimulatedHVController:
     # ---- methods --------------------------------------------------------
 
     def turn_hv_on(self):
+        """An FDA_MODE console refuses HV on until a preset is selected."""
+        if self._selected_preset_index is None:
+            raise LIFUDeviceError("HV: no preset selected", device_error_code=OW_HV_NO_PRESET)
         self._hv_on = True
         return True
 
@@ -728,39 +763,45 @@ class SimulatedHVController:
         preset["selected"] = self._selected_preset_index
         return preset
 
-    def select_preset(self,
-                      index: int,
-                      settings_crc: int,
-                      device_sensitivity: float | None = None,
-                      frequency_hz: float | None = None) -> bool:
-        if (device_sensitivity is None) != (frequency_hz is None):
-            raise ValueError("device_sensitivity and frequency_hz must be given together")
-        # Like the firmware, a select that is refused leaves nothing selected.
-        self.deselect_preset()
+    def select_preset(self, index: int, settings_crc: int, device_sensitivity: float) -> float:
+        """Same contract and refusals as :meth:`HVController.select_preset` on
+        an FDA_MODE console (preset_select in hv_presets.c). Returns the
+        voltage applied."""
+        if self._hv_on:
+            raise LIFUDeviceError("HV: HV is on; turn it off to select a preset",
+                                  device_error_code=OW_HV_FDA_REFUSED)
+        # Like the firmware, anything short of a select that succeeds leaves nothing selected.
+        self._clear_selection()
         preset = self.get_preset(index)
-        if int(preset.get("settings_crc", settings_crc)) != int(settings_crc):
-            raise LIFUDeviceError("HV: preset settings CRC mismatch",
+        if int(preset["settings_crc"]) != int(settings_crc):
+            raise LIFUDeviceError("HV: settings_crc is not this preset's",
                                   device_error_code=OW_HV_PRESET_CRC)
-        voltage = float(preset.get("voltage", 0.0))
-        ref_sensitivity = preset.get("sensitivity")
-        if (
-            ref_sensitivity is not None
-            and isinstance(device_sensitivity, (int, float))
-            and float(device_sensitivity) > 0.0
-        ):
-            voltage *= float(ref_sensitivity) / float(device_sensitivity)
-        min_voltage = float(preset.get("min_voltage", voltage))
-        max_voltage = float(preset.get("max_voltage", voltage))
-        voltage = max(min_voltage, min(max_voltage, voltage))
+        if not (isinstance(device_sensitivity, (int, float)) and math.isfinite(device_sensitivity)
+                and device_sensitivity > 0):
+            # The console's OW_CODE_DATA_ERROR; 0xFE, the value the SDK names OW_INVALID_PACKET.
+            raise LIFUDeviceError("HV: transmitter sensitivity must be a positive number",
+                                  device_error_code=OW_INVALID_PACKET)
+        volts = float(preset["voltage"]) * float(preset["sensitivity"]) / float(device_sensitivity)
+        if not preset["min_voltage"] <= volts <= preset["max_voltage"]:
+            raise LIFUDeviceError(f"HV: {volts:.2f} V for this transmitter is outside the FDA window",
+                                  device_error_code=OW_HV_RANGE)
         self._selected_preset_index = index
-        self.last_device_sensitivity = float(device_sensitivity) if isinstance(device_sensitivity, (int, float)) else None
-        self._voltage_setpoint = voltage
-        self.supply_voltage = voltage
-        return True
+        self.last_device_sensitivity = float(device_sensitivity)
+        self._voltage_setpoint = volts
+        self.supply_voltage = volts
+        return volts
+
+    def _clear_selection(self) -> None:
+        self._selected_preset_index = None
+        self.supply_voltage = None
 
     def deselect_preset(self) -> bool:
-        """Same contract as :meth:`HVController.deselect_preset`."""
-        self._selected_preset_index = None
+        """Same contract as :meth:`HVController.deselect_preset`: refused
+        while HV is on."""
+        if self._hv_on:
+            raise LIFUDeviceError("HV: HV is on; turn it off to select a preset",
+                                  device_error_code=OW_HV_FDA_REFUSED)
+        self._clear_selection()
         return True
 
     def get_voltage(self) -> float:
@@ -812,6 +853,12 @@ class SimulatedLIFUHVController(SimulatedHVController):
 
     uart = None  # connector reads this for FW DFU; not used here
     _rgb_state = 0
+
+    def turn_hv_on(self):
+        """An RUO console turns HV on at whatever voltage was set; there is
+        no preset gate."""
+        self._hv_on = True
+        return True
 
     def turn_12v_on(self):
         self._v12_on = True
@@ -1065,6 +1112,8 @@ class SimulatedDeviceInterface(QObject):
     #: interface from a real :class:`~openlifu_sdk.io.LIFUInterface`
     #: without importing the simulated class itself.
     is_simulated: bool = True
+    #: As :attr:`DeviceInterface.single_module_device`.
+    single_module_device: bool = True
 
     def __init__(self, num_modules: int = 1,
                  transducer=None,
@@ -1077,6 +1126,11 @@ class SimulatedDeviceInterface(QObject):
             if modules_attr is not None:
                 num_modules = max(1, len(list(modules_attr)))
         super().__init__()
+        if self.single_module_device and int(num_modules) != 1:
+            raise LIFUError(
+                f"TX reports {int(num_modules)} transmitter module(s); preset load supports exactly one",
+                code=LIFU_ERR_MODULE_COUNT_MISMATCH,
+            )
         self.txdevice, self.hvcontroller = self._create_devices(num_modules, preset_flash)
         self.status = LIFUInterfaceStatus.STATUS_SYS_OFF
         self._engine: Optional[_SimulatedRunEngine] = None
@@ -1087,7 +1141,6 @@ class SimulatedDeviceInterface(QObject):
         if preset_flash is not None:
             hv_presets: list[dict] = []
             for index, (machine_config, _regs_crc) in enumerate(preset_flash):
-                voltage_range = machine_config.get("voltage_range") or [machine_config.get("voltage", 0.0), machine_config.get("voltage", 0.0)]
                 hv_presets.append({
                     "count": len(preset_flash),
                     "index": index,
@@ -1098,8 +1151,8 @@ class SimulatedDeviceInterface(QObject):
                     # As HVController.get_preset reports it: the console bakes it as float32.
                     "sensitivity": (preset_sensitivity(machine_config)
                                     if machine_config.get("sensitivity") is not None else None),
-                    "min_voltage": float(voltage_range[0]),
-                    "max_voltage": float(voltage_range[1]),
+                    "min_voltage": FDA_HV_WINDOW_V[0],
+                    "max_voltage": FDA_HV_WINDOW_V[1],
                 })
             self.hvcontroller.configure_presets(hv_presets)
 
@@ -1123,26 +1176,28 @@ class SimulatedDeviceInterface(QObject):
                     frequency_hz: float,
                     duration_index: int = 0, turn_hv_on: bool = False,
                     wait_for_settle: bool = False) -> bool:
-        # Like DeviceInterface.load_preset: on both, or, if either refuses, on neither.
+        """Same contract as :meth:`DeviceInterface.load_preset`: one module
+        only, on both devices or, if either refuses, on neither."""
+        if self.txdevice.get_module_count() != 1:
+            raise LIFUError(
+                f"TX reports {self.txdevice.get_module_count()} transmitter module(s); "
+                "preset load supports exactly one",
+                code=LIFU_ERR_MODULE_COUNT_MISMATCH,
+            )
         try:
             self.txdevice.load_preset(preset_index, regs_crc, duration_index, settings_crc=settings_crc)
-            if not self.txdevice.module_user_configs:
-                self.txdevice.refresh_metadata()
+            self.txdevice.refresh_metadata()
             device_sensitivity = self.txdevice.get_sensitivity_for_frequency(frequency_hz)
             if device_sensitivity is None:
                 raise LIFUSolutionError(
                     f"TX device sensitivity is unavailable at {frequency_hz:.3f} Hz; "
                     "cannot select FDA preset on HV.")
-            self.hvcontroller.select_preset(
-                preset_index,
-                settings_crc,
-                device_sensitivity,
-                frequency_hz,
-            )
-        except Exception:
+            self._last_solution_voltage = self.hvcontroller.select_preset(
+                preset_index, settings_crc, device_sensitivity)
+        except Exception:  # reason: any failure must not leave half a preset loaded; re-raised
             self.unload_preset()
+            self.set_status(LIFUInterfaceStatus.STATUS_ERROR)
             raise
-        self._last_solution_voltage = self.hvcontroller.supply_voltage or self._last_solution_voltage
         self.set_status(LIFUInterfaceStatus.STATUS_READY)
         if turn_hv_on:
             self.hvcontroller.turn_hv_on()
@@ -1152,26 +1207,34 @@ class SimulatedDeviceInterface(QObject):
 
     def start_sonication(self, turn_hv_on: bool = True,
                          wait_for_settle: bool = True) -> bool:
-        if turn_hv_on:
-            self.hvcontroller.turn_hv_on()
-        if wait_for_settle:
-            # Brief settle delay (real device is ~200 ms); not perceptible
-            # but matches the real code path's blocking nature.
-            time.sleep(0.2)
+        """Same contract as :meth:`DeviceInterface.start_sonication`: a
+        refusal from either device is raised with HV turned back off."""
         # Stop any previous engine before starting a new one (pause/resume
         # rebuilds the trigger then re-calls start_sonication).
         if self._engine is not None and self._engine.alive:
             self._engine.stop()
-        self._engine = _SimulatedRunEngine(
-            txdevice=self.txdevice,
-            hvcontroller=self.hvcontroller,
-            sequence=self.txdevice._sequence,
-            pulse=self.txdevice._pulse,
-            voltage=self._last_solution_voltage,
-            trigger_mode=self._last_trigger_mode,
-            parent=self,
-        )
-        self._engine.start()
+        try:
+            if turn_hv_on:
+                self.hvcontroller.turn_hv_on()
+            if wait_for_settle:
+                # Brief settle delay (real device is ~200 ms); not perceptible
+                # but matches the real code path's blocking nature.
+                time.sleep(0.2)
+            self._engine = _SimulatedRunEngine(
+                txdevice=self.txdevice,
+                hvcontroller=self.hvcontroller,
+                sequence=self.txdevice._sequence,
+                pulse=self.txdevice._pulse,
+                voltage=self._last_solution_voltage,
+                trigger_mode=self._last_trigger_mode,
+                parent=self,
+            )
+            self._engine.start()
+        except LIFUError:
+            # No trigger, no HV.
+            self._engine = None
+            self.hvcontroller.turn_hv_off()
+            raise
         self.set_status(LIFUInterfaceStatus.STATUS_RUNNING)
         return True
 
@@ -1200,14 +1263,8 @@ class SimulatedDeviceInterface(QObject):
         if self._engine is not None:
             self._engine.stop()
             self._engine = None
-        try:
-            self.hvcontroller.close()
-        except Exception:
-            pass
-        try:
-            self.txdevice.close()
-        except Exception:
-            pass
+        self.hvcontroller.close()
+        self.txdevice.close()
 
 
 # =============================================================================
@@ -1216,6 +1273,8 @@ class SimulatedDeviceInterface(QObject):
 
 class SimulatedLIFUInterface(SimulatedDeviceInterface):
     """Compatibility fake for the research/RUO :class:`openlifu_sdk.LIFUInterface`."""
+
+    single_module_device = False
 
     def __init__(self, num_modules: int = 1,
                  transducer=None,
