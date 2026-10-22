@@ -68,7 +68,9 @@ from openlifu_sdk.io.LIFUConfig import (
     TRIGGER_MODE_SEQUENCE,
     TRIGGER_MODE_SINGLE,
     TX7332_COMMANDS,
+    FDA_READ_ONLY_COMMANDS,
     TX_FDA_COMMANDS,
+    TX_FDA_PACKETS,
 )
 from openlifu_sdk.io.LIFUUserConfig import sensitivity_at_frequency
 from openlifu_sdk.util.annotations import OpenLIFUFieldData
@@ -215,6 +217,8 @@ class TxDevice(OWComponent):
     """
 
     SUPPORTED_COMMANDS = TX_FDA_COMMANDS
+    ALLOWED_PACKETS = TX_FDA_PACKETS
+    READ_ONLY_COMMANDS = FDA_READ_ONLY_COMMANDS
 
     def __init__(self, vid: int = OW_VID, pid: int = OW_TRANSMITTER_PID,
                  baudrate: int = 921600, timeout: float = DEFAULT_TIMEOUT, test_mode: bool = False):
@@ -498,6 +502,8 @@ class LIFUTxDevice(LIFUComponentMixin, TxDevice):
     """
 
     SUPPORTED_COMMANDS = GLOBAL_COMMANDS | TX7332_COMMANDS | CONTROLLER_COMMANDS
+    ALLOWED_PACKETS = None
+    READ_ONLY_COMMANDS = frozenset()
 
     def __init__(self, vid: int = OW_VID, pid: int = OW_TRANSMITTER_PID,
                  baudrate: int = 921600, timeout: float = DEFAULT_TIMEOUT, test_mode: bool = False,

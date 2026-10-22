@@ -58,6 +58,12 @@ class OWComponent:
     globals (async monitoring, echo, LED, reset, DFU, config write).
     """
 
+    #: packet type -> opcodes this component may send as that type; None
+    #: allows any packet type for a supported opcode (the RUO components).
+    ALLOWED_PACKETS: dict[int, frozenset[int]] | None = None
+    #: Opcodes this component may only send with ``reserved == 0`` (reads).
+    READ_ONLY_COMMANDS: frozenset[int] = frozenset()
+
     def __init__(self, vid: int, pid: int, supported_commands: set[int],
                  baudrate: int = 921600, timeout: float = DEFAULT_TIMEOUT,
                  desc: str = "VCP"):
@@ -100,14 +106,30 @@ class OWComponent:
 
     # -- Command validation -------------------------------------------
 
-    def _resolve(self, command: int, packet_type: int | None) -> int:
+    def _resolve(self, command: int, packet_type: int | None, reserved: int = 0) -> int:
+        """The packet type *command* goes out as, after the component's rules:
+        the opcode must be one it supports and, where the class restricts
+        them (:attr:`ALLOWED_PACKETS`, :attr:`READ_ONLY_COMMANDS`), the
+        (packet type, opcode) pair must be allowed and a read-only command
+        must be sent as a read (``reserved == 0``).
+
+        Raises:
+            ValueError: The send is not allowed; nothing reaches the wire.
+        """
         if command not in self._supported_commands:
             raise ValueError(
                 f"Command 0x{command:02X} is not supported by {self._uart.desc}"
             )
-        if packet_type is not None:
-            return packet_type
-        return _CMD_TO_PKT_TYPE.get(command, OW_CMD)
+        pt = packet_type if packet_type is not None else _CMD_TO_PKT_TYPE.get(command, OW_CMD)
+        if self.ALLOWED_PACKETS is not None and command not in self.ALLOWED_PACKETS.get(pt, ()):
+            raise ValueError(
+                f"Command 0x{command:02X} as packet type 0x{pt:02X} is not supported by {self._uart.desc}"
+            )
+        if command in self.READ_ONLY_COMMANDS and reserved != 0:
+            raise ValueError(
+                f"Command 0x{command:02X} may only be read (reserved=0) by {self._uart.desc}"
+            )
+        return pt
 
     # -- Send helpers -------------------------------------------------
 
@@ -120,7 +142,7 @@ class OWComponent:
         :meth:`send_checked`, which raises a typed :class:`LIFUError` instead
         of returning ``None``.
         """
-        pt = self._resolve(command, packet_type)
+        pt = self._resolve(command, packet_type, reserved)
         r = self._uart.send_packet(
             packet_type=pt, command=command,
             addr=addr, reserved=reserved, data=data, timeout=timeout,
@@ -366,7 +388,7 @@ class LIFUComponentMixin:
         Returns the packet ID.  The response is delivered via
         ``signal_data_received``; timeouts via ``signal_error``.
         """
-        pt = self._resolve(command, packet_type)
+        pt = self._resolve(command, packet_type, reserved)
         return self._uart.send_packet_async(
             packet_type=pt, command=command,
             addr=addr, reserved=reserved, data=data, timeout=timeout,

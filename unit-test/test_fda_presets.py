@@ -27,12 +27,17 @@ from openlifu_sdk.io.exceptions import LIFUDeviceError, LIFUError, LIFUSolutionE
 from openlifu_sdk.io.LIFUConfig import (
     LIFU_ERR_MODULE_COUNT_MISMATCH,
     OW_BAD_CRC,
+    OW_CMD,
     OW_CMD_ECHO,
+    OW_CMD_USR_CFG,
+    OW_CTRL_START_SWTRIG,
     OW_HV_PRESET_CRC,
+    OW_POWER_HV_ON,
     OW_POWER_PRESET_SELECT,
     OW_POWER_SET_HV,
     OW_PRESET_LOAD,
     OW_RESP,
+    OW_TX7332,
     OW_TX7332_WREG,
 )
 from openlifu_sdk.io.LIFUHVController import HVController, LIFUHVController
@@ -864,6 +869,63 @@ class TestCommandWhitelist(unittest.TestCase):
         uart.send_packet.return_value = _packet(b"")
         hv.send_checked(OW_POWER_SET_HV)
         uart.send_packet.assert_called_once()
+
+    def test_fda_components_refuse_a_user_config_write(self):
+        # reserved=1 is the write: it carries the calibration that scales HV.
+        for component, desc in ((TxDevice(), "TX"), (HVController(), "HV")):
+            with self.subTest(desc=desc):
+                uart = _mock_uart(component, desc)
+                with self.assertRaisesRegex(ValueError, "only be read"):
+                    component.send_checked(OW_CMD_USR_CFG, reserved=1, data=b"{}")
+                uart.send_packet.assert_not_called()
+
+    def test_fda_components_still_read_the_user_config(self):
+        for component, desc in ((TxDevice(), "TX"), (HVController(), "HV")):
+            with self.subTest(desc=desc):
+                uart = _mock_uart(component, desc)
+                uart.send_packet.return_value = _packet(b"")
+                component.send_checked(OW_CMD_USR_CFG, reserved=0)
+                self.assertEqual(uart.send_packet.call_args.kwargs["packet_type"], OW_CMD)
+
+    def test_fda_components_refuse_an_allowed_opcode_as_another_packet_type(self):
+        # Opcode numbers repeat across packet types: the pair is what is allowed.
+        for component, desc, command, packet_type in (
+                (TxDevice(), "TX", OW_CTRL_START_SWTRIG, OW_TX7332),
+                (TxDevice(), "TX", OW_PRESET_LOAD, OW_CMD),
+                (HVController(), "HV", OW_POWER_HV_ON, OW_CMD)):
+            with self.subTest(desc=desc, command=command, packet_type=packet_type):
+                uart = _mock_uart(component, desc)
+                with self.assertRaisesRegex(ValueError, "packet type"):
+                    component.send_checked(command, packet_type=packet_type)
+                uart.send_packet.assert_not_called()
+
+    def test_ruo_components_keep_the_user_config_write(self):
+        for component, desc in ((LIFUTxDevice(), "TX"), (LIFUHVController(), "HV")):
+            with self.subTest(desc=desc):
+                uart = _mock_uart(component, desc)
+                uart.send_packet.return_value = _packet(b"")
+                component.send_checked(OW_CMD_USR_CFG, reserved=1, data=b"{}")
+                uart.send_packet.assert_called_once()
+
+    def test_every_send_the_fda_components_make_is_allowed(self):
+        # Each FDA method, against a mocked link: none is stopped by its own whitelist.
+        tx, hv = TxDevice(), HVController()
+        tx_uart, hv_uart = _mock_uart(tx, "TX"), _mock_uart(hv, "HV")
+        tx_uart.send_packet.return_value = hv_uart.send_packet.return_value = _packet(b"")
+        calls = [tx.ping, tx.get_version, tx.get_hardware_id, tx.read_config, tx.get_temperature,
+                 tx.get_ambient_temperature, tx.get_trigger_json, tx.start_trigger, tx.stop_trigger,
+                 lambda: tx.get_preset(0), lambda: tx.load_preset(0, 1, settings_crc=2),
+                 tx.unload_preset, tx.get_module_count,
+                 hv.ping, hv.get_version, hv.read_config, hv.get_temperature1, hv.get_temperature2,
+                 hv.get_12v_status, hv.turn_hv_on, hv.turn_hv_off, hv.get_hv_status, lambda: hv.get_preset(0),
+                 lambda: hv.select_preset(0, 1, 2720.0), hv.deselect_preset, hv.get_voltage,
+                 hv.get_fan_speed, hv.get_vmon_values]
+        for call in calls:
+            with self.subTest(call=getattr(call, "__name__", "lambda")):
+                try:
+                    call()
+                except LIFUError:
+                    pass   # an empty mocked reply is a protocol error; a whitelist refusal would be ValueError
 
 
 if __name__ == "__main__":

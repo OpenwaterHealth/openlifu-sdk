@@ -32,6 +32,7 @@ OW_PRESET_SLOT_TAIL = 0xF4 # TX: slot holds the second half of the preset before
 OW_PRESET_EMPTY = 0xF5     # TX: nothing stored in the slot
 OW_HV_PRESET_CRC = 0xF6    # console: select's settings_crc is not that preset's
 OW_HV_NO_PRESET = 0xF7     # console: HV on before any preset was selected
+# OW_HV_FDA_REFUSED and OW_FDA_REFUSED share 0xF8: one is the console's, the other the TX's.
 OW_HV_FDA_REFUSED = 0xF8   # console: host-set voltage / raw DACs, or select while HV on
 OW_FDA_REFUSED = 0xF8      # TX: a user config write in FDA mode, where it is read-only
 OW_TEMP_UNKNOWN = 0xF9     # TX: no fresh thermistor reading
@@ -83,7 +84,7 @@ OW_CTRL_GET_PATTERN_PROFILE = 0x29
 
 # FDA and preset modes
 OW_PRESET_GET = 0x50
-OW_PRESET_LOAD = 0x51  
+OW_PRESET_LOAD = 0x51
 # Preset mode only: storing and deleting presets
 OW_PRESET_WRITE = 0x52
 OW_PRESET_COMMIT = 0x53
@@ -183,20 +184,39 @@ GLOBAL_FDA_COMMANDS = {
     OW_CMD_PING, OW_CMD_VERSION, OW_CMD_HWID, OW_CMD_USR_CFG,
 }
 
-TX_FDA_COMMANDS = GLOBAL_FDA_COMMANDS | {
-    OW_CMD_GET_TEMP, OW_CMD_GET_AMBIENT,
-    OW_CTRL_GET_SWTRIG, OW_CTRL_START_SWTRIG, OW_CTRL_STOP_SWTRIG,
-    OW_CTRL_GET_MODULE_COUNT,
-    OW_TX7332_DEVICE_COUNT,  # get_module_count fallback on older images
-    OW_PRESET_GET, OW_PRESET_LOAD,
+# What the FDA components may send, as packet type -> opcodes. Opcode numbers
+# repeat across packet types (an OW_TX7332 opcode can share its number with
+# an allowed OW_CONTROLLER one), so the pair is what is checked, not the
+# number alone. These are exactly the sends TxDevice / HVController make.
+TX_FDA_PACKETS = {
+    OW_CMD: frozenset(GLOBAL_FDA_COMMANDS),
+    OW_CONTROLLER: frozenset({
+        OW_CMD_GET_TEMP, OW_CMD_GET_AMBIENT,
+        OW_CTRL_GET_SWTRIG, OW_CTRL_START_SWTRIG, OW_CTRL_STOP_SWTRIG,
+        OW_CTRL_GET_MODULE_COUNT,
+        OW_PRESET_GET, OW_PRESET_LOAD,
+    }),
+    OW_TX7332: frozenset({OW_TX7332_DEVICE_COUNT}),  # get_module_count fallback on older images
 }
 
-HV_FDA_COMMANDS = GLOBAL_FDA_COMMANDS | {
-    OW_POWER_GET_HV, OW_POWER_HV_ON, OW_POWER_HV_OFF, OW_POWER_GET_HVON,
-    OW_POWER_GET_12VON, OW_POWER_GET_TEMP1, OW_POWER_GET_TEMP2,
-    OW_POWER_GET_FAN, OW_POWER_VMON,
-    OW_POWER_PRESET_GET, OW_POWER_PRESET_SELECT,
+HV_FDA_PACKETS = {
+    OW_CMD: frozenset(GLOBAL_FDA_COMMANDS),
+    OW_POWER: frozenset({
+        OW_POWER_GET_HV, OW_POWER_HV_ON, OW_POWER_HV_OFF, OW_POWER_GET_HVON,
+        OW_POWER_GET_12VON, OW_POWER_GET_TEMP1, OW_POWER_GET_TEMP2,
+        OW_POWER_GET_FAN, OW_POWER_VMON,
+        OW_POWER_PRESET_GET, OW_POWER_PRESET_SELECT,
+    }),
 }
+
+TX_FDA_COMMANDS = set().union(*TX_FDA_PACKETS.values())
+HV_FDA_COMMANDS = set().union(*HV_FDA_PACKETS.values())
+
+# Commands the FDA components may only read with (reserved == 0): the user
+# config carries the sensitivity calibration that scales the HV, and its
+# write is reserved == 1. FDA_MODE firmware refuses that write too
+# (OW_FDA_REFUSED); this keeps an FDA host from sending it at all.
+FDA_READ_ONLY_COMMANDS = frozenset({OW_CMD_USR_CFG})
 
 TRIGGER_MODE_SEQUENCE = 0
 TRIGGER_MODE_CONTINUOUS = 1

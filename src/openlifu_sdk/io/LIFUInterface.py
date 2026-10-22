@@ -223,10 +223,14 @@ class DeviceInterface:
 
     This is the surface FDA-mode applications program against. It loads
     presets baked into device flash (:meth:`load_preset`) and starts / stops
-    them; it has no way to program an arbitrary solution or HV setpoint. Its
-    components are the FDA :class:`TxDevice` / :class:`HVController`, which
-    neither define nor whitelist the RUO commands. It connects synchronously
-    and has no async / USB-monitoring mode.
+    them; it has no method that programs an arbitrary solution or HV
+    setpoint. Its components are the FDA :class:`TxDevice` /
+    :class:`HVController`, which do not define the RUO commands and refuse
+    to send anything but the (packet type, opcode) pairs their own methods
+    use, with the user config read-only. That is a host-side guard; the
+    safety boundary is the FDA_MODE firmware, which refuses those commands
+    itself. It connects synchronously and has no async / USB-monitoring
+    mode.
     :class:`LIFUInterface` extends it with those research (RUO) endpoints.
     """
     hvcontroller: HVController = None

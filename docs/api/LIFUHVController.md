@@ -4,10 +4,18 @@
 
 > **FDA / RUO split.** `HVController` is the FDA component created by
 > `DeviceInterface`: it exposes identity, HV on/off/status, preset
-> select/get, and telemetry reads, and refuses any other opcode before it
-> reaches the wire. Voltage/DAC setters, 12 V rail and fan control, RGB LED,
+> select/get, and telemetry reads, and refuses any other send before it
+> reaches the wire (below). Voltage/DAC setters, 12 V rail and fan control, RGB LED,
 > config writes, DFU and LED/echo/reset live on the RUO subclass
 > `LIFUHVController`, which only `LIFUInterface` creates.
+>
+> **What the host-side check is.** The FDA classes send only the
+> (packet type, opcode) pairs their own methods use, and the user config
+> only as a read (`reserved == 0`); anything else, including through the
+> public `send` / `send_checked`, raises `ValueError` before it reaches the
+> wire. That is a guard against host mistakes, not the safety boundary: an
+> FDA_MODE firmware image refuses register writes, host-set voltage and
+> user-config writes itself (`OW_FDA_REFUSED` / `OW_HV_FDA_REFUSED`).
 
 Constructor
 - `HVController(uart: LIFUUart = None)` — accepts `LIFUUart` for console communication.

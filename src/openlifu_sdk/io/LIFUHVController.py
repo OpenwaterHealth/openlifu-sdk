@@ -8,7 +8,9 @@ from openlifu_sdk.io.LIFUConfig import (
     CONTROLLER_COMMANDS,
     DEFAULT_TIMEOUT,
     GLOBAL_COMMANDS,
+    FDA_READ_ONLY_COMMANDS,
     HV_FDA_COMMANDS,
+    HV_FDA_PACKETS,
     LIFU_ERR_BAD_PAYLOAD_LENGTH,
     OW_CONSOLE_PID,
     OW_POWER,
@@ -60,6 +62,8 @@ class HVController(OWComponent):
     """
 
     SUPPORTED_COMMANDS = HV_FDA_COMMANDS
+    ALLOWED_PACKETS = HV_FDA_PACKETS
+    READ_ONLY_COMMANDS = FDA_READ_ONLY_COMMANDS
 
     def __init__(self,  vid: int = OW_VID, pid: int = OW_CONSOLE_PID,
                  baudrate: int = 921600, timeout: float = DEFAULT_TIMEOUT, test_mode: bool = False):
@@ -369,6 +373,8 @@ class LIFUHVController(LIFUComponentMixin, HVController):
     """
 
     SUPPORTED_COMMANDS = GLOBAL_COMMANDS | CONTROLLER_COMMANDS | POWER_COMMANDS
+    ALLOWED_PACKETS = None
+    READ_ONLY_COMMANDS = frozenset()
 
     def turn_12v_off(self) -> bool:
         """Turn off the 12V rail.
