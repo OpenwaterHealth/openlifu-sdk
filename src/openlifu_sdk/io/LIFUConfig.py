@@ -184,10 +184,11 @@ GLOBAL_FDA_COMMANDS = {
     OW_CMD_PING, OW_CMD_VERSION, OW_CMD_HWID, OW_CMD_USR_CFG,
 }
 
-# What the FDA components may send, as packet type -> opcodes. Opcode numbers
-# repeat across packet types (an OW_TX7332 opcode can share its number with
-# an allowed OW_CONTROLLER one), so the pair is what is checked, not the
-# number alone. These are exactly the sends TxDevice / HVController make.
+# What the FDA components may send, as packet type -> opcodes. The firmware
+# dispatches on the packet type first, so an allowed opcode sent under
+# another packet type reaches a different handler than the one whitelisted.
+# The (packet type, opcode) pair is therefore what is checked, not the
+# opcode alone. These are exactly the sends TxDevice / HVController make.
 TX_FDA_PACKETS = {
     OW_CMD: frozenset(GLOBAL_FDA_COMMANDS),
     OW_CONTROLLER: frozenset({

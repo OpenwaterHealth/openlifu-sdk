@@ -31,7 +31,10 @@ from openlifu_sdk.io.LIFUConfig import (
     OW_CMD,
     OW_CMD_ECHO,
     OW_CMD_USR_CFG,
+    OW_CONTROLLER,
+    OW_CTRL_GET_MODULE_COUNT,
     OW_CTRL_START_SWTRIG,
+    OW_ERROR,
     OW_HV_PRESET_CRC,
     OW_POWER_HV_ON,
     OW_POWER_PRESET_SELECT,
@@ -39,6 +42,7 @@ from openlifu_sdk.io.LIFUConfig import (
     OW_PRESET_LOAD,
     OW_RESP,
     OW_TX7332,
+    OW_TX7332_DEVICE_COUNT,
     OW_TX7332_WREG,
 )
 from openlifu_sdk.io.LIFUHVController import HVController, LIFUHVController
@@ -625,11 +629,14 @@ class TestInterfacePresetLoad(unittest.TestCase):
             for modules in (0, 2):
                 with self.subTest(cls=cls.__name__, modules=modules):
                     iface = self._mocked(cls, modules)
+                    iface.status = LIFUInterfaceStatus.STATUS_READY   # an earlier load succeeded
                     with self.assertRaises(LIFUError) as raised:
                         iface.load_preset(0, 0xABCD, 0xDCBA, 400000.0)
                     self.assertEqual(raised.exception.code, LIFU_ERR_MODULE_COUNT_MISMATCH)
                     iface.txdevice.load_preset.assert_not_called()
                     iface.hvcontroller.select_preset.assert_not_called()
+                    # Handled like any refusal: the earlier load is cleared, status is ERROR.
+                    self._cleared(iface)
 
     def test_a_frequency_the_transmitter_is_not_calibrated_at_is_refused(self):
         iface = self._mocked()
@@ -664,10 +671,17 @@ class TestInterfacePresetLoad(unittest.TestCase):
         self.assertIs(iface.txdevice, tx)
         tx.close.assert_not_called()
 
-    def test_research_interface_does_not_check_at_connect(self):
+    def test_research_interface_connects_to_a_multi_module_transmitter(self):
         # LIFUInterface drives multi-module research rigs; only its preset load is single-module.
-        self.assertFalse(LIFUInterface.single_module_device)
-        self.assertTrue(DeviceInterface.single_module_device)
+        tx, hv = MagicMock(), MagicMock()
+        tx.is_connected.return_value = True
+        tx.get_module_count.return_value = 2
+        with patch.object(LIFUInterface, "_claim_hw_interface_pid"), \
+                patch.object(LIFUInterface, "_create_devices", return_value=(tx, hv)):
+            iface = LIFUInterface()
+        self.assertIs(iface.txdevice, tx)
+        tx.connect.assert_called_once_with()
+        tx.close.assert_not_called()
 
     def test_transmitter_refusal_leaves_the_console_with_nothing_selected(self):
         iface = self._mocked()
@@ -725,16 +739,20 @@ class TestInterfacePresetLoad(unittest.TestCase):
         tx_uart, hv_uart = _mock_uart(iface.txdevice, "TX"), _mock_uart(iface.hvcontroller, "HV")
         tx_uart.send_packet.return_value = _packet(b"")
         hv_uart.send_packet.side_effect = [_packet(struct.pack("<f", 44.75)), _packet(b"")]
-        # Module count and calibration reads are covered elsewhere; this test is about the load wire format.
-        iface.txdevice.get_module_count = MagicMock(return_value=1)
-        iface.txdevice.refresh_metadata = MagicMock()
-        iface.txdevice.module_user_configs = [{"module": {"sensitivity": [[400000, 3220]]}}]
+        # The real module-count and calibration reads: count, load, count, the user config.
+        config = LifuUserConfig(json_data={"sn": "SN-1", "hwid": "HW-1",
+                                           "module": {"sensitivity": [[400000, 3220]]}})
+        tx_uart.send_packet.side_effect = [_packet(bytes([1])), _packet(b""), _packet(bytes([1])),
+                                           _packet(config.to_wire_bytes())]
 
         iface.load_preset(0, 0xAABBCCDD, 0x11223344, 400000.0, duration_index=2)
 
-        sent = tx_uart.send_packet.call_args.kwargs
-        self.assertEqual((sent["command"], sent["reserved"], bytes(sent["data"])),
-                         (OW_PRESET_LOAD, 0, struct.pack("<III", 2, 0x11223344, 0xAABBCCDD)))
+        sent = [c.kwargs for c in tx_uart.send_packet.call_args_list]
+        self.assertEqual([s["command"] for s in sent],
+                         [OW_CTRL_GET_MODULE_COUNT, OW_PRESET_LOAD, OW_CTRL_GET_MODULE_COUNT, OW_CMD_USR_CFG])
+        self.assertEqual((sent[1]["reserved"], bytes(sent[1]["data"])),
+                         (0, struct.pack("<III", 2, 0x11223344, 0xAABBCCDD)))
+        self.assertEqual(sent[3]["reserved"], 0)   # the calibration is read, never written
         sent = hv_uart.send_packet.call_args_list[0].kwargs
         self.assertEqual((sent["command"], sent["reserved"], bytes(sent["data"])),
                          (OW_POWER_PRESET_SELECT, 0, struct.pack("<If", 0xAABBCCDD, 3220.0)))
@@ -923,10 +941,24 @@ class TestCommandWhitelist(unittest.TestCase):
                  hv.get_fan_speed, hv.get_vmon_values]
         for call in calls:
             with self.subTest(call=getattr(call, "__name__", "lambda")):
+                sent = tx_uart.send_packet.call_count + hv_uart.send_packet.call_count
                 try:
                     call()
                 except LIFUError:
                     pass   # an empty mocked reply is a protocol error; a whitelist refusal would be ValueError
+                self.assertGreater(tx_uart.send_packet.call_count + hv_uart.send_packet.call_count, sent)
+
+    def test_module_count_fallback_is_an_allowed_send(self):
+        # Older images refuse OW_CTRL_GET_MODULE_COUNT; the fallback is the one OW_TX7332 pair allowed.
+        tx = TxDevice()
+        uart = _mock_uart(tx, "TX")
+        refused = _packet(b"")
+        refused.packet_type = OW_ERROR
+        uart.send_packet.side_effect = [refused, _packet(bytes([1]))]
+        self.assertEqual(tx.get_module_count(), 1)
+        sent = [c.kwargs for c in uart.send_packet.call_args_list]
+        self.assertEqual([(s["packet_type"], s["command"]) for s in sent],
+                         [(OW_CONTROLLER, OW_CTRL_GET_MODULE_COUNT), (OW_TX7332, OW_TX7332_DEVICE_COUNT)])
 
 
 if __name__ == "__main__":

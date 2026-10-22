@@ -1508,8 +1508,8 @@ class LIFUTxDevice(LIFUComponentMixin, TxDevice):
         Raises:
             None
         """
-        print("TX Device Information") # noqa: T201
-        print("  UART Port:") # noqa: T201
+        print("TX Device Information") # noqa: T201 -- reason: print() is the console dump this method exists for
+        print("  UART Port:") # noqa: T201 -- reason: as above
 
 def get_delay_location(channel:int, profile:int=1):
     """
@@ -1654,9 +1654,9 @@ def print_regs(d):
     for addr, val in sorted(d.items()):
         if isinstance(val, list):
             for i, v in enumerate(val):
-                print(f'0x{addr:X}[+{i:d}]:x{v:08X}') # noqa: T201
+                print(f'0x{addr:X}[+{i:d}]:x{v:08X}') # noqa: T201 -- reason: register dump to the console, by design
         else:
-            print(f'0x{addr:X}:x{val:08X}') # noqa: T201
+            print(f'0x{addr:X}:x{val:08X}') # noqa: T201 -- reason: register dump to the console, by design
 
 def pack_registers(regs, pack_single:bool=False):
     """

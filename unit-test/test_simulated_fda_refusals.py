@@ -193,6 +193,50 @@ def test_research_interface_keeps_multi_module_but_not_its_preset_load():
         interface.close()
 
 
+def test_research_simulator_preset_load_refusal_leaves_error_status():
+    mc, regs = flash_entry()
+    interface = SimulatedLIFUInterface(num_modules=2, preset_flash=[(mc, regs)])
+    try:
+        with pytest.raises(LIFUError):
+            interface.load_preset(0, mc["settings_crc"], regs, 400_000.0)
+        assert interface.get_status() == LIFUInterfaceStatus.STATUS_ERROR
+    finally:
+        interface.close()
+
+
+def test_research_simulator_console_keeps_the_fda_select_rules():
+    # An RUO console image has no preset table, so the simulator's preset select is the
+    # FDA console's on both interfaces; HV on and set_voltage stay ungated (RUO).
+    mc, regs = flash_entry()
+    interface = SimulatedLIFUInterface(preset_flash=[(mc, regs)])
+    try:
+        with pytest.raises(LIFUDeviceError) as excinfo:
+            interface.hvcontroller.select_preset(0, mc["settings_crc"], 2267.0)   # 47.99 V
+        assert _code(excinfo) == OW_HV_RANGE
+        interface.hvcontroller.set_voltage(60.0)
+        interface.hvcontroller.turn_hv_on()
+        with pytest.raises(LIFUDeviceError) as excinfo:
+            interface.hvcontroller.select_preset(0, mc["settings_crc"], 2720.0)
+        assert _code(excinfo) == OW_HV_FDA_REFUSED
+        assert interface.hvcontroller.get_voltage() == pytest.approx(60.0)
+    finally:
+        interface.close()
+
+
+def test_any_failure_starting_the_run_turns_hv_back_off(iface, monkeypatch):
+    # Not only device refusals: an unexpected error building the run must not leave HV on.
+    import openlifu_sdk.ui.simulated_interface as sim
+
+    def broken(*args, **kwargs):
+        raise TypeError("engine construction failed")
+
+    _load(iface)
+    monkeypatch.setattr(sim, "_SimulatedRunEngine", broken)
+    with pytest.raises(TypeError):
+        iface.start_sonication(turn_hv_on=True, wait_for_settle=False)
+    assert iface.hvcontroller.get_hv_status() is False
+
+
 def test_research_simulator_has_no_preset_gates():
     # SlicerOpenLIFU and the test app drive the RUO simulator with set_solution and no preset.
     interface = SimulatedLIFUInterface()

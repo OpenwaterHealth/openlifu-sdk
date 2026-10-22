@@ -186,12 +186,15 @@ def sensitivity_at_frequency(module_configs: Iterable[Dict[str, Any]], freq_hz: 
     """Return a transmitter's sensitivity at *freq_hz* from its module user configs.
 
     Each config's ``module.sensitivity`` is a ``[[freq_hz, sensitivity], ...]``
-    calibration table. A module contributes the entry whose frequency matches
-    *freq_hz* (within :data:`SENSITIVITY_FREQ_TOLERANCE_HZ`) and whose value is
-    a finite positive number -- the same exact match the preset generator uses
-    when it bakes the console record, so host and image agree. There is no
-    interpolation or extrapolation: a frequency the table does not list gives
-    nothing rather than the nearest end point's value.
+    calibration table, measured at discrete frequencies. A module contributes
+    the entry whose frequency matches *freq_hz* (within
+    :data:`SENSITIVITY_FREQ_TOLERANCE_HZ`) and whose value is a finite
+    positive number. The HV scaling (console: voltage x preset sensitivity /
+    this value) therefore only ever uses a measured calibration point. There
+    is no interpolation or extrapolation: a frequency the table does not list
+    gives nothing rather than an estimate or the nearest end point's value.
+    This is the match the FDA bench check (``examples/test_fda_mode.py``,
+    via ``LIFUTXPresets.device_sensitivity``) already used.
 
     Returns:
         The mean over the modules that have a matching entry, or ``None`` if

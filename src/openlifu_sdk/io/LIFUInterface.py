@@ -344,17 +344,18 @@ class DeviceInterface:
         come on, and :attr:`status` is ``STATUS_ERROR``.
 
         Only a single-module transmitter is supported, on this class and on
-        :class:`LIFUInterface`: anything else is refused before anything is
-        sent to the transmitter.
+        :class:`LIFUInterface`: anything else is refused before the load is
+        sent, and handled like any other refusal (whatever an earlier load
+        left is cleared, and status is ``STATUS_ERROR``).
 
         Raises:
             LIFUError: More than one module (``LIFU_ERR_MODULE_COUNT_MISMATCH``),
                 a refusal from either device, or a transmitter with no
                 calibrated sensitivity at *frequency_hz* (LIFUSolutionError).
         """
-        self._require_single_module()
         self.set_status(LIFUInterfaceStatus.STATUS_PROGRAMMING)
         try:
+            self._require_single_module()
             self._load_and_select(preset_index, settings_crc, regs_crc, frequency_hz, duration_index)
             if self.hvcontroller is not None:
                 if turn_hv_on:

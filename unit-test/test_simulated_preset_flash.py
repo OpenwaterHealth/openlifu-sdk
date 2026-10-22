@@ -17,8 +17,8 @@ from sr003_presets import flash_entry  # noqa: E402 -- reason: after the PyQt6 i
 
 from openlifu_sdk.io.exceptions import LIFUDeviceError  # noqa: E402 -- reason: after the PyQt6 importorskip
 from openlifu_sdk.io.LIFUConfig import OW_BAD_CRC, OW_HV_PRESET_CRC  # noqa: E402 -- reason: after the PyQt6 importorskip
-from openlifu_sdk.io.LIFUTXPresets import preset_sensitivity
-from openlifu_sdk.ui.simulated_interface import (
+from openlifu_sdk.io.LIFUTXPresets import preset_sensitivity  # noqa: E402 -- reason: after the PyQt6 importorskip
+from openlifu_sdk.ui.simulated_interface import (  # noqa: E402 -- reason: after the PyQt6 importorskip
     SimulatedDeviceInterface,
     SimulatedLIFUInterface,
     SimulatedTxDevice,
@@ -133,18 +133,25 @@ def test_load_preset_rejects_bad_duration_index(bad_duration):
 
 
 def test_interface_constructor_forwards_preset_flash():
-    interface = SimulatedDeviceInterface(
-        preset_flash=[(_mc("diathermy", 0xAD813B92), 0xABBAABBA)]
-    )
+    mc, regs = flash_entry(id="diathermy")
+    interface = SimulatedDeviceInterface(preset_flash=[(mc, regs)])
     assert interface.txdevice.get_preset(0)["id"] == "diathermy"
-    assert interface.hvcontroller.get_preset(0)["settings_crc"] == 0xAD813B92
+    assert interface.hvcontroller.get_preset(0)["settings_crc"] == mc["settings_crc"]
 
 
 def test_lifu_interface_accepts_preset_flash():
-    interface = SimulatedLIFUInterface(
-        preset_flash=[(_mc("diathermy", 0xAD813B92), 0xABBAABBA)]
-    )
-    assert interface.txdevice.get_preset(0)["settings_crc"] == 0xAD813B92
+    mc, regs = flash_entry(id="diathermy")
+    interface = SimulatedLIFUInterface(preset_flash=[(mc, regs)])
+    assert interface.txdevice.get_preset(0)["settings_crc"] == mc["settings_crc"]
+
+
+@pytest.mark.parametrize("missing", ["voltage", "sensitivity"])
+def test_a_console_preset_without_voltage_or_sensitivity_is_refused_up_front(missing):
+    # A console image always carries both; the simulator refuses at configure time,
+    # not with an untyped error at select time.
+    mc, regs = flash_entry()
+    with pytest.raises(ValueError, match=missing):
+        SimulatedDeviceInterface(preset_flash=[(dict(mc, **{missing: None}), regs)])
 
 
 def test_hv_get_preset_reports_sensitivity_as_the_console_does():
@@ -180,11 +187,10 @@ def test_interface_load_preset_scales_hv_by_sensitivity_at_frequency():
 def test_interface_load_preset_settings_crc_mismatch_is_refused_by_the_transmitter():
     """A host whose preset file differs is stopped at the transmitter, before
     the console is asked."""
-    interface = SimulatedDeviceInterface(
-        preset_flash=[(_mc("preset-A", 0x11111111), 0xAAAAAAAA)]
-    )
+    mc, regs = flash_entry()
+    interface = SimulatedDeviceInterface(preset_flash=[(mc, regs)])
     with pytest.raises(LIFUDeviceError) as excinfo:
-        interface.load_preset(0, 0xDEADBEEF, 0xAAAAAAAA, 400_000.0)
+        interface.load_preset(0, mc["settings_crc"] ^ 0xDEADBEEF, regs, 400_000.0)
     assert excinfo.value.device_error_code == OW_BAD_CRC
     assert interface.txdevice.get_loaded_preset() == (None, None)
     assert interface.hvcontroller.get_preset(0)["selected"] is None
@@ -193,13 +199,12 @@ def test_interface_load_preset_settings_crc_mismatch_is_refused_by_the_transmitt
 def test_interface_load_preset_hv_settings_crc_mismatch():
     """A console built from another preset file refuses, though the
     transmitter matched."""
-    interface = SimulatedDeviceInterface(
-        preset_flash=[(_mc("preset-A", 0x11111111), 0xAAAAAAAA)]
-    )
+    mc, regs = flash_entry()
+    interface = SimulatedDeviceInterface(preset_flash=[(mc, regs)])
     console = interface.hvcontroller.get_preset(0)
-    interface.hvcontroller.configure_presets([dict(console, settings_crc=0x22222222)])
+    interface.hvcontroller.configure_presets([dict(console, settings_crc=mc["settings_crc"] ^ 0x22222222)])
     with pytest.raises(LIFUDeviceError) as excinfo:
-        interface.load_preset(0, 0x11111111, 0xAAAAAAAA, 400_000.0)
+        interface.load_preset(0, mc["settings_crc"], regs, 400_000.0)
     assert excinfo.value.device_error_code == OW_HV_PRESET_CRC
     # On both or on neither: the transmitter's load is undone.
     assert interface.txdevice.get_loaded_preset() == (None, None)

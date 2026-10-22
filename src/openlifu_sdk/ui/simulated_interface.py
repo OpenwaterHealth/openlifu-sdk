@@ -34,7 +34,7 @@ import sys as _sys
 
 if "slicer" in _sys.modules:
     try:
-        import qt as _slicer_qt  # type: ignore
+        import qt as _slicer_qt  # type: ignore  # reason: Slicer's PythonQt module ships no type stubs
     except ImportError as _exc:  # pragma: no cover
         raise ImportError(
             "openlifu_sdk.ui.simulated_interface could not import 3D Slicer's "
@@ -46,11 +46,11 @@ if "slicer" in _sys.modules:
     _QT_BACKEND = "PythonQt"
 else:
     try:
-        from PyQt6.QtCore import QObject, QTimer, pyqtSignal  # type: ignore
+        from PyQt6.QtCore import QObject, QTimer, pyqtSignal  # type: ignore  # reason: optional dependency, absent from type-checking environments
         _QT_BACKEND = "PyQt6"
     except ImportError:  # pragma: no cover - exercised only in Slicer
         try:
-            import qt as _slicer_qt  # type: ignore
+            import qt as _slicer_qt  # type: ignore  # reason: Slicer's PythonQt module ships no type stubs
         except ImportError as _exc:  # pragma: no cover - no Qt at all
             raise ImportError(
                 "openlifu_sdk.ui.simulated_interface requires PyQt6 (install "
@@ -752,6 +752,20 @@ class SimulatedHVController:
         return 31.0 + 0.05 * self._voltage_setpoint + _gauss(HV_TEMP_NOISE_SIGMA)
 
     def configure_presets(self, presets: List[dict]) -> None:
+        """Replace the simulated console's preset table.
+
+        Raises:
+            ValueError: A preset without a positive ``voltage`` and
+                ``sensitivity``. A real console image always has both (the
+                generator refuses to bake one without), so the simulator
+                refuses here rather than at select time.
+        """
+        for index, preset in enumerate(presets):
+            for key in ("voltage", "sensitivity"):
+                value = preset.get(key)
+                if isinstance(value, bool) or not isinstance(value, (int, float)) \
+                        or not math.isfinite(value) or value <= 0:
+                    raise ValueError(f"simulated console preset {index}: {key} must be a positive number, got {value!r}")
         self._presets = [dict(preset) for preset in presets]
 
     def get_preset(self, index: int) -> dict | None:
@@ -849,7 +863,15 @@ class SimulatedHVController:
 
 
 class SimulatedLIFUHVController(SimulatedHVController):
-    """Fake of the RUO :class:`~openlifu_sdk.io.LIFUHVController.LIFUHVController`."""
+    """Fake of the RUO :class:`~openlifu_sdk.io.LIFUHVController.LIFUHVController`.
+
+    HV on and ``set_voltage`` are ungated, as on an RUO console image. The
+    preset select / deselect are inherited unchanged, FDA rules included
+    (35-45 V window, no change while HV is on): an RUO image has no preset
+    table at all, so the only preset behaviour there is to simulate is the
+    FDA console's. Apps that drive FDA preset loads through
+    ``SimulatedLIFUInterface`` therefore see the same refusals as hardware.
+    """
 
     uart = None  # connector reads this for FW DFU; not used here
     _rgb_state = 0
@@ -1146,11 +1168,10 @@ class SimulatedDeviceInterface(QObject):
                     "index": index,
                     "selected": None,
                     "settings_crc": int(machine_config.get("settings_crc", 0)),
-                    "voltage": float(machine_config.get("voltage", 0.0)),
+                    "voltage": machine_config.get("voltage"),   # configure_presets checks it
                     "id": machine_config.get("id", f"preset-{index}"),
                     # As HVController.get_preset reports it: the console bakes it as float32.
-                    "sensitivity": (preset_sensitivity(machine_config)
-                                    if machine_config.get("sensitivity") is not None else None),
+                    "sensitivity": preset_sensitivity(machine_config),
                     "min_voltage": FDA_HV_WINDOW_V[0],
                     "max_voltage": FDA_HV_WINDOW_V[1],
                 })
@@ -1178,13 +1199,14 @@ class SimulatedDeviceInterface(QObject):
                     wait_for_settle: bool = False) -> bool:
         """Same contract as :meth:`DeviceInterface.load_preset`: one module
         only, on both devices or, if either refuses, on neither."""
-        if self.txdevice.get_module_count() != 1:
-            raise LIFUError(
-                f"TX reports {self.txdevice.get_module_count()} transmitter module(s); "
-                "preset load supports exactly one",
-                code=LIFU_ERR_MODULE_COUNT_MISMATCH,
-            )
+        self.set_status(LIFUInterfaceStatus.STATUS_PROGRAMMING)
         try:
+            modules = self.txdevice.get_module_count()
+            if modules != 1:
+                raise LIFUError(
+                    f"TX reports {modules} transmitter module(s); preset load supports exactly one",
+                    code=LIFU_ERR_MODULE_COUNT_MISMATCH,
+                )
             self.txdevice.load_preset(preset_index, regs_crc, duration_index, settings_crc=settings_crc)
             self.txdevice.refresh_metadata()
             device_sensitivity = self.txdevice.get_sensitivity_for_frequency(frequency_hz)
@@ -1230,7 +1252,7 @@ class SimulatedDeviceInterface(QObject):
                 parent=self,
             )
             self._engine.start()
-        except LIFUError:
+        except Exception:  # reason: any failure, typed or not, must not leave HV on without a trigger; re-raised
             # No trigger, no HV.
             self._engine = None
             self.hvcontroller.turn_hv_off()
