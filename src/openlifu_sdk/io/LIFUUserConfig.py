@@ -202,8 +202,11 @@ def sensitivity_at_frequency(module_configs: Iterable[Dict[str, Any]], freq_hz: 
     """
     values = []
     for config in module_configs:
-        for f, v in ((config or {}).get("module") or {}).get("sensitivity") or []:
-            f, v = float(f), float(v)
+        for row in ((config or {}).get("module") or {}).get("sensitivity") or []:
+            try:
+                f, v = (float(x) for x in row)
+            except (TypeError, ValueError):
+                continue   # a malformed row (user config is RUO-writable) is no calibration point
             if abs(f - freq_hz) <= SENSITIVITY_FREQ_TOLERANCE_HZ and math.isfinite(v) and v > 0:
                 values.append(v)
                 break

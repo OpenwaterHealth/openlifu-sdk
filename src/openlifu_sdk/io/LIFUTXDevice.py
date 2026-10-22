@@ -219,6 +219,9 @@ class TxDevice(OWComponent):
     SUPPORTED_COMMANDS = TX_FDA_COMMANDS
     ALLOWED_PACKETS = TX_FDA_PACKETS
     READ_ONLY_COMMANDS = FDA_READ_ONLY_COMMANDS
+    #: FDA mode is one module: presets load and unload on module 0 only.
+    #: LIFUTxDevice clears this for PRESET_MODE images that span modules.
+    SINGLE_MODULE_PRESETS = True
 
     def __init__(self, vid: int = OW_VID, pid: int = OW_TRANSMITTER_PID,
                  baudrate: int = 921600, timeout: float = DEFAULT_TIMEOUT, test_mode: bool = False):
@@ -252,9 +255,15 @@ class TxDevice(OWComponent):
         module calibration (see :func:`sensitivity_at_frequency`)."""
         return sensitivity_at_frequency(self.module_user_configs, freq_hz)
 
-    def refresh_metadata(self) -> None:
-        """Hydrate TX identity + sensitivity fields from stored calibration."""
-        module_count = max(1, int(self.get_module_count()))
+    def refresh_metadata(self, module_count: Optional[int] = None) -> None:
+        """Hydrate TX identity + sensitivity fields from stored calibration.
+
+        Reads the user config of each of *module_count* modules, or of as
+        many as the device reports when None. A caller that has just checked
+        the count passes it, so the calibration read matches the check.
+        """
+        if module_count is None:
+            module_count = max(1, int(self.get_module_count()))
         configs: list[dict] = []
         for module_idx in range(module_count):
             config = self.read_config(module=module_idx).to_dict()
@@ -429,8 +438,11 @@ class TxDevice(OWComponent):
         """Program one module's chips from its part of preset *index* (OW_PRESET_LOAD).
 
         Each module holds its own part of a preset -- its own two chips --
-        with its own regs_crc, so a preset that spans modules is loaded on
-        each in turn (LIFUTXPresets.load_preset does that).
+        with its own regs_crc. FDA mode is one module, so this FDA component
+        loads module 0 only (*module* other than 0 raises ValueError before
+        anything is sent). On :class:`LIFUTxDevice`, a PRESET_MODE preset
+        that spans modules is loaded on each in turn
+        (LIFUTXPresets.load_preset does that).
 
         The firmware refuses the load unless *regs_crc* equals the CRC-32 it
         computes over its own tables and *settings_crc* is the one its preset
@@ -452,6 +464,7 @@ class TxDevice(OWComponent):
                 duration index the preset does not offer, trigger running, or
                 firmware from before the load took settings_crc.
         """
+        self._require_preset_module(module)
         self.send_checked(packet_type=OW_CONTROLLER, command=OW_PRESET_LOAD, addr=module,
                           reserved=index,
                           data=struct.pack("<III", duration_index, regs_crc, settings_crc),
@@ -467,9 +480,14 @@ class TxDevice(OWComponent):
             LIFUDeviceError: Trigger running (OW_PRESET_BUSY), or firmware
                 from before a load could be cleared.
         """
+        self._require_preset_module(module)
         self.send_checked(packet_type=OW_CONTROLLER, command=OW_PRESET_LOAD, addr=module,
                           op="unload_preset")
         return True
+
+    def _require_preset_module(self, module: int) -> None:
+        if self.SINGLE_MODULE_PRESETS and module != 0:
+            raise ValueError(f"TX: FDA mode is one module; presets load on module 0, not {module}")
 
     def get_module_count(self) -> int:
         """Return the number of connected LIFU transmitter modules.
@@ -504,6 +522,7 @@ class LIFUTxDevice(LIFUComponentMixin, TxDevice):
     SUPPORTED_COMMANDS = GLOBAL_COMMANDS | TX7332_COMMANDS | CONTROLLER_COMMANDS
     ALLOWED_PACKETS = None
     READ_ONLY_COMMANDS = frozenset()
+    SINGLE_MODULE_PRESETS = False
 
     def __init__(self, vid: int = OW_VID, pid: int = OW_TRANSMITTER_PID,
                  baudrate: int = 921600, timeout: float = DEFAULT_TIMEOUT, test_mode: bool = False,

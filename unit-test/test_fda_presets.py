@@ -24,7 +24,7 @@ _SRC = os.path.join(os.path.dirname(__file__), "..", "src")
 if _SRC not in sys.path:
     sys.path.insert(0, _SRC)
 
-from openlifu_sdk.io.exceptions import LIFUDeviceError, LIFUError, LIFUSolutionError
+from openlifu_sdk.io.exceptions import LIFUCommunicationError, LIFUDeviceError, LIFUError, LIFUSolutionError
 from openlifu_sdk.io.LIFUConfig import (
     LIFU_ERR_MODULE_COUNT_MISMATCH,
     OW_BAD_CRC,
@@ -551,6 +551,23 @@ class TestTxMetadata(unittest.TestCase):
         self.assertIsNone(tx.get_sensitivity_for_frequency(425000.0))
 
 
+class TestPresetVoltageRange(unittest.TestCase):
+    """voltage_range is preset data, carried through compile_preset, not baked."""
+
+    def test_carried_through_compile_without_changing_the_crcs(self):
+        with_range = _compiled(voltage=40.0, sensitivity=3600, voltage_range=[37.0, 42.0])
+        without = _compiled(voltage=40.0, sensitivity=3600)
+        self.assertEqual(with_range["voltage_range"], [37.0, 42.0])
+        self.assertNotIn("voltage_range", without)
+        self.assertEqual(regs_crc(with_range), regs_crc(without))   # not in the blob
+
+    def test_malformed_range_is_refused(self):
+        for bad in ([42.0, 37.0], [0, 45], [35.0], "35-45", [35.0, float("nan")]):
+            with self.subTest(bad=bad):
+                with self.assertRaisesRegex(ValueError, "voltage_range"):
+                    _compiled(voltage=40.0, sensitivity=3600, voltage_range=bad)
+
+
 class TestSensitivityLookup(unittest.TestCase):
     """The SDK's one sensitivity lookup (LIFUUserConfig.sensitivity_at_frequency)."""
 
@@ -573,6 +590,12 @@ class TestSensitivityLookup(unittest.TestCase):
         for bad in (0.0, -5.0, float("nan"), float("inf")):
             with self.subTest(bad=bad):
                 self.assertIsNone(sensitivity_at_frequency([self._module((400000, bad))], 400000.0))
+
+    def test_malformed_rows_are_skipped_not_raised(self):
+        # The user config is RUO-writable: one bad row must not break the lookup of a good one.
+        module = {"module": {"sensitivity": [["x", 1], None, [1, 2, 3], [400000, None], [400000, 2720]]}}
+        self.assertEqual(sensitivity_at_frequency([module], 400000.0), 2720.0)
+        self.assertIsNone(sensitivity_at_frequency([{"module": {"sensitivity": [["x", 1]]}}], 400000.0))
 
     def test_device_sensitivity_is_the_same_lookup(self):
         modules = [self._module((400000, 3000)), self._module((400000, 3600))]
@@ -624,7 +647,7 @@ class TestInterfacePresetLoad(unittest.TestCase):
         self.assertEqual([c.args for c in iface.hvcontroller.select_preset.call_args_list],
                          [(0, 0xABCD, 3000.0), (0, 0xABCD, 3600.0)])
 
-    def test_more_than_one_module_is_refused_before_the_transmitter_is_touched(self):
+    def test_more_than_one_module_is_refused_before_anything_is_loaded(self):
         for cls in (DeviceInterface, LIFUInterface):
             for modules in (0, 2):
                 with self.subTest(cls=cls.__name__, modules=modules):
@@ -660,6 +683,44 @@ class TestInterfacePresetLoad(unittest.TestCase):
         tx.close.assert_called_once_with()
         hv.close.assert_called_once_with()
         release.assert_called_once_with()
+
+    def _construct(self, tx):
+        hv = MagicMock()
+        with patch.object(DeviceInterface, "_claim_hw_interface_pid"), \
+                patch.object(DeviceInterface, "_release_hw_interface_pid") as release, \
+                patch.object(DeviceInterface, "_create_devices", return_value=(tx, hv)):
+            return DeviceInterface(), hv, release
+
+    def test_an_unanswered_module_count_at_connect_is_checked_at_load_instead(self):
+        tx = MagicMock()
+        tx.is_connected.return_value = True
+        tx.get_module_count.side_effect = LIFUCommunicationError("TX: get_module_count timed out")
+        iface, _hv, release = self._construct(tx)
+        tx.close.assert_not_called()
+        release.assert_not_called()
+        with self.assertRaises(LIFUCommunicationError):
+            iface.load_preset(0, 0xABCD, 0xDCBA, 400000.0)
+        tx.load_preset.assert_not_called()
+
+    def test_an_unexpected_error_at_connect_closes_everything(self):
+        tx = MagicMock()
+        tx.is_connected.return_value = True
+        tx.get_module_count.side_effect = ValueError("refused by the whitelist")
+        hv = MagicMock()
+        with patch.object(DeviceInterface, "_claim_hw_interface_pid"), \
+                patch.object(DeviceInterface, "_release_hw_interface_pid") as release, \
+                patch.object(DeviceInterface, "_create_devices", return_value=(tx, hv)):
+            with self.assertRaises(ValueError):
+                DeviceInterface()
+        tx.close.assert_called_once_with()
+        hv.close.assert_called_once_with()
+        release.assert_called_once_with()
+
+    def test_load_reads_the_calibration_of_the_one_module_it_checked(self):
+        iface = self._mocked()
+        iface.load_preset(0, 0xABCD, 0xDCBA, 400000.0)
+        iface.txdevice.refresh_metadata.assert_called_once_with(module_count=1)
+        iface.txdevice.get_module_count.assert_called_once_with()
 
     def test_fda_connection_to_one_module_is_kept(self):
         tx, hv = MagicMock(), MagicMock()
@@ -722,6 +783,22 @@ class TestInterfacePresetLoad(unittest.TestCase):
         iface.hvcontroller.turn_hv_off.assert_called_once_with()
         self.assertNotEqual(iface.status, LIFUInterfaceStatus.STATUS_RUNNING)
 
+    def test_fda_transmitter_loads_presets_on_module_0_only(self):
+        tx = TxDevice()
+        uart = _mock_uart(tx, "TX")
+        for call in (lambda: tx.load_preset(0, 1, module=1, settings_crc=2), lambda: tx.unload_preset(module=1)):
+            with self.assertRaisesRegex(ValueError, "one module"):
+                call()
+        uart.send_packet.assert_not_called()
+
+    def test_research_transmitter_loads_presets_on_any_module(self):
+        # PRESET_MODE images span modules; LIFUTXPresets.load_preset loads each in turn.
+        tx = LIFUTxDevice()
+        uart = _mock_uart(tx, "TX")
+        uart.send_packet.return_value = _packet(b"")
+        tx.load_preset(0, 1, module=1, settings_crc=2)
+        self.assertEqual(uart.send_packet.call_args.kwargs["addr"], 1)
+
     def test_unload_is_a_load_with_no_payload(self):
         tx = TxDevice()
         uart = _mock_uart(tx, "TX")
@@ -742,17 +819,17 @@ class TestInterfacePresetLoad(unittest.TestCase):
         # The real module-count and calibration reads: count, load, count, the user config.
         config = LifuUserConfig(json_data={"sn": "SN-1", "hwid": "HW-1",
                                            "module": {"sensitivity": [[400000, 3220]]}})
-        tx_uart.send_packet.side_effect = [_packet(bytes([1])), _packet(b""), _packet(bytes([1])),
-                                           _packet(config.to_wire_bytes())]
+        tx_uart.send_packet.side_effect = [_packet(bytes([1])), _packet(b""), _packet(config.to_wire_bytes())]
 
         iface.load_preset(0, 0xAABBCCDD, 0x11223344, 400000.0, duration_index=2)
 
         sent = [c.kwargs for c in tx_uart.send_packet.call_args_list]
+        # One count read: the HV scaling uses the module that check allowed, not a second read.
         self.assertEqual([s["command"] for s in sent],
-                         [OW_CTRL_GET_MODULE_COUNT, OW_PRESET_LOAD, OW_CTRL_GET_MODULE_COUNT, OW_CMD_USR_CFG])
+                         [OW_CTRL_GET_MODULE_COUNT, OW_PRESET_LOAD, OW_CMD_USR_CFG])
         self.assertEqual((sent[1]["reserved"], bytes(sent[1]["data"])),
                          (0, struct.pack("<III", 2, 0x11223344, 0xAABBCCDD)))
-        self.assertEqual(sent[3]["reserved"], 0)   # the calibration is read, never written
+        self.assertEqual((sent[2]["reserved"], sent[2]["addr"]), (0, 0))   # module 0's calibration, read only
         sent = hv_uart.send_packet.call_args_list[0].kwargs
         self.assertEqual((sent["command"], sent["reserved"], bytes(sent["data"])),
                          (OW_POWER_PRESET_SELECT, 0, struct.pack("<If", 0xAABBCCDD, 3220.0)))

@@ -41,6 +41,7 @@ OW_NO_PRESET = 0xFB        # TX: no preset loaded
 OW_UNKNOWN_COMMAND = 0xFC
 OW_BAD_CRC = 0xFD
 OW_INVALID_PACKET = 0xFE
+OW_HV_DATA_ERROR = 0xFE     # console: malformed select (e.g. a sensitivity that is not positive); TX calls 0xFE OW_INVALID_PACKET
 OW_UNKNOWN_ERROR = 0xFF
 
 # Global Commands

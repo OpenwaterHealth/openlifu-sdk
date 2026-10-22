@@ -274,11 +274,7 @@ class DeviceInterface:
             vid, tx_pid, con_pid, baudrate, timeout, TX_test_mode, HV_test_mode)
         self._connect_devices()
         if self.single_module_device and self.txdevice.is_connected():
-            try:
-                self._require_single_module()
-            except LIFUError:
-                self.close()
-                raise
+            self._check_module_count_at_connect()
 
     def _create_devices(self, vid: int, tx_pid: int, con_pid: int, baudrate: int,
                         timeout: float, TX_test_mode: bool,
@@ -294,6 +290,23 @@ class DeviceInterface:
             self.txdevice.connect()
         if self.hvcontroller is not None:
             self.hvcontroller.connect()
+
+    def _check_module_count_at_connect(self) -> None:
+        """Refuse, closing everything, a transmitter that reports other than
+        one module. A count the transmitter does not answer is not a
+        refusal here -- the link may still be coming up -- and is checked
+        again on every :meth:`load_preset`."""
+        try:
+            self._require_single_module()
+        except LIFUError as exc:
+            if exc.code != LIFU_ERR_MODULE_COUNT_MISMATCH:
+                logger.warning("TX module count not read at connect (%s); checked again at load", exc)
+                return
+            self.close()
+            raise
+        except Exception:  # reason: an unexpected error must not leave the ports open and the PID lock held; re-raised
+            self.close()
+            raise
 
     def _require_single_module(self) -> None:
         """Refuse a transmitter that reports more than one module.
@@ -344,9 +357,12 @@ class DeviceInterface:
         come on, and :attr:`status` is ``STATUS_ERROR``.
 
         Only a single-module transmitter is supported, on this class and on
-        :class:`LIFUInterface`: anything else is refused before the load is
-        sent, and handled like any other refusal (whatever an earlier load
-        left is cleared, and status is ``STATUS_ERROR``).
+        :class:`LIFUInterface`: anything else is refused before anything is
+        loaded, and handled like any other refusal (whatever an earlier load
+        left on module 0, the only module a load writes, is cleared, and
+        status is ``STATUS_ERROR``). For PRESET_MODE images that span
+        modules, use ``LIFUTXPresets.load_preset`` with a
+        :class:`LIFUTxDevice`.
 
         Raises:
             LIFUError: More than one module (``LIFU_ERR_MODULE_COUNT_MISMATCH``),
@@ -401,8 +417,9 @@ class DeviceInterface:
         if self.hvcontroller is not None:
             # Read the calibration every load: the transmitter may have been
             # reconnected or swapped since the last one, and its sensitivity
-            # scales the HV.
-            self.txdevice.refresh_metadata()
+            # scales the HV. One module, as load_preset has just checked: the
+            # HV scaling comes from that module alone, not a second count read.
+            self.txdevice.refresh_metadata(module_count=1)
             device_sensitivity = self.txdevice.get_sensitivity_for_frequency(frequency_hz)
             if device_sensitivity is None:
                 raise LIFUSolutionError(

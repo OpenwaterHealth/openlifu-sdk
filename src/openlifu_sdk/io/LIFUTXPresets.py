@@ -137,6 +137,31 @@ def preset_voltage(machine_config: Dict) -> float:
     return struct.unpack("<f", struct.pack("<f", v))[0]
 
 
+def preset_voltage_range(machine_config: Dict) -> tuple[float, float] | None:
+    """The preset's own HV range, ``voltage_range`` = [low, high] volts, or
+    None if it has none.
+
+    Preset data: the range the applied (sensitivity-rescaled) voltage may
+    take for this preset. An FDA_MODE console does not see it -- its image
+    only carries a fixed 35-45 V hard stop -- so on FDA hardware it is the
+    host's to check; consoles that are not FDA images check it themselves.
+
+    Raises:
+        ValueError: Not two finite positive numbers with low <= high.
+    """
+    rng = machine_config.get("voltage_range")
+    if rng is None:
+        return None
+    ok = (isinstance(rng, (list, tuple)) and len(rng) == 2
+          and all(not isinstance(v, bool) and isinstance(v, (int, float)) and math.isfinite(v) and v > 0
+                  for v in rng)
+          and rng[0] <= rng[1])
+    if not ok:
+        raise ValueError("%s: voltage_range must be [low, high] positive volts, got %r"
+                         % (machine_config.get("id"), rng))
+    return float(rng[0]), float(rng[1])
+
+
 def preset_sensitivity(machine_config: Dict) -> float:
     """The transmitter sensitivity the preset's voltage suits, as the console
     bakes it: ``sensitivity`` as float32.
@@ -293,6 +318,10 @@ def compile_preset(preset: Dict, preset_id: str | None = None,
     captured["frequency_khz"] = preset["frequency_khz"]
     if "sensitivity" in preset:
         captured["sensitivity"] = preset["sensitivity"]
+    # Preset data only (not in the blob, so neither CRC changes): consoles that are not
+    # FDA images check the applied voltage against it.
+    if preset.get("voltage_range") is not None:
+        captured["voltage_range"] = list(preset_voltage_range(preset))
     # Refuse bad run lengths or limits now, not at emit time.
     counts = train_count_selections(captured)
     thermal_limits(captured)

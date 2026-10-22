@@ -28,7 +28,7 @@ from openlifu_sdk.io.LIFUConfig import (  # noqa: E402 -- reason: after the PyQt
     OW_HV_FDA_REFUSED,
     OW_HV_NO_PRESET,
     OW_HV_RANGE,
-    OW_INVALID_PACKET,
+    OW_HV_DATA_ERROR,
     OW_NO_PRESET,
     OW_TEMP_TOO_HIGH,
 )
@@ -111,7 +111,7 @@ def test_select_with_a_non_positive_sensitivity_is_refused(iface, sensitivity):
     settings_crc, _ = iface.preset
     with pytest.raises(LIFUDeviceError) as excinfo:
         iface.hvcontroller.select_preset(0, settings_crc, sensitivity)
-    assert _code(excinfo) == OW_INVALID_PACKET
+    assert _code(excinfo) == OW_HV_DATA_ERROR
     assert iface.hvcontroller.get_preset(0)["selected"] is None
 
 
@@ -204,21 +204,95 @@ def test_research_simulator_preset_load_refusal_leaves_error_status():
         interface.close()
 
 
-def test_research_simulator_console_keeps_the_fda_select_rules():
-    # An RUO console image has no preset table, so the simulator's preset select is the
-    # FDA console's on both interfaces; HV on and set_voltage stay ungated (RUO).
-    mc, regs = flash_entry()
-    interface = SimulatedLIFUInterface(preset_flash=[(mc, regs)])
+# ---- two layers: the preset's own voltage_range vs the FDA image's hard stop ------
+# Default calibration: 2720 @ 400 kHz, 2744 @ 395 kHz, 2267 @ 410 kHz, 2300 @ 405 kHz.
+# A 40 V / 2720 preset therefore applies 40.0, 39.65, 47.99 and 47.30 V.
+
+@pytest.mark.parametrize("interface_cls", [SimulatedDeviceInterface, SimulatedLIFUInterface])
+def test_preset_37_42_loads_within_its_range(interface_cls):
+    mc, regs = flash_entry(voltage_range=[37.0, 42.0])
+    interface = interface_cls(preset_flash=[(mc, regs)])
+    try:
+        assert interface.hvcontroller.select_preset(0, mc["settings_crc"], 2720.0) == pytest.approx(40.0)
+    finally:
+        interface.close()
+
+
+def test_non_fda_console_holds_a_select_to_the_presets_own_range():
+    # 43.4 V: inside the FDA hard stop, outside this preset's [37, 42].
+    mc, regs = flash_entry(voltage_range=[37.0, 42.0])
+    ruo = SimulatedLIFUInterface(preset_flash=[(mc, regs)])
+    fda = SimulatedDeviceInterface(preset_flash=[(mc, regs)])
     try:
         with pytest.raises(LIFUDeviceError) as excinfo:
-            interface.hvcontroller.select_preset(0, mc["settings_crc"], 2267.0)   # 47.99 V
+            ruo.hvcontroller.select_preset(0, mc["settings_crc"], 2507.0)
         assert _code(excinfo) == OW_HV_RANGE
+        # The FDA image never sees the preset's range (the host checks it): only its hard stop applies.
+        assert fda.hvcontroller.select_preset(0, mc["settings_crc"], 2507.0) == pytest.approx(43.4, abs=0.01)
+    finally:
+        ruo.close()
+        fda.close()
+
+
+def test_preset_35_55_works_unless_the_fda_hard_stop_is_crossed():
+    mc, regs = flash_entry(voltage_range=[35.0, 55.0])
+    ruo = SimulatedLIFUInterface(preset_flash=[(mc, regs)])
+    fda = SimulatedDeviceInterface(preset_flash=[(mc, regs)])
+    try:
+        # 47.99 V: within the preset's range, so a non-FDA console applies it ...
+        assert ruo.hvcontroller.select_preset(0, mc["settings_crc"], 2267.0) == pytest.approx(47.99, abs=0.01)
+        # ... but over the FDA image's 45 V hard stop.
+        with pytest.raises(LIFUDeviceError) as excinfo:
+            fda.hvcontroller.select_preset(0, mc["settings_crc"], 2267.0)
+        assert _code(excinfo) == OW_HV_RANGE
+        # Within both, both apply it.
+        assert fda.hvcontroller.select_preset(0, mc["settings_crc"], 2744.0) == pytest.approx(39.65, abs=0.01)
+    finally:
+        ruo.close()
+        fda.close()
+
+
+def test_preset_data_cannot_widen_the_fda_hard_stop(iface):
+    console = iface.hvcontroller.get_preset(0)
+    iface.hvcontroller.configure_presets([dict(console, voltage_range=[5.0, 100.0], min_voltage=5.0, max_voltage=100.0)])
+    with pytest.raises(LIFUDeviceError) as excinfo:
+        iface.hvcontroller.select_preset(0, iface.preset[0], 2267.0)   # 47.99 V
+    assert _code(excinfo) == OW_HV_RANGE
+    assert (iface.hvcontroller.get_preset(0)["min_voltage"], iface.hvcontroller.get_preset(0)["max_voltage"]) == (35.0, 45.0)
+
+
+def test_non_fda_console_has_no_fda_image_rules():
+    mc, regs = flash_entry()   # no voltage_range: nothing to hold a select to
+    interface = SimulatedLIFUInterface(preset_flash=[(mc, regs)])
+    try:
+        assert interface.hvcontroller.select_preset(0, mc["settings_crc"], 2267.0) == pytest.approx(47.99, abs=0.01)
         interface.hvcontroller.set_voltage(60.0)
         interface.hvcontroller.turn_hv_on()
-        with pytest.raises(LIFUDeviceError) as excinfo:
-            interface.hvcontroller.select_preset(0, mc["settings_crc"], 2720.0)
-        assert _code(excinfo) == OW_HV_FDA_REFUSED
-        assert interface.hvcontroller.get_voltage() == pytest.approx(60.0)
+        # Selection may change with HV on: not an FDA image.
+        assert interface.hvcontroller.select_preset(0, mc["settings_crc"], 2720.0) == pytest.approx(40.0)
+        interface.hvcontroller.deselect_preset()
+    finally:
+        interface.close()
+
+
+@pytest.mark.parametrize("voltage, transmitter, accepted", [
+    (35.0, 2720.0, True),                 # exactly 35.0 V in float32
+    (35.0, 2720.0005, False),             # next float32 sensitivity up: 34.999996 V
+    (45.0, 2720.0, True),                 # exactly 45.0 V
+    (45.0, 2719.9995, False),             # next float32 sensitivity down: 45.000008 V
+])
+def test_fda_hard_stop_boundaries_in_float32(voltage, transmitter, accepted):
+    # The console computes voltage x preset sensitivity / transmitter in float32 and compares
+    # with 35.0f / 45.0f; the simulator does the same, so edge presets agree with hardware.
+    mc, regs = flash_entry(voltage=voltage)
+    interface = SimulatedDeviceInterface(preset_flash=[(mc, regs)])
+    try:
+        if accepted:
+            assert interface.hvcontroller.select_preset(0, mc["settings_crc"], transmitter) == voltage
+        else:
+            with pytest.raises(LIFUDeviceError) as excinfo:
+                interface.hvcontroller.select_preset(0, mc["settings_crc"], transmitter)
+            assert _code(excinfo) == OW_HV_RANGE
     finally:
         interface.close()
 
