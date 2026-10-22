@@ -46,3 +46,6 @@ htmlcov/
 #Downloaded Firmware
 src/openlifu_sdk/firmware/downloads
 src/openlifu_sdk/_version.py
+
+# Output of examples/generate_presets.py; copied into the firmware tree by hand.
+generated_presets/

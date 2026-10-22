@@ -2,6 +2,25 @@
 
 `TxDevice` is the TX-module controller that programs TX7332 chips, configures triggers, and performs firmware updates for transmitter modules.
 
+> **FDA / RUO split.** `TxDevice` is the FDA component created by
+> `DeviceInterface`: it exposes only identity, temperature, trigger
+> read/start/stop and stored-preset (`get_preset` / `load_preset`) methods,
+> and refuses any other send before it reaches the wire (below). Every other
+> method listed below (trigger/profile programming, register access,
+> `async_mode`, config writes, DFU, LED/echo/reset) lives on the RUO subclass
+> `LIFUTxDevice`, which only `LIFUInterface` creates. So do the methods that
+> list, store and delete the presets of a PRESET_MODE image
+> (`get_preset_slot` / `get_preset_capacity` / `write_preset` /
+> `delete_preset`).
+>
+> **What the host-side check is.** The FDA classes send only the
+> (packet type, opcode) pairs their own methods use, and the user config
+> only as a read (`reserved == 0`); anything else, including through the
+> public `send` / `send_checked`, raises `ValueError` before it reaches the
+> wire. That is a guard against host mistakes, not the safety boundary: an
+> FDA_MODE firmware image refuses register writes, host-set voltage and
+> user-config writes itself (`OW_FDA_REFUSED` / `OW_HV_FDA_REFUSED`).
+
 Constructor
 - `TxDevice(uart: LIFUUart, module_invert: bool | list[bool]=False)` — low-level transport `LIFUUart` instance is required.
 
