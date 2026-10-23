@@ -17,7 +17,7 @@ from __future__ import annotations
 import logging
 import threading
 
-from PyQt6.QtCore import QThread
+from openlifu_sdk.ui._qt import QThread
 
 logger = logging.getLogger(__name__)
 
