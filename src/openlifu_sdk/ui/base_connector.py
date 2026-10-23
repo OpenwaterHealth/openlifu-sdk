@@ -31,10 +31,7 @@ import logging
 from enum import IntEnum
 from typing import Optional
 
-from openlifu_sdk.ui._qt import Property as pyqtProperty
-from openlifu_sdk.ui._qt import QObject
-from openlifu_sdk.ui._qt import Signal as pyqtSignal
-from openlifu_sdk.ui._qt import Slot as pyqtSlot
+from openlifu_sdk.ui._qt import Property, QObject, Signal, Slot
 
 from openlifu_sdk.ui.telemetry_thread import TelemetryPollThread
 
@@ -61,10 +58,10 @@ class BaseConnector(QObject):
 
     # ---- Signals ---------------------------------------------------------
 
-    signalConnected = pyqtSignal(str, str)       # (descriptor, port)
-    signalDisconnected = pyqtSignal(str, str)
-    connectionStatusChanged = pyqtSignal()       # tx/hv flag flipped
-    stateChanged = pyqtSignal(int)               # ConnectorState value
+    signalConnected = Signal(str, str)       # (descriptor, port)
+    signalDisconnected = Signal(str, str)
+    connectionStatusChanged = Signal()       # tx/hv flag flipped
+    stateChanged = Signal(int)               # ConnectorState value
 
     # ---- Construction ----------------------------------------------------
 
@@ -158,7 +155,7 @@ class BaseConnector(QObject):
 
     # ---- Connection slots ------------------------------------------------
 
-    @pyqtSlot(str, str)
+    @Slot(str, str)
     def on_connected(self, descriptor: str, port: str) -> None:
         if descriptor == "TX":
             self._txConnected = True
@@ -168,7 +165,7 @@ class BaseConnector(QObject):
         self.connectionStatusChanged.emit()
         self.update_state()
 
-    @pyqtSlot(str, str)
+    @Slot(str, str)
     def on_disconnected(self, descriptor: str, port: str) -> None:
         if descriptor == "TX":
             self._txConnected = False
@@ -200,15 +197,15 @@ class BaseConnector(QObject):
 
     # ---- QML-visible properties ------------------------------------------
 
-    @pyqtProperty(bool, notify=connectionStatusChanged)
+    @Property(bool, notify=connectionStatusChanged)
     def txConnected(self) -> bool:
         return self._txConnected
 
-    @pyqtProperty(bool, notify=connectionStatusChanged)
+    @Property(bool, notify=connectionStatusChanged)
     def hvConnected(self) -> bool:
         return self._hvConnected
 
-    @pyqtProperty(int, notify=stateChanged)
+    @Property(int, notify=stateChanged)
     def state(self) -> int:
         return self._state
 

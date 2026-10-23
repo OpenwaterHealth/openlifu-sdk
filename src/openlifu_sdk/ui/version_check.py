@@ -103,7 +103,8 @@ def show_incompatible_version_dialog(
         QApplication, QMessageBox = QtWidgets.QApplication, QtWidgets.QMessageBox
         QApplication.instance() or QApplication(sys.argv)
         QMessageBox.critical(parent, title, f"{message}\n\nThe application will now exit.")
-    except Exception:
+    except Exception:  # reason: last-resort path; the caller exits either way, so any Qt failure falls back to stderr
+        logger.exception("Could not show the SDK version dialog; reporting on stderr")
         print(f"ERROR: {message}", file=sys.stderr)
 
 
