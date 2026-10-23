@@ -62,6 +62,10 @@ Homepage = "https://github.com/OpenwaterHealth/openlifu-sdk"
 "Bug Tracker" = "https://github.com/OpenwaterHealth/openlifu-sdk/issues"
 
 
+[tool.pytest.ini_options]
+# examples/test_*.py are bench scripts that need hardware, not tests.
+testpaths = ["unit-test"]
+
 [tool.setuptools.packages.find]
 where = ["src"]
 

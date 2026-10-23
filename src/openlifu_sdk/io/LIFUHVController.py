@@ -9,6 +9,9 @@ from openlifu_sdk.io.LIFUConfig import (
     CONTROLLER_COMMANDS,
     DEFAULT_TIMEOUT,
     GLOBAL_COMMANDS,
+    FDA_READ_ONLY_COMMANDS,
+    HV_FDA_COMMANDS,
+    HV_FDA_PACKETS,
     LIFU_ERR_BAD_PAYLOAD_LENGTH,
     ODO_RESET_BOTH,
     OW_CONSOLE_PID,
@@ -26,6 +29,8 @@ from openlifu_sdk.io.LIFUConfig import (
     OW_POWER_HV_ENABLE,
     OW_POWER_HV_OFF,
     OW_POWER_HV_ON,
+    OW_POWER_PRESET_GET,
+    OW_POWER_PRESET_SELECT,
     OW_POWER_RAW_DAC,
     OW_POWER_RESET_ODO,
     OW_POWER_SET_DACS,
@@ -46,7 +51,11 @@ from openlifu_sdk.io.LIFUConfig import (
     OW_VID,
     POWER_COMMANDS,
 )
-from openlifu_sdk.io.component import OWComponent, register_command_packet_types
+from openlifu_sdk.io.component import (
+    LIFUComponentMixin,
+    OWComponent,
+    register_command_packet_types,
+)
 from openlifu_sdk.io.exceptions import LIFUHVSettleError, LIFUProtocolError
 
 logger = logging.getLogger(__name__)
@@ -62,6 +71,15 @@ class ConsoleOdometer:
     """Seconds the HV supply has been enabled."""
 
 class HVController(OWComponent):
+    """FDA console component: HV on/off, preset select, and read-only
+    telemetry. :class:`LIFUHVController` adds the RUO setpoint, rail, fan,
+    LED and DAC commands.
+    """
+
+    SUPPORTED_COMMANDS = HV_FDA_COMMANDS
+    ALLOWED_PACKETS = HV_FDA_PACKETS
+    READ_ONLY_COMMANDS = FDA_READ_ONLY_COMMANDS
+
     def __init__(self,  vid: int = OW_VID, pid: int = OW_CONSOLE_PID,
                  baudrate: int = 921600, timeout: float = DEFAULT_TIMEOUT, test_mode: bool = False):
         """
@@ -72,7 +90,7 @@ class HVController(OWComponent):
         """
         super().__init__(
             vid, pid,
-            supported_commands=GLOBAL_COMMANDS | CONTROLLER_COMMANDS | POWER_COMMANDS,
+            supported_commands=self.SUPPORTED_COMMANDS,
             baudrate=baudrate, timeout=timeout, desc="HV",
         )
         
@@ -124,28 +142,6 @@ class HVController(OWComponent):
                 code=LIFU_ERR_BAD_PAYLOAD_LENGTH,
             )
         return round(struct.unpack("<f", r.data)[0], 2)
-
-    def turn_12v_off(self) -> bool:
-        """Turn off the 12V rail.
-
-        Raises:
-            LIFUNotConnectedError, LIFUCommunicationError, LIFUDeviceError.
-        """
-        self.send_checked(packet_type=OW_POWER, command=OW_POWER_12V_OFF, op="turn_12v_off")
-        logger.info("12V turned off")
-        self.is_12v_on = False
-        return True
-
-    def turn_12v_on(self) -> bool:
-        """Turn on the 12V rail.
-
-        Raises:
-            LIFUNotConnectedError, LIFUCommunicationError, LIFUDeviceError.
-        """
-        self.send_checked(packet_type=OW_POWER, command=OW_POWER_12V_ON, op="turn_12v_on")
-        logger.info("12V turned on")
-        self.is_12v_on = True
-        return True
 
     def get_12v_status(self) -> bool:
         """Return True if the 12V rail is on.
@@ -232,49 +228,189 @@ class HVController(OWComponent):
                               op="get_hv_status")
         return r.reserved == 1
 
-    def get_odometer(self) -> ConsoleOdometer | None:
-        """Read the console's lifetime power-on and HV-on time.
+    def get_preset(self, index: int) -> dict | None:
+        """Describe a preset in an FDA_MODE console's HV table (OW_POWER_PRESET_GET).
 
-        The firmware saves the counters to flash every 10 minutes and on
-        HV-off / host-disconnect, so up to that much time can be lost when
-        power is cut; the value read here is always live.
+        The table is indexed like the transmitter image's presets, so index N
+        is the same preset on both.
 
         Returns:
-            ConsoleOdometer, or None when the console firmware predates the
-            odometer (it answers OW_POWER_GET_ODO as an unknown command).
+            ``count``, ``index``, ``selected`` (the index whose voltage is
+            applied, None before any select), ``settings_crc`` (CRC-32 of the
+            source .json), ``voltage`` and ``sensitivity`` (the preset's own:
+            that voltage suits a transmitter of that sensitivity),
+            ``applied_voltage`` (what the last select put on the supply,
+            None before one), ``min_voltage`` / ``max_voltage`` (the window a
+            select must land in) and ``id``; or None when the console is not
+            an FDA_MODE image and has no table.
+
+        Raises:
+            LIFUDeviceError: No such index.
+            LIFUNotConnectedError, LIFUCommunicationError,
+            LIFUProtocolError: If the payload is malformed.
+        """
+        r = self.send_checked(packet_type=OW_POWER, command=OW_POWER_PRESET_GET,
+                              reserved=index, op="get_preset")
+        if r.data_len == 0:
+            return None
+        d = bytes(r.data)
+        if len(d) < 28 or len(d) < 28 + d[27]:
+            raise LIFUProtocolError(f"HV: get_preset payload too short ({len(d)})",
+                                    code=LIFU_ERR_BAD_PAYLOAD_LENGTH)
+        settings_crc, voltage, sensitivity, applied, low, high = struct.unpack("<Ifffff", d[3:27])
+        selected = None if d[2] == 0xFF else d[2]
+        return {"count": d[0], "index": d[1], "selected": selected,
+                "settings_crc": settings_crc, "voltage": voltage, "sensitivity": sensitivity,
+                "applied_voltage": None if selected is None else applied,
+                "min_voltage": low, "max_voltage": high,
+                "id": d[28:28 + d[27]].decode("ascii", "replace")}
+
+    def select_preset(self, index: int, settings_crc: int, device_sensitivity: float) -> float:
+        """Apply preset *index*'s voltage, rescaled to the connected transmitter
+        (OW_POWER_PRESET_SELECT). Returns the voltage applied.
+
+        The FDA_MODE way to set the HV: the console holds each preset's
+        voltage and the sensitivity it suits, refuses set_voltage, and works
+        out ``voltage * preset sensitivity / device_sensitivity`` itself.
+        *settings_crc* must be that preset's (LIFUTXPresets.compile_preset
+        gives it), so a host holding a different idea of preset N is
+        refused. *device_sensitivity* is the transmitter's at the preset's
+        frequency (TxDevice.get_sensitivity_for_frequency). The payload is
+        ``<If`` (settings_crc, sensitivity), the 8 bytes the console's
+        ``hv_presets.c`` accepts; the frequency stays on the host, where the
+        sensitivity was looked up. Select the same index loaded into the
+        transmitter, with HV off. A select the console refuses leaves it
+        with nothing selected.
+
+        Raises:
+            LIFUDeviceError: No such index, OW_HV_PRESET_CRC (wrong
+                settings_crc), OW_HV_RANGE (the rescaled voltage is outside
+                the console's window), a sensitivity that is not a positive
+                number, or OW_HV_FDA_REFUSED (HV is on).
+            LIFUNotConnectedError, LIFUCommunicationError.
+        """
+        r = self.send_checked(packet_type=OW_POWER, command=OW_POWER_PRESET_SELECT,
+                              reserved=index, data=struct.pack("<If", settings_crc, device_sensitivity),
+                              op="select_preset")
+        if r.data_len < 4:
+            raise LIFUProtocolError(f"HV: select_preset payload too short ({r.data_len} < 4)",
+                                    code=LIFU_ERR_BAD_PAYLOAD_LENGTH)
+        (volts,) = struct.unpack("<f", bytes(r.data[:4]))
+        # wait_for_settle() aims at supply_voltage, which set_voltage no longer sets.
+        self.supply_voltage = volts
+        return volts
+
+    def deselect_preset(self) -> bool:
+        """Leave the console with no preset selected, so HV on is refused
+        (OW_POWER_PRESET_SELECT with no payload). What a host does when the
+        other half of a load, the transmitter's load_preset, did not go
+        through.
+
+        Raises:
+            LIFUDeviceError: OW_HV_FDA_REFUSED (HV is on), or firmware from
+                before a selection could be cleared.
+        """
+        self.send_checked(packet_type=OW_POWER, command=OW_POWER_PRESET_SELECT, op="deselect_preset")
+        self.supply_voltage = None
+        return True
+
+    def get_voltage(self) -> float:
+        """Read the measured HV output voltage.
 
         Raises:
             LIFUNotConnectedError, LIFUCommunicationError, LIFUDeviceError,
             LIFUProtocolError: If the payload length is invalid.
         """
-        r = self.send_checked(packet_type=OW_POWER, command=OW_POWER_GET_ODO,
-                              op="get_odometer")
-        if r.packet_type == OW_UNKNOWN:
-            logger.info("HV: console firmware has no odometer (OW_POWER_GET_ODO unsupported)")
-            return None
-        if r.data_len != 8:
+        r = self.send_checked(packet_type=OW_POWER, command=OW_POWER_GET_HV,
+                              op="get_voltage")
+        if r.data_len != 4:
             raise LIFUProtocolError(
-                f"HV: odometer payload length {r.data_len} != 8",
+                f"HV: get_voltage payload length {r.data_len} != 4",
                 code=LIFU_ERR_BAD_PAYLOAD_LENGTH,
             )
-        power_on_s, hv_on_s = struct.unpack("<II", r.data)
-        return ConsoleOdometer(power_on_s=power_on_s, hv_on_s=hv_on_s)
+        return round(struct.unpack("<f", r.data)[0], 2)
 
-    def reset_odometer(self, target: int = ODO_RESET_BOTH) -> bool:
-        """Zero one or both odometers and save the cleared state to flash.
-
-        Args:
-            target: ODO_RESET_POWER (0), ODO_RESET_HV (1) or ODO_RESET_BOTH (2).
+    def get_fan_speed(self, fan_id: int = 0) -> int:
+        """Read a fan's current duty-cycle percentage.
 
         Raises:
-            ValueError: If *target* is not 0, 1 or 2.
+            ValueError: If *fan_id* is out of range.
+            LIFUNotConnectedError, LIFUCommunicationError, LIFUDeviceError,
+            LIFUProtocolError: If the payload length is invalid.
+        """
+        if fan_id not in (0, 1):
+            raise ValueError("Invalid fan ID. Must be 0 or 1")
+        r = self.send_checked(packet_type=OW_POWER, command=OW_POWER_GET_FAN,
+                              addr=fan_id, op="get_fan_speed")
+        if r.data_len < 1:
+            raise LIFUProtocolError(
+                f"HV: get_fan_speed payload length {r.data_len} < 1",
+                code=LIFU_ERR_BAD_PAYLOAD_LENGTH,
+            )
+        return r.data[0]
+
+    def get_vmon_values(self) -> list[dict]:
+        """Retrieve the voltage-monitor readings.
+
+        Returns:
+            A list of 8 dicts (one per channel) with raw_adc, voltage,
+            and converted_voltage fields.
+
+        Raises:
+            LIFUNotConnectedError, LIFUCommunicationError, LIFUDeviceError,
+            LIFUProtocolError: If the payload length is invalid.
+        """
+        r = self.send_checked(packet_type=OW_POWER, command=OW_POWER_VMON,
+                              op="get_vmon_values")
+        if r.data_len != 80:
+            raise LIFUProtocolError(
+                f"HV: VMON payload length {r.data_len} != 80",
+                code=LIFU_ERR_BAD_PAYLOAD_LENGTH,
+            )
+        raw_values = struct.unpack_from("<8H", r.data, 0)
+        voltages = struct.unpack_from("<8f", r.data, 16)
+        converted_voltages = struct.unpack_from("<8f", r.data, 48)
+        return [
+            {
+                "channel": i,
+                "raw_adc": raw_values[i],
+                "voltage": round(voltages[i], 3),
+                "converted_voltage": round(converted_voltages[i], 3),
+            }
+            for i in range(8)
+        ]
+
+
+class LIFUHVController(LIFUComponentMixin, HVController):
+    """Research (RUO) console component: :class:`HVController` plus host-set
+    voltage, 12V rail, fan, RGB LED, raw DAC control and the odometer.
+    Created only by :class:`LIFUInterface`.
+    """
+
+    SUPPORTED_COMMANDS = GLOBAL_COMMANDS | CONTROLLER_COMMANDS | POWER_COMMANDS
+    ALLOWED_PACKETS = None
+    READ_ONLY_COMMANDS = frozenset()
+
+    def turn_12v_off(self) -> bool:
+        """Turn off the 12V rail.
+
+        Raises:
             LIFUNotConnectedError, LIFUCommunicationError, LIFUDeviceError.
         """
-        if target not in (0, 1, 2):
-            raise ValueError(f"Odometer reset target must be 0, 1 or 2, got {target}")
-        self.send_checked(packet_type=OW_POWER, command=OW_POWER_RESET_ODO,
-                          reserved=target, op="reset_odometer")
-        logger.info("Odometer reset (target %d)", target)
+        self.send_checked(packet_type=OW_POWER, command=OW_POWER_12V_OFF, op="turn_12v_off")
+        logger.info("12V turned off")
+        self.is_12v_on = False
+        return True
+
+    def turn_12v_on(self) -> bool:
+        """Turn on the 12V rail.
+
+        Raises:
+            LIFUNotConnectedError, LIFUCommunicationError, LIFUDeviceError.
+        """
+        self.send_checked(packet_type=OW_POWER, command=OW_POWER_12V_ON, op="turn_12v_on")
+        logger.info("12V turned on")
+        self.is_12v_on = True
         return True
 
     def set_voltage(self, voltage: float) -> bool:
@@ -282,6 +418,9 @@ class HVController(OWComponent):
 
         Args:
             voltage: Desired output voltage (5.0 – 100.0 V).
+
+        An FDA_MODE console refuses this outright (OW_HV_FDA_REFUSED): the
+        voltage comes from the preset chosen with select_preset().
 
         Raises:
             ValueError: If *voltage* is out of range.
@@ -329,22 +468,6 @@ class HVController(OWComponent):
                           data=data, op="set_dacs")
         return True
 
-    def get_voltage(self) -> float:
-        """Read the measured HV output voltage.
-
-        Raises:
-            LIFUNotConnectedError, LIFUCommunicationError, LIFUDeviceError,
-            LIFUProtocolError: If the payload length is invalid.
-        """
-        r = self.send_checked(packet_type=OW_POWER, command=OW_POWER_GET_HV,
-                              op="get_voltage")
-        if r.data_len != 4:
-            raise LIFUProtocolError(
-                f"HV: get_voltage payload length {r.data_len} != 4",
-                code=LIFU_ERR_BAD_PAYLOAD_LENGTH,
-            )
-        return round(struct.unpack("<f", r.data)[0], 2)
-
     def set_fan_speed(self, fan_id: int = 0, fan_speed: int = 50) -> int:
         """Set a fan's duty-cycle percentage.
 
@@ -365,25 +488,6 @@ class HVController(OWComponent):
                           op="set_fan_speed")
         logger.info("Set fan %d speed to %d", fan_id, fan_speed)
         return fan_speed
-
-    def get_fan_speed(self, fan_id: int = 0) -> int:
-        """Read a fan's current duty-cycle percentage.
-
-        Raises:
-            ValueError: If *fan_id* is out of range.
-            LIFUNotConnectedError, LIFUCommunicationError, LIFUDeviceError,
-            LIFUProtocolError: If the payload length is invalid.
-        """
-        if fan_id not in (0, 1):
-            raise ValueError("Invalid fan ID. Must be 0 or 1")
-        r = self.send_checked(packet_type=OW_POWER, command=OW_POWER_GET_FAN,
-                              addr=fan_id, op="get_fan_speed")
-        if r.data_len < 1:
-            raise LIFUProtocolError(
-                f"HV: get_fan_speed payload length {r.data_len} < 1",
-                code=LIFU_ERR_BAD_PAYLOAD_LENGTH,
-            )
-        return r.data[0]
 
     def set_rgb_led(self, rgb_state: int) -> bool:
         """Set the RGB LED state (0 = OFF, 1 = RED, 2 = GREEN, 3 = BLUE).
@@ -523,37 +627,6 @@ class HVController(OWComponent):
         """
         return self._send_rgb_fx(OW_RGB_FX_STOP, op="rgb_effect_stop")
 
-    def get_vmon_values(self) -> list[dict]:
-        """Retrieve the voltage-monitor readings.
-
-        Returns:
-            A list of 8 dicts (one per channel) with raw_adc, voltage,
-            and converted_voltage fields.
-
-        Raises:
-            LIFUNotConnectedError, LIFUCommunicationError, LIFUDeviceError,
-            LIFUProtocolError: If the payload length is invalid.
-        """
-        r = self.send_checked(packet_type=OW_POWER, command=OW_POWER_VMON,
-                              op="get_vmon_values")
-        if r.data_len != 80:
-            raise LIFUProtocolError(
-                f"HV: VMON payload length {r.data_len} != 80",
-                code=LIFU_ERR_BAD_PAYLOAD_LENGTH,
-            )
-        raw_values = struct.unpack_from("<8H", r.data, 0)
-        voltages = struct.unpack_from("<8f", r.data, 16)
-        converted_voltages = struct.unpack_from("<8f", r.data, 48)
-        return [
-            {
-                "channel": i,
-                "raw_adc": raw_values[i],
-                "voltage": round(voltages[i], 3),
-                "converted_voltage": round(converted_voltages[i], 3),
-            }
-            for i in range(8)
-        ]
-
     def set_raw_dac(self, dac_id: int = 0, dac_value: int = 0) -> int:
         """Set a raw 12-bit DAC value.
 
@@ -589,5 +662,50 @@ class HVController(OWComponent):
         self.is_hv_on = enable
         logger.info("High voltage output %s successfully.",
                     "enabled" if enable else "disabled")
+        return True
+
+    def get_odometer(self) -> ConsoleOdometer | None:
+        """Read the console's lifetime power-on and HV-on time.
+
+        The firmware saves the counters to flash every 10 minutes and on
+        HV-off / host-disconnect, so up to that much time can be lost when
+        power is cut; the value read here is always live.
+
+        Returns:
+            ConsoleOdometer, or None when the console firmware predates the
+            odometer (it answers OW_POWER_GET_ODO as an unknown command).
+
+        Raises:
+            LIFUNotConnectedError, LIFUCommunicationError, LIFUDeviceError,
+            LIFUProtocolError: If the payload length is invalid.
+        """
+        r = self.send_checked(packet_type=OW_POWER, command=OW_POWER_GET_ODO,
+                              op="get_odometer")
+        if r.packet_type == OW_UNKNOWN:
+            logger.info("HV: console firmware has no odometer (OW_POWER_GET_ODO unsupported)")
+            return None
+        if r.data_len != 8:
+            raise LIFUProtocolError(
+                f"HV: odometer payload length {r.data_len} != 8",
+                code=LIFU_ERR_BAD_PAYLOAD_LENGTH,
+            )
+        power_on_s, hv_on_s = struct.unpack("<II", r.data)
+        return ConsoleOdometer(power_on_s=power_on_s, hv_on_s=hv_on_s)
+
+    def reset_odometer(self, target: int = ODO_RESET_BOTH) -> bool:
+        """Zero one or both odometers and save the cleared state to flash.
+
+        Args:
+            target: ODO_RESET_POWER (0), ODO_RESET_HV (1) or ODO_RESET_BOTH (2).
+
+        Raises:
+            ValueError: If *target* is not 0, 1 or 2.
+            LIFUNotConnectedError, LIFUCommunicationError, LIFUDeviceError.
+        """
+        if target not in (0, 1, 2):
+            raise ValueError(f"Odometer reset target must be 0, 1 or 2, got {target}")
+        self.send_checked(packet_type=OW_POWER, command=OW_POWER_RESET_ODO,
+                          reserved=target, op="reset_odometer")
+        logger.info("Odometer reset (target %d)", target)
         return True
 

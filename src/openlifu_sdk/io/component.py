@@ -50,7 +50,19 @@ def register_command_packet_types(commands: set[int], packet_type: int) -> None:
 
 class OWComponent:
     """Base for Transmitter / Console -- wraps an OWUart and restricts the
-    allowed command set."""
+    allowed command set.
+
+    Carries only what the FDA components (:class:`TxDevice`,
+    :class:`HVController`) need: synchronous connect / send and the
+    read-only global commands. :class:`LIFUComponentMixin` adds the RUO
+    globals (async monitoring, echo, LED, reset, DFU, config write).
+    """
+
+    #: packet type -> opcodes this component may send as that type; None
+    #: allows any packet type for a supported opcode (the RUO components).
+    ALLOWED_PACKETS: dict[int, frozenset[int]] | None = None
+    #: Opcodes this component may only send with ``reserved == 0`` (reads).
+    READ_ONLY_COMMANDS: frozenset[int] = frozenset()
 
     def __init__(self, vid: int, pid: int, supported_commands: set[int],
                  baudrate: int = 921600, timeout: float = DEFAULT_TIMEOUT,
@@ -59,10 +71,6 @@ class OWComponent:
         self._supported_commands = supported_commands
 
     # -- Expose underlying OWUart attributes --------------------------
-
-    @property
-    def uart(self) -> OWUart:
-        return self._uart
 
     def is_connected(self) -> bool:
         return self._uart.is_connected
@@ -91,12 +99,6 @@ class OWComponent:
     def disconnect(self):
         self._uart.disconnect()
 
-    def start(self):
-        self._uart.start()
-
-    def stop(self):
-        self._uart.stop()
-
     def close(self):
         """Stop async threads (if running) and disconnect."""
         self._uart.stop()
@@ -104,14 +106,30 @@ class OWComponent:
 
     # -- Command validation -------------------------------------------
 
-    def _resolve(self, command: int, packet_type: int | None) -> int:
+    def _resolve(self, command: int, packet_type: int | None, reserved: int = 0) -> int:
+        """The packet type *command* goes out as, after the component's rules:
+        the opcode must be one it supports and, where the class restricts
+        them (:attr:`ALLOWED_PACKETS`, :attr:`READ_ONLY_COMMANDS`), the
+        (packet type, opcode) pair must be allowed and a read-only command
+        must be sent as a read (``reserved == 0``).
+
+        Raises:
+            ValueError: The send is not allowed; nothing reaches the wire.
+        """
         if command not in self._supported_commands:
             raise ValueError(
                 f"Command 0x{command:02X} is not supported by {self._uart.desc}"
             )
-        if packet_type is not None:
-            return packet_type
-        return _CMD_TO_PKT_TYPE.get(command, OW_CMD)
+        pt = packet_type if packet_type is not None else _CMD_TO_PKT_TYPE.get(command, OW_CMD)
+        if self.ALLOWED_PACKETS is not None and command not in self.ALLOWED_PACKETS.get(pt, ()):
+            raise ValueError(
+                f"Command 0x{command:02X} as packet type 0x{pt:02X} is not supported by {self._uart.desc}"
+            )
+        if command in self.READ_ONLY_COMMANDS and reserved != 0:
+            raise ValueError(
+                f"Command 0x{command:02X} may only be read (reserved=0) by {self._uart.desc}"
+            )
+        return pt
 
     # -- Send helpers -------------------------------------------------
 
@@ -124,7 +142,7 @@ class OWComponent:
         :meth:`send_checked`, which raises a typed :class:`LIFUError` instead
         of returning ``None``.
         """
-        pt = self._resolve(command, packet_type)
+        pt = self._resolve(command, packet_type, reserved)
         r = self._uart.send_packet(
             packet_type=pt, command=command,
             addr=addr, reserved=reserved, data=data, timeout=timeout,
@@ -256,20 +274,6 @@ class OWComponent:
         # Unreachable: the loop either returns or raises above.
         raise last_timeout_exc  # pragma: no cover
 
-    def send_async(self, command: int, addr: int = 0, reserved: int = 0,
-                   data: bytearray | None = None, timeout: float | None = None,
-                   packet_type: int | None = None) -> int:
-        """Queue *command* for sending without blocking (async mode).
-
-        Returns the packet ID.  The response is delivered via
-        ``signal_data_received``; timeouts via ``signal_error``.
-        """
-        pt = self._resolve(command, packet_type)
-        return self._uart.send_packet_async(
-            packet_type=pt, command=command,
-            addr=addr, reserved=reserved, data=data, timeout=timeout,
-        )
-
     # ------------------------------------------------------------------
     # Global command helpers (available on every component)
     # ------------------------------------------------------------------
@@ -309,18 +313,6 @@ class OWComponent:
         log.info("%s version: %s", self._uart.desc, ver)
         return ver
 
-    def echo(self, module: int = 0, echo_data: bytes | bytearray = b"Hello LIFU!") -> tuple[bytes, int]:
-        """Echo a payload through the device.
-
-        Raises:
-            TypeError: If *echo_data* is not bytes/bytearray.
-            LIFUNotConnectedError, LIFUCommunicationError, LIFUDeviceError.
-        """
-        if not isinstance(echo_data, (bytes, bytearray)):
-            raise TypeError("echo_data must be bytes or bytearray")
-        r = self.send_checked(OW_CMD_ECHO, addr=module, data=bytearray(echo_data), op="echo")
-        return bytes(r.data[:r.data_len]), r.data_len
-
     def get_hardware_id(self, module: int = 0, raw_hex: bool = False) -> str:
         """Read the device hardware ID.
 
@@ -337,6 +329,82 @@ class OWComponent:
             )
         hwid = r.data[:HW_ID_DATA_LENGTH].hex()
         return hwid if raw_hex else format_hwid(hwid)
+
+    # ------------------------------------------------------------------
+    # User configuration helpers
+    # ------------------------------------------------------------------
+
+    def read_config(self, module: int = 0) -> LifuUserConfig:
+        """Read the user configuration from device flash.
+
+        Args:
+            module: Target module address (default 0).
+
+        Returns:
+            Parsed LifuUserConfig.
+
+        Raises:
+            LIFUNotConnectedError, LIFUCommunicationError, LIFUDeviceError,
+            LIFUProtocolError: If the response payload cannot be parsed.
+        """
+        log.debug("Reading user config from %s ...", self._uart.desc)
+        r = self.send_checked(OW_CMD_USR_CFG, addr=module, reserved=0, op="read_config")
+        try:
+            config = LifuUserConfig.from_wire_bytes(r.data)
+        except (ValueError, struct.error) as exc:
+            raise LIFUProtocolError(
+                f"{self._uart.desc}: failed to parse config response: {exc}",
+                code=LIFU_ERR_BAD_PAYLOAD_FORMAT,
+            ) from exc
+        log.debug("Read config: seq=%d, json_len=%d", config.header.seq, config.header.json_len)
+        return config
+
+
+class LIFUComponentMixin:
+    """RUO additions to :class:`OWComponent`: async monitoring, raw UART
+    access, and the global commands that change device state (echo, LED,
+    reset, DFU, config write).
+
+    Mixed into :class:`LIFUTxDevice` / :class:`LIFUHVController` ahead of
+    their FDA base so these methods are not defined on the FDA components
+    at all.
+    """
+
+    @property
+    def uart(self) -> OWUart:
+        return self._uart
+
+    def start(self):
+        self._uart.start()
+
+    def stop(self):
+        self._uart.stop()
+
+    def send_async(self, command: int, addr: int = 0, reserved: int = 0,
+                   data: bytearray | None = None, timeout: float | None = None,
+                   packet_type: int | None = None) -> int:
+        """Queue *command* for sending without blocking (async mode).
+
+        Returns the packet ID.  The response is delivered via
+        ``signal_data_received``; timeouts via ``signal_error``.
+        """
+        pt = self._resolve(command, packet_type, reserved)
+        return self._uart.send_packet_async(
+            packet_type=pt, command=command,
+            addr=addr, reserved=reserved, data=data, timeout=timeout,
+        )
+
+    def echo(self, module: int = 0, echo_data: bytes | bytearray = b"Hello LIFU!") -> tuple[bytes, int]:
+        """Echo a payload through the device.
+
+        Raises:
+            TypeError: If *echo_data* is not bytes/bytearray.
+            LIFUNotConnectedError, LIFUCommunicationError, LIFUDeviceError.
+        """
+        if not isinstance(echo_data, (bytes, bytearray)):
+            raise TypeError("echo_data must be bytes or bytearray")
+        r = self.send_checked(OW_CMD_ECHO, addr=module, data=bytearray(echo_data), op="echo")
+        return bytes(r.data[:r.data_len]), r.data_len
 
     def toggle_led(self, module: int = 0) -> bool:
         """Toggle the device's indicator LED.
@@ -369,7 +437,7 @@ class OWComponent:
         With the default *reserved* the device enters whichever DFU its
         installed bootloader provides (STM32 ROM for no-bootloader units,
         the legacy or secure bootloader otherwise). Pass
-        ``reserved=OWComponent.DFU_FORCE_STM32_ROM`` (or use
+        ``reserved=LIFUComponentMixin.DFU_FORCE_STM32_ROM`` (or use
         :meth:`enter_stm32_rom_dfu`) to force the STM32 ROM DFU loader.
 
         Raises:
@@ -390,35 +458,6 @@ class OWComponent:
             LIFUNotConnectedError, LIFUCommunicationError, LIFUDeviceError.
         """
         return self.enter_dfu(module=module, reserved=self.DFU_FORCE_STM32_ROM)
-
-    # ------------------------------------------------------------------
-    # User configuration helpers
-    # ------------------------------------------------------------------
-
-    def read_config(self, module: int = 0) -> LifuUserConfig:
-        """Read the user configuration from device flash.
-
-        Args:
-            module: Target module address (default 0).
-
-        Returns:
-            Parsed LifuUserConfig.
-
-        Raises:
-            LIFUNotConnectedError, LIFUCommunicationError, LIFUDeviceError,
-            LIFUProtocolError: If the response payload cannot be parsed.
-        """
-        log.debug("Reading user config from %s ...", self._uart.desc)
-        r = self.send_checked(OW_CMD_USR_CFG, addr=module, reserved=0, op="read_config")
-        try:
-            config = LifuUserConfig.from_wire_bytes(r.data)
-        except (ValueError, struct.error) as exc:
-            raise LIFUProtocolError(
-                f"{self._uart.desc}: failed to parse config response: {exc}",
-                code=LIFU_ERR_BAD_PAYLOAD_FORMAT,
-            ) from exc
-        log.debug("Read config: seq=%d, json_len=%d", config.header.seq, config.header.json_len)
-        return config
 
     def write_config(self, config: LifuUserConfig, module: int = 0) -> LifuUserConfig:
         """Write user configuration to device flash.

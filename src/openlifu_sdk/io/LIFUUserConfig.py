@@ -1,8 +1,9 @@
 import struct
 import json
 from dataclasses import dataclass
-from typing import Optional, Any, Dict
+from typing import Optional, Any, Dict, Iterable
 import logging
+import math
 
 logger = logging.getLogger(__name__)
 
@@ -175,3 +176,40 @@ class LifuUserConfig:
     def __repr__(self) -> str:
         return (f"LifuUserConfig(seq={self.header.seq}, crc=0x{self.header.crc:04X}, "
                 f"json_len={self.header.json_len}, data={self.json_data})")
+
+
+# How close a calibration table's frequency must be to count as the preset's.
+SENSITIVITY_FREQ_TOLERANCE_HZ = 1e-3
+
+
+def sensitivity_at_frequency(module_configs: Iterable[Dict[str, Any]], freq_hz: float) -> Optional[float]:
+    """Return a transmitter's sensitivity at *freq_hz* from its module user configs.
+
+    Each config's ``module.sensitivity`` is a ``[[freq_hz, sensitivity], ...]``
+    calibration table, measured at discrete frequencies. A module contributes
+    the entry whose frequency matches *freq_hz* (within
+    :data:`SENSITIVITY_FREQ_TOLERANCE_HZ`) and whose value is a finite
+    positive number. The HV scaling (console: voltage x preset sensitivity /
+    this value) therefore only ever uses a measured calibration point. There
+    is no interpolation or extrapolation: a frequency the table does not list
+    gives nothing rather than an estimate or the nearest end point's value.
+    This is the match the FDA bench check (``examples/test_fda_mode.py``,
+    via ``LIFUTXPresets.device_sensitivity``) already used.
+
+    Returns:
+        The mean over the modules that have a matching entry, or ``None`` if
+        none has (the caller must refuse to scale HV from it).
+    """
+    values = []
+    for config in module_configs:
+        for row in ((config or {}).get("module") or {}).get("sensitivity") or []:
+            try:
+                f, v = (float(x) for x in row)
+            except (TypeError, ValueError):
+                continue   # a malformed row (user config is RUO-writable) is no calibration point
+            if abs(f - freq_hz) <= SENSITIVITY_FREQ_TOLERANCE_HZ and math.isfinite(v) and v > 0:
+                values.append(v)
+                break
+    if not values:
+        return None
+    return sum(values) / len(values)
