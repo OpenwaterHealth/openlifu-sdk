@@ -36,7 +36,9 @@ def _select_api() -> str:
                 f"use one of {sorted(_BINDINGS)}."
             )
         return _BINDINGS[requested]
-    loaded = [api for api in _BINDINGS.values() if api in sys.modules]
+    # A ``None`` entry is an import blocker (``sys.modules[name] = None``),
+    # not a loaded binding.
+    loaded = [api for api in _BINDINGS.values() if sys.modules.get(api) is not None]
     if len(loaded) == 1:
         return loaded[0]
     for api in _BINDINGS.values():
