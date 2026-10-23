@@ -44,13 +44,13 @@ if "slicer" in _sys.modules:
         ) from _exc
     QObject = _slicer_qt.QObject
     QTimer = _slicer_qt.QTimer
-    pyqtSignal = _slicer_qt.Signal
     _QT_BACKEND = "PythonQt"
 else:
+    # Only ImportError (no Qt6 binding installed) falls back to PythonQt.
+    # A bad OPENLIFU_QT_API is a ValueError from _qt and propagates.
     try:
         from openlifu_sdk.ui._qt import QT_API as _QT_BACKEND
         from openlifu_sdk.ui._qt import QObject, QTimer
-        from openlifu_sdk.ui._qt import Signal as pyqtSignal
     except ImportError:  # pragma: no cover - exercised only in Slicer
         try:
             import qt as _slicer_qt  # type: ignore  # reason: Slicer's PythonQt module ships no type stubs
@@ -61,7 +61,6 @@ else:
             ) from _exc
         QObject = _slicer_qt.QObject
         QTimer = _slicer_qt.QTimer
-        pyqtSignal = _slicer_qt.Signal
         _QT_BACKEND = "PythonQt"
 
 from openlifu_sdk.io import LIFUInterfaceStatus
