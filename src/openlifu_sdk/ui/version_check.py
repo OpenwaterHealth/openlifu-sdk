@@ -101,7 +101,17 @@ def show_incompatible_version_dialog(
 
         QtWidgets = import_qt_module("QtWidgets")
         QApplication, QMessageBox = QtWidgets.QApplication, QtWidgets.QMessageBox
-        QApplication.instance() or QApplication(sys.argv)
+        app = QApplication.instance() or QApplication(sys.argv)
+        if not isinstance(app, QApplication):
+            # A QGuiApplication / QCoreApplication host can't show widgets:
+            # Qt aborts the process, which no except can catch.
+            logger.error(
+                "Not showing the SDK version dialog: the application is a %s, "
+                "not a QApplication",
+                type(app).__name__,
+            )
+            print(f"ERROR: {message}", file=sys.stderr)
+            return
         QMessageBox.critical(parent, title, f"{message}\n\nThe application will now exit.")
     except Exception:  # reason: last-resort path; the caller exits either way, so any Qt failure falls back to stderr
         logger.exception("Could not show the SDK version dialog; reporting on stderr")

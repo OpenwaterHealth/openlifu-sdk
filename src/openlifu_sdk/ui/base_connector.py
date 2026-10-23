@@ -31,7 +31,7 @@ import logging
 from enum import IntEnum
 from typing import Optional
 
-from openlifu_sdk.ui._qt import Property, QObject, Signal, Slot
+from openlifu_sdk.ui._qt import Property, QObject, Signal, Slot, check_host_binding
 
 from openlifu_sdk.ui.telemetry_thread import TelemetryPollThread
 
@@ -66,6 +66,7 @@ class BaseConnector(QObject):
     # ---- Construction ----------------------------------------------------
 
     def __init__(self, parent: Optional[QObject] = None, *, poll_interval_s: float = 1.0):
+        check_host_binding()
         super().__init__(parent)
         self._txConnected = False
         self._hvConnected = False

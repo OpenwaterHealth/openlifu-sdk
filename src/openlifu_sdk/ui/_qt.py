@@ -9,29 +9,33 @@ PyQt6 object (each binding ships and drives its own Qt runtime).
 The binding is chosen once, at first import, in this order:
 
 1. ``OPENLIFU_QT_API`` environment variable (``pyqt6`` or ``pyside6``).
-   An unknown value, or one naming a binding other than the one the
-   host already imported, raises :class:`ValueError`: honouring it would
-   load a second Qt runtime.
-2. A binding the host has already imported. Apps should therefore
+   It must name a binding the host has imported, if the host has
+   imported any: anything else would load a second Qt runtime.
+2. The binding the host has already imported. Apps should therefore
    import their Qt binding before importing ``openlifu_sdk.ui``.
-3. PyQt6 (the historical default and the ``ui`` extra), then PySide6.
-   This also applies, with a logged warning, when the host has imported
-   both bindings.
+3. If the host has imported neither: PyQt6 (the historical default and
+   the ``ui`` extra), then PySide6.
+
+Every case the SDK can't resolve safely raises :class:`ValueError`: an
+unknown ``OPENLIFU_QT_API``, one naming a binding other than the
+host's, and a host that has imported both bindings with no
+``OPENLIFU_QT_API`` to say which one its application runs on.
+
+A host that imports ``openlifu_sdk.ui`` *before* its own binding can't
+be caught here. :func:`check_host_binding`, called when an SDK object
+is constructed, reports it then.
 
 Exports binding-neutral names: :data:`QObject`, :data:`QThread`,
 :data:`QTimer`, :data:`Signal`, :data:`Slot`, :data:`Property`, the
-chosen :data:`QT_API` (``"PyQt6"`` or ``"PySide6"``) and
-:func:`import_qt_module`.
+chosen :data:`QT_API` (``"PyQt6"`` or ``"PySide6"``),
+:func:`import_qt_module` and :func:`check_host_binding`.
 """
 
 from __future__ import annotations
 
 import importlib
-import logging
 import os
 import sys
-
-logger = logging.getLogger(__name__)
 
 _BINDINGS = {"pyqt6": "PyQt6", "pyside6": "PySide6"}
 
@@ -58,9 +62,10 @@ def _select_api() -> str:
     if len(loaded) == 1:
         return loaded[0]
     if loaded:
-        logger.warning(
-            "Both PyQt6 and PySide6 are imported; openlifu_sdk.ui uses PyQt6. "
-            "Set OPENLIFU_QT_API to choose."
+        raise ValueError(
+            "Both PyQt6 and PySide6 are imported, so openlifu_sdk.ui can't tell "
+            "which one the application runs on. Set OPENLIFU_QT_API to "
+            "pyqt6 or pyside6."
         )
     for api in _BINDINGS.values():
         try:
@@ -89,6 +94,32 @@ def import_qt_module(name: str):
     return importlib.import_module(f"{QT_API}.{name}")
 
 
+def check_host_binding() -> None:
+    """Raise :class:`RuntimeError` if the application object runs on the
+    other binding.
+
+    That happens when a host imports ``openlifu_sdk.ui`` before its own
+    binding: the SDK picks the default, the host then starts its
+    ``QCoreApplication`` on the other one, and SDK signals and timers
+    would never run on the host's event loop. No application yet, or one
+    on :data:`QT_API`, passes.
+    """
+    other = "PySide6" if QT_API == "PyQt6" else "PyQt6"
+    other_core = sys.modules.get(f"{other}.QtCore")
+    if other_core is None:
+        return
+    if import_qt_module("QtCore").QCoreApplication.instance() is not None:
+        return
+    if other_core.QCoreApplication.instance() is None:
+        return
+    raise RuntimeError(
+        f"openlifu_sdk.ui is built on {QT_API}, but the application runs on "
+        f"{other}: its signals and timers would never reach the event loop. "
+        f"Import {other} before openlifu_sdk.ui, or set "
+        f"OPENLIFU_QT_API={other.lower()}."
+    )
+
+
 __all__ = [
     "QT_API",
     "Property",
@@ -97,5 +128,6 @@ __all__ = [
     "QTimer",
     "Signal",
     "Slot",
+    "check_host_binding",
     "import_qt_module",
 ]

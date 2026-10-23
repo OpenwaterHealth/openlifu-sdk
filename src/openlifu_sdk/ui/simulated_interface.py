@@ -51,6 +51,7 @@ else:
     try:
         from openlifu_sdk.ui._qt import QT_API as _QT_BACKEND
         from openlifu_sdk.ui._qt import QObject, QTimer
+        from openlifu_sdk.ui._qt import check_host_binding as _check_host_binding
     except ImportError:  # pragma: no cover - exercised only in Slicer
         try:
             import qt as _slicer_qt  # type: ignore  # reason: Slicer's PythonQt module ships no type stubs
@@ -83,6 +84,11 @@ from openlifu_sdk.ui.status_frame import format_status_frame as _format_status_f
 
 logger = logging.getLogger(__name__)
 logger.debug("openlifu_sdk.ui.simulated_interface using Qt backend: %s", _QT_BACKEND)
+
+if _QT_BACKEND == "PythonQt":
+    def _check_host_binding() -> None:
+        """PythonQt is Slicer's own Qt, so there is nothing to check. The
+        Qt6 path imports :func:`openlifu_sdk.ui._qt.check_host_binding`."""
 
 # The FDA image's second-line hard stop: the only HV setpoints an FDA_MODE
 # console's select may arrive at (FDA_HV_MIN_VOLTS / FDA_HV_MAX_VOLTS in the
@@ -1190,6 +1196,7 @@ class SimulatedDeviceInterface(QObject):
             modules_attr = getattr(transducer, "modules", None)
             if modules_attr is not None:
                 num_modules = max(1, len(list(modules_attr)))
+        _check_host_binding()
         super().__init__()
         self.txdevice, self.hvcontroller = self._create_devices(num_modules, preset_flash)
         self.status = LIFUInterfaceStatus.STATUS_SYS_OFF
