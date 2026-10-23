@@ -39,3 +39,34 @@ jobs:
         env:
           QT_QPA_PLATFORM: offscreen
         run: pytest -rs
+
+  # openlifu_sdk.ui follows the host's Qt binding (#76). The operator
+  # interface runs it on PySide6, so run the suite again with PySide6
+  # installed next to PyQt6: unit-test/test_qt_binding.py then exercises
+  # every selection case, none skipped. PySide6 is a CI-only install, not
+  # an SDK dependency, so sbom.cdx.json does not change.
+  pytest-pyside6:
+    name: pytest (PySide6 + PyQt6)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Qt runtime libraries
+        run: sudo apt-get update && sudo apt-get install -y libegl1 libgl1 libxkbcommon0 libdbus-1-3
+
+      - name: Install the SDK with the ui and test extras, plus PySide6
+        run: pip install -e ".[ui,test]" "PySide6-Essentials==6.12.0"
+
+      - name: Require both bindings (the binding tests must not skip)
+        run: python -c "import PyQt6.QtCore" && python -c "import PySide6.QtCore"
+
+      - name: Run unit tests
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: pytest -rs
