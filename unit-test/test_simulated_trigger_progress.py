@@ -24,11 +24,10 @@ import time
 
 import pytest
 
-pytest.importorskip("PyQt6")
+_qt = pytest.importorskip("openlifu_sdk.ui._qt")
+QCoreApplication = _qt.import_qt_module("QtCore").QCoreApplication
 
-from PyQt6.QtCore import QCoreApplication  # noqa: E402 -- reason: after the PyQt6 importorskip
-
-from openlifu_sdk.ui.simulated_interface import (  # noqa: E402 -- reason: after the PyQt6 importorskip
+from openlifu_sdk.ui.simulated_interface import (  # noqa: E402 -- reason: after the Qt importorskip
     SimulatedLIFUInterface,
     SimulatedTxDevice,
 )

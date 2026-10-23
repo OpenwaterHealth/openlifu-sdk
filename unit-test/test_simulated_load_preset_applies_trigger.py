@@ -17,12 +17,12 @@ from __future__ import annotations
 
 import pytest
 
-pytest.importorskip("PyQt6")
+pytest.importorskip("openlifu_sdk.ui._qt")
 
-from sr003_presets import flash_entry  # noqa: E402 -- reason: after the PyQt6 importorskip
+from sr003_presets import flash_entry  # noqa: E402 -- reason: after the Qt importorskip
 
-from openlifu_sdk.io.exceptions import LIFUDeviceError  # noqa: E402 -- reason: after the PyQt6 importorskip
-from openlifu_sdk.ui.simulated_interface import SimulatedTxDevice  # noqa: E402 -- reason: after the PyQt6 importorskip
+from openlifu_sdk.io.exceptions import LIFUDeviceError  # noqa: E402 -- reason: after the Qt importorskip
+from openlifu_sdk.ui.simulated_interface import SimulatedTxDevice  # noqa: E402 -- reason: after the Qt importorskip
 
 
 def _tx_with(**overrides):
@@ -160,5 +160,7 @@ def test_start_sonication_runs_preset_selected_sequence(qt_app):
 
 @pytest.fixture(scope="module")
 def qt_app():
-    from PyQt6.QtCore import QCoreApplication
+    from openlifu_sdk.ui._qt import import_qt_module
+
+    QCoreApplication = import_qt_module("QtCore").QCoreApplication
     return QCoreApplication.instance() or QCoreApplication([])

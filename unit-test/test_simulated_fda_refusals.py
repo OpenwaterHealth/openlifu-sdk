@@ -18,12 +18,12 @@ from __future__ import annotations
 
 import pytest
 
-pytest.importorskip("PyQt6")
+pytest.importorskip("openlifu_sdk.ui._qt")
 
-from sr003_presets import flash_entry, two_module_flash_entry  # noqa: E402 -- reason: after the PyQt6 importorskip
+from sr003_presets import flash_entry, two_module_flash_entry  # noqa: E402 -- reason: after the Qt importorskip
 
-from openlifu_sdk.io.exceptions import LIFUDeviceError, LIFUError, LIFUSolutionError  # noqa: E402 -- reason: after the PyQt6 importorskip
-from openlifu_sdk.io.LIFUConfig import (  # noqa: E402 -- reason: after the PyQt6 importorskip
+from openlifu_sdk.io.exceptions import LIFUDeviceError, LIFUError, LIFUSolutionError  # noqa: E402 -- reason: after the Qt importorskip
+from openlifu_sdk.io.LIFUConfig import (  # noqa: E402 -- reason: after the Qt importorskip
     LIFU_ERR_MODULE_COUNT_MISMATCH,
     OW_HV_FDA_REFUSED,
     OW_HV_NO_PRESET,
@@ -33,8 +33,8 @@ from openlifu_sdk.io.LIFUConfig import (  # noqa: E402 -- reason: after the PyQt
     OW_NO_PRESET,
     OW_TEMP_TOO_HIGH,
 )
-from openlifu_sdk.io.LIFUInterface import LIFUInterfaceStatus  # noqa: E402 -- reason: after the PyQt6 importorskip
-from openlifu_sdk.ui.simulated_interface import (  # noqa: E402 -- reason: after the PyQt6 importorskip
+from openlifu_sdk.io.LIFUInterface import LIFUInterfaceStatus  # noqa: E402 -- reason: after the Qt importorskip
+from openlifu_sdk.ui.simulated_interface import (  # noqa: E402 -- reason: after the Qt importorskip
     SimulatedDeviceInterface,
     SimulatedLIFUInterface,
 )

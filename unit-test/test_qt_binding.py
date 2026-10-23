@@ -8,8 +8,13 @@ imported, else PyQt6, then PySide6. 3D Slicer's PythonQt path in
 
 Each case runs in a fresh interpreter: the binding is chosen once per
 process, and pytest itself may already have imported one. Cases that
-need a binding skip when it is not installed; the "Unit tests (PySide6
-+ PyQt6)" CI job installs both, so none skip there.
+need a binding skip when it is not installed; the ``pytest (PySide6 +
+PyQt6)`` CI job installs both, so none skip there.
+
+In-process behaviour on each binding (BaseConnector's QML contract,
+cross-thread delivery, the simulator's timers) is covered by
+``test_base_connector.py`` and the simulator tests, which the PySide6
+job runs with ``OPENLIFU_QT_API=pyside6``.
 """
 
 from __future__ import annotations
@@ -101,16 +106,19 @@ def test_follows_pyqt6_when_the_host_imported_it_first():
 
 
 @needs_pyqt6
-def test_both_bindings_imported_falls_back_to_the_default_order():
+def test_both_bindings_imported_falls_back_to_the_default_order_with_a_warning():
     # A stand-in module marks PySide6 as imported, so only one real Qt
     # runtime loads.
-    _check("""
-        import sys, types
+    result = _run("""
+        import logging, sys, types
+        logging.basicConfig(level=logging.WARNING)
         import PyQt6.QtCore
         sys.modules["PySide6"] = types.ModuleType("PySide6")
         from openlifu_sdk.ui import _qt
         assert _qt.QT_API == "PyQt6", _qt.QT_API
     """)
+    assert result.returncode == 0, result.stderr
+    assert "Both PyQt6 and PySide6 are imported" in result.stderr
 
 
 @pytest.mark.parametrize(
@@ -135,16 +143,45 @@ def test_env_var_selects_the_binding_and_loads_only_that_one(qt_api, expected, o
 def test_env_var_rejects_an_unknown_binding():
     result = _run("from openlifu_sdk.ui import _qt", qt_api="pyqt5")
     assert result.returncode != 0
-    assert "OPENLIFU_QT_API='pyqt5' is not supported" in result.stderr
+    assert "ValueError: OPENLIFU_QT_API='pyqt5' is not supported" in result.stderr
+
+
+@pytest.mark.parametrize(
+    ("qt_api", "imported"),
+    [("pyqt6", "PySide6"), ("pyside6", "PyQt6")],
+)
+def test_env_var_naming_another_binding_than_the_host_imported_is_refused(qt_api, imported):
+    # A stand-in module plays the host's binding; the refusal comes
+    # before anything is imported, so no real Qt loads.
+    result = _run(f"""
+        import sys, types
+        sys.modules["{imported}"] = types.ModuleType("{imported}")
+        from openlifu_sdk.ui import _qt
+    """, qt_api=qt_api)
+    assert result.returncode != 0
+    assert f"already imported {imported}" in result.stderr
+    assert "second Qt runtime" in result.stderr
+
+
+def test_bad_env_var_surfaces_from_simulated_interface():
+    """The simulator's PythonQt fallback catches ImportError only, so a
+    configuration error is reported as itself, not as "no Qt found"."""
+    result = _run(
+        "from openlifu_sdk.ui import simulated_interface", qt_api="pyqt5",
+    )
+    assert result.returncode != 0
+    assert "ValueError: OPENLIFU_QT_API='pyqt5' is not supported" in result.stderr
+    assert "3D Slicer's PythonQt" not in result.stderr
 
 
 @needs_pyside6
-def test_pyside6_signals_and_timers_run_on_the_host_event_loop():
-    """A BaseConnector signal and the simulator's QTimer both deliver on
-    a PySide6 application's event loop."""
+def test_pyside6_queued_signal_and_sdk_timer_deliver_on_the_host_loop():
+    """On a PySide6 host, a queued BaseConnector signal is delivered only
+    by the host's event loop, and a QTimer parented to an SDK object
+    fires on it. The simulator is built on PySide6."""
     _check("""
         import sys
-        from PySide6.QtCore import QCoreApplication
+        from PySide6.QtCore import QCoreApplication, QObject, Qt
         app = QCoreApplication([])
         from openlifu_sdk.ui._qt import QTimer
         from openlifu_sdk.ui.base_connector import BaseConnector
@@ -152,18 +189,23 @@ def test_pyside6_signals_and_timers_run_on_the_host_event_loop():
             _QT_BACKEND, SimulatedDeviceInterface,
         )
         assert _QT_BACKEND == "PySide6", _QT_BACKEND
-        SimulatedDeviceInterface()
+        assert isinstance(SimulatedDeviceInterface(), QObject)
 
         received = []
         connector = BaseConnector()
-        connector.stateChanged.connect(received.append)
+        connector.stateChanged.connect(
+            received.append, Qt.ConnectionType.QueuedConnection,
+        )
         connector.stateChanged.emit(2)
-        fired = []
-        QTimer.singleShot(0, lambda: (fired.append(True), app.quit()))
-        QTimer.singleShot(5000, app.quit)
-        app.exec()
+        assert received == [], "queued delivery must wait for the loop"
+
+        timer = QTimer(connector)
+        timer.setSingleShot(True)
+        timer.timeout.connect(app.quit)
+        timer.start(0)
+        QTimer.singleShot(5000, lambda: app.exit(1))
+        assert app.exec() == 0, "SDK-parented timer did not fire"
         assert received == [2], received
-        assert fired, "timer did not fire on the PySide6 loop"
         assert "PyQt6" not in sys.modules
     """)
 
