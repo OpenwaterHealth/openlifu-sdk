@@ -1,0 +1,41 @@
+# SPDX-License-Identifier: Apache-2.0
+#
+# Unit tests on every PR and on main. The simulator tests (including the
+# SR-014 one) skip themselves when PyQt6 is missing, so this installs the
+# `ui` extra and fails outright if PyQt6 cannot be imported: a green run
+# means they ran.
+name: Unit tests
+
+on:
+  pull_request:
+  push:
+    branches: [ main ]
+
+permissions:
+  contents: read
+
+jobs:
+  pytest:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Qt runtime libraries
+        run: sudo apt-get update && sudo apt-get install -y libegl1 libgl1 libxkbcommon0 libdbus-1-3
+
+      - name: Install the SDK with the ui and test extras
+        run: pip install -e ".[ui,test]"
+
+      - name: Require PyQt6 (the simulator tests must not skip)
+        run: python -c "import PyQt6.QtCore"
+
+      - name: Run unit tests
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: pytest -rs

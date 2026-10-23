@@ -5,13 +5,14 @@ import logging
 import os
 import sys
 from enum import Enum
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Sequence
 
 import numpy as np
 import pandas as pd
 
 from openlifu_sdk.io.LIFUConfig import (
     DEFAULT_TIMEOUT, 
+    LIFU_ERR_MODULE_COUNT_MISMATCH,
     OW_CONSOLE_PID, 
     OW_TRANSMITTER_PID, 
     OW_VID,
@@ -25,6 +26,7 @@ from openlifu_sdk.io.exceptions import (
     LIFUSolutionError,
 )
 from openlifu_sdk.io.LIFUHVController import HVController, LIFUHVController
+from openlifu_sdk.io.LIFUTXPresets import module_regs_crcs
 from openlifu_sdk.io.LIFUTXDevice import LIFUTxDevice, TriggerModeOpts, TxDevice
 
 # Maximum-voltage lookup tables keyed by hardware/test profile.
@@ -222,10 +224,14 @@ class DeviceInterface:
 
     This is the surface FDA-mode applications program against. It loads
     presets baked into device flash (:meth:`load_preset`) and starts / stops
-    them; it has no way to program an arbitrary solution or HV setpoint. Its
-    components are the FDA :class:`TxDevice` / :class:`HVController`, which
-    neither define nor whitelist the RUO commands. It connects synchronously
-    and has no async / USB-monitoring mode.
+    them; it has no method that programs an arbitrary solution or HV
+    setpoint. Its components are the FDA :class:`TxDevice` /
+    :class:`HVController`, which do not define the RUO commands and refuse
+    to send anything but the (packet type, opcode) pairs their own methods
+    use, with the user config read-only. That is a host-side guard; the
+    safety boundary is the FDA_MODE firmware, which refuses those commands
+    itself. It connects synchronously and has no async / USB-monitoring
+    mode.
     :class:`LIFUInterface` extends it with those research (RUO) endpoints.
     """
     hvcontroller: HVController = None
@@ -256,6 +262,8 @@ class DeviceInterface:
         self.txdevice = None
         self.hvcontroller = None
         self.status = LIFUInterfaceStatus.STATUS_SYS_OFF
+        # Modules the last load_preset wrote, so unload_preset clears each of them.
+        self._preset_modules = 1
         self._test_mode = TX_test_mode
         self._owns_hw_pid_env = False
 
@@ -297,22 +305,55 @@ class DeviceInterface:
     def load_preset(self,
                     preset_index: int,
                     settings_crc: int,
-                    regs_crc: int,
+                    regs_crc: int | Sequence[int],
                     frequency_hz: float,
                     duration_index: int = 0,
                     turn_hv_on: bool = False,
-                    wait_for_settle: bool = False) -> bool:
+                    wait_for_settle: bool = False,
+                    voltage_range: tuple[float, float] | None = None) -> bool:
         """Load an FDA preset across TX and HV in one operation.
 
         The preset ends up on both or on neither: if the transmitter or the
         console refuses it, the error is raised with the transmitter left
         unloaded and the console with HV off and nothing selected
         (:meth:`unload_preset`), so the trigger cannot start and HV cannot
-        come on.
+        come on, and :attr:`status` is ``STATUS_ERROR``.
+
+        *regs_crc* is the preset's per-module ``regs_crc`` list
+        (``LIFUTXPresets.regs_crc(machine_config, module)`` for each module
+        the preset spans), or a single int for a one-module preset. The
+        preset must span exactly the modules the transmitter reports: a
+        one-module preset on a two-module transmitter, or the reverse, is
+        refused before anything is loaded (``LIFU_ERR_MODULE_COUNT_MISMATCH``)
+        and handled like any other refusal. Each module is then loaded with
+        its own CRC, and the console scaled from their calibration.
+
+        *voltage_range*, the preset's own ``[low, high]`` (preset data, see
+        ``LIFUTXPresets.preset_voltage_range``), is checked against the
+        voltage the console reports applying. A select outside it is refused
+        like a device refusal. That is the host's check of the preset's range.
+        An FDA_MODE console never sees the range; it holds every select to its
+        own fixed 35-45 V hard stop as a second line.
+
+        Raises:
+            LIFUError: The preset's module count differs from the
+                transmitter's (``LIFU_ERR_MODULE_COUNT_MISMATCH``), a refusal
+                from either device, a transmitter with no calibrated
+                sensitivity at *frequency_hz*, or an applied voltage outside
+                *voltage_range* (LIFUSolutionError).
         """
         self.set_status(LIFUInterfaceStatus.STATUS_PROGRAMMING)
+        regs_crcs = module_regs_crcs(regs_crc)
         try:
-            self._load_and_select(preset_index, settings_crc, regs_crc, frequency_hz, duration_index)
+            modules = int(self.txdevice.get_module_count())
+            if modules != len(regs_crcs):
+                raise LIFUError(
+                    f"the preset spans {len(regs_crcs)} transmitter module(s); the TX reports {modules}",
+                    code=LIFU_ERR_MODULE_COUNT_MISMATCH,
+                )
+            self._preset_modules = len(regs_crcs)
+            self._load_and_select(preset_index, settings_crc, regs_crcs, frequency_hz, duration_index,
+                                  voltage_range)
             if self.hvcontroller is not None:
                 if turn_hv_on:
                     logger.debug("Turn ON HV")
@@ -320,8 +361,9 @@ class DeviceInterface:
                 if self.hvcontroller.get_hv_status() and wait_for_settle:
                     logger.debug("Wait for Settle")
                     self.hvcontroller.wait_for_settle(timeout=SETTLE_TIME_HV_ON)
-        except Exception:
+        except Exception:  # reason: any failure, typed or not, must not leave half a preset loaded; re-raised
             self.unload_preset()
+            self.set_status(LIFUInterfaceStatus.STATUS_ERROR)
             raise
 
         self.set_status(LIFUInterfaceStatus.STATUS_READY)
@@ -330,9 +372,12 @@ class DeviceInterface:
 
     def unload_preset(self) -> None:
         """Leave the transmitter with nothing loaded and the console with HV off
-        and nothing selected, as far as each can be reached. Each step is
-        tried whatever the others do; a failure is logged, not raised."""
-        steps = [("transmitter unload", self.txdevice.unload_preset)]
+        and nothing selected, as far as each can be reached. Every module the
+        last load wrote is unloaded. Each step is tried whatever the others
+        do; a failure is logged, not raised."""
+        modules = getattr(self, "_preset_modules", 1)
+        steps = [(f"module {m} unload", lambda m=m: self.txdevice.unload_preset(module=m))
+                 for m in range(modules)]
         if self.hvcontroller is not None:
             steps += [("HV off", self.hvcontroller.turn_hv_off),
                       ("console deselect", self.hvcontroller.deselect_preset)]
@@ -342,32 +387,38 @@ class DeviceInterface:
             except LIFUError as exc:
                 logger.warning("unload_preset: %s failed: %s", name, exc)
 
-    def _load_and_select(self, preset_index: int, settings_crc: int, regs_crc: int,
-                         frequency_hz: float, duration_index: int) -> None:
-        """The two halves of :meth:`load_preset`: the transmitter's load, then
+    def _load_and_select(self, preset_index: int, settings_crc: int, regs_crcs: Sequence[int],
+                         frequency_hz: float, duration_index: int,
+                         voltage_range: tuple[float, float] | None) -> None:
+        """The two halves of :meth:`load_preset`: each module's load, then
         the console's select for that transmitter."""
-        self.txdevice.load_preset(
-            preset_index,
-            regs_crc,
-            duration_index=duration_index,
-            settings_crc=settings_crc,
-        )
+        for module, crc in enumerate(regs_crcs):
+            self.txdevice.load_preset(
+                preset_index,
+                crc,
+                duration_index=duration_index,
+                module=module,
+                settings_crc=settings_crc,
+            )
 
         if self.hvcontroller is not None:
-            if not self.txdevice.module_user_configs:
-                self.txdevice.refresh_metadata()
+            # Read the calibration every load: the transmitter may have been
+            # reconnected or swapped since the last one, and its sensitivity
+            # scales the HV. The modules just loaded, as load_preset has just
+            # counted them: not a second count read.
+            self.txdevice.refresh_metadata(module_count=len(regs_crcs))
             device_sensitivity = self.txdevice.get_sensitivity_for_frequency(frequency_hz)
             if device_sensitivity is None:
                 raise LIFUSolutionError(
                     f"TX device sensitivity is unavailable at {frequency_hz:.3f} Hz; cannot select FDA preset on HV."
                 )
 
-            self.hvcontroller.select_preset(
-                preset_index,
-                settings_crc,
-                device_sensitivity,
-                frequency_hz,
-            )
+            applied = self.hvcontroller.select_preset(preset_index, settings_crc, device_sensitivity)
+            if voltage_range is not None and not voltage_range[0] <= applied <= voltage_range[1]:
+                raise LIFUSolutionError(
+                    f"HV {applied:.2f} V for this transmitter is outside the preset's voltage_range "
+                    f"{voltage_range[0]:g}-{voltage_range[1]:g} V"
+                )
             logger.debug(
                 "Selected HV preset %d using TX sensitivity %.6g at %.3f Hz",
                 preset_index,
@@ -411,7 +462,7 @@ class DeviceInterface:
 
             logger.debug("Starting Trigger")
             self.txdevice.start_trigger()
-        except Exception:
+        except Exception:  # reason: any failure, typed or not, must not leave HV on without a trigger; re-raised
             # No trigger, no HV.
             if self.hvcontroller is not None:
                 try:

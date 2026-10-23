@@ -26,9 +26,9 @@ import pytest
 
 pytest.importorskip("PyQt6")
 
-from PyQt6.QtCore import QCoreApplication  # noqa: E402
+from PyQt6.QtCore import QCoreApplication  # noqa: E402 -- reason: after the PyQt6 importorskip
 
-from openlifu_sdk.ui.simulated_interface import (  # noqa: E402
+from openlifu_sdk.ui.simulated_interface import (  # noqa: E402 -- reason: after the PyQt6 importorskip
     SimulatedLIFUInterface,
     SimulatedTxDevice,
 )
