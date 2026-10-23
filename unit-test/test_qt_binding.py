@@ -2,9 +2,11 @@
 """Unit tests for :mod:`openlifu_sdk.ui._qt` binding selection (#76).
 
 ``openlifu_sdk.ui`` builds its QObjects on the host app's Qt binding:
-``OPENLIFU_QT_API`` if set, else the binding the host already
-imported, else PyQt6, then PySide6. 3D Slicer's PythonQt path in
-``simulated_interface`` bypasses the selector.
+``OPENLIFU_QT_API`` if set (it must match the host's binding), else the
+binding the host already imported, else PyQt6, then PySide6. Cases it
+can't resolve safely raise, and SDK objects refuse to construct when the
+host's application runs on the other binding. 3D Slicer's PythonQt
+path in ``simulated_interface`` bypasses the selector.
 
 Each case runs in a fresh interpreter: the binding is chosen once per
 process, and pytest itself may already have imported one. Cases that
@@ -19,38 +21,11 @@ job runs with ``OPENLIFU_QT_API=pyside6``.
 
 from __future__ import annotations
 
-import importlib.util
-import os
-import subprocess
-import sys
-import textwrap
-
 import pytest
 
-_SRC = os.path.join(os.path.dirname(__file__), "..", "src")
-
-HAS_PYQT6 = importlib.util.find_spec("PyQt6") is not None
-HAS_PYSIDE6 = importlib.util.find_spec("PySide6") is not None
-needs_pyqt6 = pytest.mark.skipif(not HAS_PYQT6, reason="PyQt6 not installed")
-needs_pyside6 = pytest.mark.skipif(not HAS_PYSIDE6, reason="PySide6 not installed")
-
-
-def _run(code: str, qt_api: str | None = None) -> subprocess.CompletedProcess:
-    """Run ``code`` in a fresh interpreter; ``qt_api`` sets OPENLIFU_QT_API."""
-    env = {k: v for k, v in os.environ.items() if k != "OPENLIFU_QT_API"}
-    if qt_api is not None:
-        env["OPENLIFU_QT_API"] = qt_api
-    env["PYTHONPATH"] = os.pathsep.join(filter(None, [_SRC, env.get("PYTHONPATH")]))
-    env.setdefault("QT_QPA_PLATFORM", "offscreen")
-    return subprocess.run(
-        [sys.executable, "-c", textwrap.dedent(code)],
-        env=env, capture_output=True, text=True, timeout=60,
-    )
-
-
-def _check(code: str, qt_api: str | None = None) -> None:
-    result = _run(code, qt_api)
-    assert result.returncode == 0, result.stderr
+from qt_subprocess import check as _check
+from qt_subprocess import needs_pyqt6, needs_pyside6
+from qt_subprocess import run as _run
 
 
 @needs_pyqt6
@@ -105,20 +80,85 @@ def test_follows_pyqt6_when_the_host_imported_it_first():
     """)
 
 
-@needs_pyqt6
-def test_both_bindings_imported_falls_back_to_the_default_order_with_a_warning():
-    # A stand-in module marks PySide6 as imported, so only one real Qt
-    # runtime loads.
+def test_both_bindings_imported_without_env_var_is_refused():
+    # Stand-in modules mark both bindings as imported; the refusal comes
+    # before any real Qt loads.
     result = _run("""
-        import logging, sys, types
-        logging.basicConfig(level=logging.WARNING)
-        import PyQt6.QtCore
+        import sys, types
+        sys.modules["PyQt6"] = types.ModuleType("PyQt6")
         sys.modules["PySide6"] = types.ModuleType("PySide6")
         from openlifu_sdk.ui import _qt
-        assert _qt.QT_API == "PyQt6", _qt.QT_API
     """)
-    assert result.returncode == 0, result.stderr
-    assert "Both PyQt6 and PySide6 are imported" in result.stderr
+    assert result.returncode != 0
+    assert "ValueError: Both PyQt6 and PySide6 are imported" in result.stderr
+    assert "Set OPENLIFU_QT_API" in result.stderr
+
+
+@pytest.mark.parametrize(
+    ("qt_api", "real", "stand_in"),
+    [
+        pytest.param("pyqt6", "PyQt6", "PySide6", marks=needs_pyqt6),
+        pytest.param("pyside6", "PySide6", "PyQt6", marks=needs_pyside6),
+    ],
+)
+def test_both_bindings_imported_env_var_picks_one(qt_api, real, stand_in):
+    _check(f"""
+        import sys, types
+        import {real}.QtCore
+        sys.modules["{stand_in}"] = types.ModuleType("{stand_in}")
+        from openlifu_sdk.ui import _qt
+        assert _qt.QT_API == "{real}", _qt.QT_API
+    """, qt_api=qt_api)
+
+
+_HOST_APP_ON_OTHER_BINDING = """
+    import sys, types
+    from openlifu_sdk.ui import _qt
+    assert _qt.QT_API == "{chosen}", _qt.QT_API
+    # The host imports its binding only now, after the SDK, and starts
+    # its application on it. A stand-in plays that binding, so only one
+    # real Qt runtime loads.
+    other = types.ModuleType("{other}")
+    other.QtCore = types.ModuleType("{other}.QtCore")
+    other.QtCore.QCoreApplication = type(
+        "QCoreApplication", (), {{"instance": staticmethod(lambda: object())}},
+    )
+    sys.modules["{other}"] = other
+    sys.modules["{other}.QtCore"] = other.QtCore
+    from openlifu_sdk.ui.base_connector import BaseConnector
+    from openlifu_sdk.ui.simulated_interface import SimulatedDeviceInterface
+    for make in (BaseConnector, SimulatedDeviceInterface):
+        try:
+            make()
+        except RuntimeError as exc:
+            assert "the application runs on {other}" in str(exc), exc
+            assert "Import {other} before openlifu_sdk.ui" in str(exc), exc
+        else:
+            raise AssertionError(f"{{make.__name__}} constructed on the wrong binding")
+"""
+
+
+@pytest.mark.parametrize(
+    ("qt_api", "chosen", "other"),
+    [
+        pytest.param("pyqt6", "PyQt6", "PySide6", marks=needs_pyqt6),
+        pytest.param("pyside6", "PySide6", "PyQt6", marks=needs_pyside6),
+    ],
+)
+def test_sdk_objects_refuse_a_host_application_on_the_other_binding(qt_api, chosen, other):
+    _check(_HOST_APP_ON_OTHER_BINDING.format(chosen=chosen, other=other), qt_api=qt_api)
+
+
+@needs_pyqt6
+def test_sdk_objects_construct_with_no_application_or_one_on_their_binding():
+    _check("""
+        from openlifu_sdk.ui.base_connector import BaseConnector
+        from openlifu_sdk.ui.simulated_interface import SimulatedDeviceInterface
+        BaseConnector(); SimulatedDeviceInterface()
+        from PyQt6.QtCore import QCoreApplication
+        app = QCoreApplication([])
+        BaseConnector(); SimulatedDeviceInterface()
+    """)
 
 
 @pytest.mark.parametrize(

@@ -104,7 +104,8 @@ def test_poll_thread_signals_are_delivered_on_the_main_thread_loop(qt_app):
             time.sleep(0.005)
     finally:
         thread.stop()
-        assert thread.wait(2000), "poll thread did not stop"
+        stopped = thread.wait(2000)
+    assert stopped, "poll thread did not stop"
     assert len(sink.received) >= 2, sink.received
     main = threading.get_ident()
     assert all(ident == main for _, ident in sink.received)
