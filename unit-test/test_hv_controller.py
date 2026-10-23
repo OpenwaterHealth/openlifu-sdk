@@ -35,11 +35,17 @@ from openlifu_sdk.io.exceptions import (
     LIFUProtocolError,
 )
 from openlifu_sdk.io.LIFUConfig import (
+    ODO_RESET_BOTH,
+    ODO_RESET_HV,
+    ODO_RESET_POWER,
     OW_ERROR,
     OW_POWER,
+    OW_POWER_GET_ODO,
+    OW_POWER_RESET_ODO,
     OW_RESP,
+    OW_UNKNOWN,
 )
-from openlifu_sdk.io.LIFUHVController import LIFUHVController
+from openlifu_sdk.io.LIFUHVController import ConsoleOdometer, LIFUHVController
 from openlifu_sdk.io.uart import OWUart
 
 
@@ -377,6 +383,54 @@ class TestHVControllerUnit(unittest.TestCase):
             self.hv.get_vmon_values()
 
 
+    # --- odometer -----------------------------------------------------------
+
+    def test_45_get_odometer_valid(self):
+        """get_odometer() sends OW_POWER_GET_ODO and decodes two LE uint32s."""
+        self.uart.send_packet.return_value = _make_packet(struct.pack("<II", 1_500_000, 86_400))
+        odo = self.hv.get_odometer()
+        self.assertEqual(odo, ConsoleOdometer(power_on_s=1_500_000, hv_on_s=86_400))
+        kwargs = self.uart.send_packet.call_args.kwargs
+        self.assertEqual(kwargs.get("command"), OW_POWER_GET_ODO)
+        self.assertEqual(kwargs.get("packet_type"), OW_POWER)
+
+    def test_46_get_odometer_old_firmware_returns_none(self):
+        """get_odometer() returns None when the firmware answers OW_UNKNOWN."""
+        self.uart.send_packet.return_value = _make_packet(packet_type=OW_UNKNOWN)
+        self.assertIsNone(self.hv.get_odometer())
+
+    def test_47_get_odometer_bad_payload(self):
+        """get_odometer() raises LIFUProtocolError on a wrong payload size."""
+        self.uart.send_packet.return_value = _make_packet(b"\x00" * 4)
+        with self.assertRaises(LIFUProtocolError):
+            self.hv.get_odometer()
+
+    def test_48_reset_odometer_sends_target(self):
+        """reset_odometer() sends OW_POWER_RESET_ODO with the target in reserved."""
+        self.uart.send_packet.return_value = _make_packet()
+        self.assertTrue(self.hv.reset_odometer(ODO_RESET_HV))
+        kwargs = self.uart.send_packet.call_args.kwargs
+        self.assertEqual(kwargs.get("command"), OW_POWER_RESET_ODO)
+        self.assertEqual(kwargs.get("reserved"), ODO_RESET_HV)
+
+    def test_49_reset_odometer_defaults_to_both(self):
+        """reset_odometer() with no argument clears both counters."""
+        self.uart.send_packet.return_value = _make_packet()
+        self.hv.reset_odometer()
+        self.assertEqual(self.uart.send_packet.call_args.kwargs.get("reserved"), ODO_RESET_BOTH)
+
+    def test_50_reset_odometer_bad_target_raises(self):
+        """reset_odometer() rejects an unknown target without sending."""
+        with self.assertRaises(ValueError):
+            self.hv.reset_odometer(3)
+        self.uart.send_packet.assert_not_called()
+
+    def test_51_reset_odometer_device_error_raises(self):
+        """reset_odometer() raises LIFUDeviceError when the save fails on the device."""
+        self.uart.send_packet.return_value = _make_packet(packet_type=OW_ERROR)
+        with self.assertRaises(LIFUDeviceError):
+            self.hv.reset_odometer(ODO_RESET_POWER)
+
 # ===========================================================================
 # Interactive (menu-driven) Tests  — real hardware
 # ===========================================================================
@@ -403,6 +457,7 @@ class HVControllerInteractiveTests:
             ("Set RGB LED",                 self.test_set_rgb_led),
             ("Get RGB LED",                 self.test_get_rgb_led),
             ("Get VMON Values",             self.test_get_vmon_values),
+            ("Get Odometer",                self.test_get_odometer),
             ("Set Raw DAC",                 self.test_set_raw_dac),
             ("Set DACs (HVP/HVM/HRP/HRM)",  self.test_set_dacs),
             ("HV Enable / Disable",         self.test_hv_enable),
@@ -572,6 +627,21 @@ class HVControllerInteractiveTests:
         self._ok("VMON read complete.")
         return channels
 
+    def test_get_odometer(self):
+        print("Reading console odometer...")
+        try:
+            odo = self.hv.get_odometer()
+        except Exception as exc:
+            self._err(f"Exception: {exc}")
+            return None
+        if odo is None:
+            self._err("Console firmware has no odometer.")
+            return None
+        print(f"   power-on: {odo.power_on_s} s ({odo.power_on_s / 3600:.2f} h)")
+        print(f"   HV-on:    {odo.hv_on_s} s ({odo.hv_on_s / 3600:.2f} h)")
+        self._ok("Odometer read complete.")
+        return odo
+
     def test_set_raw_dac(self):
         try:
             dac_id = int(input("  DAC ID (0-3): "))
@@ -632,6 +702,7 @@ class HVControllerInteractiveTests:
             "Get Temperature 1", "Get Temperature 2",
             "Get 12V Status", "Get HV Status", "Get HV Voltage",
             "Get Fan Speed", "Get RGB LED", "Get VMON Values",
+            "Get Odometer",
         ]
         print("\n=== Running All Read-Only Tests ===")
         for label, fn in self.menu_items:
