@@ -279,6 +279,24 @@ def test_start_after_timeout_is_refused_until_stop(qt_app):
         interface.close()
 
 
+def test_load_preset_while_paused_is_refused(qt_app):
+    mc, regs = flash_entry()
+    interface = SimulatedDeviceInterface(preset_flash=[(mc, regs)])
+    try:
+        interface.load_preset(0, mc["settings_crc"], regs, 400_000.0, duration_index=1)
+        interface.start_sonication(turn_hv_on=True, wait_for_settle=False)
+        interface.pause_sonication()
+        _train_boundary(interface)
+
+        with pytest.raises(LIFUError, match="paused"):
+            interface.load_preset(0, mc["settings_crc"], regs, 400_000.0, duration_index=0)
+        assert _trigger(interface)["trigger_status"] == "PAUSED"
+        assert interface.hvcontroller.get_hv_status()
+        assert interface.resume_sonication()
+    finally:
+        interface.close()
+
+
 def test_timeout_notifies_the_finished_callback(qt_app):
     interface = _make_running_interface(timeout_s=0.12)
     finished = []

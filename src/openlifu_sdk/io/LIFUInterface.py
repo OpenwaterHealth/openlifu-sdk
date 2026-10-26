@@ -343,7 +343,10 @@ class DeviceInterface:
                 from either device, a transmitter with no calibrated
                 sensitivity at *frequency_hz*, or an applied voltage outside
                 *voltage_range* (LIFUSolutionError).
+            LIFUError: If a sequence is paused or timed out; see
+                :meth:`_refuse_while_sequence_held`.
         """
+        self._refuse_while_sequence_held("load_preset")
         self.set_status(LIFUInterfaceStatus.STATUS_PROGRAMMING)
         regs_crcs = module_regs_crcs(regs_crc)
         try:
@@ -440,18 +443,13 @@ class DeviceInterface:
                 again if the rail does not settle or the trigger does not
                 start (a transmitter with nothing loaded refuses to).
             LIFUHVSettleError: If the HV rail does not settle in time.
-            LIFUError: If the sequence is paused (SR-023) or timed out
-                (SR-024). The firmware refuses Start then, so this is
-                refused before HV is touched; Stop first to start over.
+            LIFUError: If a sequence is paused or timed out; see
+                :meth:`_refuse_while_sequence_held`.
         """
         if self._test_mode:
             return True
 
-        # Asked of the firmware, not the cached status, which a reconnect
-        # or load_preset() may have reset.
-        trigger_status = str(self.txdevice.get_trigger_json().get("TriggerStatus", "")).upper()
-        if trigger_status in ("PAUSED", "TIMEOUT"):
-            raise LIFUError(f"start_sonication: the sequence is {trigger_status.lower()}; stop it first")
+        self._refuse_while_sequence_held("start_sonication")
 
         try:
             if self.hvcontroller is not None:
@@ -485,6 +483,23 @@ class DeviceInterface:
         self.set_status(LIFUInterfaceStatus.STATUS_RUNNING)
         return True
 
+    def _refuse_while_sequence_held(self, op: str) -> None:
+        """Refuse *op* while the firmware holds a paused (SR-023) or
+        timed-out (SR-024) sequence, before HV or the preset is touched.
+
+        The firmware refuses Start and preset loads while paused, and the
+        error paths of :meth:`start_sonication` / :meth:`load_preset`
+        would then turn HV off under a pause that could still be resumed.
+        A timed-out sequence must be ended with Stop rather than restarted.
+        The status is asked of the firmware, not the cached ``status``,
+        which a reconnect or an earlier refusal may have reset. (TIMEOUT
+        needs openlifu-transmitter-fw#22; today's firmware reports
+        RUNNING, PAUSED or STOPPED.)
+        """
+        trigger_status = str(self.txdevice.get_trigger_json().get("TriggerStatus", "")).upper()
+        if trigger_status in ("PAUSED", "TIMEOUT"):
+            raise LIFUError(f"{op}: the sequence is {trigger_status.lower()}; stop it first")
+
     def set_status(self, status: LIFUInterfaceStatus) -> None:
         """
         Set the device status.
@@ -499,10 +514,13 @@ class DeviceInterface:
         """
         Query the device status.
 
-        While a sequence is running or paused, the trigger status is read
-        from the firmware (:meth:`is_running`), so PAUSED and TIMEOUT
-        reflect what the firmware reports (SR-023, SR-024). That read is
-        a UART round trip.
+        Returns the cached status, refreshed from the firmware's trigger
+        status (:meth:`is_running`, a UART round trip) only while the
+        cached status is RUNNING or PAUSED, so PAUSED and TIMEOUT follow
+        the firmware during a run (SR-023, SR-024). After a reconnect or
+        a refused load the cache may read READY or ERROR while the
+        firmware still holds a paused sequence; :meth:`start_sonication`
+        and :meth:`load_preset` ask the firmware directly for that reason.
 
         Returns:
             LIFUInterfaceStatus: The device status.
@@ -528,7 +546,8 @@ class DeviceInterface:
         HV and the trigger configuration are not touched.
 
         Raises:
-            LIFUDeviceError: The firmware rejected the pause (no sequence running).
+            LIFUDeviceError: The firmware rejected the pause (no sequence
+                running, or not a SEQUENCE-mode run).
             LIFUNotConnectedError, LIFUCommunicationError.
         """
         if self._test_mode:
@@ -544,8 +563,10 @@ class DeviceInterface:
         trigger configuration are not touched.
 
         Raises:
-            LIFUDeviceError: The firmware rejected the resume (not paused,
-                over temperature, or after a timeout, SR-024).
+            LIFUDeviceError: The firmware rejected the resume: not paused
+                (including after the firmware ended the run), or the
+                over-temperature flag is set. A distinct refusal after a
+                treatment timeout (SR-024) needs openlifu-transmitter-fw#22.
             LIFUNotConnectedError, LIFUCommunicationError.
         """
         if self._test_mode:

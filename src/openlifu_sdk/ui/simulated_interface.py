@@ -1385,6 +1385,9 @@ class SimulatedDeviceInterface(QObject):
         """Same contract as :meth:`DeviceInterface.load_preset`: the preset
         must span the modules the transmitter reports, and it ends up on
         both devices or, if either refuses, on neither."""
+        status = self.txdevice._trigger_status
+        if status in ("PAUSED", "TIMEOUT"):
+            raise LIFUError(f"load_preset: the sequence is {status.lower()}; stop it first")
         self.set_status(LIFUInterfaceStatus.STATUS_PROGRAMMING)
         regs_crcs = module_regs_crcs(regs_crc)
         try:

@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, call
 
 import pytest
 
 from openlifu_sdk.io.LIFUConfig import (
+    OW_CONTROLLER,
     OW_CTRL_PAUSE_SWTRIG,
     OW_CTRL_RESUME_SWTRIG,
     OW_ERROR,
@@ -48,6 +49,7 @@ def test_tx_pause_resume_send_commands_and_raise_on_error(method_name, command):
 
     assert getattr(tx, method_name)()
     assert uart.send_packet.call_args.kwargs["command"] == command
+    assert uart.send_packet.call_args.kwargs["packet_type"] == OW_CONTROLLER
 
     uart.send_packet.return_value.packet_type = OW_ERROR
     with pytest.raises(LIFUDeviceError):
@@ -59,11 +61,12 @@ def test_pause_resume_do_not_touch_hv_or_reconfigure_trigger():
     interface.status = LIFUInterfaceStatus.STATUS_RUNNING
 
     assert interface.pause_sonication()
-    assert interface.txdevice.pause_trigger.call_count == 1
+    assert interface.txdevice.mock_calls == [call.pause_trigger()]
     assert interface.hvcontroller.mock_calls == []
 
+    interface.txdevice.reset_mock()
     assert interface.resume_sonication()
-    assert interface.txdevice.resume_trigger.call_count == 1
+    assert interface.txdevice.mock_calls == [call.resume_trigger()]
     assert interface.hvcontroller.mock_calls == []
 
 
@@ -193,6 +196,32 @@ def test_start_after_timeout_is_refused_before_hv_is_touched():
 
     assert interface.hvcontroller.mock_calls == []
     interface.txdevice.start_trigger.assert_not_called()
+
+
+@pytest.mark.parametrize("trigger_status", ["PAUSED", "TIMEOUT"])
+def test_load_preset_while_a_sequence_is_held_is_refused_untouched(trigger_status):
+    # The firmware refuses a preset load while paused; the refusal path
+    # would otherwise unload the preset and turn HV off under the pause.
+    interface = _interface()
+    interface.txdevice.get_trigger_json.return_value = {"TriggerStatus": trigger_status}
+
+    with pytest.raises(LIFUError, match=trigger_status.lower()):
+        interface.load_preset(0, 1, 2, 400_000.0)
+
+    assert interface.hvcontroller.mock_calls == []
+    assert interface.txdevice.mock_calls == [call.get_trigger_json()]
+    assert interface.status == LIFUInterfaceStatus.STATUS_READY
+
+
+def test_get_status_follows_the_cache_when_idle():
+    # Documented: with a cached READY the firmware is not asked, even if
+    # it holds a paused sequence; Start and load_preset ask it directly.
+    interface = _interface()
+    interface.txdevice.get_trigger_json.return_value = {"TriggerStatus": "PAUSED"}
+
+    assert interface.get_status() == LIFUInterfaceStatus.STATUS_READY
+    with pytest.raises(LIFUError, match="paused"):
+        interface.start_sonication()
 
 
 def test_start_fails_without_hv_when_the_trigger_status_cannot_be_read():
