@@ -54,6 +54,8 @@ from openlifu_sdk.io.LIFUConfig import (
     OW_CTRL_SET_SWTRIG,
     OW_CTRL_START_SWTRIG,
     OW_CTRL_STOP_SWTRIG,
+    OW_CTRL_PAUSE_SWTRIG,
+    OW_CTRL_RESUME_SWTRIG,
     OW_TRANSMITTER_PID,
     OW_TX7332,
     OW_TX7332_DEMO,
@@ -380,6 +382,18 @@ class TxDevice(OWComponent):
         r = self.send_checked(packet_type=OW_CONTROLLER, command=OW_CTRL_STOP_SWTRIG,
                               addr=0, op="stop_trigger")
         r.print_packet()
+        return True
+
+    def pause_trigger(self) -> bool:
+        """Pause the running software trigger at a pulse-train boundary."""
+        self.send_checked(packet_type=OW_CONTROLLER, command=OW_CTRL_PAUSE_SWTRIG,
+                          addr=0, op="pause_trigger")
+        return True
+
+    def resume_trigger(self) -> bool:
+        """Resume a paused software trigger."""
+        self.send_checked(packet_type=OW_CONTROLLER, command=OW_CTRL_RESUME_SWTRIG,
+                          addr=0, op="resume_trigger")
         return True
 
     def get_preset(self, index: int) -> Dict:

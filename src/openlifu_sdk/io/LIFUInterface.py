@@ -115,6 +115,8 @@ class LIFUInterfaceStatus(Enum):
     STATUS_RUNNING = 6
     STATUS_FINISHED = 7
     STATUS_ERROR = 8
+    STATUS_PAUSED = 9
+    STATUS_TIMEOUT = 10
 
 logger = logging.getLogger(__name__)
 
@@ -494,7 +496,25 @@ class DeviceInterface:
         if self._test_mode:
             return LIFUInterfaceStatus.STATUS_READY
 
+        if self.status in (LIFUInterfaceStatus.STATUS_RUNNING, LIFUInterfaceStatus.STATUS_PAUSED):
+            self.is_running()
         return self.status
+
+    def pause_sonication(self) -> bool:
+        """Pause the trigger without changing HV or trigger configuration."""
+        if self._test_mode:
+            return True
+        self.txdevice.pause_trigger()
+        self.set_status(LIFUInterfaceStatus.STATUS_PAUSED)
+        return True
+
+    def resume_sonication(self) -> bool:
+        """Resume the trigger without changing HV or trigger configuration."""
+        if self._test_mode:
+            return True
+        self.txdevice.resume_trigger()
+        self.set_status(LIFUInterfaceStatus.STATUS_RUNNING)
+        return True
 
     def is_running(self) -> bool:
         """
@@ -506,8 +526,16 @@ class DeviceInterface:
         trigger_json = self.txdevice.get_trigger_json()
         trigger_status = trigger_json.get("TriggerStatus", "NOSTATUS").upper()
         if trigger_status == "RUNNING":
+            self.set_status(LIFUInterfaceStatus.STATUS_RUNNING)
             return True
+        elif trigger_status == "PAUSED":
+            self.set_status(LIFUInterfaceStatus.STATUS_PAUSED)
+            return False
+        elif trigger_status == "TIMEOUT":
+            self.set_status(LIFUInterfaceStatus.STATUS_TIMEOUT)
+            return False
         elif trigger_status == "STOPPED":
+            self.set_status(LIFUInterfaceStatus.STATUS_FINISHED)
             return False
         elif trigger_status == "NOSTATUS":
             raise LIFUNoTriggerStatusError("Device failed to provide valid trigger status.")
