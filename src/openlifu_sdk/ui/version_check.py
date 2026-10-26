@@ -97,11 +97,24 @@ def show_incompatible_version_dialog(
     back to ``stderr`` if QtWidgets isn't importable.
     """
     try:
-        from PyQt6.QtWidgets import QApplication, QMessageBox
+        from openlifu_sdk.ui._qt import import_qt_module
 
-        QApplication.instance() or QApplication(sys.argv)
+        QtWidgets = import_qt_module("QtWidgets")
+        QApplication, QMessageBox = QtWidgets.QApplication, QtWidgets.QMessageBox
+        app = QApplication.instance() or QApplication(sys.argv)
+        if not isinstance(app, QApplication):
+            # A QGuiApplication / QCoreApplication host can't show widgets:
+            # Qt aborts the process, which no except can catch.
+            logger.error(
+                "Not showing the SDK version dialog: the application is a %s, "
+                "not a QApplication",
+                type(app).__name__,
+            )
+            print(f"ERROR: {message}", file=sys.stderr)
+            return
         QMessageBox.critical(parent, title, f"{message}\n\nThe application will now exit.")
-    except Exception:
+    except Exception:  # reason: last-resort path; the caller exits either way, so any Qt failure falls back to stderr
+        logger.exception("Could not show the SDK version dialog; reporting on stderr")
         print(f"ERROR: {message}", file=sys.stderr)
 
 

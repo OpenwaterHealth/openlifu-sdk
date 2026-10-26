@@ -11,14 +11,14 @@ from __future__ import annotations
 
 import pytest
 
-pytest.importorskip("PyQt6")
+pytest.importorskip("openlifu_sdk.ui._qt")
 
-from sr003_presets import flash_entry  # noqa: E402 -- reason: after the PyQt6 importorskip
+from sr003_presets import flash_entry  # noqa: E402 -- reason: after the Qt importorskip
 
-from openlifu_sdk.io.exceptions import LIFUDeviceError  # noqa: E402 -- reason: after the PyQt6 importorskip
-from openlifu_sdk.io.LIFUConfig import OW_BAD_CRC, OW_HV_PRESET_CRC  # noqa: E402 -- reason: after the PyQt6 importorskip
-from openlifu_sdk.io.LIFUTXPresets import preset_sensitivity  # noqa: E402 -- reason: after the PyQt6 importorskip
-from openlifu_sdk.ui.simulated_interface import (  # noqa: E402 -- reason: after the PyQt6 importorskip
+from openlifu_sdk.io.exceptions import LIFUDeviceError  # noqa: E402 -- reason: after the Qt importorskip
+from openlifu_sdk.io.LIFUConfig import OW_BAD_CRC, OW_HV_PRESET_CRC  # noqa: E402 -- reason: after the Qt importorskip
+from openlifu_sdk.io.LIFUTXPresets import preset_sensitivity  # noqa: E402 -- reason: after the Qt importorskip
+from openlifu_sdk.ui.simulated_interface import (  # noqa: E402 -- reason: after the Qt importorskip
     SimulatedDeviceInterface,
     SimulatedLIFUInterface,
     SimulatedTxDevice,

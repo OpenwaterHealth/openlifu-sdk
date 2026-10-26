@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import pytest
 
-pytest.importorskip("PyQt6")
+pytest.importorskip("openlifu_sdk.ui._qt")
 
 from openlifu_sdk.ui.simulated_interface import (
     SimulatedHVController,
