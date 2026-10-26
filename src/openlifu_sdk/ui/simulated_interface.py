@@ -584,8 +584,15 @@ class SimulatedTxDevice:
         return True
 
     def resume_trigger(self):
+        """Like the firmware (SR-023 item 8): not gated by start_C, but
+        refused at or above the loaded preset's shutoff_C."""
         if self._trigger_status != "PAUSED":
             raise LIFUDeviceError("TX: sequence is not paused")
+        if self._loaded_preset_index is not None:
+            shutoff_c = self._preset_flash[self._loaded_preset_index][0].get("shutoff_C")
+            if shutoff_c is not None and self._modules[0].read_temp() >= float(shutoff_c):
+                raise LIFUDeviceError(f"TX at shutoff_C {float(shutoff_c):.1f} C",
+                                      device_error_code=OW_TEMP_TOO_HIGH)
         self._trigger_status = "RUNNING"
         return True
 
@@ -1059,7 +1066,7 @@ class _SimulatedRunEngine(QObject):
         self._train_curr = 0
         self.alive = True
         self.paused = False
-        self._remaining_train_ms = 0
+        self.pause_pending = False
         self._timeout_deadline: Optional[float] = None
         self._train_period_ms = max(20, int(round(self._train_period_s * 1000)))
 
@@ -1116,25 +1123,25 @@ class _SimulatedRunEngine(QObject):
             self._heartbeat.start(HEARTBEAT_INTERVAL_MS)
 
     def pause(self):
+        """Request a pause, as the firmware does (SR-023): it lands at
+        the next train tick, and not at all if that tick completes the
+        sequence. Until it lands the status stays RUNNING. Pausing
+        while paused is a no-op."""
         if not self.alive:
             raise LIFUDeviceError("TX: no sequence is running")
-        if self.paused:
-            return True
-        self._remaining_train_ms = max(0, self._train_timer.remainingTime())
-        self._train_timer.stop()
-        self._heartbeat.stop()
-        self._tx.pause_trigger()
-        self.paused = True
-        self._tx.emit_status_frame(
-            self._train_curr, self._frame_train_total(),
-            status="PAUSED", mode=self._mode_label,
-        )
-        self.parent().set_status(LIFUInterfaceStatus.STATUS_PAUSED)
+        if not self.paused:
+            self.pause_pending = True
         return True
 
     def resume(self):
+        """Resume from the next train, one full train period after
+        Resume, with the count retained. Before the pause lands, Resume
+        withdraws it. Refused after a timeout or at shutoff_C."""
         if self._timeout_deadline is not None and time.monotonic() >= self._timeout_deadline:
             self._on_timeout()
+        if self.alive and self.pause_pending:
+            self.pause_pending = False
+            return True
         if not self.alive or not self.paused:
             raise LIFUDeviceError("TX: sequence is not paused or treatment timed out")
         self._tx.resume_trigger()
@@ -1143,8 +1150,7 @@ class _SimulatedRunEngine(QObject):
             self._train_curr, self._frame_train_total(),
             status="RUNNING", mode=self._mode_label,
         )
-        self._train_timer.start(self._remaining_train_ms)
-        self._remaining_train_ms = self._train_period_ms
+        self._train_timer.start(self._train_period_ms)
         if self._train_period_ms > HEARTBEAT_INTERVAL_MS:
             self._heartbeat.start(HEARTBEAT_INTERVAL_MS)
         self.parent().set_status(LIFUInterfaceStatus.STATUS_RUNNING)
@@ -1181,6 +1187,7 @@ class _SimulatedRunEngine(QObject):
             return
         self.alive = False
         self.paused = False
+        self.pause_pending = False
         self._train_timer.stop()
         self._heartbeat.stop()
         self._timeout_timer.stop()
@@ -1210,12 +1217,25 @@ class _SimulatedRunEngine(QObject):
                 self._train_curr, self._train_curr,
                 status="RUNNING", mode=self._mode_label,
             )
+        else:
+            self._tx.emit_status_frame(
+                self._train_curr, self._train_total,
+                status="RUNNING", mode=self._mode_label,
+            )
+        if self.pause_pending and (self._infinite or self._train_curr < self._train_total):
+            # A requested pause lands at this train boundary (SR-023).
+            self.pause_pending = False
+            self.paused = True
+            self._train_timer.stop()
+            self._heartbeat.stop()
+            self._tx.pause_trigger()
+            self._tx.emit_status_frame(
+                self._train_curr, self._frame_train_total(),
+                status="PAUSED", mode=self._mode_label,
+            )
+            self.parent().set_status(LIFUInterfaceStatus.STATUS_PAUSED)
             return
-        self._tx.emit_status_frame(
-            self._train_curr, self._train_total,
-            status="RUNNING", mode=self._mode_label,
-        )
-        if self._train_curr >= self._train_total:
+        if not self._infinite and self._train_curr >= self._train_total:
             # Mark inactive BEFORE emitting so a queued heartbeat tick
             # cannot race past us and re-emit a RUNNING frame that
             # would clobber the state reset on the connector side.
@@ -1237,6 +1257,8 @@ class _SimulatedRunEngine(QObject):
                 self._train_curr, self._train_total,
                 status="STOPPED", mode=self._mode_label,
             )
+            # As DeviceInterface.get_status() reports on STOPPED.
+            self.parent().set_status(LIFUInterfaceStatus.STATUS_FINISHED)
             if self._finished_cb is not None:
                 try:
                     self._finished_cb()
@@ -1286,8 +1308,9 @@ class SimulatedDeviceInterface(QObject):
                 num_modules = max(1, len(list(modules_attr)))
         _check_host_binding()
         super().__init__()
-        if not math.isfinite(treatment_timeout_s) or treatment_timeout_s < 0:
-            raise ValueError("treatment_timeout_s must be a finite non-negative number")
+        # Upper bound: the timeout runs on a QTimer (int32 milliseconds).
+        if not 0 <= treatment_timeout_s <= 2_000_000:
+            raise ValueError("treatment_timeout_s must be between 0 and 2,000,000 s")
         self.treatment_timeout_s = float(treatment_timeout_s)
         self.txdevice, self.hvcontroller = self._create_devices(num_modules, preset_flash)
         self.status = LIFUInterfaceStatus.STATUS_SYS_OFF

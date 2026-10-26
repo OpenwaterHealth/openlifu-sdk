@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+"""Pause/Resume commands and PAUSED/TIMEOUT status on the real interface classes (SR-023, SR-024)."""
 from __future__ import annotations
 
 from types import SimpleNamespace

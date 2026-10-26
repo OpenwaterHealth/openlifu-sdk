@@ -896,6 +896,7 @@ class TestComponentSurface(unittest.TestCase):
     TX_FDA = ("ping", "get_version", "get_hardware_id", "read_config",
               "refresh_metadata", "get_temperature", "get_ambient_temperature",
               "get_trigger", "get_trigger_json", "start_trigger", "stop_trigger",
+              "pause_trigger", "resume_trigger",
               "get_preset", "load_preset", "get_module_count")
     HV_FDA = ("ping", "get_version", "get_hardware_id", "read_config",
               "turn_hv_on", "turn_hv_off", "get_hv_status", "get_12v_status",
@@ -1013,6 +1014,7 @@ class TestCommandWhitelist(unittest.TestCase):
         calls = [tx.ping, tx.get_version, tx.get_hardware_id, tx.read_config,
                  lambda: tx.refresh_metadata(module_count=1), tx.get_temperature,
                  tx.get_ambient_temperature, tx.get_trigger_json, tx.start_trigger, tx.stop_trigger,
+                 tx.pause_trigger, tx.resume_trigger,
                  lambda: tx.get_preset(0), lambda: tx.load_preset(0, 1, settings_crc=2),
                  tx.unload_preset, tx.get_module_count,
                  hv.ping, hv.get_version, hv.read_config, hv.get_temperature1, hv.get_temperature2,

@@ -13,7 +13,7 @@ host reads ``train_count`` and ``trigger_status`` off a polled
 
 Also exercises a pre-existing sim bug fix: on natural completion
 of a sequence, the engine now flips the TxDevice's
-``_trigger_running`` to False (previously only an explicit
+``_trigger_status`` to ``"STOPPED"`` (previously only an explicit
 ``stop_trigger()`` did so, which only mattered for callers that
 subscribed to STATUS frames rather than polling).
 """

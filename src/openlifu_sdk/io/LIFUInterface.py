@@ -492,10 +492,16 @@ class DeviceInterface:
 
         While a sequence is running or paused, the trigger status is read
         from the firmware (:meth:`is_running`), so PAUSED and TIMEOUT
-        reflect what the firmware reports (SR-023, SR-024).
+        reflect what the firmware reports (SR-023, SR-024). That read is
+        a UART round trip.
 
         Returns:
             LIFUInterfaceStatus: The device status.
+
+        Raises:
+            LIFUNoTriggerStatusError, LIFUNotConnectedError,
+            LIFUCommunicationError, LIFUDeviceError: While running or
+                paused, if the trigger status cannot be read.
         """
         if self._test_mode:
             return LIFUInterfaceStatus.STATUS_READY
@@ -540,10 +546,14 @@ class DeviceInterface:
 
     def is_running(self) -> bool:
         """
-        Check if the device is currently running a sonication.
+        Check if the device is currently running a sonication, and set
+        ``status`` from the firmware's trigger status.
 
         Returns:
-            bool: True if the device is running, False otherwise.
+            bool: True only while the firmware reports RUNNING. PAUSED,
+            TIMEOUT and STOPPED all return False, so a caller waiting for
+            the end of a run that can be paused should check
+            :meth:`get_status` instead.
         """
         trigger_json = self.txdevice.get_trigger_json()
         trigger_status = trigger_json.get("TriggerStatus", "NOSTATUS").upper()
