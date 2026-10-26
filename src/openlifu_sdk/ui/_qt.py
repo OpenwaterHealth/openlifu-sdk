@@ -14,7 +14,11 @@ The binding is chosen once, at first import, in this order:
 2. The binding the host has already imported. Apps should therefore
    import their Qt binding before importing ``openlifu_sdk.ui``.
 3. If the host has imported neither: PyQt6 (the historical default and
-   the ``ui`` extra), then PySide6.
+   the ``ui`` extra), then PySide6. One that is installed but fails to
+   import is logged as a warning before the next is tried.
+
+"Imported" means ``<binding>.QtCore`` is in ``sys.modules``; the bare
+package alone loads no Qt runtime.
 
 Every case the SDK can't resolve safely raises :class:`ValueError`: an
 unknown ``OPENLIFU_QT_API``, one naming a binding other than the
@@ -34,16 +38,25 @@ chosen :data:`QT_API` (``"PyQt6"`` or ``"PySide6"``),
 from __future__ import annotations
 
 import importlib
+import importlib.util
+import logging
 import os
 import sys
+
+logger = logging.getLogger(__name__)
 
 _BINDINGS = {"pyqt6": "PyQt6", "pyside6": "PySide6"}
 
 
 def _select_api() -> str:
-    # A ``None`` entry is an import blocker (``sys.modules[name] = None``),
-    # not a loaded binding.
-    loaded = [api for api in _BINDINGS.values() if sys.modules.get(api) is not None]
+    # A binding is in use once its QtCore is imported, as in
+    # check_host_binding: the bare package (``import PyQt6``, or a
+    # ``find_spec("PyQt6.QtCore")`` probe) loads no Qt runtime. A ``None``
+    # entry is an import blocker (``sys.modules[name] = None``), not a
+    # loaded binding.
+    loaded = [
+        api for api in _BINDINGS.values() if sys.modules.get(f"{api}.QtCore") is not None
+    ]
     requested = os.environ.get("OPENLIFU_QT_API", "").strip().lower()
     if requested:
         if requested not in _BINDINGS:
@@ -68,9 +81,12 @@ def _select_api() -> str:
             "pyqt6 or pyside6."
         )
     for api in _BINDINGS.values():
+        if importlib.util.find_spec(api) is None:  # not installed, or blocked
+            continue
         try:
             importlib.import_module(f"{api}.QtCore")
-        except ImportError:
+        except ImportError as exc:  # e.g. a Qt DLL / shared library failed to load
+            logger.warning("%s is installed but failed to import: %s", api, exc)
             continue
         return api
     raise ImportError(

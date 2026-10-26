@@ -41,13 +41,38 @@ def test_defaults_to_pyqt6_when_no_binding_is_imported():
 @needs_pyside6
 def test_falls_back_to_pyside6_when_pyqt6_cannot_be_imported():
     # sys.modules[name] = None blocks the import; it must not count as
-    # "the host imported PyQt6".
-    _check("""
-        import sys
+    # "the host imported PyQt6". A binding that isn't there is no
+    # warning.
+    result = _check("""
+        import logging, sys
+        logging.basicConfig(level=logging.WARNING)
         sys.modules["PyQt6"] = None
         from openlifu_sdk.ui import _qt
         assert _qt.QT_API == "PySide6", _qt.QT_API
     """)
+    assert "failed to import" not in result.stderr
+
+
+@needs_pyqt6
+@needs_pyside6
+def test_warns_when_an_installed_binding_fails_to_import():
+    # PyQt6 is installed, but its QtCore fails the way a missing Qt DLL
+    # does. The fallback to PySide6 must say so rather than stay silent.
+    result = _check("""
+        import importlib.abc, logging, sys
+        logging.basicConfig(level=logging.WARNING)
+
+        class BrokenQtCore(importlib.abc.MetaPathFinder):
+            def find_spec(self, name, path, target=None):
+                if name == "PyQt6.QtCore":
+                    raise ImportError("DLL load failed while importing QtCore")
+
+        sys.meta_path.insert(0, BrokenQtCore())
+        from openlifu_sdk.ui import _qt
+        assert _qt.QT_API == "PySide6", _qt.QT_API
+    """)
+    assert "PyQt6 is installed but failed to import" in result.stderr
+    assert "DLL load failed while importing QtCore" in result.stderr
 
 
 @needs_pyside6
@@ -81,12 +106,14 @@ def test_follows_pyqt6_when_the_host_imported_it_first():
 
 
 def test_both_bindings_imported_without_env_var_is_refused():
-    # Stand-in modules mark both bindings as imported; the refusal comes
+    # Stand-in QtCore modules mark both bindings as imported (a binding
+    # counts once its QtCore is in sys.modules); the refusal comes
     # before any real Qt loads.
     result = _run("""
         import sys, types
-        sys.modules["PyQt6"] = types.ModuleType("PyQt6")
-        sys.modules["PySide6"] = types.ModuleType("PySide6")
+        for name in ("PyQt6", "PySide6"):
+            sys.modules[name] = types.ModuleType(name)
+            sys.modules[f"{name}.QtCore"] = types.ModuleType(f"{name}.QtCore")
         from openlifu_sdk.ui import _qt
     """)
     assert result.returncode != 0
@@ -106,9 +133,26 @@ def test_both_bindings_imported_env_var_picks_one(qt_api, real, stand_in):
         import sys, types
         import {real}.QtCore
         sys.modules["{stand_in}"] = types.ModuleType("{stand_in}")
+        sys.modules["{stand_in}.QtCore"] = types.ModuleType("{stand_in}.QtCore")
         from openlifu_sdk.ui import _qt
         assert _qt.QT_API == "{real}", _qt.QT_API
     """, qt_api=qt_api)
+
+
+@needs_pyqt6
+@needs_pyside6
+def test_a_bare_package_import_does_not_count_as_the_host_binding():
+    # A library probing for PyQt6 imports the bare package, which loads
+    # no Qt runtime: a PySide6 host must not be refused as "both imported".
+    _check("""
+        import importlib.util, sys
+        import PySide6.QtCore
+        assert importlib.util.find_spec("PyQt6.QtCore") is not None
+        assert "PyQt6" in sys.modules and "PyQt6.QtCore" not in sys.modules
+        from openlifu_sdk.ui import _qt
+        assert _qt.QT_API == "PySide6", _qt.QT_API
+        assert "PyQt6.QtCore" not in sys.modules
+    """)
 
 
 _HOST_APP_ON_OTHER_BINDING = """
@@ -127,14 +171,17 @@ _HOST_APP_ON_OTHER_BINDING = """
     sys.modules["{other}.QtCore"] = other.QtCore
     from openlifu_sdk.ui.base_connector import BaseConnector
     from openlifu_sdk.ui.simulated_interface import SimulatedDeviceInterface
-    for make in (BaseConnector, SimulatedDeviceInterface):
+    from openlifu_sdk.ui.telemetry_thread import TelemetryPollThread
+    for cls, args in (
+        (BaseConnector, ()), (SimulatedDeviceInterface, ()), (TelemetryPollThread, (None,)),
+    ):
         try:
-            make()
+            cls(*args)
         except RuntimeError as exc:
             assert "the application runs on {other}" in str(exc), exc
             assert "Import {other} before openlifu_sdk.ui" in str(exc), exc
         else:
-            raise AssertionError(f"{{make.__name__}} constructed on the wrong binding")
+            raise AssertionError(f"{{cls.__name__}} constructed on the wrong binding")
 """
 
 
@@ -149,16 +196,25 @@ def test_sdk_objects_refuse_a_host_application_on_the_other_binding(qt_api, chos
     _check(_HOST_APP_ON_OTHER_BINDING.format(chosen=chosen, other=other), qt_api=qt_api)
 
 
-@needs_pyqt6
-def test_sdk_objects_construct_with_no_application_or_one_on_their_binding():
-    _check("""
+@pytest.mark.parametrize(
+    ("qt_api", "binding"),
+    [
+        pytest.param("pyqt6", "PyQt6", marks=needs_pyqt6),
+        pytest.param("pyside6", "PySide6", marks=needs_pyside6),
+    ],
+)
+def test_sdk_objects_construct_with_no_application_or_one_on_their_binding(qt_api, binding):
+    _check(f"""
+        from openlifu_sdk.ui import _qt
         from openlifu_sdk.ui.base_connector import BaseConnector
         from openlifu_sdk.ui.simulated_interface import SimulatedDeviceInterface
-        BaseConnector(); SimulatedDeviceInterface()
-        from PyQt6.QtCore import QCoreApplication
+        from openlifu_sdk.ui.telemetry_thread import TelemetryPollThread
+        assert _qt.QT_API == "{binding}", _qt.QT_API
+        BaseConnector(); SimulatedDeviceInterface(); TelemetryPollThread(None)
+        from {binding}.QtCore import QCoreApplication
         app = QCoreApplication([])
-        BaseConnector(); SimulatedDeviceInterface()
-    """)
+        BaseConnector(); SimulatedDeviceInterface(); TelemetryPollThread(None)
+    """, qt_api=qt_api)
 
 
 @pytest.mark.parametrize(
@@ -191,11 +247,12 @@ def test_env_var_rejects_an_unknown_binding():
     [("pyqt6", "PySide6"), ("pyside6", "PyQt6")],
 )
 def test_env_var_naming_another_binding_than_the_host_imported_is_refused(qt_api, imported):
-    # A stand-in module plays the host's binding; the refusal comes
+    # A stand-in QtCore plays the host's binding; the refusal comes
     # before anything is imported, so no real Qt loads.
     result = _run(f"""
         import sys, types
         sys.modules["{imported}"] = types.ModuleType("{imported}")
+        sys.modules["{imported}.QtCore"] = types.ModuleType("{imported}.QtCore")
         from openlifu_sdk.ui import _qt
     """, qt_api=qt_api)
     assert result.returncode != 0

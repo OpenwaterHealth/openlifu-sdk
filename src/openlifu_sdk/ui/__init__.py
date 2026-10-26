@@ -24,9 +24,11 @@ Errors surface only when a Qt-backed symbol is first accessed:
 :class:`ImportError` if no Qt6 binding is installed, :class:`ValueError`
 if the binding can't be chosen safely (an unknown ``OPENLIFU_QT_API``,
 one that contradicts the host's binding, or both bindings imported
-with no ``OPENLIFU_QT_API``). Constructing a ``BaseConnector`` or
-``SimulatedDeviceInterface`` raises :class:`RuntimeError` if the
-host's ``QCoreApplication`` runs on the other binding.
+with no ``OPENLIFU_QT_API``). Constructing a ``BaseConnector``,
+``SimulatedDeviceInterface`` or ``TelemetryPollThread`` raises
+:class:`RuntimeError` if the host's ``QCoreApplication`` runs on the
+other binding; :func:`show_incompatible_version_dialog` reports on
+stderr instead.
 
 Public surface (loaded on first attribute access):
 
