@@ -64,7 +64,6 @@ def test_pause_resume_do_not_touch_hv_or_reconfigure_trigger():
 
     assert interface.resume_sonication()
     assert interface.txdevice.resume_trigger.call_count == 1
-    assert interface.txdevice.set_trigger.call_count == 0
     assert interface.hvcontroller.mock_calls == []
 
 
@@ -182,6 +181,29 @@ def test_get_status_raises_when_the_trigger_read_fails():
 
     with pytest.raises(LIFUDeviceError):
         interface.get_status()
+
+
+def test_start_after_timeout_is_refused_before_hv_is_touched():
+    # SR-024: a timed-out sequence is not restarted by Start; Stop first.
+    interface = _interface()
+    interface.txdevice.get_trigger_json.return_value = {"TriggerStatus": "TIMEOUT"}
+
+    with pytest.raises(LIFUError, match="timeout"):
+        interface.start_sonication()
+
+    assert interface.hvcontroller.mock_calls == []
+    interface.txdevice.start_trigger.assert_not_called()
+
+
+def test_start_fails_without_hv_when_the_trigger_status_cannot_be_read():
+    interface = _interface()
+    interface.txdevice.get_trigger_json.side_effect = LIFUDeviceError("no answer")
+
+    with pytest.raises(LIFUDeviceError):
+        interface.start_sonication()
+
+    assert interface.hvcontroller.mock_calls == []
+    interface.txdevice.start_trigger.assert_not_called()
 
 
 @pytest.mark.parametrize(

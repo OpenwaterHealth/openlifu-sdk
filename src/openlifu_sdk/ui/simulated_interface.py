@@ -598,7 +598,8 @@ class SimulatedTxDevice:
             raise LIFUDeviceError("TX: sequence is not paused")
         if self._loaded_preset_index is not None:
             shutoff_c = self._preset_flash[self._loaded_preset_index][0].get("shutoff_C")
-            if shutoff_c is not None and self._modules[0].read_temp() >= float(shutoff_c):
+            hottest = max(m.read_temp() for m in self._modules)
+            if shutoff_c is not None and hottest >= float(shutoff_c):
                 raise LIFUDeviceError(f"TX at shutoff_C {float(shutoff_c):.1f} C",
                                       device_error_code=OW_TEMP_TOO_HIGH)
         self._trigger_status = "RUNNING"
@@ -1424,8 +1425,9 @@ class SimulatedDeviceInterface(QObject):
                          wait_for_settle: bool = True) -> bool:
         """Same contract as :meth:`DeviceInterface.start_sonication`: a
         refusal from either device is raised with HV turned back off."""
-        if self._engine is not None and self._engine.alive and self._engine.paused:
-            raise LIFUError("start_sonication: the sequence is paused; resume it, or stop it first")
+        status = self.txdevice._trigger_status
+        if status in ("PAUSED", "TIMEOUT"):
+            raise LIFUError(f"start_sonication: the sequence is {status.lower()}; stop it first")
         # Stop any previous engine before starting a new one.
         if self._engine is not None and self._engine.alive:
             self._engine.stop()

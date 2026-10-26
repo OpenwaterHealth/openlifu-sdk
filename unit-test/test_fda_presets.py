@@ -850,6 +850,7 @@ class TestInterfaceSurface(unittest.TestCase):
     FDA_ENDPOINTS = (
         "load_preset", "start_sonication", "stop_sonication", "is_running",
         "get_status", "is_device_connected", "close",
+        "pause_sonication", "resume_sonication",
     )
 
     def test_lifu_interface_extends_device_interface(self):

@@ -262,6 +262,23 @@ def test_start_while_paused_is_refused_and_keeps_the_run(qt_app):
         interface.close()
 
 
+def test_start_after_timeout_is_refused_until_stop(qt_app):
+    # SR-024: Start must not restart the total-time clock of a timed-out
+    # treatment; an explicit Stop ends it first.
+    interface = _make_running_interface(timeout_s=0.12)
+    try:
+        assert _wait_until(qt_app, lambda: _trigger(interface)["trigger_status"] == "TIMEOUT")
+        with pytest.raises(LIFUError, match="timeout"):
+            interface.start_sonication(turn_hv_on=False, wait_for_settle=False)
+        assert _trigger(interface)["trigger_status"] == "TIMEOUT"
+
+        interface.stop_sonication(turn_hv_off=False)
+        assert interface.start_sonication(turn_hv_on=False, wait_for_settle=False)
+        assert _trigger(interface)["trigger_status"] == "RUNNING"
+    finally:
+        interface.close()
+
+
 def test_timeout_notifies_the_finished_callback(qt_app):
     interface = _make_running_interface(timeout_s=0.12)
     finished = []
