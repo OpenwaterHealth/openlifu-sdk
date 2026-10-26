@@ -1377,8 +1377,7 @@ class SimulatedDeviceInterface(QObject):
                          wait_for_settle: bool = True) -> bool:
         """Same contract as :meth:`DeviceInterface.start_sonication`: a
         refusal from either device is raised with HV turned back off."""
-        # Stop any previous engine before starting a new one (pause/resume
-        # rebuilds the trigger then re-calls start_sonication).
+        # Stop any previous engine before starting a new one.
         if self._engine is not None and self._engine.alive:
             self._engine.stop()
         try:

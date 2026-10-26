@@ -490,6 +490,10 @@ class DeviceInterface:
         """
         Query the device status.
 
+        While a sequence is running or paused, the trigger status is read
+        from the firmware (:meth:`is_running`), so PAUSED and TIMEOUT
+        reflect what the firmware reports (SR-023, SR-024).
+
         Returns:
             LIFUInterfaceStatus: The device status.
         """
@@ -501,19 +505,37 @@ class DeviceInterface:
         return self.status
 
     def pause_sonication(self) -> bool:
-        """Pause the trigger without changing HV or trigger configuration."""
+        """Ask the firmware to pause the running sequence (SR-023).
+
+        The pause lands at the next pulse-train boundary, or the sequence
+        completes if the final train is in progress, so the status is
+        left to :meth:`get_status`, which reads it from the firmware.
+        HV and the trigger configuration are not touched.
+
+        Raises:
+            LIFUDeviceError: The firmware rejected the pause (no sequence running).
+            LIFUNotConnectedError, LIFUCommunicationError.
+        """
         if self._test_mode:
             return True
         self.txdevice.pause_trigger()
-        self.set_status(LIFUInterfaceStatus.STATUS_PAUSED)
         return True
 
     def resume_sonication(self) -> bool:
-        """Resume the trigger without changing HV or trigger configuration."""
+        """Ask the firmware to resume a paused sequence (SR-023).
+
+        The firmware continues from the next pulse train with the count
+        retained; :meth:`get_status` reports the result. HV and the
+        trigger configuration are not touched.
+
+        Raises:
+            LIFUDeviceError: The firmware rejected the resume (not paused,
+                over temperature, or after a timeout, SR-024).
+            LIFUNotConnectedError, LIFUCommunicationError.
+        """
         if self._test_mode:
             return True
         self.txdevice.resume_trigger()
-        self.set_status(LIFUInterfaceStatus.STATUS_RUNNING)
         return True
 
     def is_running(self) -> bool:

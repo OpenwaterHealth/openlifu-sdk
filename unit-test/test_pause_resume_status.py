@@ -54,17 +54,36 @@ def test_tx_pause_resume_send_commands_and_raise_on_error(method_name, command):
 
 def test_pause_resume_do_not_touch_hv_or_reconfigure_trigger():
     interface = _interface()
+    interface.status = LIFUInterfaceStatus.STATUS_RUNNING
 
     assert interface.pause_sonication()
-    assert interface.status == LIFUInterfaceStatus.STATUS_PAUSED
     assert interface.txdevice.pause_trigger.call_count == 1
     assert interface.hvcontroller.mock_calls == []
 
     assert interface.resume_sonication()
-    assert interface.status == LIFUInterfaceStatus.STATUS_RUNNING
     assert interface.txdevice.resume_trigger.call_count == 1
     assert interface.txdevice.set_trigger.call_count == 0
     assert interface.hvcontroller.mock_calls == []
+
+
+def test_status_follows_firmware_not_the_command_sent():
+    # SR-023 item 9: the pause lands at the next train boundary, so until
+    # the firmware reports PAUSED the status stays RUNNING.
+    interface = _interface()
+    interface.status = LIFUInterfaceStatus.STATUS_RUNNING
+    interface.txdevice.get_trigger_json.return_value = {"TriggerStatus": "RUNNING"}
+
+    interface.pause_sonication()
+    assert interface.get_status() == LIFUInterfaceStatus.STATUS_RUNNING
+
+    interface.txdevice.get_trigger_json.return_value = {"TriggerStatus": "PAUSED"}
+    assert interface.get_status() == LIFUInterfaceStatus.STATUS_PAUSED
+
+    interface.resume_sonication()
+    assert interface.get_status() == LIFUInterfaceStatus.STATUS_PAUSED
+
+    interface.txdevice.get_trigger_json.return_value = {"TriggerStatus": "RUNNING"}
+    assert interface.get_status() == LIFUInterfaceStatus.STATUS_RUNNING
 
 
 @pytest.mark.parametrize("method", ["pause_sonication", "resume_sonication"])
