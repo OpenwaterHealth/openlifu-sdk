@@ -1,0 +1,24 @@
+# SPDX-License-Identifier: Apache-2.0
+# Adds `SPDX-License-Identifier: Apache-2.0` to any Python or YAML file
+# that lacks it, matching the operator interface's hook (#75, #82).
+#
+# One-time setup for each contributor after cloning:
+#
+#     pip install pre-commit
+#     pre-commit install
+
+repos:
+  - repo: https://github.com/Lucas-C/pre-commit-hooks
+    rev: v1.5.5
+    hooks:
+      - id: insert-license
+        name: SPDX header (Python / YAML)
+        files: \.(py|ya?ml)$
+        args:
+          - --license-filepath=.github/spdx-header.txt
+          - --comment-style=#
+          - --no-extra-eol
+          # The jupytext examples (examples/test_first.py, ...) carry the
+          # header after their 14-line `# ---` metadata block, which must
+          # stay first for jupytext to read it.
+          - --detect-license-in-X-top-lines=20
