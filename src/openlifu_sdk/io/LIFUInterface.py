@@ -494,9 +494,18 @@ class DeviceInterface:
         The status is asked of the firmware, not the cached ``status``,
         which a reconnect or an earlier refusal may have reset. (TIMEOUT
         needs openlifu-transmitter-fw#22; today's firmware reports
-        RUNNING, PAUSED or STOPPED.)
+        RUNNING, PAUSED or STOPPED.) Nothing has been touched when this
+        raises, so there is nothing for the caller's error path to undo.
+
+        Raises:
+            LIFUError: A paused or timed-out sequence is held.
+            LIFUNoTriggerStatusError: No trigger status in the reply, as
+                for :meth:`is_running`.
         """
-        trigger_status = str(self.txdevice.get_trigger_json().get("TriggerStatus", "")).upper()
+        trigger_status = self.txdevice.get_trigger_json().get("TriggerStatus")
+        if trigger_status is None:
+            raise LIFUNoTriggerStatusError(f"{op}: device failed to provide valid trigger status.")
+        trigger_status = str(trigger_status).upper()
         if trigger_status in ("PAUSED", "TIMEOUT"):
             raise LIFUError(f"{op}: the sequence is {trigger_status.lower()}; stop it first")
 

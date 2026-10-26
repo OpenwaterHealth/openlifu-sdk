@@ -224,6 +224,17 @@ def test_get_status_follows_the_cache_when_idle():
         interface.start_sonication()
 
 
+def test_start_is_refused_when_the_reply_has_no_trigger_status():
+    interface = _interface()
+    interface.txdevice.get_trigger_json.return_value = {}
+
+    with pytest.raises(LIFUNoTriggerStatusError):
+        interface.start_sonication()
+
+    assert interface.hvcontroller.mock_calls == []
+    interface.txdevice.start_trigger.assert_not_called()
+
+
 def test_start_fails_without_hv_when_the_trigger_status_cannot_be_read():
     interface = _interface()
     interface.txdevice.get_trigger_json.side_effect = LIFUDeviceError("no answer")
