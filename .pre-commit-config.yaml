@@ -20,5 +20,7 @@ repos:
           - --no-extra-eol
           # The jupytext examples (examples/test_first.py, ...) carry the
           # header after their 14-line `# ---` metadata block, which must
-          # stay first for jupytext to read it.
+          # stay first for jupytext to read it. On a *new* jupytext file
+          # the hook puts the header on line 1, above that block: move it
+          # to just below the closing `# ---` before committing.
           - --detect-license-in-X-top-lines=20
