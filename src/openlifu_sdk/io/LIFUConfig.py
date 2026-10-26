@@ -21,6 +21,7 @@ OW_I2C_PASSTHRU = 0xE9
 OW_CONTROLLER = 0xEA
 OW_POWER = 0xEB
 OW_ONEWIRE_RESP = 0xEC
+OW_UNKNOWN = 0xEE  # reply to a command the firmware does not implement
 OW_ERROR = 0xEF
 
 OW_SUCCESS = 0x00
@@ -132,6 +133,13 @@ OW_POWER_SET_RGB_FX = 0x43
 # FDA mode only: the console's per-preset HV table, indexed like the TX's.
 OW_POWER_PRESET_GET = 0x44     # reserved=index
 OW_POWER_PRESET_SELECT = 0x45  # reserved=index, data=settings_crc u32 + transmitter sensitivity f32 (LE)
+OW_POWER_GET_ODO = 0x46
+OW_POWER_RESET_ODO = 0x47
+
+# OW_POWER_RESET_ODO targets (sent in the reserved byte)
+ODO_RESET_POWER = 0
+ODO_RESET_HV = 1
+ODO_RESET_BOTH = 2
 
 # OW_POWER_SET_RGB_FX effect ids (payload byte 0 - see firmware common.h)
 OW_RGB_FX_STOP = 0
@@ -178,6 +186,7 @@ POWER_COMMANDS = {
     OW_POWER_GET_RGB, OW_POWER_GET_HVON, OW_POWER_GET_12VON, OW_POWER_SET_DACS,
     OW_POWER_VMON, OW_POWER_RAW_DAC, OW_POWER_HV_ENABLE, OW_POWER_SET_RGB_FX,
     OW_POWER_PRESET_GET, OW_POWER_PRESET_SELECT,
+    OW_POWER_GET_ODO, OW_POWER_RESET_ODO,
 }
 
 # FDA subsets: the only commands the FDA components (TxDevice / HVController)

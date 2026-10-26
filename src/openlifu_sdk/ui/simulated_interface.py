@@ -77,6 +77,7 @@ from openlifu_sdk.io.LIFUConfig import (
     OW_NO_PRESET,
     OW_TEMP_TOO_HIGH,
 )
+from openlifu_sdk.io.LIFUHVController import ConsoleOdometer
 from openlifu_sdk.io.LIFUTXPresets import module_regs_crcs, preset_sensitivity
 from openlifu_sdk.io.LIFUUserConfig import sensitivity_at_frequency
 from openlifu_sdk.io.signal import OWSignal
@@ -927,10 +928,49 @@ class SimulatedLIFUHVController(SimulatedHVController):
     uart = None  # connector reads this for FW DFU; not used here
     _rgb_state = 0
 
+    def __init__(self):
+        super().__init__()
+        # Odometer: a used console's totals that keep ticking in real time.
+        self._odo_power_base_s = 412 * 3600
+        self._odo_power_t0 = time.monotonic()
+        self._odo_hv_s = 37 * 3600.0
+        self._odo_hv_since: Optional[float] = None
+
     def turn_hv_on(self):
         """An RUO console turns HV on at whatever voltage was set; there is
         no preset gate."""
+        if not self._hv_on:
+            self._odo_hv_since = time.monotonic()
         self._hv_on = True
+        return True
+
+    def turn_hv_off(self):
+        if self._hv_on and self._odo_hv_since is not None:
+            self._odo_hv_s += time.monotonic() - self._odo_hv_since
+            self._odo_hv_since = None
+        return super().turn_hv_off()
+
+    def get_odometer(self) -> ConsoleOdometer:
+        now = time.monotonic()
+        hv_s = self._odo_hv_s
+        if self._odo_hv_since is not None:
+            hv_s += now - self._odo_hv_since
+        return ConsoleOdometer(
+            power_on_s=int(self._odo_power_base_s + now - self._odo_power_t0),
+            hv_on_s=int(hv_s),
+        )
+
+    def reset_odometer(self, target: int = 2) -> bool:
+        if target not in (0, 1, 2):
+            raise ValueError(f"Odometer reset target must be 0, 1 or 2, got {target}")
+        now = time.monotonic()
+        if target in (0, 2):
+            self._odo_power_base_s = 0
+            self._odo_power_t0 = now
+        if target in (1, 2):
+            self._odo_hv_s = 0.0
+            if self._odo_hv_since is not None:
+                self._odo_hv_since = now
         return True
 
     def turn_12v_on(self):
