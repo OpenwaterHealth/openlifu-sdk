@@ -39,14 +39,19 @@ def test_defaults_to_pyqt6_when_no_binding_is_imported():
 
 
 @needs_pyside6
-def test_falls_back_to_pyside6_when_pyqt6_cannot_be_imported():
-    # sys.modules[name] = None blocks the import; it must not count as
-    # "the host imported PyQt6". A binding that isn't there is no
-    # warning.
-    result = _check("""
-        import logging, sys
+@pytest.mark.parametrize(
+    "pyqt6_entry",
+    # An import blocker, and a bare stand-in module (no __spec__, no
+    # QtCore) like a test double or shim.
+    ["None", 'types.ModuleType("PyQt6")'],
+)
+def test_falls_back_to_pyside6_when_pyqt6_cannot_be_imported(pyqt6_entry):
+    # Neither counts as "the host imported PyQt6", and a binding that
+    # isn't really there is no warning.
+    result = _check(f"""
+        import logging, sys, types
         logging.basicConfig(level=logging.WARNING)
-        sys.modules["PyQt6"] = None
+        sys.modules["PyQt6"] = {pyqt6_entry}
         from openlifu_sdk.ui import _qt
         assert _qt.QT_API == "PySide6", _qt.QT_API
     """)
@@ -71,7 +76,7 @@ def test_warns_when_an_installed_binding_fails_to_import():
         from openlifu_sdk.ui import _qt
         assert _qt.QT_API == "PySide6", _qt.QT_API
     """)
-    assert "PyQt6 is installed but failed to import" in result.stderr
+    assert "PyQt6 is present but failed to import" in result.stderr
     assert "DLL load failed while importing QtCore" in result.stderr
 
 

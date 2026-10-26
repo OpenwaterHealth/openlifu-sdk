@@ -14,8 +14,9 @@ The binding is chosen once, at first import, in this order:
 2. The binding the host has already imported. Apps should therefore
    import their Qt binding before importing ``openlifu_sdk.ui``.
 3. If the host has imported neither: PyQt6 (the historical default and
-   the ``ui`` extra), then PySide6. One that is installed but fails to
-   import is logged as a warning before the next is tried.
+   the ``ui`` extra), then PySide6. One that is present but fails to
+   load (an ``ImportError`` other than ``ModuleNotFoundError``, such as
+   a missing Qt DLL) is logged as a warning before the next is tried.
 
 "Imported" means ``<binding>.QtCore`` is in ``sys.modules``; the bare
 package alone loads no Qt runtime.
@@ -38,7 +39,6 @@ chosen :data:`QT_API` (``"PyQt6"`` or ``"PySide6"``),
 from __future__ import annotations
 
 import importlib
-import importlib.util
 import logging
 import os
 import sys
@@ -81,12 +81,12 @@ def _select_api() -> str:
             "pyqt6 or pyside6."
         )
     for api in _BINDINGS.values():
-        if importlib.util.find_spec(api) is None:  # not installed, or blocked
-            continue
         try:
             importlib.import_module(f"{api}.QtCore")
-        except ImportError as exc:  # e.g. a Qt DLL / shared library failed to load
-            logger.warning("%s is installed but failed to import: %s", api, exc)
+        except ModuleNotFoundError:  # not installed, blocked, or a stand-in
+            continue
+        except ImportError as exc:  # present, but e.g. a Qt DLL failed to load
+            logger.warning("%s is present but failed to import: %s", api, exc)
             continue
         return api
     raise ImportError(
