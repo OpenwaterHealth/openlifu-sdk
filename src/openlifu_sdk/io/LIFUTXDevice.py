@@ -385,13 +385,21 @@ class TxDevice(OWComponent):
         return True
 
     def pause_trigger(self) -> bool:
-        """Pause the running software trigger at a pulse-train boundary."""
+        """Pause the running software trigger at a pulse-train boundary.
+
+        Raises:
+            LIFUNotConnectedError, LIFUCommunicationError, LIFUDeviceError.
+        """
         self.send_checked(packet_type=OW_CONTROLLER, command=OW_CTRL_PAUSE_SWTRIG,
                           addr=0, op="pause_trigger")
         return True
 
     def resume_trigger(self) -> bool:
-        """Resume a paused software trigger."""
+        """Resume a paused software trigger.
+
+        Raises:
+            LIFUNotConnectedError, LIFUCommunicationError, LIFUDeviceError.
+        """
         self.send_checked(packet_type=OW_CONTROLLER, command=OW_CTRL_RESUME_SWTRIG,
                           addr=0, op="resume_trigger")
         return True

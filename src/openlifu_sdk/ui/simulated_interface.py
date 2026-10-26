@@ -1197,6 +1197,12 @@ class _SimulatedRunEngine(QObject):
             status="TIMEOUT", mode=self._mode_label,
         )
         self.parent().set_status(LIFUInterfaceStatus.STATUS_TIMEOUT)
+        # The run has ended, as on natural completion.
+        if self._finished_cb is not None:
+            try:
+                self._finished_cb()
+            except Exception:  # noqa: BLE001 -- reason: the caller's callback must not stop the run engine's own timeout handling; logged
+                logger.exception("_SimulatedRunEngine finished callback raised")
 
     def _on_train_tick(self):
         if not self.alive or self.paused:
@@ -1308,9 +1314,11 @@ class SimulatedDeviceInterface(QObject):
                 num_modules = max(1, len(list(modules_attr)))
         _check_host_binding()
         super().__init__()
-        # Upper bound: the timeout runs on a QTimer (int32 milliseconds).
-        if not 0 <= treatment_timeout_s <= 2_000_000:
-            raise ValueError("treatment_timeout_s must be between 0 and 2,000,000 s")
+        # SR-024 defines a positive timeout per preset (1800 s released);
+        # there is no "disabled" value. The upper bound is the simulator's
+        # QTimer range (int32 milliseconds), far above any preset.
+        if not 0 < treatment_timeout_s <= 2_000_000:
+            raise ValueError("treatment_timeout_s must be > 0 and <= 2,000,000 s")
         self.treatment_timeout_s = float(treatment_timeout_s)
         self.txdevice, self.hvcontroller = self._create_devices(num_modules, preset_flash)
         self.status = LIFUInterfaceStatus.STATUS_SYS_OFF
@@ -1400,6 +1408,8 @@ class SimulatedDeviceInterface(QObject):
                          wait_for_settle: bool = True) -> bool:
         """Same contract as :meth:`DeviceInterface.start_sonication`: a
         refusal from either device is raised with HV turned back off."""
+        if self._engine is not None and self._engine.alive and self._engine.paused:
+            raise LIFUError("start_sonication: the sequence is paused; resume it, or stop it first")
         # Stop any previous engine before starting a new one.
         if self._engine is not None and self._engine.alive:
             self._engine.stop()

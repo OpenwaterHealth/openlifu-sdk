@@ -13,7 +13,7 @@ from openlifu_sdk.io.LIFUConfig import (
     OW_ERROR,
 )
 from openlifu_sdk.io.LIFUInterface import DeviceInterface, LIFUInterfaceStatus
-from openlifu_sdk.io.exceptions import LIFUDeviceError
+from openlifu_sdk.io.exceptions import LIFUDeviceError, LIFUError, LIFUNoTriggerStatusError
 from openlifu_sdk.io.LIFUTXDevice import LIFUTxDevice
 from openlifu_sdk.io.uart import OWUart
 from openlifu_sdk.ui.status_frame import parse_status_string
@@ -125,3 +125,66 @@ def test_status_frame_parser_retains_train_counts(status):
     assert parsed["status"] == status
     assert parsed["pulse_train_current"] == 3
     assert parsed["pulse_train_total"] == 8
+
+
+@pytest.mark.parametrize(
+    ("trigger_status", "running", "expected_status"),
+    [
+        ("RUNNING", True, LIFUInterfaceStatus.STATUS_RUNNING),
+        ("PAUSED", False, LIFUInterfaceStatus.STATUS_PAUSED),
+        ("TIMEOUT", False, LIFUInterfaceStatus.STATUS_TIMEOUT),
+        ("STOPPED", False, LIFUInterfaceStatus.STATUS_FINISHED),
+    ],
+)
+def test_is_running_sets_status_from_firmware(trigger_status, running, expected_status):
+    interface = _interface()
+    interface.status = LIFUInterfaceStatus.STATUS_RUNNING
+    interface.txdevice.get_trigger_json.return_value = {"TriggerStatus": trigger_status}
+
+    assert interface.is_running() is running
+    assert interface.status == expected_status
+
+
+@pytest.mark.parametrize("trigger_json", [{}, {"TriggerStatus": "BOGUS"}])
+def test_is_running_raises_on_missing_or_unknown_status(trigger_json):
+    interface = _interface()
+    interface.txdevice.get_trigger_json.return_value = trigger_json
+
+    with pytest.raises(LIFUNoTriggerStatusError):
+        interface.is_running()
+
+
+@pytest.mark.parametrize(
+    "status",
+    [LIFUInterfaceStatus.STATUS_READY, LIFUInterfaceStatus.STATUS_FINISHED,
+     LIFUInterfaceStatus.STATUS_TIMEOUT],
+)
+def test_get_status_reads_the_firmware_only_while_running_or_paused(status):
+    interface = _interface()
+    interface.status = status
+
+    assert interface.get_status() == status
+    interface.txdevice.get_trigger_json.assert_not_called()
+
+
+def test_get_status_raises_when_the_trigger_read_fails():
+    interface = _interface()
+    interface.status = LIFUInterfaceStatus.STATUS_PAUSED
+    interface.txdevice.get_trigger_json.side_effect = LIFUDeviceError("no answer")
+
+    with pytest.raises(LIFUDeviceError):
+        interface.get_status()
+
+
+def test_start_while_paused_is_refused_before_hv_is_touched():
+    # The firmware refuses Start while paused; refusing it here keeps HV
+    # on and the paused sequence resumable.
+    interface = _interface()
+    interface.status = LIFUInterfaceStatus.STATUS_PAUSED
+    interface.txdevice.get_trigger_json.return_value = {"TriggerStatus": "PAUSED"}
+
+    with pytest.raises(LIFUError, match="paused"):
+        interface.start_sonication()
+
+    assert interface.hvcontroller.mock_calls == []
+    interface.txdevice.start_trigger.assert_not_called()

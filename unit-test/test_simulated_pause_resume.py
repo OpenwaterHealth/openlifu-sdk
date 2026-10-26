@@ -22,7 +22,7 @@ QCoreApplication = _qt.import_qt_module("QtCore").QCoreApplication
 
 from sr003_presets import flash_entry  # noqa: E402 -- reason: after the Qt importorskip
 
-from openlifu_sdk.io.exceptions import LIFUDeviceError  # noqa: E402 -- reason: after the Qt importorskip
+from openlifu_sdk.io.exceptions import LIFUDeviceError, LIFUError  # noqa: E402 -- reason: after the Qt importorskip
 from openlifu_sdk.io.LIFUConfig import OW_TEMP_TOO_HIGH  # noqa: E402 -- reason: after the Qt importorskip
 from openlifu_sdk.io.LIFUInterface import LIFUInterfaceStatus  # noqa: E402 -- reason: after the Qt importorskip
 from openlifu_sdk.ui.simulated_interface import (  # noqa: E402 -- reason: after the Qt importorskip
@@ -166,8 +166,9 @@ def test_resume_waits_a_full_train_period_before_the_next_train(qt_app):
         paused_count = _trigger(interface)["train_count"]
 
         interface.resume_sonication()
-        time.sleep(TRAIN_PERIOD_S / 2)
-        qt_app.processEvents()
+        train_timer = interface._engine._train_timer
+        assert train_timer.isActive()
+        assert train_timer.interval() == round(TRAIN_PERIOD_S * 1000)
         assert _trigger(interface)["train_count"] == paused_count
         assert _wait_until(qt_app, lambda: _trigger(interface)["train_count"] == paused_count + 1)
     finally:
@@ -207,6 +208,36 @@ def test_timeout_runs_while_paused_and_rejects_resume(qt_app):
         interface.close()
 
 
+def test_start_while_paused_is_refused_and_keeps_the_run(qt_app):
+    # The firmware refuses Start while paused; a restart from train 0
+    # would over-deliver.
+    interface = _make_running_interface()
+    try:
+        interface.pause_sonication()
+        _train_boundary(interface)
+        paused_count = _trigger(interface)["train_count"]
+
+        with pytest.raises(LIFUError, match="paused"):
+            interface.start_sonication(turn_hv_on=False, wait_for_settle=False)
+        assert _trigger(interface)["trigger_status"] == "PAUSED"
+        assert _trigger(interface)["train_count"] == paused_count
+        assert interface.hvcontroller.get_hv_status()
+        assert interface.resume_sonication()
+    finally:
+        interface.close()
+
+
+def test_timeout_notifies_the_finished_callback(qt_app):
+    interface = _make_running_interface(timeout_s=0.12)
+    finished = []
+    interface._engine.set_finished_callback(lambda: finished.append(True))
+    try:
+        assert _wait_until(qt_app, lambda: bool(finished))
+        assert _trigger(interface)["trigger_status"] == "TIMEOUT"
+    finally:
+        interface.close()
+
+
 def test_timeout_fires_while_running(qt_app):
     interface = _make_running_interface(timeout_s=0.12)
     try:
@@ -216,7 +247,7 @@ def test_timeout_fires_while_running(qt_app):
         interface.close()
 
 
-@pytest.mark.parametrize("timeout_s", [-1.0, float("nan"), float("inf"), 3_000_000.0])
+@pytest.mark.parametrize("timeout_s", [0.0, -1.0, float("nan"), float("inf"), 3_000_000.0])
 def test_timeout_out_of_range_is_refused(qt_app, timeout_s):
     with pytest.raises(ValueError):
         SimulatedLIFUInterface(treatment_timeout_s=timeout_s)

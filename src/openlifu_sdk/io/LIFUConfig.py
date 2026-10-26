@@ -81,12 +81,14 @@ OW_CTRL_ENUMERATE = 0x1C        # Phase 2: re-run clear-config + discovery walk
 OW_CTRL_SET_DELAY_PROFILE = 0x1D
 OW_CTRL_GET_DELAY_PROFILE = 0x1E
 OW_CTRL_SET_PROFILE_CYCLE = 0x1F
-OW_CTRL_PAUSE_SWTRIG = 0x2B
-OW_CTRL_RESUME_SWTRIG = 0x2E
 # 0x28/0x29: command values must be unique across all packet types (they share
 # one command->packet-type map), so these skip the 0x20-0x27 TX7332 block.
 OW_CTRL_SET_PATTERN_PROFILE = 0x28
 OW_CTRL_GET_PATTERN_PROFILE = 0x29
+# 0x2B/0x2E (SR-023): free values beside the TX7332 opcodes 0x2C, 0x2D and
+# 0x2F (same uniqueness rule), matching openlifu-transmitter-fw.
+OW_CTRL_PAUSE_SWTRIG = 0x2B
+OW_CTRL_RESUME_SWTRIG = 0x2E
 
 # FDA and preset modes
 OW_PRESET_GET = 0x50

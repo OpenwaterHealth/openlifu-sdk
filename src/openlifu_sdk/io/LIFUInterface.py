@@ -440,9 +440,15 @@ class DeviceInterface:
                 again if the rail does not settle or the trigger does not
                 start (a transmitter with nothing loaded refuses to).
             LIFUHVSettleError: If the HV rail does not settle in time.
+            LIFUError: If the sequence is paused (SR-023). The firmware
+                refuses Start while paused, so this is refused before HV
+                is touched; Stop first to start over.
         """
         if self._test_mode:
             return True
+
+        if self.get_status() == LIFUInterfaceStatus.STATUS_PAUSED:
+            raise LIFUError("start_sonication: the sequence is paused; resume it, or stop it first")
 
         try:
             if self.hvcontroller is not None:
