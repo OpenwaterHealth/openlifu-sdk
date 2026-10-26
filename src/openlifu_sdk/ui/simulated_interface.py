@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """In-memory fake of :class:`openlifu_sdk.LIFUInterface` for ``--simulate`` modes.
 
 Drives a :class:`~openlifu_sdk.ui.base_connector.BaseConnector`

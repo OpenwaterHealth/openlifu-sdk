@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """Background QThread that periodically calls polling hooks on a
 :class:`~openlifu_sdk.ui.base_connector.BaseConnector`.
 

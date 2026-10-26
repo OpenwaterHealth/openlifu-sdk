@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 import logging
 
 from .LIFUConfig import OW_END_BYTE, OW_START_BYTE

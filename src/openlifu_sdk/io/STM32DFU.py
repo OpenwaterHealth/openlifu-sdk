@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """Pure-Python driver for the STM32 ROM (system-memory) bootloader USB DFU.
 
 Flashes an MCU over the ST DfuSe protocol (AN3156; VID 0x0483, PID 0xDF11)
