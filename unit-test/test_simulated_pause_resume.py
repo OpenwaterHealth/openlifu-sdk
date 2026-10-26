@@ -157,20 +157,55 @@ def test_paused_run_delivers_every_train_exactly_once(qt_app):
         interface.close()
 
 
-def test_resume_waits_a_full_train_period_before_the_next_train(qt_app):
-    # The firmware honours the inter-train gap owed when the pause landed.
+def test_resume_waits_only_the_rest_of_the_train_period(qt_app):
+    # As in the firmware, time paused counts toward the train period.
+    period_ms = round(TRAIN_PERIOD_S * 1000)
     interface = _make_running_interface()
     try:
         interface.pause_sonication()
         _train_boundary(interface)
+        engine = interface._engine
         paused_count = _trigger(interface)["train_count"]
 
+        engine._paused_at = time.monotonic() - TRAIN_PERIOD_S * 0.4
         interface.resume_sonication()
-        train_timer = interface._engine._train_timer
-        assert train_timer.isActive()
-        assert train_timer.interval() == round(TRAIN_PERIOD_S * 1000)
+        assert engine._train_timer.isActive()
+        assert 0 < engine._train_timer.interval() < period_ms * 0.7
         assert _trigger(interface)["train_count"] == paused_count
         assert _wait_until(qt_app, lambda: _trigger(interface)["train_count"] == paused_count + 1)
+    finally:
+        interface.close()
+
+
+def test_resume_after_a_long_pause_starts_the_next_train_at_once(qt_app):
+    interface = _make_running_interface()
+    try:
+        interface.pause_sonication()
+        _train_boundary(interface)
+        engine = interface._engine
+        engine._paused_at = time.monotonic() - 3 * TRAIN_PERIOD_S
+
+        interface.resume_sonication()
+        assert engine._train_timer.interval() == 0
+    finally:
+        interface.close()
+
+
+@pytest.mark.parametrize("mode", ["continuous", "single"])
+def test_pause_is_refused_outside_sequence_mode(qt_app, mode):
+    # The firmware pauses only a SEQUENCE run.
+    interface = SimulatedLIFUInterface()
+    try:
+        interface.txdevice.set_trigger(
+            pulse_interval=0.001, pulse_count=1,
+            pulse_train_interval=TRAIN_PERIOD_S, pulse_train_count=TRAINS,
+        )
+        interface._last_trigger_mode = mode
+        interface.hvcontroller._hv_on = True
+        interface.start_sonication(turn_hv_on=False, wait_for_settle=False)
+
+        with pytest.raises(LIFUDeviceError, match="cannot pause"):
+            interface.pause_sonication()
     finally:
         interface.close()
 
@@ -266,7 +301,9 @@ def test_pause_and_resume_are_refused_with_no_sequence(qt_app):
 
 def test_resume_ignores_start_c_but_not_shutoff_c(qt_app):
     # SR-023 item 8, on the FDA simulator with a loaded preset
-    # (start_C 35, shutoff_C 75).
+    # (start_C 35, shutoff_C 75). This is the SR, which the simulator
+    # follows; the firmware branch still checks start_C on Resume
+    # (openlifu-transmitter-fw#22).
     mc, regs = flash_entry()
     interface = SimulatedDeviceInterface(preset_flash=[(mc, regs)])
     try:

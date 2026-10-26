@@ -447,7 +447,10 @@ class DeviceInterface:
         if self._test_mode:
             return True
 
-        if self.get_status() == LIFUInterfaceStatus.STATUS_PAUSED:
+        # Asked of the firmware, not the cached status, which a reconnect
+        # or load_preset() may have reset.
+        if str(self.txdevice.get_trigger_json().get("TriggerStatus", "")).upper() == "PAUSED":
+            self.set_status(LIFUInterfaceStatus.STATUS_PAUSED)
             raise LIFUError("start_sonication: the sequence is paused; resume it, or stop it first")
 
         try:
@@ -573,7 +576,9 @@ class DeviceInterface:
             self.set_status(LIFUInterfaceStatus.STATUS_TIMEOUT)
             return False
         elif trigger_status == "STOPPED":
-            self.set_status(LIFUInterfaceStatus.STATUS_FINISHED)
+            # A run that was going has ended; an idle READY stays READY.
+            if self.status in (LIFUInterfaceStatus.STATUS_RUNNING, LIFUInterfaceStatus.STATUS_PAUSED):
+                self.set_status(LIFUInterfaceStatus.STATUS_FINISHED)
             return False
         elif trigger_status == "NOSTATUS":
             raise LIFUNoTriggerStatusError("Device failed to provide valid trigger status.")

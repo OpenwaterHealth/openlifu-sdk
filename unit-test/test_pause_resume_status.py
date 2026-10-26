@@ -145,6 +145,14 @@ def test_is_running_sets_status_from_firmware(trigger_status, running, expected_
     assert interface.status == expected_status
 
 
+def test_is_running_leaves_an_idle_ready_status_alone():
+    interface = _interface()
+    interface.txdevice.get_trigger_json.return_value = {"TriggerStatus": "STOPPED"}
+
+    assert interface.is_running() is False
+    assert interface.status == LIFUInterfaceStatus.STATUS_READY
+
+
 @pytest.mark.parametrize("trigger_json", [{}, {"TriggerStatus": "BOGUS"}])
 def test_is_running_raises_on_missing_or_unknown_status(trigger_json):
     interface = _interface()
@@ -176,11 +184,17 @@ def test_get_status_raises_when_the_trigger_read_fails():
         interface.get_status()
 
 
-def test_start_while_paused_is_refused_before_hv_is_touched():
+@pytest.mark.parametrize(
+    "cached_status",
+    # READY: the cache was reset (reconnect, load_preset) while the
+    # firmware stayed paused; the firmware is asked, not the cache.
+    [LIFUInterfaceStatus.STATUS_PAUSED, LIFUInterfaceStatus.STATUS_READY],
+)
+def test_start_while_paused_is_refused_before_hv_is_touched(cached_status):
     # The firmware refuses Start while paused; refusing it here keeps HV
     # on and the paused sequence resumable.
     interface = _interface()
-    interface.status = LIFUInterfaceStatus.STATUS_PAUSED
+    interface.status = cached_status
     interface.txdevice.get_trigger_json.return_value = {"TriggerStatus": "PAUSED"}
 
     with pytest.raises(LIFUError, match="paused"):

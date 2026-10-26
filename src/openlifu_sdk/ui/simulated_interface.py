@@ -576,6 +576,9 @@ class SimulatedTxDevice:
         self._trigger_status = "STOPPED"
 
     def pause_trigger(self):
+        """Device-level trigger flag only, like :meth:`start_trigger`:
+        a run is paused through ``SimulatedDeviceInterface.pause_sonication``,
+        which drives the run engine."""
         if self._trigger_status == "PAUSED":
             return True
         if self._trigger_status != "RUNNING":
@@ -584,8 +587,13 @@ class SimulatedTxDevice:
         return True
 
     def resume_trigger(self):
-        """Like the firmware (SR-023 item 8): not gated by start_C, but
-        refused at or above the loaded preset's shutoff_C."""
+        """Device-level trigger flag only (see :meth:`pause_trigger`).
+
+        Per SR-023 item 8: refused at or above the loaded preset's
+        shutoff_C, and not gated by start_C. The firmware branch
+        (``feature/trigger-pause-resume``) still applies the start_C check
+        on Resume; that gap is tracked on openlifu-transmitter-fw#22.
+        """
         if self._trigger_status != "PAUSED":
             raise LIFUDeviceError("TX: sequence is not paused")
         if self._loaded_preset_index is not None:
@@ -1067,6 +1075,7 @@ class _SimulatedRunEngine(QObject):
         self.alive = True
         self.paused = False
         self.pause_pending = False
+        self._paused_at = 0.0
         self._timeout_deadline: Optional[float] = None
         self._train_period_ms = max(20, int(round(self._train_period_s * 1000)))
 
@@ -1126,17 +1135,22 @@ class _SimulatedRunEngine(QObject):
         """Request a pause, as the firmware does (SR-023): it lands at
         the next train tick, and not at all if that tick completes the
         sequence. Until it lands the status stays RUNNING. Pausing
-        while paused is a no-op."""
+        while paused is a no-op. Like the firmware, only a SEQUENCE run
+        can be paused."""
         if not self.alive:
             raise LIFUDeviceError("TX: no sequence is running")
+        if self._trigger_mode != "sequence":
+            raise LIFUDeviceError(f"TX: cannot pause a {self._mode_label} run")
         if not self.paused:
             self.pause_pending = True
         return True
 
     def resume(self):
-        """Resume from the next train, one full train period after
-        Resume, with the count retained. Before the pause lands, Resume
-        withdraws it. Refused after a timeout or at shutoff_C."""
+        """Resume with the count retained. As in the firmware, the time
+        paused counts toward the train period, so the next train comes
+        once the rest of the period has passed (at once after a pause of
+        a full period or more). Before the pause lands, Resume withdraws
+        it. Refused after a timeout or at shutoff_C."""
         if self._timeout_deadline is not None and time.monotonic() >= self._timeout_deadline:
             self._on_timeout()
         if self.alive and self.pause_pending:
@@ -1150,7 +1164,8 @@ class _SimulatedRunEngine(QObject):
             self._train_curr, self._frame_train_total(),
             status="RUNNING", mode=self._mode_label,
         )
-        self._train_timer.start(self._train_period_ms)
+        paused_ms = int((time.monotonic() - self._paused_at) * 1000)
+        self._train_timer.start(max(0, self._train_period_ms - paused_ms))
         if self._train_period_ms > HEARTBEAT_INTERVAL_MS:
             self._heartbeat.start(HEARTBEAT_INTERVAL_MS)
         self.parent().set_status(LIFUInterfaceStatus.STATUS_RUNNING)
@@ -1228,10 +1243,11 @@ class _SimulatedRunEngine(QObject):
                 self._train_curr, self._train_total,
                 status="RUNNING", mode=self._mode_label,
             )
-        if self.pause_pending and (self._infinite or self._train_curr < self._train_total):
+        if self.pause_pending and self._train_curr < self._train_total:
             # A requested pause lands at this train boundary (SR-023).
             self.pause_pending = False
             self.paused = True
+            self._paused_at = time.monotonic()
             self._train_timer.stop()
             self._heartbeat.stop()
             self._tx.pause_trigger()
