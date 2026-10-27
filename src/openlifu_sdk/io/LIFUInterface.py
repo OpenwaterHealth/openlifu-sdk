@@ -630,7 +630,8 @@ class LIFUInterface(DeviceInterface):
                  run_async: bool = False,
                  ext_power_supply: bool = False,
                  module_invert: bool | List[bool] = False,
-                 voltage_table_selection: Optional[str] = None) -> None:
+                 voltage_table_selection: Optional[str] = None,
+                 preset_lock: bool = False) -> None:
         """
         Initialize the LIFUInterface with given parameters and store them in the class.
 
@@ -647,7 +648,21 @@ class LIFUInterface(DeviceInterface):
             module_invert (bool | List[bool]): Initial TX module invert configuration.
             voltage_table_selection (str | None): Voltage-table profile used by
                 :meth:`check_solution`; inferred from the HV version if None.
+            preset_lock (bool): Lock the transmitter's presets as soon as it
+                connects (:meth:`LIFUTxDevice.lock_presets`), so a DEV image
+                behaves as an FDA image until it is reset. Needs
+                ``run_async=False``: in async mode the port opens later, on
+                the monitor thread, so lock it yourself once it connects.
+
+        Raises:
+            ValueError: ``preset_lock`` with ``run_async``.
+            LIFUDeviceError, LIFUProtocolError: The transmitter connected but
+                would not lock.
         """
+        if preset_lock and run_async:
+            raise ValueError("preset_lock needs run_async=False; call txdevice.lock_presets() "
+                             "once the transmitter connects")
+        self._preset_lock = preset_lock
         self.voltage_table = None
         self.sequence_time = None
         self.duty_cycles = None
@@ -673,6 +688,8 @@ class LIFUInterface(DeviceInterface):
         # In async mode the monitor threads started by start_monitoring() open the ports.
         if not self._async_mode:
             super()._connect_devices()
+            if self._preset_lock and self.txdevice is not None and self.txdevice.is_connected():
+                self.txdevice.lock_presets()
 
     async def start_monitoring(self, interval: int = 1) -> None:
         """Start monitoring for USB device connections."""
