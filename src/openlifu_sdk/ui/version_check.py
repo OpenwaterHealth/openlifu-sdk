@@ -93,12 +93,16 @@ def show_incompatible_version_dialog(
     """Pop a modal QMessageBox with the version mismatch message.
 
     Caller is expected to ``sys.exit()`` afterward. Safe to call before
-    a QApplication exists (a temporary one is spun up if needed). Falls
-    back to ``stderr`` if QtWidgets isn't importable.
+    an application exists (a temporary QApplication is spun up if
+    needed). Reports on ``stderr`` instead, and logs why, if QtWidgets
+    isn't importable, if the application is not a ``QApplication``
+    (e.g. a QML-only ``QGuiApplication``), or if it runs on the other Qt
+    binding (a second application would start in the other runtime).
     """
     try:
-        from openlifu_sdk.ui._qt import import_qt_module
+        from openlifu_sdk.ui._qt import check_host_binding, import_qt_module
 
+        check_host_binding()
         QtWidgets = import_qt_module("QtWidgets")
         QApplication, QMessageBox = QtWidgets.QApplication, QtWidgets.QMessageBox
         app = QApplication.instance() or QApplication(sys.argv)
