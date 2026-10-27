@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """LIFU Transmitter I2C Firmware Update — DFU-already-active variant
 
 Use this script when the slave module is already sitting in DFU bootloader

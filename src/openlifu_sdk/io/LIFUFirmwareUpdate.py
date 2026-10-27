@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """High-level firmware update for the console and the transmitter.
 
 **Console** (:class:`LIFUFirmwareUpdate`) — one entry point for every case. A

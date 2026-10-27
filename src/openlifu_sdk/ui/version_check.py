@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """SDK-version pre-flight check and Incompatible-version dialog.
 
 Apps pin a minimum SDK version (e.g. ``MIN_SDK_VERSION = "1.0.7"``) and

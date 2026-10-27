@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """Local firmware discovery.
 
 The SDK flashes the firmware images shipped with the wheel under

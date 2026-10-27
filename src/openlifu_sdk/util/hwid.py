@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 import base58
 
 def format_hwid(hex_hwid_str: str) -> str:

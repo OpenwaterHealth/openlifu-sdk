@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """Reusable Qt building blocks for openlifu-sdk-based applications.
 
 Most submodules in this package (``base_connector``, ``telemetry_thread``,
