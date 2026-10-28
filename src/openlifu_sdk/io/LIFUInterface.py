@@ -115,6 +115,7 @@ class LIFUInterfaceStatus(Enum):
     STATUS_RUNNING = 6
     STATUS_FINISHED = 7
     STATUS_ERROR = 8
+    STATUS_PAUSED = 9
 
 logger = logging.getLogger(__name__)
 
@@ -442,6 +443,86 @@ class DeviceInterface:
         if self._test_mode:
             return True
 
+        self._hv_then_trigger(self.txdevice.start_trigger, turn_hv_on, wait_for_settle)
+        logger.info("Sonication started successfully.")
+        self.set_status(LIFUInterfaceStatus.STATUS_RUNNING)
+        return True
+
+    def pause_sonication(self, turn_hv_off: bool = True, timeout: Optional[float] = None) -> bool:
+        """Pause a running sequence at its next pulse-train boundary.
+
+        Waits for the pause to land: the current train's pulses finish
+        first, so this can take up to one train. :meth:`resume_sonication`
+        continues with the next train; :meth:`stop_sonication` ends the run,
+        and so does the device itself if it is not resumed in time (the
+        firmware's TRIGGER_PAUSE_TIMEOUT_S, 30 min by default).
+
+        Args:
+            turn_hv_off: If True, turn off HV once the trigger has stopped.
+            timeout: Seconds to wait for the pause to land; None waits one
+                train period plus a second.
+
+        Returns:
+            True if paused; False if the final train ran out first, so the
+            sequence finished instead.
+
+        Raises:
+            LIFUDeviceError: Nothing to pause (not running in sequence mode),
+                or a transmitter image older than pause/resume.
+            LIFUSonicationError: The pause did not land in time. The trigger
+                is stopped and HV turned off before this is raised.
+            LIFUError: On any other device-communication failure.
+        """
+        if self._test_mode:
+            return True
+
+        logger.debug("Pausing trigger")
+        self.txdevice.pause_trigger()
+        try:
+            status = self.txdevice.wait_for_pause(timeout=timeout)
+        except Exception:  # reason: an unconfirmed pause must not leave the trigger or HV on; re-raised
+            try:
+                self.stop_sonication(turn_hv_off=True)
+            except LIFUError as exc:
+                logger.warning("pause_sonication: the run could not be stopped: %s", exc)
+            raise
+
+        if self.hvcontroller is not None and turn_hv_off:
+            logger.debug("Turn OFF HV")
+            self.hvcontroller.turn_hv_off()
+
+        if status == "PAUSED":
+            logger.info("Sonication paused.")
+            self.set_status(LIFUInterfaceStatus.STATUS_PAUSED)
+            return True
+        logger.info("Sonication finished before the pause landed.")
+        self.set_status(LIFUInterfaceStatus.STATUS_FINISHED)
+        return False
+
+    def resume_sonication(self, turn_hv_on: bool = True, wait_for_settle: bool = True) -> bool:
+        """Resume a paused sequence with its next pulse train.
+
+        HV is handled as in :meth:`start_sonication`. The train starts from
+        the first profile, no sooner than the paused train's period allows.
+
+        Raises:
+            LIFUDeviceError: Nothing paused, the transmitter over
+                temperature, or a preset mode's start gate refused it. HV is
+                turned off again and the sequence stays paused.
+            LIFUHVSettleError: If the HV rail does not settle in time.
+            LIFUError: On any other device-communication failure.
+        """
+        if self._test_mode:
+            return True
+
+        self._hv_then_trigger(self.txdevice.resume_trigger, turn_hv_on, wait_for_settle)
+        logger.info("Sonication resumed.")
+        self.set_status(LIFUInterfaceStatus.STATUS_RUNNING)
+        return True
+
+    def _hv_then_trigger(self, start, turn_hv_on: bool, wait_for_settle: bool) -> None:
+        """HV on (and settled, if asked), then *start* the trigger; any
+        failure turns HV off again and is re-raised."""
         try:
             if self.hvcontroller is not None:
                 if turn_hv_on:
@@ -461,18 +542,15 @@ class DeviceInterface:
                 logger.debug("No HV Controller detected, assuming external power supply. Skipping HV checks.")
 
             logger.debug("Starting Trigger")
-            self.txdevice.start_trigger()
+            start()
         except Exception:  # reason: any failure, typed or not, must not leave HV on without a trigger; re-raised
             # No trigger, no HV.
             if self.hvcontroller is not None:
                 try:
                     self.hvcontroller.turn_hv_off()
                 except LIFUError as exc:
-                    logger.warning("start_sonication: HV could not be turned off: %s", exc)
+                    logger.warning("HV could not be turned off after a failed start: %s", exc)
             raise
-        logger.info("Sonication started successfully.")
-        self.set_status(LIFUInterfaceStatus.STATUS_RUNNING)
-        return True
 
     def set_status(self, status: LIFUInterfaceStatus) -> None:
         """
@@ -507,15 +585,20 @@ class DeviceInterface:
         trigger_status = trigger_json.get("TriggerStatus", "NOSTATUS").upper()
         if trigger_status == "RUNNING":
             return True
-        elif trigger_status == "STOPPED":
+        elif trigger_status in ("STOPPED", "PAUSED"):
             return False
         elif trigger_status == "NOSTATUS":
             raise LIFUNoTriggerStatusError("Device failed to provide valid trigger status.")
         else:
             raise LIFUNoTriggerStatusError(f"Unexpected trigger status '{trigger_status}' received from device.")
 
+    def is_paused(self) -> bool:
+        """True while a sequence is paused between pulse trains (see :meth:`pause_sonication`)."""
+        trigger_json = self.txdevice.get_trigger_json()
+        return str(trigger_json.get("TriggerStatus", "")).upper() == "PAUSED"
+
     def stop_sonication(self, turn_hv_off: bool = True, wait_for_settle: bool = False) -> bool:
-        """Stop sonication.
+        """Stop sonication. A paused sequence ends here too.
 
         Args:
             turn_hv_off: If True, turn off HV after stopping the trigger.

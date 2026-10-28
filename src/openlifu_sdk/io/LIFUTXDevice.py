@@ -4,6 +4,7 @@ import json
 import logging
 import re
 import struct
+import time
 import zlib
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Annotated, Dict, List, Literal, Optional
@@ -20,6 +21,7 @@ from openlifu_sdk.io.exceptions import (
     LIFUDeviceError,
     LIFUError,
     LIFUProtocolError,
+    LIFUSonicationError,
 )
 from openlifu_sdk.io.LIFUConfig import (
     CONTROLLER_COMMANDS,
@@ -52,6 +54,8 @@ from openlifu_sdk.io.LIFUConfig import (
     OW_CONTROLLER,
     OW_CTRL_GET_SWTRIG,
     OW_CTRL_SET_SWTRIG,
+    OW_CTRL_PAUSE_SWTRIG,
+    OW_CTRL_RESUME_SWTRIG,
     OW_CTRL_START_SWTRIG,
     OW_CTRL_STOP_SWTRIG,
     OW_TRANSMITTER_PID,
@@ -381,6 +385,71 @@ class TxDevice(OWComponent):
                               addr=0, op="stop_trigger")
         r.print_packet()
         return True
+
+    def pause_trigger(self) -> bool:
+        """Ask a running sequence to pause at its next pulse-train boundary.
+
+        Returns once the device has taken the request. The pause lands when
+        the current train's pulses are out (at once if they already are):
+        ``TriggerStatus`` then reads ``"PAUSED"`` and ``TrainCount`` holds the
+        trains delivered. On the final train the sequence runs out instead
+        and the status reads ``"STOPPED"``. See :meth:`wait_for_pause`.
+        A pause not resumed in time (the firmware's TRIGGER_PAUSE_TIMEOUT_S,
+        30 min by default) is ended by the device: ``"STOPPED"``, and resume
+        is refused.
+
+        Raises:
+            LIFUNotConnectedError, LIFUCommunicationError.
+            LIFUDeviceError: No sequence-mode run to pause, or an image
+                older than pause/resume.
+        """
+        self.send_checked(packet_type=OW_CONTROLLER, command=OW_CTRL_PAUSE_SWTRIG,
+                          addr=0, op="pause_trigger")
+        return True
+
+    def resume_trigger(self) -> bool:
+        """Resume a paused sequence with its next pulse train, or withdraw a
+        pause that has not landed yet.
+
+        The train starts from the first profile, and no sooner than the
+        paused train's period (``pulse_train_interval``) allows.
+
+        Raises:
+            LIFUNotConnectedError, LIFUCommunicationError.
+            LIFUDeviceError: Nothing paused, the transmitter over temperature,
+                or a preset mode's start gate refused it (the error code says
+                which, as for :meth:`start_trigger`). The pause stays.
+        """
+        self.send_checked(packet_type=OW_CONTROLLER, command=OW_CTRL_RESUME_SWTRIG,
+                          addr=0, op="resume_trigger")
+        return True
+
+    def wait_for_pause(self, timeout: Optional[float] = None, poll_s: float = 0.05) -> str:
+        """Poll until a requested pause has landed and return the trigger
+        status: ``"PAUSED"``, or ``"STOPPED"`` if the sequence ran out first.
+
+        Args:
+            timeout: Seconds to wait. None waits one train period, as the
+                device reports it, plus a second.
+
+        Raises:
+            LIFUSonicationError: Still running after *timeout*.
+            LIFUNotConnectedError, LIFUCommunicationError, LIFUDeviceError,
+            LIFUProtocolError.
+        """
+        trigger = self.get_trigger_json()
+        if timeout is None:
+            pulses_s = trigger["TriggerPulseCount"] / max(1, trigger["TriggerFrequencyHz"])
+            timeout = max(pulses_s, trigger["TriggerPulseTrainInterval"] * 1e-6) + 1.0
+        deadline = time.monotonic() + timeout
+        while True:
+            status = str(trigger.get("TriggerStatus", "UNKNOWN")).upper()
+            if status != "RUNNING":
+                return status
+            if time.monotonic() >= deadline:
+                raise LIFUSonicationError(f"TX: the pause had not landed after {timeout:.1f} s")
+            time.sleep(poll_s)
+            trigger = self.get_trigger_json()
 
     def get_preset(self, index: int) -> Dict:
         """Describe a preset an FDA_MODE or PRESET_MODE image holds (OW_PRESET_GET).

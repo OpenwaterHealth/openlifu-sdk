@@ -189,6 +189,7 @@ class SimulatedTxDevice:
         }
         self._pulse = {"frequency": 400_000.0, "duration": 100e-6, "amplitude": 1.0}
         self._trigger_running = False
+        self._trigger_paused = False
         self.serial_number: Optional[str] = None
         self.hwid: Optional[str] = None
         self.hardware_id: Optional[str] = None
@@ -513,7 +514,7 @@ class SimulatedTxDevice:
 
     def get_trigger_json(self) -> dict:
         return {
-            "TriggerStatus": "RUNNING" if self._trigger_running else "STOPPED",
+            "TriggerStatus": self._trigger_status(),
             "TriggerMode": "SEQUENCE",
             "TrainCount": self._train_curr,
             **self._sequence,
@@ -532,7 +533,7 @@ class SimulatedTxDevice:
         * ``train_count`` -- current pulse-train counter, 0 before
           an engine starts, incremented each train tick, equal to
           ``pulse_train_count`` on natural completion.
-        * ``trigger_status`` -- ``"RUNNING"`` or ``"STOPPED"``;
+        * ``trigger_status`` -- ``"RUNNING"``, ``"PAUSED"`` or ``"STOPPED"``;
           flips to ``"STOPPED"`` on both operator stop and natural
           completion so a polled host sees a single stop edge
           either way.
@@ -549,7 +550,7 @@ class SimulatedTxDevice:
             "profile_index": 1,
             "profile_increment": True,
             "train_count": self._train_curr,
-            "trigger_status": "RUNNING" if self._trigger_running else "STOPPED",
+            "trigger_status": self._trigger_status(),
         }
 
     def start_trigger(self):
@@ -567,6 +568,35 @@ class SimulatedTxDevice:
 
     def stop_trigger(self):
         self._trigger_running = False
+        self._trigger_paused = False
+
+    def _trigger_status(self) -> str:
+        if self._trigger_running:
+            return "RUNNING"
+        return "PAUSED" if self._trigger_paused else "STOPPED"
+
+    def pause_trigger(self):
+        """Lands at once; :meth:`_SimulatedRunEngine.pause` counts the train
+        in progress as delivered, as the device does where it lands."""
+        if not self._trigger_running:
+            raise LIFUDeviceError("TX: nothing running to pause")
+        self._trigger_running = False
+        self._trigger_paused = True
+
+    def resume_trigger(self):
+        """Same refusals as :meth:`start_trigger`; a refusal keeps the pause."""
+        if not self._trigger_paused:
+            raise LIFUDeviceError("TX: nothing paused")
+        self._trigger_paused = False
+        try:
+            self.start_trigger()
+        except LIFUError:
+            self._trigger_paused = True
+            raise
+
+    def wait_for_pause(self, timeout: Optional[float] = None, poll_s: float = 0.05) -> str:
+        """A simulated pause has already landed."""
+        return self._trigger_status()
 
     def ping(self, module: int = 0):
         return True
@@ -1032,6 +1062,7 @@ class _SimulatedRunEngine(QObject):
 
         self._train_curr = 0
         self.alive = True
+        self.paused = False
 
         self._train_timer = QTimer(self)
         self._train_timer.setSingleShot(False)
@@ -1040,6 +1071,15 @@ class _SimulatedRunEngine(QObject):
         self._heartbeat = QTimer(self)
         self._heartbeat.setSingleShot(False)
         self._heartbeat.timeout.connect(self._on_heartbeat)
+
+        # Ends a pause not resumed in time, as the device does.
+        self._pause_timer = QTimer(self)
+        self._pause_timer.setSingleShot(True)
+        self._pause_timer.timeout.connect(self._on_pause_timeout)
+
+    #: Seconds a pause may last: the firmware's default
+    #: (TRIGGER_PAUSE_TIMEOUT_S in its trigger.h). Tests shorten it.
+    PAUSE_TIMEOUT_S: float = 30 * 60
 
     def start(self):
         self._tx.start_trigger()
@@ -1070,6 +1110,10 @@ class _SimulatedRunEngine(QObject):
             self._train_curr, max(1, initial_total),
             status="RUNNING", mode=self._mode_label,
         )
+        self._start_timers()
+
+    def _start_timers(self):
+        period_ms = max(20, int(round(self._train_period_s * 1000)))
         self._train_timer.start(period_ms)
         # The heartbeat exists to carry temperature updates between
         # long train ticks. When the train period is already <= the
@@ -1079,12 +1123,49 @@ class _SimulatedRunEngine(QObject):
         if period_ms > HEARTBEAT_INTERVAL_MS:
             self._heartbeat.start(HEARTBEAT_INTERVAL_MS)
 
+    def pause(self) -> bool:
+        """Pause as the device does, at the end of the train in progress,
+        but at once: :meth:`SimulatedDeviceInterface.pause_sonication` must
+        not block the GUI thread for a train. False if that train was the
+        last one, which ends the run instead."""
+        if self._trigger_mode != "sequence":
+            raise LIFUDeviceError("TX: only a sequence-mode run can pause")
+        self._train_timer.stop()
+        self._heartbeat.stop()
+        self._on_train_tick()
+        if not self.alive:
+            return False
+        self._tx.pause_trigger()
+        self.paused = True
+        self._pause_timer.start(int(self.PAUSE_TIMEOUT_S * 1000))
+        self._tx.emit_status_frame(
+            self._train_curr, self._train_total,
+            status="PAUSED", mode=self._mode_label,
+        )
+        return True
+
+    def _on_pause_timeout(self):
+        if self.alive and self.paused:
+            self.paused = False
+            self.stop()
+
+    def resume(self):
+        self._tx.resume_trigger()
+        self._pause_timer.stop()
+        self.paused = False
+        self._tx.emit_status_frame(
+            self._train_curr, self._train_total,
+            status="RUNNING", mode=self._mode_label,
+        )
+        self._start_timers()
+
     def stop(self):
         was_alive = self.alive
         # Mark inactive first so any queued timer ticks become no-ops.
         self.alive = False
         self._train_timer.stop()
         self._heartbeat.stop()
+        self._pause_timer.stop()
         self._tx.stop_trigger()
         # Emit a final STOPPED frame so the connector's STATUS-based
         # trigger-state machine flips cleanly (especially in continuous
@@ -1280,11 +1361,14 @@ class SimulatedDeviceInterface(QObject):
         refusal from either device is raised with HV turned back off."""
         # Stop any previous engine before starting a new one (pause/resume
         # rebuilds the trigger then re-calls start_sonication).
-        if self._engine is not None and self._engine.alive:
+        if self._engine is not None and self._engine.alive and not self._engine.paused:
             self._engine.stop()
         try:
             if turn_hv_on:
                 self.hvcontroller.turn_hv_on()
+            # As the device refuses START: resume or stop a paused run.
+            if self._engine is not None and self._engine.alive:
+                raise LIFUDeviceError("TX: a paused sequence must be resumed or stopped")
             if wait_for_settle:
                 # Brief settle delay (real device is ~200 ms); not perceptible
                 # but matches the real code path's blocking nature.
@@ -1299,9 +1383,48 @@ class SimulatedDeviceInterface(QObject):
                 parent=self,
             )
             self._engine.start()
+        except LIFUDeviceError:
+            # A paused run stays for resume or stop.
+            if self._engine is not None and not self._engine.paused:
+                self._engine = None
+            self.hvcontroller.turn_hv_off()
+            raise
         except Exception:  # reason: any failure, typed or not, must not leave HV on without a trigger; re-raised
             # No trigger, no HV.
             self._engine = None
+            self.hvcontroller.turn_hv_off()
+            raise
+        self.set_status(LIFUInterfaceStatus.STATUS_RUNNING)
+        return True
+
+    def pause_sonication(self, turn_hv_off: bool = True,
+                         timeout: Optional[float] = None) -> bool:
+        """Same contract as :meth:`DeviceInterface.pause_sonication`, except
+        that the pause lands at once (see :meth:`_SimulatedRunEngine.pause`)."""
+        if self._engine is None or not self._engine.alive or self._engine.paused:
+            raise LIFUDeviceError("TX: nothing running to pause")
+        paused = self._engine.pause()
+        if turn_hv_off:
+            self.hvcontroller.turn_hv_off()
+        if paused:
+            self.set_status(LIFUInterfaceStatus.STATUS_PAUSED)
+        else:
+            self._engine = None
+            self.set_status(LIFUInterfaceStatus.STATUS_FINISHED)
+        return paused
+
+    def resume_sonication(self, turn_hv_on: bool = True,
+                          wait_for_settle: bool = True) -> bool:
+        """Same contract as :meth:`DeviceInterface.resume_sonication`."""
+        if self._engine is None or not self._engine.paused:
+            raise LIFUDeviceError("TX: nothing paused")
+        try:
+            if turn_hv_on:
+                self.hvcontroller.turn_hv_on()
+            if wait_for_settle:
+                time.sleep(0.2)
+            self._engine.resume()
+        except Exception:  # reason: any failure, typed or not, must not leave HV on without a trigger; re-raised
             self.hvcontroller.turn_hv_off()
             raise
         self.set_status(LIFUInterfaceStatus.STATUS_RUNNING)
@@ -1318,7 +1441,10 @@ class SimulatedDeviceInterface(QObject):
         return True
 
     def is_running(self) -> bool:
-        return self._engine is not None and self._engine.alive
+        return self._engine is not None and self._engine.alive and not self._engine.paused
+
+    def is_paused(self) -> bool:
+        return self._engine is not None and self._engine.alive and self._engine.paused
 
     # ---- misc -----------------------------------------------------------
 
