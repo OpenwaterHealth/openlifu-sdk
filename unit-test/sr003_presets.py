@@ -27,6 +27,7 @@ DEFAULTS = {
     "apodization": [[1.0] * 64],
     "start_C": 35,
     "shutoff_C": 75,
+    "treatment_timeout_s": 1800,
     "voltage": 40.0,
     "sensitivity": 2720,
 }
