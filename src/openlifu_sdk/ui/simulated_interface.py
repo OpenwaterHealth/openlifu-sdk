@@ -283,6 +283,7 @@ class SimulatedTxDevice:
             "pulse_train_count_selections": [1],
             "start_C": 35.0,
             "shutoff_C": 75.0,
+            "treatment_timeout_s": 1800,
         }
         return machine_config, 0x87654321
 
