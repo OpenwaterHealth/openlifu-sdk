@@ -29,7 +29,8 @@ the host matches its version exactly.
 --presets DIR bakes a preset context into a presets-only image: DIR is a
 preset context folder (presets.json listing the presets, each in
 <id>/<id>_settings.json), and its folder name is the image's suffix
-(-DFW_BUILD_VARIANT). Each preset is compiled as the operator interface
+(-DFW_PRESET_VARIANT, which the firmware accepts as fda or test,
+transmitter-fw#36 / console-fw#32). Each preset is compiled as the operator interface
 compiles it, so the CRCs in the image are the ones the host verifies. This is
 how presets reach a device: the operator interface never writes them. One
 preset is linked as fda_preset.h; several as the transmitter's preset table
@@ -295,7 +296,7 @@ def build(repo: Path, preset: str, increment: bool, stamp: bool = True,
               % preset)
     # Configure first, on its own: left to ninja, the regeneration would rewrite
     # version.h mid-build and drop the stamp. cmake reads presets from the cwd.
-    suffix = ["-DFW_BUILD_VARIANT=%s" % variant] if variant else []
+    suffix = ["-DFW_PRESET_VARIANT=%s" % variant] if variant else []
     subprocess.run(["cmake", "--preset", preset, *suffix], cwd=repo, check=True)
     stamp_build_number(repo, preset, number)
     subprocess.run(["cmake", "--build", "--preset", preset], cwd=repo, check=True)
