@@ -57,8 +57,10 @@ class TestModuleCountGuard(unittest.TestCase):
                 with self.assertRaises(LIFUError) as ctx:
                     store_preset(tx, 3, _compiled(elements))
                 self.assertEqual(ctx.exception.code, LIFU_ERR_MODULE_COUNT_MISMATCH)
-                tx.write_preset.assert_not_called()
-                tx.get_preset.assert_not_called()
+                self.assertIn("unit spans %d transmitter module(s); the TX reports %d"
+                              % (elements // 64, modules), str(ctx.exception))
+                # Nothing but the module-count query reaches the device.
+                self.assertEqual(tx.method_calls, [call.get_module_count()])
 
     def test_load_mismatch_loads_nothing(self):
         for elements, modules in ((64, 2), (128, 1), (64, 0)):
@@ -67,8 +69,7 @@ class TestModuleCountGuard(unittest.TestCase):
                 with self.assertRaises(LIFUError) as ctx:
                     load_preset(tx, 0, _compiled(elements))
                 self.assertEqual(ctx.exception.code, LIFU_ERR_MODULE_COUNT_MISMATCH)
-                tx.load_preset.assert_not_called()
-                tx.unload_preset.assert_not_called()
+                self.assertEqual(tx.method_calls, [call.get_module_count()])
 
     def test_store_matching_count_writes_every_module(self):
         mc = _compiled(128)

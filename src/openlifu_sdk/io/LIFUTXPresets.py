@@ -979,7 +979,8 @@ def load_preset(txdevice, index: int, machine_config: Dict, duration_index: int 
     Raises:
         ValueError: *machine_config* has no settings_crc.
         LIFUError: The preset's module count differs from the transmitter's
-            (LIFU_ERR_MODULE_COUNT_MISMATCH); nothing is loaded.
+            (LIFU_ERR_MODULE_COUNT_MISMATCH); nothing is sent, so
+            whatever was loaded before stays loaded.
         LIFUDeviceError: A module refused (see TxDevice.load_preset).
     """
     if "settings_crc" not in machine_config:
