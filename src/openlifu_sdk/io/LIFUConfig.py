@@ -208,7 +208,7 @@ TX_FDA_PACKETS = {
         OW_CTRL_GET_SWTRIG, OW_CTRL_START_SWTRIG, OW_CTRL_STOP_SWTRIG,
         OW_CTRL_GET_MODULE_COUNT,
         OW_PRESET_GET, OW_PRESET_LOAD, OW_PRESET_LOADED,
-        OW_PRESET_LOCK,   # read only (FDA_READ_ONLY_COMMANDS)
+        OW_PRESET_LOCK,   # read, or turn on: the lock only restricts
     }),
     OW_TX7332: frozenset({OW_TX7332_DEVICE_COUNT}),  # get_module_count fallback on older images
 }
@@ -229,10 +229,11 @@ HV_FDA_COMMANDS = set().union(*HV_FDA_PACKETS.values())
 # Commands the FDA components may only read with (reserved == 0): the user
 # config carries the sensitivity calibration that scales the HV, and its
 # write is reserved == 1. FDA_MODE firmware refuses that write too
-# (OW_FDA_REFUSED); this keeps an FDA host from sending it at all. The FDA
-# host reads the preset lock but has no reason to set it: an FDA image is
-# always locked.
-FDA_READ_ONLY_COMMANDS = frozenset({OW_CMD_USR_CFG, OW_PRESET_LOCK})
+# (OW_FDA_REFUSED); this keeps an FDA host from sending it at all. The
+# preset lock is not here: turning it on only restricts the device, an FDA
+# image is always locked, and a host that never writes presets locks a DEV
+# image with it.
+FDA_READ_ONLY_COMMANDS = frozenset({OW_CMD_USR_CFG})
 
 TRIGGER_MODE_SEQUENCE = 0
 TRIGGER_MODE_CONTINUOUS = 1

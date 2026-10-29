@@ -133,3 +133,16 @@ def test_sim_lifu_interface_locks_on_request():
         assert iface.txdevice.is_preset_locked() is False
     finally:
         iface.close()
+
+
+def test_sim_fda_lock_is_a_no_op_and_the_console_reports_float32():
+    """The FDA component may send the lock; an FDA image is already locked.
+    The simulated console reports each record's voltage as float32, as a real
+    console does, so verify_console_preset's exact check passes."""
+    from openlifu_sdk.io.LIFUTXPresets import verify_console_preset
+    from openlifu_sdk.ui.simulated_interface import SimulatedDeviceInterface
+
+    mc, regs = flash_entry(voltage=27.98984157172857)
+    iface = SimulatedDeviceInterface(preset_flash=[(mc, regs)])
+    assert iface.txdevice.lock_presets() is True and iface.txdevice.is_preset_locked() is True
+    verify_console_preset(iface.hvcontroller, 0, mc)

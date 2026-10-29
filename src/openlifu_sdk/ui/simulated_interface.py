@@ -80,7 +80,7 @@ from openlifu_sdk.io.LIFUConfig import (
     OW_PRESET_BUSY,
     OW_TEMP_TOO_HIGH,
 )
-from openlifu_sdk.io.LIFUTXPresets import module_regs_crcs, preset_sensitivity
+from openlifu_sdk.io.LIFUTXPresets import module_regs_crcs, preset_sensitivity, preset_voltage
 from openlifu_sdk.io.LIFUUserConfig import sensitivity_at_frequency
 from openlifu_sdk.io.signal import OWSignal
 from openlifu_sdk.ui.status_frame import format_status_frame as _format_status_frame
@@ -411,6 +411,11 @@ class SimulatedTxDevice:
     def is_preset_locked(self) -> bool:
         """Same contract as :meth:`TxDevice.is_preset_locked`: an FDA image
         is always locked."""
+        return True
+
+    def lock_presets(self) -> bool:
+        """Same contract as :meth:`TxDevice.lock_presets`: an FDA image is
+        already locked."""
         return True
 
     def is_connected(self) -> bool:
@@ -1278,7 +1283,9 @@ class SimulatedDeviceInterface(QObject):
                     "index": index,
                     "selected": None,
                     "settings_crc": int(machine_config.get("settings_crc", 0)),
-                    "voltage": machine_config.get("voltage"),   # configure_presets checks it
+                    # As HVController.get_preset reports it: the console bakes it
+                    # as float32. preset_voltage refuses a missing or bad voltage.
+                    "voltage": preset_voltage(machine_config),
                     "id": machine_config.get("id", f"preset-{index}"),
                     # As HVController.get_preset reports it: the console bakes it as float32.
                     "sensitivity": preset_sensitivity(machine_config),
