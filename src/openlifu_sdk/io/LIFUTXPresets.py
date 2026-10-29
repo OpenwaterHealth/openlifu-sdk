@@ -45,6 +45,7 @@ from pathlib import Path
 from typing import Dict, List, Sequence
 
 from openlifu_sdk.io.exceptions import LIFUError
+from openlifu_sdk.io.LIFUConfig import LIFU_ERR_MODULE_COUNT_MISMATCH
 from openlifu_sdk.io.LIFUTXDevice import (
     PRESET_BLOB_MAGIC,
     PRESET_BLOB_VERSION,
@@ -950,13 +951,15 @@ def store_preset(txdevice, slot: int, machine_config: Dict) -> Dict:
 
     Uploads each module its own part, then reads the slot back
     (:func:`verify_preset`), so a success means the device holds this preset
-    under index *slot*. Returns the device's description of it. A transmitter
-    with fewer modules than the preset spans gets the parts it has modules
-    for.
+    under index *slot*. Returns the device's description of it. A preset
+    whose module count differs from the transmitter's is refused before
+    anything is written, as DeviceInterface.load_preset refuses it.
 
     Raises:
         ValueError: The blob cannot be stored, or the slot does not read back
             as this preset.
+        LIFUError: The preset's module count differs from the transmitter's
+            (LIFU_ERR_MODULE_COUNT_MISMATCH).
         LIFUDeviceError: The device refused the write (see write_preset).
     """
     preset_slots(machine_config)
@@ -975,6 +978,8 @@ def load_preset(txdevice, index: int, machine_config: Dict, duration_index: int 
 
     Raises:
         ValueError: *machine_config* has no settings_crc.
+        LIFUError: The preset's module count differs from the transmitter's
+            (LIFU_ERR_MODULE_COUNT_MISMATCH); nothing is loaded.
         LIFUDeviceError: A module refused (see TxDevice.load_preset).
     """
     if "settings_crc" not in machine_config:
@@ -1025,12 +1030,15 @@ def loaded_registers(machine_config: Dict) -> Dict[tuple, int]:
 
 
 def _device_modules(txdevice, machine_config: Dict) -> range:
-    """The modules to address: the ones the preset spans that the transmitter has."""
-    wanted, present = preset_modules(machine_config), txdevice.get_module_count()
-    if present < wanted:
-        logger.warning("%s spans %d modules; this transmitter has %d, so only those get their part",
-                       machine_config["id"], wanted, present)
-    return range(min(wanted, present))
+    """The modules to address: every one the preset spans, which must be every
+    one the transmitter has. A preset on a transmitter with more or fewer
+    modules would be half stored or half loaded, so it is refused."""
+    wanted, present = preset_modules(machine_config), int(txdevice.get_module_count())
+    if present != wanted:
+        raise LIFUError("%s spans %d transmitter module(s); the TX reports %d"
+                        % (machine_config["id"], wanted, present),
+                        code=LIFU_ERR_MODULE_COUNT_MISMATCH)
+    return range(wanted)
 
 
 # --------------------------------------------------------------------------
