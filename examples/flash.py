@@ -150,6 +150,28 @@ def cmake_presets(repo: Path) -> dict:
     return {name: variables(name) for name in configure if name in names}
 
 
+CMAKE_TRUE = {"1", "ON", "YES", "Y", "TRUE"}
+CMAKE_FALSE = {"", "0", "OFF", "NO", "N", "FALSE", "IGNORE", "NOTFOUND"}
+
+
+def cache_flag(variables: dict, name: str) -> bool:
+    """A boolean cache variable as CMake reads it. CMakePresets.json allows a
+    bool, a string or {"type": ..., "value": ...}. A value CMake would not
+    read as a plain true or false is refused rather than guessed at, since
+    FDA_MODE decides what an image holds and how it is versioned."""
+    value = variables.get(name, False)
+    if isinstance(value, dict):
+        value = value.get("value", False)
+    if isinstance(value, bool):
+        return value
+    text = str(value).upper()
+    if text in CMAKE_TRUE:
+        return True
+    if text in CMAKE_FALSE or text.endswith("-NOTFOUND"):
+        return False
+    sys.exit("cannot read %s=%r as true or false" % (name, value))
+
+
 def step_build_number(repo: Path, increment: bool) -> int:
     # One counter for every preset of a tree. It lives under build/, so it is
     # gitignored and deleting build/ starts it again at 1.
@@ -209,8 +231,9 @@ def load_preset_set(context: Path) -> list:
 def write_preset_headers(repo: Path, name: str, fda: bool, context: Path) -> list:
     """Generate the board's preset headers for the set in *context*: an FDA
     image takes exactly one preset; any other build gets the whole set. The
-    headers are generated first; only then are the board's old ones replaced,
-    so a refused or failed run leaves the tree as it was."""
+    headers are generated in a staging folder first, so a set that is refused
+    or fails to generate leaves the tree's headers as they were. Once the
+    swap starts, the old headers are gone."""
     from openlifu_sdk.io.LIFUTXPresets import (
         generate_console_fda_preset,
         generate_console_presets,
@@ -248,6 +271,9 @@ def write_preset_headers(repo: Path, name: str, fda: bool, context: Path) -> lis
             shutil.copy2(new, out / new.name)
     print("Presets    : %s from %s (%s)" % (", ".join(mc["id"] for mc in configs), context,
                                           "FDA, one preset" if fda else "%d preset(s)" % len(configs)))
+    if not fda:
+        print("             A DEV image links this set only with transmitter-fw#50 / console-fw#21;\n"
+              "             an older tree builds without it.")
     return configs
 
 
@@ -504,8 +530,8 @@ def main() -> int:
         preset = args.preset or board.default_preset
         if preset not in presets:
             sys.exit("%s has no preset %r. It has: %s" % (repo, preset, ", ".join(sorted(presets))))
-        slot_preset = presets[preset].get("BARE_METAL") != "ON"
-        fda_preset = presets[preset].get("FDA_MODE") == "ON"
+        slot_preset = not cache_flag(presets[preset], "BARE_METAL")
+        fda_preset = cache_flag(presets[preset], "FDA_MODE")
         # Asked before building, so the answer is not kept waiting on the compiler.
         if slot_preset and not args.force:
             print(SLOT_WARNING % ("'%s'" % preset))
@@ -516,6 +542,9 @@ def main() -> int:
             return 1
         if args.presets:
             write_preset_headers(repo, name, fda_preset, args.presets.resolve())
+        elif args.build and fda_preset:
+            print("Presets    : none given, so this links whatever %s the tree already has"
+                  % (PRESET_DIR / "fda_preset.h").as_posix())
         if args.build:
             build(repo, preset, not args.no_increment, stamp=not fda_preset)
         image = newest_hex(repo, preset)

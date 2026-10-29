@@ -21,7 +21,7 @@ import pytest
 
 from sr003_presets import DEFAULTS
 
-from openlifu_sdk.io.LIFUTXPresets import preset_blob
+from openlifu_sdk.io.LIFUTXPresets import compile_preset, preset_blob
 
 FLASH = Path(__file__).resolve().parent.parent / "examples" / "flash.py"
 
@@ -66,6 +66,8 @@ def test_the_set_follows_the_operator_interface_contract(flash, tmp_path):
     for mc in configs:
         raw = (context / mc["id"] / ("%s_settings.json" % mc["id"])).read_bytes()
         assert mc["settings_crc"] == zlib.crc32(raw)
+        direct = compile_preset(json.loads(raw), preset_id=mc["id"], settings_bytes=raw)
+        assert preset_blob(mc) == preset_blob(direct)   # so its regs_crc too
 
 
 def _blob_bytes(header: Path, symbol: str) -> bytes:
@@ -111,7 +113,57 @@ def test_fda_mode_is_read_through_preset_inheritance(flash, tmp_path):
     assert presets["Release-FDA-BareMetal"] == {
         "FDA_MODE": "ON", "BARE_METAL": "ON", "CMAKE_BUILD_TYPE": "Release"}
     assert "FDA_MODE" not in presets["Release"]
-    assert set(presets) == {"Release-FDA-BareMetal", "Release"}   # hidden bases are not offered
+    assert set(presets) == {"Release-FDA-BareMetal", "Release"}   # only buildable presets are offered
+
+
+@pytest.mark.parametrize("value, expected", [
+    ("ON", True), ("on", True), ("TRUE", True), ("1", True), (True, True),
+    ({"type": "BOOL", "value": "ON"}, True), ("OFF", False), (False, False),
+    ({"type": "BOOL", "value": "FALSE"}, False), ("X-NOTFOUND", False)])
+def test_fda_mode_is_read_as_cmake_reads_it(flash, value, expected):
+    """CMakePresets.json may write a boolean as a bool, a string or an
+    object; an FDA preset must not be taken for a DEV one."""
+    assert flash.cache_flag({"FDA_MODE": value}, "FDA_MODE") is expected
+    assert flash.cache_flag({}, "FDA_MODE") is False
+
+
+def test_an_unreadable_fda_mode_is_refused(flash):
+    with pytest.raises(SystemExit, match="cannot read FDA_MODE"):
+        flash.cache_flag({"FDA_MODE": "maybe"}, "FDA_MODE")
+
+
+@pytest.mark.parametrize("fda", [True, False], ids=["fda", "dev"])
+def test_main_bakes_and_builds_by_the_presets_fda_mode(flash, tmp_path, monkeypatch, fda):
+    """#108 done-when, end to end through main(): an FDA preset gets one
+    preset and no build number; a DEV preset gets the set and one."""
+    tree = tmp_path / "fw"
+    tree.mkdir()
+    (tree / "CMakePresets.json").write_text(json.dumps({
+        "configurePresets": [{"name": "P", "cacheVariables": {
+            "FDA_MODE": {"type": "BOOL", "value": "ON" if fda else "OFF"}, "BARE_METAL": "ON"}}],
+        "buildPresets": [{"name": "P"}],
+    }), encoding="utf-8")
+    context = _context(tmp_path, ids=("only",))
+    calls = {}
+
+    class Built(Exception):
+        pass
+
+    def newest_hex(*_):
+        raise Built
+
+    monkeypatch.setattr(flash, "find_programmer", lambda: "cli")
+    monkeypatch.setattr(flash, "pick_target", lambda *_: ("sn", "transmitter"))
+    monkeypatch.setattr(flash, "write_preset_headers",
+                        lambda repo, name, is_fda, ctx: calls.update(headers=(name, is_fda, ctx)))
+    monkeypatch.setattr(flash, "build",
+                        lambda repo, preset, increment, stamp=True: calls.update(stamp=stamp))
+    monkeypatch.setattr(flash, "newest_hex", newest_hex)
+    monkeypatch.setattr("sys.argv", ["flash.py", "--board", "transmitter", "--preset", "P", "--build",
+                                     "--presets", str(context), "--transmitter-fw", str(tree)])
+    with pytest.raises(Built):
+        flash.main()
+    assert calls == {"headers": ("transmitter", fda, context.resolve()), "stamp": not fda}
 
 
 def test_a_dev_transmitter_build_gets_the_whole_set(flash, tmp_path):
