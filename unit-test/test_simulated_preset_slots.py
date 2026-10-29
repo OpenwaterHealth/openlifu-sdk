@@ -40,6 +40,17 @@ def _code(excinfo):
     return excinfo.value.device_error_code
 
 
+def _slot_size(monkeypatch, size):
+    """Shrink the slots, keeping the device's geometry: a blob is at most two."""
+    monkeypatch.setattr(sim, "PRESET_SLOT_SIZE", size)
+    monkeypatch.setattr(sim, "PRESET_BLOB_MAX", 2 * size)
+
+
+def _short_entry(**overrides):
+    """A preset whose blob is shorter than flash_entry()'s: fewer run lengths."""
+    return flash_entry(pulse_train_count_selections=[1], **overrides)
+
+
 def _dev(num_modules=1):
     """A DEV image with nothing stored."""
     return SimulatedLIFUTxDevice(num_modules=num_modules, preset_flash=[])
@@ -185,10 +196,10 @@ def test_damaged_blob_is_refused_and_the_slot_unchanged(damage, match):
 
 
 def test_a_long_blob_takes_the_next_slot(monkeypatch):
-    monkeypatch.setattr(sim, "PRESET_SLOT_SIZE", 64)  # every real blob is then "long"
     tx = _dev()
     mc, _ = flash_entry()
     other, _ = flash_entry(pulse_count=3)
+    _slot_size(monkeypatch, len(preset_blob(mc)) - 1)  # both blobs are then "long"
     store_preset(tx, 4, mc)
     assert tx.get_preset_slot(5) == {"index": 5, "state": "tail"}
 
@@ -216,17 +227,45 @@ def test_a_long_blob_takes_the_next_slot(monkeypatch):
 def test_a_long_part_keeps_its_tail_when_another_module_part_is_short(monkeypatch):
     """Whether a part takes two slots is each module's own."""
     tx = _dev(num_modules=2)
-    mc, _ = two_module_flash_entry()
-    long_size = len(preset_blob(mc, 0))
-    monkeypatch.setattr(sim, "PRESET_SLOT_SIZE", long_size - 1)  # module 0's part is "long"
-    tx.write_preset(0, preset_blob(mc, 0), 0)
-    monkeypatch.setattr(sim, "PRESET_SLOT_SIZE", long_size + 1)  # module 1's part is short
-    tx.write_preset(0, preset_blob(mc, 1), 1)
-    other, _ = flash_entry()
+    long_mc, _ = two_module_flash_entry()
+    short_mc, _ = two_module_flash_entry(pulse_train_count_selections=[1])
+    _slot_size(monkeypatch, len(preset_blob(short_mc, 1)))
+    assert len(preset_blob(long_mc, 0)) > sim.PRESET_SLOT_SIZE
+    tx.write_preset(0, preset_blob(long_mc, 0), 0)    # module 0: two slots
+    tx.write_preset(0, preset_blob(short_mc, 1), 1)   # module 1: one slot, another preset
     with pytest.raises(LIFUDeviceError) as e:
-        tx.write_preset(1, preset_blob(other), 0)  # module 0's slot 1 is its tail
+        tx.write_preset(1, preset_blob(short_mc, 0), 0)  # module 0's slot 1 is still its tail
     assert _code(e) == OW_PRESET_SLOT_TAIL
-    tx.write_preset(1, preset_blob(two_module_flash_entry(pulse_count=3)[0], 1), 1)  # module 1's is free
+    tx.write_preset(1, preset_blob(short_mc, 1), 1)      # module 1's slot 1 is free
+
+
+def test_replacing_a_long_preset_with_a_short_one_frees_the_tail(monkeypatch):
+    tx = _dev()
+    long_mc, _ = flash_entry()
+    short_mc, _ = _short_entry()
+    _slot_size(monkeypatch, len(preset_blob(short_mc)))
+    store_preset(tx, 4, long_mc)
+    assert tx.get_preset_slot(5)["state"] == "tail"
+    store_preset(tx, 4, short_mc)
+    assert [tx.get_preset_slot(i)["state"] for i in (4, 5)] == ["preset", "empty"]
+
+
+def test_deleting_or_replacing_the_loaded_preset_unloads_it_and_others_do_not():
+    tx = _dev()
+    mc, _ = flash_entry()
+    other, _ = flash_entry(pulse_count=3)
+    store_preset(tx, 0, mc)
+    store_preset(tx, 1, other)
+    load_preset(tx, 0, mc)
+    store_preset(tx, 2, other)   # another slot: the load stays
+    delete_preset(tx, 1)
+    assert tx.get_loaded_preset_state()["loaded"] is True
+    delete_preset(tx, 0)         # the loaded slot: nothing loaded
+    assert tx.get_loaded_preset_state()["loaded"] is False
+    store_preset(tx, 0, mc)
+    load_preset(tx, 0, mc)
+    store_preset(tx, 0, other)   # over the loaded slot: nothing loaded
+    assert tx.get_loaded_preset_state()["loaded"] is False
 
 
 def test_delete_empties_the_slot_and_an_empty_delete_is_fine():

@@ -661,14 +661,19 @@ class SimulatedLIFUTxDevice(SimulatedTxDevice):
     refuses is refused.
 
     Every module has its own :data:`PRESET_SLOTS` preset slots and keeps
-    its own part of each preset, as on the firmware. ``preset_flash``
+    its own part of each preset (transmitter-fw#44). ``preset_flash``
     fills them from slot 0, one slot per entry; the rest start empty. A
     module's blob over :data:`PRESET_SLOT_SIZE` also takes that module's
     next slot. Module 0 answers the preset queries.
 
-    A preset stored here loads with its trigger timing and train counts,
-    but not its pulse length, which lives in the blob's register tables:
-    the trigger then reports the simulator's default pulse width.
+    A preset stored here loads with its train counts and its trigger
+    timing as the blob encodes it (the pulse rate in whole Hz), but not
+    its pulse length, which lives in the blob's register tables: the
+    trigger then reports the simulator's default pulse width.
+
+    The refusals and their order are modelled on transmitter-fw#44 and
+    the :class:`LIFUTxDevice` docstrings; they are not checked against
+    hardware.
     """
 
     _async_mode = False
@@ -728,7 +733,7 @@ class SimulatedLIFUTxDevice(SimulatedTxDevice):
                 "slot_size": PRESET_SLOT_SIZE, "blob_max": PRESET_BLOB_MAX}
 
     def _preset_store_gate(self, what: str, slot: int, module: int) -> None:
-        """What the firmware checks before it stores or deletes a preset."""
+        """What a store or delete is refused for (modelled on transmitter-fw#44)."""
         if self._locked:
             raise LIFUDeviceError(f"TX: {what} refused by the preset lock",
                                   device_error_code=OW_FDA_REFUSED)
@@ -743,9 +748,10 @@ class SimulatedLIFUTxDevice(SimulatedTxDevice):
     def write_preset(self, slot: int, blob: bytes, module: int = 0) -> bool:
         """Same contract and refusals as :meth:`LIFUTxDevice.write_preset`:
         *module*'s part of the preset in *slot* is replaced, or nothing
-        changes. Storing leaves nothing loaded on that module. Which part
-        of the preset the blob is (its ``module`` field) is not checked
-        here; a wrong part is refused at load, on its regs_crc.
+        changes. Storing over the loaded preset leaves nothing loaded on
+        that module, as deleting it does. Which part of the preset the
+        blob is (its ``module`` field) is not checked here; a wrong part
+        is refused at load, on its regs_crc.
         """
         blob = bytes(blob)
         if not 0 < len(blob) <= PRESET_BLOB_MAX:
@@ -773,7 +779,8 @@ class SimulatedLIFUTxDevice(SimulatedTxDevice):
             "start_C": part["start_c_x10"] / 10.0,
             "shutoff_C": part["shutoff_c_x10"] / 10.0,
         }
-        self.unload_preset(module)
+        if self._loaded_preset_index == slot:
+            self.unload_preset(module)
         if slots[slot] not in (None, _TAIL) and slot + 1 < PRESET_SLOTS and slots[slot + 1] == _TAIL:
             slots[slot + 1] = None  # the long preset this replaces
         slots[slot] = (machine_config, part["regs_crc"], max(1, int(part["modules"])))
