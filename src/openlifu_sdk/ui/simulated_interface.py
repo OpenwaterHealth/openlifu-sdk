@@ -70,15 +70,18 @@ from openlifu_sdk.io.exceptions import LIFUDeviceError, LIFUError, LIFUSolutionE
 from openlifu_sdk.io.LIFUConfig import (
     LIFU_ERR_MODULE_COUNT_MISMATCH,
     OW_BAD_CRC,
+    OW_FDA_REFUSED,
     OW_HV_FDA_REFUSED,
     OW_HV_NO_PRESET,
     OW_HV_PRESET_CRC,
     OW_HV_RANGE,
     OW_HV_DATA_ERROR,
+    OW_INVALID_PACKET,
     OW_NO_PRESET,
+    OW_PRESET_BUSY,
     OW_TEMP_TOO_HIGH,
 )
-from openlifu_sdk.io.LIFUTXPresets import module_regs_crcs, preset_sensitivity
+from openlifu_sdk.io.LIFUTXPresets import module_regs_crcs, preset_sensitivity, preset_voltage
 from openlifu_sdk.io.LIFUUserConfig import sensitivity_at_frequency
 from openlifu_sdk.io.signal import OWSignal
 from openlifu_sdk.ui.status_frame import format_status_frame as _format_status_frame
@@ -330,7 +333,7 @@ class SimulatedTxDevice:
         }
 
     def load_preset(self, index: int, regs_crc: int, duration_index: int = 0,
-                    settings_crc: int | None = None, module: int = 0) -> bool:
+                    module: int = 0, *, settings_crc: int | None = None) -> bool:
         """Same contract as :meth:`TxDevice.load_preset` (OW_PRESET_LOAD).
 
         Like the firmware, loading applies the preset's trigger and pulse
@@ -382,9 +385,34 @@ class SimulatedTxDevice:
         return True
 
     def get_loaded_preset(self) -> tuple[Optional[int], Optional[int]]:
-        """``(preset_index, duration_index)`` of the last successful
-        :meth:`load_preset`, or ``(None, None)``. Simulator inspection only."""
-        return self._loaded_preset_index, self._loaded_duration_index
+        """Same contract as :meth:`TxDevice.get_loaded_preset`."""
+        state = self.get_loaded_preset_state()
+        return state["index"], state["duration_index"]
+
+    def get_loaded_preset_state(self, module: Optional[int] = None) -> dict:
+        """Same contract as :meth:`TxDevice.get_loaded_preset_state`
+        (OW_PRESET_LOADED): loaded only if module 0 and every other module
+        hold the load, with the modules that don't in ``missing_modules``."""
+        modules = range(self.num_modules) if module is None else [module]
+        if self._loaded_preset_index is None:
+            missing = list(modules)
+        else:
+            missing = [m for m in modules if m not in self._loaded_modules]
+        if missing:
+            return {"loaded": False, "index": None, "duration_index": None, "train_count": None,
+                    "settings_crc": None, "regs_crc": None, "missing_modules": missing}
+        machine_config, flash_regs_crc = self._preset_flash[self._loaded_preset_index]
+        crcs = self._module_crcs(flash_regs_crc)
+        return {"loaded": True, "index": self._loaded_preset_index,
+                "duration_index": self._loaded_duration_index,
+                "train_count": int(self._sequence["pulse_train_count"]),
+                "settings_crc": int(machine_config["settings_crc"]),
+                "regs_crc": crcs[0 if module is None else module], "missing_modules": []}
+
+    def is_preset_locked(self) -> bool:
+        """Same contract as :meth:`TxDevice.is_preset_locked`: an FDA image
+        is always locked."""
+        return True
 
     def is_connected(self) -> bool:
         return self._connected
@@ -612,13 +640,43 @@ class SimulatedTxDevice:
 
 
 class SimulatedLIFUTxDevice(SimulatedTxDevice):
-    """Fake of the RUO :class:`~openlifu_sdk.io.LIFUTXDevice.LIFUTxDevice`."""
+    """Fake of the RUO :class:`~openlifu_sdk.io.LIFUTXDevice.LIFUTxDevice`
+    on a DEV image (transmitter-fw presets.h): full host control until
+    :meth:`lock_presets`, then what an FDA image refuses is refused."""
 
     _async_mode = False
+    _locked = False
+
+    def is_preset_locked(self) -> bool:
+        """Same contract as :meth:`TxDevice.is_preset_locked`."""
+        return self._locked
+
+    def lock_presets(self) -> bool:
+        """Same contract as :meth:`LIFUTxDevice.lock_presets`; the simulator
+        has no reset, so it stays locked."""
+        self._locked = True
+        return True
+
+    def _raw_write(self, what: str) -> None:
+        """A register, profile or trigger write, as the DEV firmware gates it:
+        refused while locked; refused while a loaded preset runs; otherwise
+        it leaves nothing loaded on any module."""
+        if self._locked:
+            raise LIFUDeviceError(f"TX: {what} refused by the preset lock",
+                                  device_error_code=OW_INVALID_PACKET)
+        if self._loaded_modules and self._trigger_running:
+            raise LIFUDeviceError(f"TX: {what} refused while a loaded preset runs",
+                                  device_error_code=OW_PRESET_BUSY)
+        for module in list(self._loaded_modules):
+            self.unload_preset(module)
 
     def start_trigger(self):
-        """An RUO image starts whatever solution was programmed; there is no
-        preset gate."""
+        """Unlocked with nothing loaded, a DEV image starts whatever solution
+        was programmed. With a preset loaded, or locked, it gates the start as
+        an FDA image does."""
+        if self._locked or self._loaded_preset_index is not None:
+            super().start_trigger()
+            return
         self._trigger_running = True
 
     def get_tx_module_count(self) -> int:
@@ -626,6 +684,9 @@ class SimulatedLIFUTxDevice(SimulatedTxDevice):
 
     def write_config_json(self, json_str: str, module: int = 0):
         from openlifu_sdk.io.LIFUUserConfig import LifuUserConfig
+        if self._locked:
+            raise LIFUDeviceError("TX: user config write refused by the preset lock",
+                                  device_error_code=OW_FDA_REFUSED)
         try:
             self._user_configs[module] = json.loads(json_str)
         except (TypeError, ValueError):
@@ -636,6 +697,7 @@ class SimulatedLIFUTxDevice(SimulatedTxDevice):
     def set_solution(self, pulse=None, delays=None, apodizations=None,
                      sequence=None, profile_index=1, profile_increment=True,
                      trigger_mode="sequence"):
+        self._raw_write("set_solution")
         if pulse:
             self._pulse = dict(pulse)
         if sequence:
@@ -646,6 +708,7 @@ class SimulatedLIFUTxDevice(SimulatedTxDevice):
     def set_trigger(self, pulse_interval=None, pulse_count=None,
                     pulse_train_interval=None, pulse_train_count=None,
                     trigger_mode="sequence"):
+        self._raw_write("set_trigger")
         if pulse_interval is not None:
             self._sequence["pulse_interval"] = float(pulse_interval)
         if pulse_count is not None:
@@ -658,6 +721,7 @@ class SimulatedLIFUTxDevice(SimulatedTxDevice):
         return self.get_trigger_json()
 
     def set_trigger_json(self, data) -> dict:
+        self._raw_write("set_trigger_json")
         if isinstance(data, dict):
             for k in ("pulse_interval", "pulse_count",
                       "pulse_train_interval", "pulse_train_count"):
@@ -1215,7 +1279,9 @@ class SimulatedDeviceInterface(QObject):
                     "index": index,
                     "selected": None,
                     "settings_crc": int(machine_config.get("settings_crc", 0)),
-                    "voltage": machine_config.get("voltage"),   # configure_presets checks it
+                    # As HVController.get_preset reports it: the console bakes it
+                    # as float32. preset_voltage refuses a missing or bad voltage.
+                    "voltage": preset_voltage(machine_config),
                     "id": machine_config.get("id", f"preset-{index}"),
                     # As HVController.get_preset reports it: the console bakes it as float32.
                     "sensitivity": preset_sensitivity(machine_config),
@@ -1359,10 +1425,13 @@ class SimulatedLIFUInterface(SimulatedDeviceInterface):
                  transducer=None,
                  voltage_table_selection: Optional[str] = None,
                  preset_flash: Optional[list[tuple[dict, int]]] = None,
+                 preset_lock: bool = False,
                  **_unused):
         super().__init__(num_modules=num_modules, transducer=transducer,
                          preset_flash=preset_flash)
         self.voltage_table_selection = voltage_table_selection
+        if preset_lock:
+            self.txdevice.lock_presets()
 
     def _create_devices(self, num_modules: int,
                         preset_flash: Optional[List[tuple[dict, int]]]):

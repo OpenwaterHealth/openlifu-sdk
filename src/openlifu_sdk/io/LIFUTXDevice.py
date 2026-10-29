@@ -42,6 +42,8 @@ from openlifu_sdk.io.LIFUConfig import (
     OW_PRESET_EMPTY,
     OW_PRESET_GET,
     OW_PRESET_LOAD,
+    OW_PRESET_LOADED,
+    OW_PRESET_LOCK,
     OW_PRESET_SLOT_TAIL,
     OW_PRESET_CAPACITY,
     OW_PRESET_WRITE,
@@ -479,6 +481,65 @@ class TxDevice(OWComponent):
                           op="unload_preset")
         return True
 
+    def get_loaded_preset_state(self, module: Optional[int] = None) -> Dict:
+        """What the transmitter has loaded, as the firmware sees it (OW_PRESET_LOADED).
+
+        The master asks every module. ``loaded`` is True only if all of them
+        hold the same load -- same index, run length and settings_crc -- and
+        then the dict also carries ``index``, ``duration_index``,
+        ``train_count`` (the pulse-train count the load programmed),
+        ``settings_crc`` and ``regs_crc`` (the master's own part). Otherwise
+        those are None. ``missing_modules`` lists the modules that hold
+        nothing or another load (0 is the master), so a raw write that
+        unloaded one module on a DEV image shows up here.
+
+        With *module*, that module's own state alone, for diagnostics.
+
+        Raises:
+            LIFUDeviceError: Firmware without OW_PRESET_LOADED.
+            LIFUProtocolError: The reply is not 16 bytes.
+        """
+        r = self.send_checked(packet_type=OW_CONTROLLER, command=OW_PRESET_LOADED,
+                              addr=0 if module is None else module, op="get_loaded_preset")
+        if r.data_len < 16:
+            raise LIFUProtocolError(f"TX: get_loaded_preset payload too short ({r.data_len} < 16)",
+                                    code=LIFU_ERR_BAD_PAYLOAD_LENGTH)
+        d = bytes(r.data)
+        loaded = d[0] == 1
+        train_count, settings_crc, regs_crc = struct.unpack("<III", d[3:15])
+        missing = [m for m in range(8) if d[15] & (1 << m)]
+        if not loaded:
+            return {"loaded": False, "index": None, "duration_index": None, "train_count": None,
+                    "settings_crc": None, "regs_crc": None, "missing_modules": missing}
+        return {"loaded": True, "index": d[1], "duration_index": d[2], "train_count": train_count,
+                "settings_crc": settings_crc, "regs_crc": regs_crc, "missing_modules": missing}
+
+    def get_loaded_preset(self) -> tuple[Optional[int], Optional[int]]:
+        """``(preset_index, duration_index)`` loaded on every module, or
+        ``(None, None)``. See :meth:`get_loaded_preset_state` for the rest.
+
+        Raises:
+            LIFUDeviceError, LIFUProtocolError: As :meth:`get_loaded_preset_state`.
+        """
+        state = self.get_loaded_preset_state()
+        return state["index"], state["duration_index"]
+
+    def is_preset_locked(self) -> bool:
+        """Is the preset lock on (OW_PRESET_LOCK, read)? Always, on an FDA
+        image. A locked DEV image refuses what an FDA image refuses until it
+        is reset (:meth:`LIFUTxDevice.lock_presets`).
+
+        Raises:
+            LIFUDeviceError: Firmware without the lock.
+            LIFUProtocolError: The reply is not 1 byte.
+        """
+        r = self.send_checked(packet_type=OW_CONTROLLER, command=OW_PRESET_LOCK,
+                              reserved=0, op="is_preset_locked")
+        if r.data_len < 1:
+            raise LIFUProtocolError("TX: is_preset_locked payload empty",
+                                    code=LIFU_ERR_BAD_PAYLOAD_LENGTH)
+        return r.data[0] == 1
+
     def get_module_count(self) -> int:
         """Return the number of connected LIFU transmitter modules.
 
@@ -889,14 +950,39 @@ class LIFUTxDevice(LIFUComponentMixin, TxDevice):
             return {"index": slot, "state": state}
         return {**got, "state": "preset"}
 
+    def lock_presets(self) -> bool:
+        """Turn on the preset lock of a DEV image (OW_PRESET_LOCK, reserved=1).
+
+        From here until the transmitter is reset, it refuses what an FDA image
+        refuses: raw register, profile and trigger writes (OW_INVALID_PACKET),
+        and user config writes, DFU, raw I2C and storing or deleting presets
+        (OW_FDA_REFUSED). Presets still load, run and report as on an FDA
+        image. There is no unlock command. On an FDA image, which is always
+        locked, this changes nothing.
+
+        Returns:
+            True once the image reports itself locked.
+
+        Raises:
+            LIFUDeviceError: Firmware without the lock.
+            LIFUProtocolError: The reply is empty, or says it is not locked.
+        """
+        r = self.send_checked(packet_type=OW_CONTROLLER, command=OW_PRESET_LOCK,
+                              reserved=1, op="lock_presets")
+        if r.data_len < 1 or r.data[0] != 1:
+            raise LIFUProtocolError("TX: lock_presets did not report the lock on",
+                                    code=LIFU_ERR_BAD_PAYLOAD_FORMAT)
+        return True
+
     def get_preset_capacity(self) -> Dict | None:
-        """How many presets a PRESET_MODE image can hold (OW_PRESET_CAPACITY).
+        """How many presets a DEV image can store (OW_PRESET_CAPACITY).
 
         Returns ``slots``, ``free`` (slots holding neither a preset nor the
         second half of one), ``slot_size`` and ``blob_max`` (bytes), as the
-        firmware has them. None when the image has no slots to describe: an
-        FDA_MODE image, or firmware that predates the query. The answer is
-        the first module's; every module has the same slots.
+        firmware has them. None when the image cannot store presets: an FDA
+        image, a DEV image running under the bootloader, or firmware that
+        predates the query. The answer is the first module's; every module has
+        the same slots.
         """
         try:
             r = self.send_checked(packet_type=OW_CONTROLLER, command=OW_PRESET_CAPACITY, op="get_preset_capacity")
