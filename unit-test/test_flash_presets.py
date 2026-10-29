@@ -11,14 +11,17 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import re
+import shutil
 import subprocess
+import zlib
 from pathlib import Path
 
 import pytest
 
 from sr003_presets import DEFAULTS
 
-from openlifu_sdk.io.LIFUTXPresets import compile_preset, regs_crc
+from openlifu_sdk.io.LIFUTXPresets import preset_blob
 
 FLASH = Path(__file__).resolve().parent.parent / "examples" / "flash.py"
 
@@ -54,15 +57,61 @@ def _tree(root: Path, tracked_header: bool = False) -> Path:
     return tree
 
 
-def test_the_set_compiles_as_the_operator_interface_does(flash, tmp_path):
-    """settings_crc over the file's exact bytes, id from the manifest, in order."""
+def test_the_set_follows_the_operator_interface_contract(flash, tmp_path):
+    """The OI's contract (SR-003): ids and order from the manifest, and
+    settings_crc the CRC-32 of each settings file's exact bytes."""
     context = _context(tmp_path)
     configs = flash.load_preset_set(context)
     assert [mc["id"] for mc in configs] == ["bench_a", "bench_b"]
     for mc in configs:
         raw = (context / mc["id"] / ("%s_settings.json" % mc["id"])).read_bytes()
-        want = compile_preset(json.loads(raw), preset_id=mc["id"], settings_bytes=raw)
-        assert (mc["settings_crc"], regs_crc(mc)) == (want["settings_crc"], regs_crc(want))
+        assert mc["settings_crc"] == zlib.crc32(raw)
+
+
+def _blob_bytes(header: Path, symbol: str) -> bytes:
+    """The bytes of the C array *symbol* in a generated header."""
+    text = header.read_text(encoding="utf-8")
+    body = re.search(r"\b%s\[[^]]*\]\s*=\s*\{(.*?)\};" % re.escape(symbol), text, re.S).group(1)
+    body = re.sub(r"//.*", "", body)   # comments name register addresses in hex
+    return bytes(int(b, 16) for b in re.findall(r"0x([0-9a-fA-F]{2})", body))
+
+
+def test_dev_slot_0_is_byte_identical_to_the_fda_preset(flash, tmp_path):
+    """#108 done-when: the engineering set's preset 0 is the FDA preset's
+    settings file, so its baked blob is the FDA image's, byte for byte."""
+    dev_context = _context(tmp_path / "dev", ids=("diathermy", "extended"))
+    fda_context = tmp_path / "fda" / "diathermy_ctx"
+    (fda_context / "diathermy").mkdir(parents=True)
+    shutil.copy2(dev_context / "diathermy" / "diathermy_settings.json", fda_context / "diathermy")
+    (fda_context / "presets.json").write_text(json.dumps({"presets": ["diathermy"]}), encoding="utf-8")
+
+    dev_tree, fda_tree = _tree(tmp_path / "dev"), _tree(tmp_path / "fda")
+    flash.write_preset_headers(dev_tree, "transmitter", False, dev_context)
+    flash.write_preset_headers(fda_tree, "transmitter", True, fda_context)
+
+    fda_blob = _blob_bytes(fda_tree / "Core/Inc/presets/fda_preset.h", "FDA_PRESET_BLOB")
+    dev_header = next((dev_tree / "Core/Inc/presets").glob("*diathermy.h"))
+    dev_blob = _blob_bytes(dev_header, "PRESET_BENCH_DIATHERMY_BLOB")
+    assert dev_blob == fda_blob == preset_blob(flash.load_preset_set(fda_context)[0])
+
+
+def test_fda_mode_is_read_through_preset_inheritance(flash, tmp_path):
+    """An FDA preset that inherits FDA_MODE must still count as FDA."""
+    (tmp_path / "CMakePresets.json").write_text(json.dumps({
+        "configurePresets": [
+            {"name": "fda-base", "hidden": True, "cacheVariables": {"FDA_MODE": "ON"}},
+            {"name": "bare", "hidden": True, "cacheVariables": {"BARE_METAL": "ON"}},
+            {"name": "Release-FDA-BareMetal", "inherits": ["fda-base", "bare"],
+             "cacheVariables": {"CMAKE_BUILD_TYPE": "Release"}},
+            {"name": "Release", "cacheVariables": {"CMAKE_BUILD_TYPE": "Release"}},
+        ],
+        "buildPresets": [{"name": "Release-FDA-BareMetal"}, {"name": "Release"}],
+    }), encoding="utf-8")
+    presets = flash.cmake_presets(tmp_path)
+    assert presets["Release-FDA-BareMetal"] == {
+        "FDA_MODE": "ON", "BARE_METAL": "ON", "CMAKE_BUILD_TYPE": "Release"}
+    assert "FDA_MODE" not in presets["Release"]
+    assert set(presets) == {"Release-FDA-BareMetal", "Release"}   # hidden bases are not offered
 
 
 def test_a_dev_transmitter_build_gets_the_whole_set(flash, tmp_path):
@@ -99,6 +148,23 @@ def test_headers_from_another_set_are_removed(flash, tmp_path):
     assert not stale.exists()
 
 
+def test_a_refused_set_leaves_the_tree_as_it_was(flash, tmp_path):
+    tree = _tree(tmp_path)
+    kept = tree / "Core/Inc/presets/fda_preset.h"
+    kept.write_text("// the last FDA build\n", encoding="utf-8")
+    with pytest.raises(SystemExit, match="an FDA image holds one preset"):
+        flash.write_preset_headers(tree, "transmitter", True, _context(tmp_path))
+    assert kept.read_text(encoding="utf-8") == "// the last FDA build\n"
+
+
+def test_a_tree_git_cannot_read_is_refused(flash, tmp_path):
+    """The tracked-header guard fails closed."""
+    tree = tmp_path / "exported"
+    (tree / "Core/Inc/presets").mkdir(parents=True)
+    with pytest.raises(SystemExit, match="cannot tell whether"):
+        flash.write_preset_headers(tree, "transmitter", False, _context(tmp_path))
+
+
 def test_a_tracked_header_is_not_overwritten(flash, tmp_path):
     tree = _tree(tmp_path, tracked_header=True)
     with pytest.raises(SystemExit, match="tracks its own preset headers"):
@@ -112,10 +178,11 @@ def test_only_a_non_fda_build_is_stamped(flash, tmp_path, monkeypatch, stamp):
     tree = tmp_path / "fw"
     header = tree / "build/Release/generated/version.h"
     header.parent.mkdir(parents=True)
-    header.write_text('#define FW_VERSION "2.0.8-4-g0bad0e8+fda"\n', encoding="utf-8")
+    # As left by an earlier stamped build of the same preset.
+    header.write_text('#define FW_VERSION "2.0.8-4-g0bad0e8+fda+b7"\n', encoding="utf-8")
     monkeypatch.setattr(flash, "add_toolchain_to_path", lambda: None)
     monkeypatch.setattr(flash.subprocess, "run", lambda *a, **k: None)
     flash.build(tree, "Release", True, stamp=stamp)
     text = header.read_text(encoding="utf-8")
-    assert ("+b1" in text) is stamp
+    assert text == ('#define FW_VERSION "2.0.8-4-g0bad0e8+fda%s"\n' % ("+b1" if stamp else ""))
     assert (tree / "build/.localbuild").exists() is stamp
