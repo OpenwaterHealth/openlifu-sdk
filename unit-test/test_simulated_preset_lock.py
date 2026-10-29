@@ -146,3 +146,13 @@ def test_sim_fda_lock_is_a_no_op_and_the_console_reports_float32():
     iface = SimulatedDeviceInterface(preset_flash=[(mc, regs)])
     assert iface.txdevice.lock_presets() is True and iface.txdevice.is_preset_locked() is True
     verify_console_preset(iface.hvcontroller, 0, mc)
+
+
+def test_sim_loads_through_the_sdk_preset_helper_on_every_module():
+    """LIFUTXPresets.load_preset passes module positionally, as
+    TxDevice.load_preset takes it."""
+    from openlifu_sdk.io.LIFUTXPresets import load_preset
+
+    tx, mc, regs = _sim(SimulatedLIFUTxDevice, two_module_flash_entry())
+    load_preset(tx, 0, mc, 1)
+    assert tx.get_loaded_preset_state()["loaded"] is True

@@ -332,7 +332,7 @@ class SimulatedTxDevice:
         }
 
     def load_preset(self, index: int, regs_crc: int, duration_index: int = 0,
-                    settings_crc: int | None = None, module: int = 0) -> bool:
+                    module: int = 0, *, settings_crc: int | None = None) -> bool:
         """Same contract as :meth:`TxDevice.load_preset` (OW_PRESET_LOAD).
 
         Like the firmware, loading applies the preset's trigger and pulse
