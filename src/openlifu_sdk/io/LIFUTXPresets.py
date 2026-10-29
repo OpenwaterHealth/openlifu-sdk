@@ -1033,7 +1033,7 @@ def _device_modules(txdevice, machine_config: Dict) -> range:
     """The modules to address: every one the preset spans, which must be every
     one the transmitter has. A preset on a transmitter with more or fewer
     modules would be half stored or half loaded, so it is refused."""
-    wanted, present = preset_modules(machine_config), int(txdevice.get_module_count())
+    wanted, present = preset_modules(machine_config), txdevice.get_module_count()
     if present != wanted:
         raise LIFUError("%s spans %d transmitter module(s); the TX reports %d"
                         % (machine_config["id"], wanted, present),

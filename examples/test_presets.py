@@ -283,6 +283,13 @@ def load_presets(tx, path, slot):
     if slot is not None and len(presets) > 1:
         sys.exit("--slot places one preset; %s holds %d, which go to the first available slots" % (path, len(presets)))
     slot_size = slot_layout(tx)[1]
+    # store_preset refuses a module-count mismatch; check them all first
+    # so a folder is stored whole or not at all.
+    modules = tx.get_module_count()
+    wrong = ["%s (%d)" % (mc["id"], preset_modules(mc)) for mc in presets if preset_modules(mc) != modules]
+    if wrong:
+        sys.exit("refused before writing: the TX has %d module(s); made for another count: %s"
+                 % (modules, ", ".join(wrong)))
     for mc in presets:
         need = preset_slots(mc, slot_size)
         where, how = slot, "stored"
@@ -464,10 +471,6 @@ def main():
         sys.exit("refused: %s" % (REFUSALS.get(e.device_error_code) or reason(e)))
     except ValueError as e:
         sys.exit("refused: %s" % e)
-    except LIFUError as e:
-        if e.code != LIFU_ERR_MODULE_COUNT_MISMATCH:
-            raise
-        sys.exit("refused before writing: %s" % e)
 
     # With nothing else asked for, the list is what the script shows.
     if args.list_presets or changed or args.verify_preset is None:

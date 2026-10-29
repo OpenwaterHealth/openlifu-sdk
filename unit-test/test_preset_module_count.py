@@ -6,7 +6,7 @@ from __future__ import annotations
 
 import json
 import unittest
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, call
 
 from openlifu_sdk.io.exceptions import LIFUError
 from openlifu_sdk.io.LIFUConfig import LIFU_ERR_MODULE_COUNT_MISMATCH
@@ -79,15 +79,18 @@ class TestModuleCountGuard(unittest.TestCase):
             "start_c": 35.0, "shutoff_c": 75.0,
         }
         store_preset(tx, 3, mc)
-        self.assertEqual([c.args for c in tx.write_preset.call_args_list],
-                         [(3, preset_blob(mc, 0), 0), (3, preset_blob(mc, 1), 1)])
+        self.assertEqual(tx.write_preset.call_args_list,
+                         [call(3, preset_blob(mc, 0), 0), call(3, preset_blob(mc, 1), 1)])
+        tx.get_preset.assert_called_once_with(3)
 
     def test_load_matching_count_loads_every_module(self):
         mc = _compiled(128)
         tx = _tx(2)
         load_preset(tx, 0, mc, duration_index=1)
-        self.assertEqual([c.args for c in tx.load_preset.call_args_list],
-                         [(0, regs_crc(mc, 0), 1, 0), (0, regs_crc(mc, 1), 1, 1)])
+        crc = mc["settings_crc"]
+        self.assertEqual(tx.load_preset.call_args_list,
+                         [call(0, regs_crc(mc, 0), 1, 0, settings_crc=crc),
+                          call(0, regs_crc(mc, 1), 1, 1, settings_crc=crc)])
 
 
 if __name__ == "__main__":
