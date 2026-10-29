@@ -8,8 +8,8 @@
     python examples/flash.py --full-erase                 # erase the whole chip, then flash
     python examples/flash.py --image lifu-transmitter-fw.bin   # flash a downloaded file as-is
     python examples/flash.py --list-probes                # show the probes and their boards, flash nothing
-    python examples/flash.py --board transmitter --preset Release-FDA-BareMetal --build --presets path/to/diathermy
-    python examples/flash.py --board console --preset Release-BareMetal --build --presets path/to/engineering
+    python examples/flash.py --board transmitter --preset Release-FDA-BareMetal --build --presets path/to/fda
+    python examples/flash.py --board console --preset Release-FDA-BareMetal --build --presets path/to/test
 
 The board is found from the chip each probe is wired to: an STM32L43x/L44x
 (device ID 0x435) is the transmitter, an STM32F07x (0x448) the console. With
@@ -17,23 +17,26 @@ both wired up, name one with --board, or the probe with --probe-sn. The
 firmware trees are looked for beside this repo, and --transmitter-fw /
 --console-fw name them if they are elsewhere.
 
-Any preset in the tree's CMakePresets.json can be flashed. Each --build of a
-non-FDA preset bumps a counter in that tree's build/.localbuild and bakes it
-into FW_VERSION as "+bN", so the version the device reports back confirms the
-new image took. An FDA preset (FDA_MODE) is never stamped: an FDA image must
-report exactly the version it was released as (operator-interface #192 D2).
+There are two kinds of image (operator-interface #192, Peter and Alex,
+2026-10-29). A plain image (a preset without FDA_MODE) has every command and
+no presets; each --build of one bumps a counter in that tree's
+build/.localbuild and bakes it into FW_VERSION as "+bN", so the version the
+device reports back confirms the new image took. A presets-only image (an
+FDA_MODE preset) links the presets of one preset context and reports that
+context as its build suffix, "+fda" or "+test"; it is never stamped, because
+the host matches its version exactly.
 
---presets DIR bakes a preset set into the image: DIR is a preset context
-folder (presets.json listing the presets, each in <id>/<id>_settings.json).
-Each preset is compiled as the operator interface compiles it, so the CRCs
-in the image are the ones the host verifies. This is the intended way for
-presets to reach a device: the operator interface does not write them
-(operator-interface #192, 2026-10-28). An FDA preset takes exactly one
-preset (fda_preset.h). Any other preset gets the whole set: the transmitter's
-preset table and the console's HV table, both in Core/Inc/presets/, which a
-DEV image links once transmitter-fw#50 and console-fw#21 are in. The images
-this builds are unsigned; signed images come from the diathermy repo's
-firmware/build_firmware.py.
+--presets DIR bakes a preset context into a presets-only image: DIR is a
+preset context folder (presets.json listing the presets, each in
+<id>/<id>_settings.json), and its folder name is the image's suffix
+(-DFW_BUILD_VARIANT). Each preset is compiled as the operator interface
+compiles it, so the CRCs in the image are the ones the host verifies. This is
+how presets reach a device: the operator interface never writes them. One
+preset is linked as fda_preset.h; several as the transmitter's preset table
+and the console's HV table, both in Core/Inc/presets/, which the firmware
+links once transmitter-fw#50 and console-fw#21 are in. A plain image takes no
+presets. The images this builds are unsigned; signed images come from the
+diathermy repo's firmware/build_firmware.py.
 
 The chip is programmed under reset, so its firmware and watchdog are not
 running while the download is. The console's watchdog, about five seconds,
@@ -228,12 +231,13 @@ def load_preset_set(context: Path) -> list:
     return configs
 
 
-def write_preset_headers(repo: Path, name: str, fda: bool, context: Path) -> list:
-    """Generate the board's preset headers for the set in *context*: an FDA
-    image takes exactly one preset; any other build gets the whole set. The
-    headers are generated in a staging folder first, so a set that is refused
-    or fails to generate leaves the tree's headers as they were. Once the
-    swap starts, the old headers are gone."""
+def write_preset_headers(repo: Path, name: str, presets_only: bool, context: Path) -> list:
+    """Generate the board's preset headers for the set in *context*, for a
+    presets-only image; a plain image takes none. One preset is linked as
+    fda_preset.h, several as the board's preset table. The headers are
+    generated in a staging folder first, so a set that is refused or fails
+    to generate leaves the tree's headers as they were. Once the swap
+    starts, the old headers are gone."""
     from openlifu_sdk.io.LIFUTXPresets import (
         generate_console_fda_preset,
         generate_console_presets,
@@ -241,6 +245,8 @@ def write_preset_headers(repo: Path, name: str, fda: bool, context: Path) -> lis
         generate_preset_set,
     )
 
+    if not presets_only:
+        sys.exit("a plain image links no presets; --presets needs an FDA_MODE (presets-only) preset")
     listed = subprocess.run(["git", "-C", str(repo), "ls-files", PRESET_DIR.as_posix()],
                             capture_output=True, text=True)
     if listed.returncode != 0:
@@ -250,11 +256,9 @@ def write_preset_headers(repo: Path, name: str, fda: bool, context: Path) -> lis
         sys.exit("%s tracks its own preset headers (%s); refusing to overwrite them"
                  % (repo, ", ".join(listed.stdout.split())))
     configs = load_preset_set(context)
-    if fda and len(configs) != 1:
-        sys.exit("an FDA image holds one preset; %s lists %d" % (context, len(configs)))
     with tempfile.TemporaryDirectory() as staging:
         try:
-            if fda:
+            if len(configs) == 1:
                 generate = generate_fda_preset if name == "transmitter" else generate_console_fda_preset
                 generate(staging, configs[0], context.name)
             elif name == "transmitter":
@@ -269,25 +273,30 @@ def write_preset_headers(repo: Path, name: str, fda: bool, context: Path) -> lis
             old.unlink()   # a header left from another set must not be linked in
         for new in Path(staging).glob("*.h"):
             shutil.copy2(new, out / new.name)
-    print("Presets    : %s from %s (%s)" % (", ".join(mc["id"] for mc in configs), context,
-                                          "FDA, one preset" if fda else "%d preset(s)" % len(configs)))
-    if not fda:
-        print("             A DEV image links this set only with transmitter-fw#50 / console-fw#21;\n"
-              "             an older tree builds without it.")
+    print("Presets    : %s from %s (+%s, %d preset(s))" % (", ".join(mc["id"] for mc in configs),
+                                                       context, context.name, len(configs)))
+    if len(configs) > 1:
+        print("             The image links several presets only with transmitter-fw#50 /\n"
+              "             console-fw#21; an older tree's presets-only build needs fda_preset.h.")
     return configs
 
 
-def build(repo: Path, preset: str, increment: bool, stamp: bool = True) -> None:
+def build(repo: Path, preset: str, increment: bool, stamp: bool = True,
+          variant: str | None = None) -> None:
+    """Configure and build *preset*. A presets-only image is not stamped
+    and reports *variant*, its preset context, as its build suffix."""
     add_toolchain_to_path()
     if stamp:
         number = step_build_number(repo, increment)
         print("Building   : %s (local build b%d)" % (preset, number))
     else:
         number = None
-        print("Building   : %s (FDA: no local build number, so it reports its exact version)" % preset)
+        print("Building   : %s (presets-only: no local build number, so it reports its exact version)"
+              % preset)
     # Configure first, on its own: left to ninja, the regeneration would rewrite
     # version.h mid-build and drop the stamp. cmake reads presets from the cwd.
-    subprocess.run(["cmake", "--preset", preset], cwd=repo, check=True)
+    suffix = ["-DFW_BUILD_VARIANT=%s" % variant] if variant else []
+    subprocess.run(["cmake", "--preset", preset, *suffix], cwd=repo, check=True)
     stamp_build_number(repo, preset, number)
     subprocess.run(["cmake", "--build", "--preset", preset], cwd=repo, check=True)
 
@@ -458,7 +467,8 @@ def main() -> int:
     ap.add_argument("--build", action="store_true", help="rebuild the preset before flashing")
     ap.add_argument("--no-increment", action="store_true", help="with --build, reuse the previous local build number")
     ap.add_argument("--presets", type=Path, metavar="DIR",
-                    help="with --build, bake the preset set in this preset context folder into the image")
+                    help="with --build of an FDA_MODE preset, link this preset context folder's "
+                         "presets into the image, which reports the folder's name as its suffix")
     ap.add_argument("--image", type=Path, metavar="FILE",
                     help="flash this .hex, .bin or .elf as-is instead of a build")
     ap.add_argument("--address", type=lambda s: int(s, 0), metavar="ADDR",
@@ -546,7 +556,8 @@ def main() -> int:
             print("Presets    : none given, so this links whatever %s the tree already has"
                   % (PRESET_DIR / "fda_preset.h").as_posix())
         if args.build:
-            build(repo, preset, not args.no_increment, stamp=not fda_preset)
+            build(repo, preset, not args.no_increment, stamp=not fda_preset,
+                  variant=args.presets.resolve().name if args.presets else None)
         image = newest_hex(repo, preset)
         kind, address, head = inspect_image(image, None)
         describe_image(image, kind, address, head, name, board)
