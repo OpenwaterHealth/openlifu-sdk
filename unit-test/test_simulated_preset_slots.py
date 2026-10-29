@@ -244,3 +244,13 @@ def test_preset_flash_fills_the_first_slots():
     assert tx.get_preset(0)["settings_crc"] == mc["settings_crc"]
     assert tx.get_preset_slot(1)["state"] == "empty"
     assert tx.get_preset_capacity()["free"] == PRESET_SLOTS - 1
+
+
+def test_the_simulated_console_reports_its_records_as_float32():
+    """As a real console does, so verify_console_preset's exact check passes."""
+    from openlifu_sdk.io.LIFUTXPresets import verify_console_preset
+    from openlifu_sdk.ui.simulated_interface import SimulatedLIFUInterface
+
+    mc, regs = flash_entry(voltage=27.98984157172857)
+    iface = SimulatedLIFUInterface(preset_flash=[(mc, regs)])
+    verify_console_preset(iface.hvcontroller, 0, mc)
