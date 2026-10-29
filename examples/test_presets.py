@@ -41,8 +41,9 @@ import sys
 import time
 from pathlib import Path
 
-from openlifu_sdk.io.exceptions import LIFUCommunicationError, LIFUDeviceError, LIFUNotConnectedError
+from openlifu_sdk.io.exceptions import LIFUCommunicationError, LIFUDeviceError, LIFUError, LIFUNotConnectedError
 from openlifu_sdk.io.LIFUConfig import (
+    LIFU_ERR_MODULE_COUNT_MISMATCH,
     OW_BAD_CRC,
     OW_INVALID_PACKET,
     OW_PRESET_BUSY,
@@ -343,7 +344,10 @@ def examine(tx, e, mc, duration):
                          "it offers %s" % counts)], False
     try:
         load_preset(tx, e["index"], mc, duration)
-    except LIFUDeviceError as err:
+    except LIFUError as err:
+        # A device refusal, or a preset made for another module count (sent nothing).
+        if not isinstance(err, LIFUDeviceError) and err.code != LIFU_ERR_MODULE_COUNT_MISMATCH:
+            raise
         return found + [(name + ": loads on the host's CRC", False, reason(err))], False
     found.append((name + ": loads on the host's CRC", True,
                   "run length %d = %d train(s)" % (duration, counts[duration])))
@@ -460,6 +464,10 @@ def main():
         sys.exit("refused: %s" % (REFUSALS.get(e.device_error_code) or reason(e)))
     except ValueError as e:
         sys.exit("refused: %s" % e)
+    except LIFUError as e:
+        if e.code != LIFU_ERR_MODULE_COUNT_MISMATCH:
+            raise
+        sys.exit("refused before writing: %s" % e)
 
     # With nothing else asked for, the list is what the script shows.
     if args.list_presets or changed or args.verify_preset is None:

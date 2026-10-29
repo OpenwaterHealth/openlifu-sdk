@@ -51,7 +51,7 @@ class TestModuleCountGuard(unittest.TestCase):
         self.assertEqual(preset_modules(_compiled(128)), 2)
 
     def test_store_mismatch_writes_nothing(self):
-        for elements, modules in ((64, 2), (128, 1)):
+        for elements, modules in ((64, 2), (128, 1), (64, 0)):
             with self.subTest(preset_modules=elements // 64, tx_modules=modules):
                 tx = _tx(modules)
                 with self.assertRaises(LIFUError) as ctx:
@@ -61,7 +61,7 @@ class TestModuleCountGuard(unittest.TestCase):
                 tx.get_preset.assert_not_called()
 
     def test_load_mismatch_loads_nothing(self):
-        for elements, modules in ((64, 2), (128, 1)):
+        for elements, modules in ((64, 2), (128, 1), (64, 0)):
             with self.subTest(preset_modules=elements // 64, tx_modules=modules):
                 tx = _tx(modules)
                 with self.assertRaises(LIFUError) as ctx:
