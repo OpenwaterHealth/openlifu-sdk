@@ -20,6 +20,7 @@ from openlifu_sdk.io.exceptions import LIFUDeviceError  # noqa: E402 -- reason: 
 from openlifu_sdk.io.LIFUConfig import (  # noqa: E402 -- reason: after the Qt importorskip
     OW_BAD_CRC,
     OW_FDA_REFUSED,
+    OW_INVALID_PACKET,
     OW_PRESET_BUSY,
     OW_PRESET_EMPTY,
     OW_PRESET_NO_ROOM,
@@ -79,9 +80,46 @@ def test_a_preset_one_module_has_not_stored_does_not_load_there():
     tx = _dev(num_modules=2)
     mc, _ = two_module_flash_entry()
     tx.write_preset(0, preset_blob(mc, 0), 0)
-    with pytest.raises(LIFUDeviceError):
+    with pytest.raises(LIFUDeviceError, match="module 1's slot 0 is empty") as e:
         load_preset(tx, 0, mc)
-    assert tx.get_loaded_preset_state()["loaded"] is False
+    assert _code(e) == OW_PRESET_EMPTY
+    state = tx.get_loaded_preset_state()
+    assert state["loaded"] is False and state["missing_modules"] == [0, 1]  # module 0 rolled back
+
+
+def test_each_module_keeps_its_own_part():
+    """A module writing another preset leaves the other module's part
+    as it was, and only that module's load is dropped."""
+    tx = _dev(num_modules=2)
+    mc, _ = two_module_flash_entry()
+    other, _ = two_module_flash_entry(pulse_count=3)
+    store_preset(tx, 0, mc)
+    load_preset(tx, 0, mc)
+    tx.write_preset(0, preset_blob(other, 1), 1)
+    assert tx.get_preset(0)["settings_crc"] == mc["settings_crc"]  # module 0 answers
+    state = tx.get_loaded_preset_state()
+    assert state["loaded"] is False and state["missing_modules"] == [1]
+    assert tx.get_loaded_preset_state(module=0)["loaded"] is True
+
+
+def test_only_another_module_holding_a_preset_reads_as_empty():
+    """Module 0 answers the preset queries."""
+    tx = _dev(num_modules=2)
+    mc, _ = two_module_flash_entry()
+    tx.write_preset(0, preset_blob(mc, 1), 1)
+    assert tx.get_preset_slot(0) == {"index": 0, "state": "empty"}
+
+
+def test_a_stored_preset_loads_with_its_trigger_timing():
+    tx = _dev()
+    mc, _ = flash_entry()
+    store_preset(tx, 0, mc)
+    load_preset(tx, 0, mc, duration_index=1)
+    seeded = SimulatedLIFUTxDevice(preset_flash=[flash_entry()])
+    load_preset(seeded, 0, mc, duration_index=1)
+    timing = ("pulse_interval", "pulse_count", "pulse_train_interval", "pulse_train_count")
+    assert ({k: tx.get_trigger_json()[k] for k in timing}
+            == {k: seeded.get_trigger_json()[k] for k in timing})
 
 
 def test_storing_replaces_the_slot_and_unloads():
@@ -110,22 +148,38 @@ def test_lock_refuses_store_and_delete_and_keeps_the_slot():
     assert tx.get_loaded_preset_state()["loaded"] is True
 
 
-def test_store_refused_while_the_trigger_runs():
+def test_store_and_delete_refused_while_the_trigger_runs():
     tx = _dev()
     mc, _ = flash_entry()
+    store_preset(tx, 0, mc)
     tx.start_trigger()  # unlocked, nothing loaded: runs the host's config
-    with pytest.raises(LIFUDeviceError) as e:
-        tx.write_preset(0, preset_blob(mc), 0)
-    assert _code(e) == OW_PRESET_BUSY
+    for call in (lambda: tx.write_preset(1, preset_blob(mc), 0), lambda: tx.delete_preset(0)):
+        with pytest.raises(LIFUDeviceError) as e:
+            call()
+        assert _code(e) == OW_PRESET_BUSY
+    assert tx.get_preset_slot(0)["state"] == "preset"
 
 
-def test_damaged_blob_is_refused_and_the_slot_unchanged():
+@pytest.mark.parametrize(("slot", "module"), [(PRESET_SLOTS, 0), (-1, 0), (0, 1), (0, -1)])
+def test_a_slot_or_module_out_of_range_is_refused(slot, module):
     tx = _dev()
     mc, _ = flash_entry()
-    blob = bytearray(preset_blob(mc))
-    blob[-1] ^= 0xFF
-    with pytest.raises(LIFUDeviceError) as e:
-        tx.write_preset(0, bytes(blob), 0)
+    for call in (lambda: tx.write_preset(slot, preset_blob(mc), module),
+                 lambda: tx.delete_preset(slot, module)):
+        with pytest.raises(LIFUDeviceError) as e:
+            call()
+        assert _code(e) == OW_INVALID_PACKET
+
+
+@pytest.mark.parametrize(("damage", "match"), [
+    (lambda b: b[:-1], "not a preset blob"),                     # truncated: does not parse
+    (lambda b: b[:-1] + bytes([b[-1] ^ 0xFF]), "does not match"),  # parses; body CRC wrong
+])
+def test_damaged_blob_is_refused_and_the_slot_unchanged(damage, match):
+    tx = _dev()
+    mc, _ = flash_entry()
+    with pytest.raises(LIFUDeviceError, match=match) as e:
+        tx.write_preset(0, damage(preset_blob(mc)), 0)
     assert _code(e) == OW_BAD_CRC
     assert tx.get_preset_slot(0)["state"] == "empty"
 
@@ -147,8 +201,32 @@ def test_a_long_blob_takes_the_next_slot(monkeypatch):
         tx.write_preset(6, preset_blob(mc), 0)  # needs 7, which holds a preset
     assert _code(e) == OW_PRESET_NO_ROOM
 
+    with pytest.raises(LIFUDeviceError) as e:
+        tx.delete_preset(5)
+    assert _code(e) == OW_PRESET_SLOT_TAIL
+
+    with pytest.raises(LIFUDeviceError) as e:
+        tx.write_preset(PRESET_SLOTS - 1, preset_blob(mc), 0)  # no slot after the last
+    assert _code(e) == OW_PRESET_NO_ROOM
+
     delete_preset(tx, 4)
     assert [tx.get_preset_slot(i)["state"] for i in (4, 5)] == ["empty", "empty"]
+
+
+def test_a_long_part_keeps_its_tail_when_another_module_part_is_short(monkeypatch):
+    """Whether a part takes two slots is each module's own."""
+    tx = _dev(num_modules=2)
+    mc, _ = two_module_flash_entry()
+    long_size = len(preset_blob(mc, 0))
+    monkeypatch.setattr(sim, "PRESET_SLOT_SIZE", long_size - 1)  # module 0's part is "long"
+    tx.write_preset(0, preset_blob(mc, 0), 0)
+    monkeypatch.setattr(sim, "PRESET_SLOT_SIZE", long_size + 1)  # module 1's part is short
+    tx.write_preset(0, preset_blob(mc, 1), 1)
+    other, _ = flash_entry()
+    with pytest.raises(LIFUDeviceError) as e:
+        tx.write_preset(1, preset_blob(other), 0)  # module 0's slot 1 is its tail
+    assert _code(e) == OW_PRESET_SLOT_TAIL
+    tx.write_preset(1, preset_blob(two_module_flash_entry(pulse_count=3)[0], 1), 1)  # module 1's is free
 
 
 def test_delete_empties_the_slot_and_an_empty_delete_is_fine():

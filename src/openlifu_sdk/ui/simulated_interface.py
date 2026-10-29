@@ -306,29 +306,35 @@ class SimulatedTxDevice:
     def get_sensitivity_for_frequency(self, freq_hz: float) -> Optional[float]:
         return sensitivity_at_frequency(self.module_user_configs, freq_hz)
 
-    def _flash_entry(self, index: int) -> tuple[dict, int]:
+    def _module_part(self, index: int, module: int) -> tuple[dict, int, int]:
+        """``(machine_config, regs_crc, modules)`` of *module*'s part of
+        preset *index*: its own regs_crc, and how many modules the preset
+        spans. A flash entry's regs_crc is one int (a 1x preset) or one per
+        module."""
         if not 0 <= index < len(self._preset_flash):
             raise LIFUDeviceError(f"TX: no preset at index {index}")
-        return self._preset_flash[index]
+        machine_config, flash_regs_crc = self._preset_flash[index]
+        crcs = [int(flash_regs_crc)] if isinstance(flash_regs_crc, int) else [int(c) for c in flash_regs_crc]
+        if not 0 <= module < min(self.num_modules, len(crcs)):
+            raise LIFUDeviceError(f"TX: module {module} holds no part of preset {index}")
+        return machine_config, crcs[module], len(crcs)
 
-    @staticmethod
-    def _module_crcs(flash_regs_crc) -> list[int]:
-        """A flash entry's regs_crc is one int (a 1x preset) or one per module."""
-        return [int(flash_regs_crc)] if isinstance(flash_regs_crc, int) else [int(c) for c in flash_regs_crc]
+    def _preset_count(self) -> int:
+        """How many presets the image holds (module 0's, as it answers)."""
+        return len(self._preset_flash)
 
     def get_preset(self, index: int) -> dict:
         """Same shape as :meth:`TxDevice.get_preset` (OW_PRESET_GET)."""
-        machine_config, flash_regs_crc = self._flash_entry(index)
-        crcs = self._module_crcs(flash_regs_crc)
+        machine_config, part_crc, modules = self._module_part(index, 0)
         return {
-            "count": len(self._preset_flash),
+            "count": self._preset_count(),
             "index": index,
             "chip_count": 2,
             "profile_count": 1,
             "settings_crc": int(machine_config["settings_crc"]),
-            "regs_crc": crcs[0],   # module 0's part, as the module that answers reports
-            "baked_regs_crc": crcs[0],
-            "modules": len(crcs),
+            "regs_crc": part_crc,   # module 0's part, as the module that answers reports
+            "baked_regs_crc": part_crc,
+            "modules": modules,
             "id": machine_config["id"],
             "train_counts": list(machine_config.get("pulse_train_count_selections") or []),
             "start_c": machine_config.get("start_C"),
@@ -346,14 +352,11 @@ class SimulatedTxDevice:
         """
         # Like the firmware, a load that is refused leaves this module with nothing loaded.
         self.unload_preset(module)
-        machine_config, flash_regs_crc = self._flash_entry(index)
-        crcs = self._module_crcs(flash_regs_crc)
-        if not 0 <= module < min(self.num_modules, len(crcs)) or crcs[module] is None:
-            raise LIFUDeviceError(f"TX: module {module} holds no part of preset {index}")
-        if int(regs_crc) != crcs[module]:
+        machine_config, part_crc, _ = self._module_part(index, module)
+        if int(regs_crc) != part_crc:
             raise LIFUDeviceError(
                 f"TX: regs_crc 0x{int(regs_crc):08X} does not match module {module}'s part of preset "
-                f"{index} (0x{crcs[module]:08X})",
+                f"{index} (0x{part_crc:08X})",
                 device_error_code=OW_BAD_CRC,
             )
         if settings_crc is not None and int(settings_crc) != int(machine_config["settings_crc"]):
@@ -404,13 +407,13 @@ class SimulatedTxDevice:
         if missing:
             return {"loaded": False, "index": None, "duration_index": None, "train_count": None,
                     "settings_crc": None, "regs_crc": None, "missing_modules": missing}
-        machine_config, flash_regs_crc = self._preset_flash[self._loaded_preset_index]
-        crcs = self._module_crcs(flash_regs_crc)
+        machine_config, part_crc, _ = self._module_part(self._loaded_preset_index,
+                                                        0 if module is None else module)
         return {"loaded": True, "index": self._loaded_preset_index,
                 "duration_index": self._loaded_duration_index,
                 "train_count": int(self._sequence["pulse_train_count"]),
                 "settings_crc": int(machine_config["settings_crc"]),
-                "regs_crc": crcs[0 if module is None else module], "missing_modules": []}
+                "regs_crc": part_crc, "missing_modules": []}
 
     def is_preset_locked(self) -> bool:
         """Same contract as :meth:`TxDevice.is_preset_locked`: an FDA image
@@ -598,7 +601,7 @@ class SimulatedTxDevice:
         reports OW_TEMP_UNKNOWN."""
         if self._loaded_preset_index is None:
             raise LIFUDeviceError("TX: no preset loaded", device_error_code=OW_NO_PRESET)
-        start_c = self._preset_flash[self._loaded_preset_index][0].get("start_C")
+        start_c = self._module_part(self._loaded_preset_index, 0)[0].get("start_C")
         if start_c is not None and self._modules[0].read_temp() > float(start_c):
             raise LIFUDeviceError(f"TX above start_C {float(start_c):.1f} C",
                                   device_error_code=OW_TEMP_TOO_HIGH)
@@ -652,10 +655,15 @@ class SimulatedLIFUTxDevice(SimulatedTxDevice):
     full host control until :meth:`lock_presets`, then what an FDA image
     refuses is refused.
 
-    It has :data:`PRESET_SLOTS` writable preset slots. ``preset_flash``
+    Every module has its own :data:`PRESET_SLOTS` preset slots and keeps
+    its own part of each preset, as on the firmware. ``preset_flash``
     fills them from slot 0, one slot per entry; the rest start empty. A
-    blob over :data:`PRESET_SLOT_SIZE` also takes the next slot, as on
-    the firmware. Every module keeps its own part of each preset.
+    module's blob over :data:`PRESET_SLOT_SIZE` also takes that module's
+    next slot. Module 0 answers the preset queries.
+
+    A preset stored here loads with its trigger timing and train counts,
+    but not its pulse length, which lives in the blob's register tables:
+    the trigger then reports the simulator's default pulse width.
     """
 
     _async_mode = False
@@ -666,39 +674,36 @@ class SimulatedLIFUTxDevice(SimulatedTxDevice):
         super().__init__(num_modules=num_modules, preset_flash=preset_flash)
         if len(self._preset_flash) > PRESET_SLOTS:
             raise ValueError(f"a DEV image has {PRESET_SLOTS} preset slots")
-        # Slot i: (machine_config, regs_crc per module, None where a
-        # module holds no part yet), _TAIL, or None (empty).
-        self._preset_flash = (
-            [(mc, self._module_crcs(crc)) for mc, crc in self._preset_flash]
-            + [None] * (PRESET_SLOTS - len(self._preset_flash))
-        )
+        # _slots[module][slot]: (machine_config, regs_crc, modules), _TAIL, or None.
+        self._slots: list[list] = [[None] * PRESET_SLOTS for _ in range(self.num_modules)]
+        for index in range(len(self._preset_flash)):
+            for module in range(self.num_modules):
+                try:
+                    self._slots[module][index] = super()._module_part(index, module)
+                except LIFUDeviceError:
+                    pass  # a 1x entry on a 2-module device: module 1 holds no part
 
     # ---- preset slots (OW_PRESET_WRITE / COMMIT / DELETE / CAPACITY) ----
 
-    def _flash_entry(self, index: int) -> tuple[dict, int]:
-        if not 0 <= index < PRESET_SLOTS:
-            raise LIFUDeviceError(f"TX: no preset slot {index}", device_error_code=OW_INVALID_PACKET)
-        entry = self._preset_flash[index]
+    def _check_slot(self, slot: int, module: int) -> None:
+        if not 0 <= module < self.num_modules:
+            raise LIFUDeviceError(f"TX: no module {module}", device_error_code=OW_INVALID_PACKET)
+        if not 0 <= slot < PRESET_SLOTS:
+            raise LIFUDeviceError(f"TX: no preset slot {slot}", device_error_code=OW_INVALID_PACKET)
+
+    def _module_part(self, index: int, module: int) -> tuple[dict, int, int]:
+        self._check_slot(index, module)
+        entry = self._slots[module][index]
         if entry is None:
-            raise LIFUDeviceError(f"TX: slot {index} is empty", device_error_code=OW_PRESET_EMPTY)
+            raise LIFUDeviceError(f"TX: module {module}'s slot {index} is empty",
+                                  device_error_code=OW_PRESET_EMPTY)
         if entry == _TAIL:
-            raise LIFUDeviceError(f"TX: slot {index} holds the second half of slot {index - 1}",
-                                  device_error_code=OW_PRESET_SLOT_TAIL)
+            raise LIFUDeviceError(f"TX: module {module}'s slot {index} holds the second half of "
+                                  f"slot {index - 1}", device_error_code=OW_PRESET_SLOT_TAIL)
         return entry
 
-    @staticmethod
-    def _module_crcs(flash_regs_crc) -> list:
-        """As the FDA image's, but a module that holds no part yet is None."""
-        if isinstance(flash_regs_crc, int):
-            return [int(flash_regs_crc)]
-        return [None if c is None else int(c) for c in flash_regs_crc]
-
-    def get_preset(self, index: int) -> dict:
-        """Same shape as :meth:`TxDevice.get_preset`; ``count`` is the
-        number of presets stored."""
-        got = super().get_preset(index)
-        got["count"] = sum(1 for e in self._preset_flash if e not in (None, _TAIL))
-        return got
+    def _preset_count(self) -> int:
+        return sum(1 for e in self._slots[0] if e not in (None, _TAIL))
 
     def get_preset_slot(self, slot: int) -> dict:
         """Same contract as :meth:`LIFUTxDevice.get_preset_slot`."""
@@ -712,12 +717,12 @@ class SimulatedLIFUTxDevice(SimulatedTxDevice):
         return {**got, "state": "preset"}
 
     def get_preset_capacity(self) -> dict:
-        """Same contract as :meth:`LIFUTxDevice.get_preset_capacity`."""
-        free = sum(1 for e in self._preset_flash if e is None)
-        return {"slots": PRESET_SLOTS, "free": free, "slot_size": PRESET_SLOT_SIZE,
-                "blob_max": PRESET_BLOB_MAX}
+        """Same contract as :meth:`LIFUTxDevice.get_preset_capacity`
+        (module 0's slots)."""
+        return {"slots": PRESET_SLOTS, "free": sum(1 for e in self._slots[0] if e is None),
+                "slot_size": PRESET_SLOT_SIZE, "blob_max": PRESET_BLOB_MAX}
 
-    def _preset_store_gate(self, what: str, slot: int) -> None:
+    def _preset_store_gate(self, what: str, slot: int, module: int) -> None:
         """What the firmware checks before it stores or deletes a preset."""
         if self._locked:
             raise LIFUDeviceError(f"TX: {what} refused by the preset lock",
@@ -725,20 +730,22 @@ class SimulatedLIFUTxDevice(SimulatedTxDevice):
         if self._trigger_running:
             raise LIFUDeviceError(f"TX: {what} refused while the trigger runs",
                                   device_error_code=OW_PRESET_BUSY)
-        if not 0 <= slot < PRESET_SLOTS:
-            raise LIFUDeviceError(f"TX: no preset slot {slot}", device_error_code=OW_INVALID_PACKET)
-        if self._preset_flash[slot] == _TAIL:
-            raise LIFUDeviceError(f"TX: slot {slot} holds the second half of slot {slot - 1}",
-                                  device_error_code=OW_PRESET_SLOT_TAIL)
+        self._check_slot(slot, module)
+        if self._slots[module][slot] == _TAIL:
+            raise LIFUDeviceError(f"TX: module {module}'s slot {slot} holds the second half of "
+                                  f"slot {slot - 1}", device_error_code=OW_PRESET_SLOT_TAIL)
 
     def write_preset(self, slot: int, blob: bytes, module: int = 0) -> bool:
         """Same contract and refusals as :meth:`LIFUTxDevice.write_preset`:
-        this module's part of the preset in *slot* is replaced, or nothing
-        changes. Storing leaves nothing loaded on this module."""
+        *module*'s part of the preset in *slot* is replaced, or nothing
+        changes. Storing leaves nothing loaded on that module. Which part
+        of the preset the blob is (its ``module`` field) is not checked
+        here; a wrong part is refused at load, on its regs_crc.
+        """
         blob = bytes(blob)
         if not 0 < len(blob) <= PRESET_BLOB_MAX:
             raise ValueError("preset blob must be 1..%d bytes, got %d" % (PRESET_BLOB_MAX, len(blob)))
-        self._preset_store_gate("preset write", slot)
+        self._preset_store_gate("preset write", slot, module)
         try:
             part = parse_preset_blob(blob)
         except ValueError as e:
@@ -746,16 +753,11 @@ class SimulatedLIFUTxDevice(SimulatedTxDevice):
         if part["body_crc"] != part["regs_crc"]:
             raise LIFUDeviceError("TX: preset blob body does not match its regs_crc",
                                   device_error_code=OW_BAD_CRC)
+        slots = self._slots[module]
         two_slots = len(blob) > PRESET_SLOT_SIZE
-        if two_slots and (slot + 1 >= PRESET_SLOTS or self._preset_flash[slot + 1] not in (None, _TAIL)):
+        if two_slots and (slot + 1 >= PRESET_SLOTS or slots[slot + 1] not in (None, _TAIL)):
             raise LIFUDeviceError(f"TX: a {len(blob)}-byte preset needs slot {slot + 1} as well",
                                   device_error_code=OW_PRESET_NO_ROOM)
-        modules = max(1, int(part["modules"]))
-        old = self._preset_flash[slot]
-        crcs = [None] * modules
-        if old is not None and int(old[0]["settings_crc"]) == part["settings_crc"] and len(old[1]) == modules:
-            crcs = list(old[1])  # the other modules' parts of the same preset stay
-        crcs[module] = part["regs_crc"]
         machine_config = {
             "id": part["id"],
             "settings_crc": part["settings_crc"],
@@ -767,31 +769,25 @@ class SimulatedLIFUTxDevice(SimulatedTxDevice):
             "shutoff_C": part["shutoff_c_x10"] / 10.0,
         }
         self.unload_preset(module)
-        if not two_slots and slot + 1 < PRESET_SLOTS and self._preset_flash[slot + 1] == _TAIL:
-            self._preset_flash[slot + 1] = None
-        self._preset_flash[slot] = (machine_config, crcs)
+        if slots[slot] not in (None, _TAIL) and slot + 1 < PRESET_SLOTS and slots[slot + 1] == _TAIL:
+            slots[slot + 1] = None  # the long preset this replaces
+        slots[slot] = (machine_config, part["regs_crc"], max(1, int(part["modules"])))
         if two_slots:
-            self._preset_flash[slot + 1] = _TAIL
+            slots[slot + 1] = _TAIL
         return True
 
     def delete_preset(self, slot: int, module: int = 0) -> bool:
-        """Same contract as :meth:`LIFUTxDevice.delete_preset`: empties this
-        module's part of *slot*; already empty is fine."""
-        self._preset_store_gate("preset delete", slot)
-        entry = self._preset_flash[slot]
-        if entry is None:
+        """Same contract as :meth:`LIFUTxDevice.delete_preset`: empties
+        *module*'s *slot* (and its second half); already empty is fine."""
+        self._preset_store_gate("preset delete", slot, module)
+        slots = self._slots[module]
+        if slots[slot] is None:
             return True
-        crcs = list(entry[1])
-        if module < len(crcs):
-            crcs[module] = None
         if self._loaded_preset_index == slot:
             self.unload_preset(module)
-        if any(c is not None for c in crcs):
-            self._preset_flash[slot] = (entry[0], crcs)
-            return True
-        self._preset_flash[slot] = None
-        if slot + 1 < PRESET_SLOTS and self._preset_flash[slot + 1] == _TAIL:
-            self._preset_flash[slot + 1] = None
+        slots[slot] = None
+        if slot + 1 < PRESET_SLOTS and slots[slot + 1] == _TAIL:
+            slots[slot + 1] = None
         return True
 
     def is_preset_locked(self) -> bool:
