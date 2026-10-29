@@ -413,11 +413,6 @@ class SimulatedTxDevice:
         is always locked."""
         return True
 
-    def lock_presets(self) -> bool:
-        """Same contract as :meth:`TxDevice.lock_presets`: an FDA image is
-        already locked."""
-        return True
-
     def is_connected(self) -> bool:
         return self._connected
 

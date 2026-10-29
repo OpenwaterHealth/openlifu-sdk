@@ -16,7 +16,6 @@ import pytest
 
 from openlifu_sdk.io.exceptions import LIFUProtocolError
 from openlifu_sdk.io.LIFUConfig import (
-    OW_CMD_USR_CFG,
     OW_CONTROLLER,
     OW_PRESET_LOADED,
     OW_PRESET_LOCK,
@@ -97,10 +96,16 @@ def test_the_fda_txdevice_reads_the_lock():
     assert (sent["command"], sent["reserved"]) == (OW_PRESET_LOCK, 0)
 
 
-@pytest.mark.parametrize("cls", [TxDevice, LIFUTxDevice], ids=["fda", "ruo"])
-def test_lock_presets_sends_the_lock_and_checks_the_reply(cls):
-    """The FDA component may turn the lock on too: it only restricts."""
-    tx, uart = _with_uart(cls())
+def test_the_fda_txdevice_cannot_set_the_lock():
+    tx, uart = _with_uart(TxDevice())
+    with pytest.raises(ValueError):
+        tx.send(OW_PRESET_LOCK, reserved=1, packet_type=OW_CONTROLLER)
+    uart.send_packet.assert_not_called()
+    assert not hasattr(TxDevice, "lock_presets")
+
+
+def test_lock_presets_sends_the_lock_and_checks_the_reply():
+    tx, uart = _with_uart(LIFUTxDevice())
     uart.send_packet.return_value = _packet(b"\x01")
     assert tx.lock_presets() is True
     sent = uart.send_packet.call_args.kwargs
@@ -109,13 +114,6 @@ def test_lock_presets_sends_the_lock_and_checks_the_reply(cls):
     uart.send_packet.return_value = _packet(b"\x00")
     with pytest.raises(LIFUProtocolError):
         tx.lock_presets()
-
-
-def test_the_fda_txdevice_still_cannot_write_user_config():
-    tx, uart = _with_uart(TxDevice())
-    with pytest.raises(ValueError):
-        tx.send(OW_CMD_USR_CFG, reserved=1)
-    uart.send_packet.assert_not_called()
 
 
 def test_preset_lock_needs_a_synchronous_interface():

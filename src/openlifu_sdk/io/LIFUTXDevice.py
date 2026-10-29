@@ -539,34 +539,6 @@ class TxDevice(OWComponent):
                                     code=LIFU_ERR_BAD_PAYLOAD_LENGTH)
         return r.data[0] == 1
 
-    def lock_presets(self) -> bool:
-        """Turn on the preset lock (OW_PRESET_LOCK, reserved=1).
-
-        Allowed on the FDA component too: the lock only restricts, so a host
-        that never writes presets (the OI in either mode) can lock a DEV
-        image without the RUO interface.
-
-        From here until the transmitter is reset, it refuses what an FDA image
-        refuses: raw register, profile and trigger writes (OW_INVALID_PACKET),
-        and user config writes, DFU, raw I2C and storing or deleting presets
-        (OW_FDA_REFUSED). Presets still load, run and report as on an FDA
-        image. There is no unlock command. On an FDA image, which is always
-        locked, this changes nothing.
-
-        Returns:
-            True once the image reports itself locked.
-
-        Raises:
-            LIFUDeviceError: Firmware without the lock.
-            LIFUProtocolError: The reply is empty, or says it is not locked.
-        """
-        r = self.send_checked(packet_type=OW_CONTROLLER, command=OW_PRESET_LOCK,
-                              reserved=1, op="lock_presets")
-        if r.data_len < 1 or r.data[0] != 1:
-            raise LIFUProtocolError("TX: lock_presets did not report the lock on",
-                                    code=LIFU_ERR_BAD_PAYLOAD_FORMAT)
-        return True
-
     def get_module_count(self) -> int:
         """Return the number of connected LIFU transmitter modules.
 
@@ -977,6 +949,29 @@ class LIFUTxDevice(LIFUComponentMixin, TxDevice):
             return {"index": slot, "state": state}
         return {**got, "state": "preset"}
 
+    def lock_presets(self) -> bool:
+        """Turn on the preset lock of a DEV image (OW_PRESET_LOCK, reserved=1).
+
+        From here until the transmitter is reset, it refuses what an FDA image
+        refuses: raw register, profile and trigger writes (OW_INVALID_PACKET),
+        and user config writes, DFU, raw I2C and storing or deleting presets
+        (OW_FDA_REFUSED). Presets still load, run and report as on an FDA
+        image. There is no unlock command. On an FDA image, which is always
+        locked, this changes nothing.
+
+        Returns:
+            True once the image reports itself locked.
+
+        Raises:
+            LIFUDeviceError: Firmware without the lock.
+            LIFUProtocolError: The reply is empty, or says it is not locked.
+        """
+        r = self.send_checked(packet_type=OW_CONTROLLER, command=OW_PRESET_LOCK,
+                              reserved=1, op="lock_presets")
+        if r.data_len < 1 or r.data[0] != 1:
+            raise LIFUProtocolError("TX: lock_presets did not report the lock on",
+                                    code=LIFU_ERR_BAD_PAYLOAD_FORMAT)
+        return True
 
     def get_preset_capacity(self) -> Dict | None:
         """How many presets a DEV image can store (OW_PRESET_CAPACITY).
