@@ -379,21 +379,38 @@ class TestConsolePresets(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "sensitivity"):
             preset_sensitivity(_compiled())                    # the preset has none
 
-    def test_table_in_index_order_with_exact_values(self):
-        presets = [_compiled(id="a", voltage=47.66997571, sensitivity=3600),
-                   _compiled(id="b", voltage=30, sensitivity=2719.6)]
+    def test_v2_record_layout(self):
+        """console-fw#21: v1 plus float32 voltage_min/max after the sensitivity
+        (a 28-byte header), the id, then a CRC-32 of everything before."""
+        mc = _compiled(id="lowv", voltage=20, sensitivity=3728, voltage_range=[15, 25])
+        rec = console_preset_record(mc, version=2)
+        self.assertEqual(rec[:8], b"OWHV" + bytes([2, 4, 0, 0]))
+        self.assertEqual(struct.unpack_from("<Iffff", rec, 8),
+                         (mc["settings_crc"], 20.0, 3728.0, 15.0, 25.0))
+        self.assertEqual(rec[28:32], b"lowv")
+        self.assertEqual(struct.unpack_from("<I", rec, 32)[0], zlib.crc32(rec[:32]))
+        self.assertEqual(len(rec), 36)
+        # v1 is unchanged by the version argument's default.
+        self.assertEqual(console_preset_record(mc), console_preset_record(mc, version=1))
+        self.assertEqual(rec[8:20], console_preset_record(mc, version=1)[8:20])
+
+    def test_v2_record_needs_a_voltage_range(self):
+        with self.assertRaisesRegex(ValueError, "voltage_range"):
+            console_preset_record(_compiled(sensitivity=3600), version=2)
+        with self.assertRaisesRegex(ValueError, "version"):
+            console_preset_record(_compiled(sensitivity=3600, voltage_range=[35, 45]), version=3)
+
+    def test_table_is_v2_records_in_index_order(self):
+        presets = [_compiled(id="a", voltage=40, sensitivity=3728, voltage_range=[35, 45]),
+                   _compiled(id="b", voltage=20, sensitivity=2719.6, voltage_range=[15, 25])]
         with tempfile.TemporaryDirectory() as d:
-            text = generate_console_presets(d, presets, "vet").read_text()
-        rows = re.findall(r'\{ "(\w+)", (\S+)f, (\S+)f, 0x([0-9a-f]{8})u \}', text)
-        self.assertEqual([r[0] for r in rows], ["a", "b"])
-        for (_, volts, sens, crc), mc in zip(rows, presets):
-            # Each C literal parses back to the very float32 the preset compiles to,
-            # and is a float literal even for a whole number.
-            self.assertEqual(_f32(float(volts)), preset_voltage(mc))
-            self.assertEqual(_f32(float(sens)), preset_sensitivity(mc))
-            self.assertTrue("." in volts and "." in sens, (volts, sens))
-            self.assertEqual(int(crc, 16), mc["settings_crc"])
-        self.assertIn('#define PRESET_HV_CONTEXT_NAME "vet"', text)
+            text = generate_console_presets(d, presets, "test").read_text()
+        body = re.search(r"PRESET_HV_TABLE\[(\d+)\] = \{(.*?)\};", text, re.S)
+        table = bytes(int(b, 16) for b in re.findall(r"0x([0-9a-f]{2})", body.group(2)))
+        self.assertEqual(int(body.group(1)), len(table))
+        self.assertEqual(table, b"".join(console_preset_record(mc, version=2) for mc in presets))
+        self.assertIn('__attribute__((section(".fda_preset"), used))', text)
+        self.assertIn('#define PRESET_HV_CONTEXT_NAME "test"', text)
         self.assertIn("#define PRESET_HV_COUNT 2u", text)
 
     def test_table_needs_every_field(self):
@@ -402,6 +419,8 @@ class TestConsolePresets(unittest.TestCase):
                 generate_console_presets(d, [compile_preset(_preset(sensitivity=3600))], "vet")
             with self.assertRaisesRegex(ValueError, "sensitivity"):
                 generate_console_presets(d, [_compiled()], "vet")
+            with self.assertRaisesRegex(ValueError, "voltage_range"):
+                generate_console_presets(d, [_compiled(sensitivity=3600)], "vet")
 
     @staticmethod
     def _reply(selected: int, crc: int, volts: float, sens: float, applied: float, ident: bytes = b"unit") -> bytes:

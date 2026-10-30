@@ -40,7 +40,8 @@ def _context(root: Path, ids=("bench_a", "bench_b")) -> Path:
     context = root / "bench"
     for n, preset_id in enumerate(ids):
         (context / preset_id).mkdir(parents=True)
-        doc = dict(DEFAULTS, pulse_count=DEFAULTS["pulse_count"] + n)   # a distinct settings_crc each
+        doc = dict(DEFAULTS, pulse_count=DEFAULTS["pulse_count"] + n,   # a distinct settings_crc each
+                   voltage_range=[35, 45])                            # console record v2 needs it
         (context / preset_id / ("%s_settings.json" % preset_id)).write_text(
             json.dumps(doc, indent=2), encoding="utf-8")
     (context / "presets.json").write_text(json.dumps({"presets": list(ids)}), encoding="utf-8")
@@ -185,7 +186,8 @@ def test_several_presets_link_the_transmitter_table(flash, tmp_path):
 def test_several_presets_link_the_console_hv_table(flash, tmp_path):
     tree = _tree(tmp_path)
     flash.write_preset_headers(tree, "console", True, _context(tmp_path))
-    assert (tree / "Core/Inc/presets/preset_hv_table.h").is_file()
+    text = (tree / "Core/Inc/presets/preset_hv_table.h").read_text(encoding="utf-8")
+    assert "#define PRESET_HV_COUNT 2u" in text and "PRESET_HV_TABLE[" in text
 
 
 @pytest.mark.parametrize("board", ["transmitter", "console"])
