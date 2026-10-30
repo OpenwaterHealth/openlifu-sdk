@@ -27,7 +27,8 @@ OW_ERROR = 0xEF
 OW_SUCCESS = 0x00
 # FDA mode refusals, carried in the OW_ERROR reply's reserved byte.
 OW_HV_RANGE = 0xF1         # console: select's rescaled voltage is outside the FDA window
-OW_PRESET_BUSY = 0xF2      # TX: trigger running, presets cannot be stored or deleted
+OW_PRESET_BUSY = 0xF2      # TX: trigger running, presets cannot be stored or deleted; or (DEV, unlocked)
+                           #     a raw write while a loaded preset runs
 OW_PRESET_NO_ROOM = 0xF3   # TX: blob needs the next slot too, and it is taken or missing
 OW_PRESET_SLOT_TAIL = 0xF4 # TX: slot holds the second half of the preset before it
 OW_PRESET_EMPTY = 0xF5     # TX: nothing stored in the slot
@@ -35,7 +36,8 @@ OW_HV_PRESET_CRC = 0xF6    # console: select's settings_crc is not that preset's
 OW_HV_NO_PRESET = 0xF7     # console: HV on before any preset was selected
 # OW_HV_FDA_REFUSED and OW_FDA_REFUSED share 0xF8: one is the console's, the other the TX's.
 OW_HV_FDA_REFUSED = 0xF8   # console: host-set voltage / raw DACs, or select while HV on
-OW_FDA_REFUSED = 0xF8      # TX: a user config write in FDA mode, where it is read-only
+OW_FDA_REFUSED = 0xF8      # TX: refused by the preset lock (always on in FDA mode): user config
+                           #     write, DFU, raw I2C, preset store/delete
 OW_TEMP_UNKNOWN = 0xF9     # TX: no fresh thermistor reading
 OW_TEMP_TOO_HIGH = 0xFA    # TX: above the loaded preset's start_C
 OW_NO_PRESET = 0xFB        # TX: no preset loaded
@@ -87,14 +89,19 @@ OW_CTRL_SET_PROFILE_CYCLE = 0x1F
 OW_CTRL_SET_PATTERN_PROFILE = 0x28
 OW_CTRL_GET_PATTERN_PROFILE = 0x29
 
-# FDA and preset modes
+# Presets (transmitter-fw presets.h)
 OW_PRESET_GET = 0x50
 OW_PRESET_LOAD = 0x51
-# Preset mode only: storing and deleting presets
+# DEV images only, and only bare-metal ones: storing and deleting presets
 OW_PRESET_WRITE = 0x52
 OW_PRESET_COMMIT = 0x53
 OW_PRESET_DELETE = 0x54
 OW_PRESET_CAPACITY = 0x55
+# The preset lock: reserved=1 turns it on until reset, reserved=0 reads it (u8).
+# Always on in an FDA image; a locked DEV image refuses what an FDA image refuses.
+OW_PRESET_LOCK = 0x56
+# What every module has loaded (16 bytes; TxDevice.get_loaded_preset_state).
+OW_PRESET_LOADED = 0x57
 
 # TX7332 Commands
 OW_TX7332_STATUS = 0x20
@@ -170,6 +177,7 @@ CONTROLLER_COMMANDS = {
     OW_CTRL_SET_PROFILE_CYCLE,
     OW_PRESET_GET, OW_PRESET_LOAD,
     OW_PRESET_WRITE, OW_PRESET_COMMIT, OW_PRESET_DELETE, OW_PRESET_CAPACITY,
+    OW_PRESET_LOCK, OW_PRESET_LOADED,
 }
 
 POWER_COMMANDS = {
@@ -200,7 +208,8 @@ TX_FDA_PACKETS = {
         OW_CMD_GET_TEMP, OW_CMD_GET_AMBIENT,
         OW_CTRL_GET_SWTRIG, OW_CTRL_START_SWTRIG, OW_CTRL_STOP_SWTRIG,
         OW_CTRL_GET_MODULE_COUNT,
-        OW_PRESET_GET, OW_PRESET_LOAD,
+        OW_PRESET_GET, OW_PRESET_LOAD, OW_PRESET_LOADED,
+        OW_PRESET_LOCK,   # read only (FDA_READ_ONLY_COMMANDS)
     }),
     OW_TX7332: frozenset({OW_TX7332_DEVICE_COUNT}),  # get_module_count fallback on older images
 }
@@ -221,8 +230,10 @@ HV_FDA_COMMANDS = set().union(*HV_FDA_PACKETS.values())
 # Commands the FDA components may only read with (reserved == 0): the user
 # config carries the sensitivity calibration that scales the HV, and its
 # write is reserved == 1. FDA_MODE firmware refuses that write too
-# (OW_FDA_REFUSED); this keeps an FDA host from sending it at all.
-FDA_READ_ONLY_COMMANDS = frozenset({OW_CMD_USR_CFG})
+# (OW_FDA_REFUSED); this keeps an FDA host from sending it at all. The FDA
+# host reads the preset lock but has no reason to set it: an FDA image is
+# always locked.
+FDA_READ_ONLY_COMMANDS = frozenset({OW_CMD_USR_CFG, OW_PRESET_LOCK})
 
 TRIGGER_MODE_SEQUENCE = 0
 TRIGGER_MODE_CONTINUOUS = 1

@@ -4,14 +4,15 @@
 
 > **FDA / RUO split.** `TxDevice` is the FDA component created by
 > `DeviceInterface`: it exposes only identity, temperature, trigger
-> read/start/stop and stored-preset (`get_preset` / `load_preset`) methods,
+> read/start/stop and stored-preset (`get_preset` / `load_preset` /
+> `get_loaded_preset_state` / `is_preset_locked`) methods,
 > and refuses any other send before it reaches the wire (below). Every other
 > method listed below (trigger/profile programming, register access,
 > `async_mode`, config writes, DFU, LED/echo/reset) lives on the RUO subclass
 > `LIFUTxDevice`, which only `LIFUInterface` creates. So do the methods that
-> list, store and delete the presets of a PRESET_MODE image
-> (`get_preset_slot` / `get_preset_capacity` / `write_preset` /
-> `delete_preset`).
+> list, store and delete the presets of a DEV image (`get_preset_slot` /
+> `get_preset_capacity` / `write_preset` / `delete_preset`; a bare-metal
+> image only), and `lock_presets`.
 >
 > **What the host-side check is.** The FDA classes send only the
 > (packet type, opcode) pairs their own methods use, and the user config
@@ -36,6 +37,14 @@ Triggering and profiles
 - `get_trigger_json()` / `get_trigger()` — read current trigger configuration.
 - `start_trigger()` / `stop_trigger()` — start / stop software trigger.
 - `async_mode(enable: bool|None) -> bool` — enable/disable or read async mode state.
+
+Presets and the preset lock (transmitter-fw `presets.h`)
+- `get_preset(index)` / `load_preset(index, regs_crc, duration_index, module, settings_crc=...)` / `unload_preset(module)` — describe, load (CRC-checked, run length chosen by `duration_index`) and unload a preset.
+- `get_loaded_preset_state(module=None) -> dict` — what the firmware has loaded (`OW_PRESET_LOADED`): `loaded`, `index`, `duration_index`, `train_count`, `settings_crc`, `regs_crc`, `missing_modules`. The master asks every module; `loaded` is False unless all of them hold the same load, and `missing_modules` names the ones that don't (for example after a raw write on a DEV image unloaded one). With `module`, that module's own state.
+- `get_loaded_preset() -> (index, duration_index)` — the same, or `(None, None)`; the simulator has the same method.
+- `is_preset_locked() -> bool` — the preset lock (`OW_PRESET_LOCK`, read). Always True on an FDA image.
+- `lock_presets() -> bool` (`LIFUTxDevice` only) — lock a DEV image until it is reset. Locked, it refuses what an FDA image refuses: raw register, profile and trigger writes (`OW_INVALID_PACKET`); user config writes, DFU, raw I2C and storing or deleting presets (`OW_FDA_REFUSED`). `LIFUInterface(preset_lock=True)` calls it when the transmitter connects.
+- Unlocked, a DEV image takes raw writes as a research image does, but a raw write leaves nothing loaded on the module it runs on, and is refused (`OW_PRESET_BUSY`) while a loaded preset runs.
 
 TX registers and profiles
 - `get_tx_module_count() -> int` — number of detected TX7332 chips.
