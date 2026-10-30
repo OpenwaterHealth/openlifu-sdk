@@ -78,7 +78,7 @@ from openlifu_sdk.io.LIFUConfig import (
     OW_NO_PRESET,
     OW_TEMP_TOO_HIGH,
 )
-from openlifu_sdk.io.LIFUTXPresets import module_regs_crcs, preset_sensitivity
+from openlifu_sdk.io.LIFUTXPresets import module_regs_crcs, preset_sensitivity, preset_voltage_range
 from openlifu_sdk.io.LIFUUserConfig import sensitivity_at_frequency
 from openlifu_sdk.io.signal import OWSignal
 from openlifu_sdk.ui.status_frame import format_status_frame as _format_status_frame
@@ -91,12 +91,11 @@ if _QT_BACKEND == "PythonQt":
         """PythonQt is Slicer's own Qt, so there is nothing to check. The
         Qt6 path imports :func:`openlifu_sdk.ui._qt.check_host_binding`."""
 
-# The FDA image's second-line hard stop: the only HV setpoints an FDA_MODE
-# console's select may arrive at (FDA_HV_MIN_VOLTS / FDA_HV_MAX_VOLTS in the
-# console firmware's hv_presets.h). Fixed in that image. A preset's own
-# voltage_range is preset data that no console sees: the host checks it
-# (DeviceInterface.load_preset(voltage_range=...)).
-FDA_HV_WINDOW_V = (35.0, 45.0)
+# A presets-only console's hard ceiling (Peter, 2026-10-30): no select may
+# arrive above it, whatever a record says. There is no floor: each select is
+# held to its preset record's own voltage_range (PRESET_HV_RECORD v2,
+# console-fw#21), inside this ceiling.
+HV_CEILING_V = 45.0
 
 
 def _f32(value: float) -> float:
@@ -783,8 +782,9 @@ class SimulatedHVController:
     def get_temperature2(self) -> float:
         return 31.0 + 0.05 * self._voltage_setpoint + _gauss(HV_TEMP_NOISE_SIGMA)
 
-    #: This console is an FDA image: the 35-45 V hard stop applies and the
-    #: selection cannot change while HV is on. SimulatedLIFUHVController is not.
+    #: This console is a presets-only image: each select is held to its
+    #: record's voltage_range under the 45 V ceiling, and the selection
+    #: cannot change while HV is on. SimulatedLIFUHVController is not.
     fda_image: bool = True
 
     def configure_presets(self, presets: List[dict]) -> None:
@@ -807,9 +807,11 @@ class SimulatedHVController:
         self._presets = [dict(preset) for preset in presets]
 
     def _select_window(self, preset: dict) -> tuple[float, float] | None:
-        """The window a select's rescaled voltage must land in: the FDA image's
-        fixed hard stop. Not read from the preset, so preset data cannot widen it."""
-        return FDA_HV_WINDOW_V
+        """The window a select's rescaled voltage must land in: the record's
+        own voltage_range, capped at the image's 45 V ceiling, which no record
+        can raise. A record without a range is held to the ceiling alone."""
+        low, high = preset.get("voltage_range") or (0.0, HV_CEILING_V)
+        return float(low), min(float(high), HV_CEILING_V)
 
     def get_preset(self, index: int) -> dict | None:
         """Same shape as :meth:`HVController.get_preset`; ``min_voltage`` /
@@ -1219,6 +1221,8 @@ class SimulatedDeviceInterface(QObject):
                     "id": machine_config.get("id", f"preset-{index}"),
                     # As HVController.get_preset reports it: the console bakes it as float32.
                     "sensitivity": preset_sensitivity(machine_config),
+                    # The record's own range (v2), which the console holds a select to.
+                    "voltage_range": preset_voltage_range(machine_config),
                 })
             self.hvcontroller.configure_presets(hv_presets)
 
