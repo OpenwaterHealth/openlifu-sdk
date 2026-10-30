@@ -24,7 +24,9 @@ over the raw source .json, and ``regs_crc`` over the blob's body, which is
 everything the firmware executes from (the firmware recomputes that one).
 
 Each preset's ``start_C`` / ``shutoff_C`` go into its blob: the firmware
-refuses a trigger start above the first and stops a run at the second. Its
+refuses a trigger start above the first and stops a run at the second. So
+does its ``treatment_timeout_s``: the firmware ends a run as TIMEOUT that
+many seconds after Start, pauses included. Its
 ``voltage`` and ``sensitivity`` go to the console instead, through
 :func:`generate_console_presets`: one entry per preset, indexed as the
 transmitter's presets are. The host selects preset N on both and gives the console the
@@ -54,6 +56,8 @@ from openlifu_sdk.io.LIFUTXDevice import (
     PRESET_TEMP_RAW_MAX,
     PRESET_TEMP_RAW_MIN,
     PRESET_TEMP_SCALE,
+    PRESET_TIMEOUT_MAX_S,
+    PRESET_TIMEOUT_MIN_S,
     PRESET_TRAIN_COUNT_MAX,
     PRESET_TRAIN_SELECTIONS_MAX,
     TRANSMITTERS_PER_MODULE,
@@ -73,11 +77,12 @@ PASSTHROUGH_FIELDS = (
     "pulse_train_count_selections",
 )
 
-# Safety limits, just as required: the thermal pair goes to the transmitter,
-# the voltage into the console's preset table.
+# Safety limits, just as required: the thermal pair and the treatment timeout
+# go to the transmitter, the voltage into the console's preset table.
 LIMIT_FIELDS = (
     "start_C",
     "shutoff_C",
+    "treatment_timeout_s",
     "voltage",
 )
 
@@ -124,6 +129,24 @@ def thermal_limits(machine_config: Dict) -> tuple[int, int]:
         raise ValueError("%s: start_C (%r) must be below shutoff_C (%r)"
                          % (machine_config.get("id"), machine_config["start_C"], machine_config["shutoff_C"]))
     return raw[0], raw[1]
+
+
+def treatment_timeout(machine_config: Dict) -> int:
+    """``treatment_timeout_s`` as the u16 the blob carries: whole seconds from
+    Start, pauses included, after which the firmware ends the run as TIMEOUT.
+
+    Raises:
+        ValueError: Missing, not a whole number, or outside
+            PRESET_TIMEOUT_MIN_S..PRESET_TIMEOUT_MAX_S.
+    """
+    value = machine_config.get("treatment_timeout_s")
+    # Refuse rather than round, as for the thermal limits; 1800.0 is whole, 1800.5 is not.
+    whole = (not isinstance(value, bool) and isinstance(value, (int, float))
+             and math.isfinite(value) and value == int(value))
+    if not whole or not PRESET_TIMEOUT_MIN_S <= int(value) <= PRESET_TIMEOUT_MAX_S:
+        raise ValueError("%s: treatment_timeout_s must be whole seconds in %d..%d, got %r"
+                         % (machine_config.get("id"), PRESET_TIMEOUT_MIN_S, PRESET_TIMEOUT_MAX_S, value))
+    return int(value)
 
 
 def preset_voltage(machine_config: Dict) -> float:
@@ -276,7 +299,7 @@ def compile_preset(preset: Dict, preset_id: str | None = None,
 
     Returns:
         Dict with ``id``, the passthrough sequence fields, the limit fields
-        (``start_C``, ``shutoff_C``, ``voltage``), ``frequency_khz`` and
+        (``start_C``, ``shutoff_C``, ``treatment_timeout_s``, ``voltage``), ``frequency_khz`` and
         ``sensitivity`` when the preset has one, ``settings_crc``
         (when ``settings_bytes`` was given), ``trigger`` (``frequency_hz`` and
         ``pulse_train_interval_us``, as the device runs them),
@@ -352,6 +375,7 @@ def compile_preset(preset: Dict, preset_id: str | None = None,
     # Refuse bad run lengths or limits now, not at emit time.
     counts = train_count_selections(captured)
     thermal_limits(captured)
+    treatment_timeout(captured)
     preset_voltage(captured)
     # The timing set_trigger would send, for the longest run the preset offers.
     captured["trigger"] = resolve_trigger_timing(
@@ -445,6 +469,8 @@ def _body_segments(machine_config: Dict, module: int = 0) -> Segments:
         ("run lengths: how many, then each in pulse trains",
          struct.pack("<B%dI" % len(counts), len(counts), *counts)),
         ("start_C, shutoff_C in tenths of a degree", struct.pack("<hh", *thermal_limits(machine_config))),
+        ("treatment_timeout_s: seconds from Start, pauses included",
+         struct.pack("<H", treatment_timeout(machine_config))),
     ]
     for ci, chip in enumerate(chips, start=first_chip):
         runs = sorted(chip["registers"].items())
@@ -512,8 +538,8 @@ def parse_preset_blob(blob: bytes) -> Dict:
     ``settings_crc``, ``regs_crc`` (as stored), ``body_crc``
     (computed here), ``profile_index``, ``execution_order``, ``trig_hz``,
     ``trig_count``, ``trig_train_us``, ``train_counts``, ``start_c_x10``,
-    ``shutoff_c_x10`` and ``chips`` in the shape :func:`compile_preset`
-    returns them.
+    ``shutoff_c_x10``, ``treatment_timeout_s`` and ``chips`` in the shape
+    :func:`compile_preset` returns them.
 
     Raises:
         ValueError: Not a blob this version understands, or truncated.
@@ -545,6 +571,7 @@ def parse_preset_blob(blob: bytes) -> Dict:
     (n_counts,) = take("<B")
     counts = list(take("<%dI" % n_counts))
     start, shutoff = take("<hh")
+    (timeout_s,) = take("<H")
     chips = []
     for _ in range(n_chips):
         registers = {}
@@ -564,7 +591,8 @@ def parse_preset_blob(blob: bytes) -> Dict:
             "body_crc": zlib.crc32(blob[body_start:]) & 0xFFFFFFFF,
             "profile_index": profile_index, "execution_order": order,
             "trig_hz": trig_hz, "trig_count": trig_count, "trig_train_us": trig_train_us,
-            "train_counts": counts, "start_c_x10": start, "shutoff_c_x10": shutoff, "chips": chips}
+            "train_counts": counts, "start_c_x10": start, "shutoff_c_x10": shutoff,
+            "treatment_timeout_s": timeout_s, "chips": chips}
 
 
 def generate_header_files(filename, machine_config: Dict, context: str | None = None,
@@ -612,10 +640,11 @@ def generate_header_files(filename, machine_config: Dict, context: str | None = 
         length = sum(len(data) for _, data in segments)
         size += length
         lines += [
-            "// %s%d chip(s), %d profile(s), start_C %g, shutoff_C %g, regs_crc 0x%08x."
+            "// %s%d chip(s), %d profile(s), start_C %g, shutoff_C %g, treatment_timeout_s %d,"
             % ("" if modules == 1 else "Module %d of %d: " % (module, modules),
                len(_module_chips(machine_config, module)), n_profiles,
-               machine_config["start_C"], machine_config["shutoff_C"], regs_crc(machine_config, module)),
+               machine_config["start_C"], machine_config["shutoff_C"], treatment_timeout(machine_config)),
+            "// regs_crc 0x%08x." % regs_crc(machine_config, module),
             "// One preset blob, laid out as PRESET_BLOB in presets.h: each comment",
             "// names the bytes that follow it.",
         ] + ([

@@ -191,10 +191,16 @@ PRESET_TRAIN_COUNT_MAX = 0xFFFFFFFF
 PRESET_TEMP_SCALE = 10
 PRESET_TEMP_RAW_MIN = -0x8000
 PRESET_TEMP_RAW_MAX = 0x7FFF
+# A preset's treatment_timeout_s travels as a u16 in the preset blob: whole
+# seconds from Start, pauses included, after which the firmware ends the run
+# as TIMEOUT (SR-024). The firmware refuses 0.
+PRESET_TIMEOUT_MIN_S = 1
+PRESET_TIMEOUT_MAX_S = 0xFFFF
 # The preset blob: one pointer-free record per preset, laid out as PRESET_BLOB
 # in the firmware's presets.h. Its id is ASCII, at most PRESET_ID_MAX bytes.
 PRESET_BLOB_MAGIC = b"OWPR"
-PRESET_BLOB_VERSION = 1
+# 2 added treatment_timeout_s; the firmware refuses a version 1 blob.
+PRESET_BLOB_VERSION = 2
 PRESET_ID_MAX = 64
 # A PRESET_MODE image keeps blobs in flash slots of one page each
 # (presets.h in the firmware); a blob over one slot takes the next too.

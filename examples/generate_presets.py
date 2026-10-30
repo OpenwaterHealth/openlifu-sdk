@@ -8,7 +8,7 @@ firmware only reads it. This writes the two headers those images are built
 from, both named fda_preset.h:
 
   transmitter  Core/Inc/presets/fda_preset.h  the preset's blob: registers,
-               timing, run lengths, thermal limits
+               timing, run lengths, thermal limits, treatment timeout
   console      Core/Inc/presets/fda_preset.h  its HV entry: the voltage, the
                transmitter sensitivity that voltage suits, the .json's
                settings_crc
@@ -17,8 +17,8 @@ Add them to the firmware branches as needed; an FDA build refuses to
 configure without its one.
 
 Exactly one preset .json is taken: a file, or a folder holding just one. It
-must carry voltage, sensitivity, start_C and shutoff_C; the generator has no
-defaults. Nothing is sent anywhere and no device is needed.
+must carry voltage, sensitivity, start_C, shutoff_C and treatment_timeout_s;
+the generator has no defaults. Nothing is sent anywhere and no device is needed.
 
     python examples/generate_presets.py --presets my_preset_settings.json
 
@@ -106,10 +106,11 @@ def main():
     except ValueError as e:
         sys.exit("%s cannot be used; nothing written: %s" % (path, e))
     print("  %s settings_crc=0x%08x regs_crc=0x%08x  %d chip(s), %d profile(s), trains %s, "
-          "%g V at sensitivity %g, start %g C, shutoff %g C"
+          "%g V at sensitivity %g, start %g C, shutoff %g C, timeout %d s"
           % (mc["id"], mc["settings_crc"], regs_crc(mc),
              len(mc["chips"]), len(mc["chips"][0]["profiles"]), train_count_selections(mc),
-             mc["voltage"], mc["sensitivity"], mc["start_C"], mc["shutoff_C"]))
+             mc["voltage"], mc["sensitivity"], mc["start_C"], mc["shutoff_C"],
+             mc["treatment_timeout_s"]))
 
     try:
         tx = generate_fda_preset(presets_dir(args.out, TRANSMITTER_FALLBACK), mc, args.context)
