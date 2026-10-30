@@ -116,6 +116,8 @@ class LIFUInterfaceStatus(Enum):
     STATUS_RUNNING = 6
     STATUS_FINISHED = 7
     STATUS_ERROR = 8
+    STATUS_PAUSED = 9
+    STATUS_TIMEOUT = 10
 
 logger = logging.getLogger(__name__)
 
@@ -342,7 +344,10 @@ class DeviceInterface:
                 from either device, a transmitter with no calibrated
                 sensitivity at *frequency_hz*, or an applied voltage outside
                 *voltage_range* (LIFUSolutionError).
+            LIFUError: If a sequence is paused or timed out; see
+                :meth:`_refuse_while_sequence_held`.
         """
+        self._refuse_while_sequence_held("load_preset")
         self.set_status(LIFUInterfaceStatus.STATUS_PROGRAMMING)
         regs_crcs = module_regs_crcs(regs_crc)
         try:
@@ -439,9 +444,13 @@ class DeviceInterface:
                 again if the rail does not settle or the trigger does not
                 start (a transmitter with nothing loaded refuses to).
             LIFUHVSettleError: If the HV rail does not settle in time.
+            LIFUError: If a sequence is paused or timed out; see
+                :meth:`_refuse_while_sequence_held`.
         """
         if self._test_mode:
             return True
+
+        self._refuse_while_sequence_held("start_sonication")
 
         try:
             if self.hvcontroller is not None:
@@ -475,6 +484,32 @@ class DeviceInterface:
         self.set_status(LIFUInterfaceStatus.STATUS_RUNNING)
         return True
 
+    def _refuse_while_sequence_held(self, op: str) -> None:
+        """Refuse *op* while the firmware holds a paused (SR-023) or
+        timed-out (SR-024) sequence, before HV or the preset is touched.
+
+        The firmware refuses Start and preset loads while paused, and the
+        error paths of :meth:`start_sonication` / :meth:`load_preset`
+        would then turn HV off under a pause that could still be resumed.
+        A timed-out sequence must be ended with Stop rather than restarted.
+        The status is asked of the firmware, not the cached ``status``,
+        which a reconnect or an earlier refusal may have reset. (TIMEOUT
+        needs openlifu-transmitter-fw#22; today's firmware reports
+        RUNNING, PAUSED or STOPPED.) Nothing has been touched when this
+        raises, so there is nothing for the caller's error path to undo.
+
+        Raises:
+            LIFUError: A paused or timed-out sequence is held.
+            LIFUNoTriggerStatusError: No trigger status in the reply, as
+                for :meth:`is_running`.
+        """
+        trigger_status = self.txdevice.get_trigger_json().get("TriggerStatus")
+        if trigger_status is None:
+            raise LIFUNoTriggerStatusError(f"{op}: device failed to provide valid trigger status.")
+        trigger_status = str(trigger_status).upper()
+        if trigger_status in ("PAUSED", "TIMEOUT"):
+            raise LIFUError(f"{op}: the sequence is {trigger_status.lower()}; stop it first")
+
     def set_status(self, status: LIFUInterfaceStatus) -> None:
         """
         Set the device status.
@@ -489,26 +524,92 @@ class DeviceInterface:
         """
         Query the device status.
 
+        Returns the cached status, refreshed from the firmware's trigger
+        status (:meth:`is_running`, a UART round trip) only while the
+        cached status is RUNNING or PAUSED, so PAUSED and TIMEOUT follow
+        the firmware during a run (SR-023, SR-024). After a reconnect or
+        a refused load the cache may read READY or ERROR while the
+        firmware still holds a paused sequence; :meth:`start_sonication`
+        and :meth:`load_preset` ask the firmware directly for that reason.
+
         Returns:
             LIFUInterfaceStatus: The device status.
+
+        Raises:
+            LIFUNoTriggerStatusError, LIFUNotConnectedError,
+            LIFUCommunicationError, LIFUDeviceError: While running or
+                paused, if the trigger status cannot be read.
         """
         if self._test_mode:
             return LIFUInterfaceStatus.STATUS_READY
 
+        if self.status in (LIFUInterfaceStatus.STATUS_RUNNING, LIFUInterfaceStatus.STATUS_PAUSED):
+            self.is_running()
         return self.status
+
+    def pause_sonication(self) -> bool:
+        """Ask the firmware to pause the running sequence (SR-023).
+
+        The pause lands at the next pulse-train boundary, or the sequence
+        completes if the final train is in progress, so the status is
+        left to :meth:`get_status`, which reads it from the firmware.
+        HV and the trigger configuration are not touched.
+
+        Raises:
+            LIFUDeviceError: The firmware rejected the pause (no sequence
+                running, or not a SEQUENCE-mode run).
+            LIFUNotConnectedError, LIFUCommunicationError.
+        """
+        if self._test_mode:
+            return True
+        self.txdevice.pause_trigger()
+        return True
+
+    def resume_sonication(self) -> bool:
+        """Ask the firmware to resume a paused sequence (SR-023).
+
+        The firmware continues from the next pulse train with the count
+        retained; :meth:`get_status` reports the result. HV and the
+        trigger configuration are not touched.
+
+        Raises:
+            LIFUDeviceError: The firmware rejected the resume: not paused
+                (including after the firmware ended the run), or the
+                over-temperature flag is set. A distinct refusal after a
+                treatment timeout (SR-024) needs openlifu-transmitter-fw#22.
+            LIFUNotConnectedError, LIFUCommunicationError.
+        """
+        if self._test_mode:
+            return True
+        self.txdevice.resume_trigger()
+        return True
 
     def is_running(self) -> bool:
         """
-        Check if the device is currently running a sonication.
+        Check if the device is currently running a sonication, and set
+        ``status`` from the firmware's trigger status.
 
         Returns:
-            bool: True if the device is running, False otherwise.
+            bool: True only while the firmware reports RUNNING. PAUSED,
+            TIMEOUT and STOPPED all return False, so a caller waiting for
+            the end of a run that can be paused should check
+            :meth:`get_status` instead.
         """
         trigger_json = self.txdevice.get_trigger_json()
         trigger_status = trigger_json.get("TriggerStatus", "NOSTATUS").upper()
         if trigger_status == "RUNNING":
+            self.set_status(LIFUInterfaceStatus.STATUS_RUNNING)
             return True
+        elif trigger_status == "PAUSED":
+            self.set_status(LIFUInterfaceStatus.STATUS_PAUSED)
+            return False
+        elif trigger_status == "TIMEOUT":
+            self.set_status(LIFUInterfaceStatus.STATUS_TIMEOUT)
+            return False
         elif trigger_status == "STOPPED":
+            # A run that was going has ended; an idle READY stays READY.
+            if self.status in (LIFUInterfaceStatus.STATUS_RUNNING, LIFUInterfaceStatus.STATUS_PAUSED):
+                self.set_status(LIFUInterfaceStatus.STATUS_FINISHED)
             return False
         elif trigger_status == "NOSTATUS":
             raise LIFUNoTriggerStatusError("Device failed to provide valid trigger status.")

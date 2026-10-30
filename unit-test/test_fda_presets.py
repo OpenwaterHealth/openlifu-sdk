@@ -33,6 +33,7 @@ from openlifu_sdk.io.LIFUConfig import (
     OW_CMD_USR_CFG,
     OW_CONTROLLER,
     OW_CTRL_GET_MODULE_COUNT,
+    OW_CTRL_GET_SWTRIG,
     OW_CTRL_START_SWTRIG,
     OW_ERROR,
     OW_HV_PRESET_CRC,
@@ -837,20 +838,22 @@ class TestInterfacePresetLoad(unittest.TestCase):
         tx_uart, hv_uart = _mock_uart(iface.txdevice, "TX"), _mock_uart(iface.hvcontroller, "HV")
         tx_uart.send_packet.return_value = _packet(b"")
         hv_uart.send_packet.side_effect = [_packet(struct.pack("<f", 44.75)), _packet(b"")]
-        # The real module-count and calibration reads: count, load, then the user config.
+        # The real reads: the trigger status (no paused sequence, SR-023), the module count,
+        # the load, then the user config.
         config = LifuUserConfig(json_data={"sn": "SN-1", "hwid": "HW-1",
                                            "module": {"sensitivity": [[400000, 3220]]}})
-        tx_uart.send_packet.side_effect = [_packet(bytes([1])), _packet(b""), _packet(config.to_wire_bytes())]
+        tx_uart.send_packet.side_effect = [_packet(b'{"TriggerStatus": "STOPPED"}'), _packet(bytes([1])),
+                                           _packet(b""), _packet(config.to_wire_bytes())]
 
         iface.load_preset(0, 0xAABBCCDD, 0x11223344, 400000.0, duration_index=2)
 
         sent = [c.kwargs for c in tx_uart.send_packet.call_args_list]
         # One count read: the HV scaling uses the module that check allowed, not a second read.
         self.assertEqual([s["command"] for s in sent],
-                         [OW_CTRL_GET_MODULE_COUNT, OW_PRESET_LOAD, OW_CMD_USR_CFG])
-        self.assertEqual((sent[1]["reserved"], bytes(sent[1]["data"])),
+                         [OW_CTRL_GET_SWTRIG, OW_CTRL_GET_MODULE_COUNT, OW_PRESET_LOAD, OW_CMD_USR_CFG])
+        self.assertEqual((sent[2]["reserved"], bytes(sent[2]["data"])),
                          (0, struct.pack("<III", 2, 0x11223344, 0xAABBCCDD)))
-        self.assertEqual((sent[2]["reserved"], sent[2]["addr"]), (0, 0))   # module 0's calibration, read only
+        self.assertEqual((sent[3]["reserved"], sent[3]["addr"]), (0, 0))   # module 0's calibration, read only
         sent = hv_uart.send_packet.call_args_list[0].kwargs
         self.assertEqual((sent["command"], sent["reserved"], bytes(sent["data"])),
                          (OW_POWER_PRESET_SELECT, 0, struct.pack("<If", 0xAABBCCDD, 3220.0)))
@@ -869,6 +872,7 @@ class TestInterfaceSurface(unittest.TestCase):
     FDA_ENDPOINTS = (
         "load_preset", "start_sonication", "stop_sonication", "is_running",
         "get_status", "is_device_connected", "close",
+        "pause_sonication", "resume_sonication",
     )
 
     def test_lifu_interface_extends_device_interface(self):
@@ -915,6 +919,7 @@ class TestComponentSurface(unittest.TestCase):
     TX_FDA = ("ping", "get_version", "get_hardware_id", "read_config",
               "refresh_metadata", "get_temperature", "get_ambient_temperature",
               "get_trigger", "get_trigger_json", "start_trigger", "stop_trigger",
+              "pause_trigger", "resume_trigger",
               "get_preset", "load_preset", "get_module_count")
     HV_FDA = ("ping", "get_version", "get_hardware_id", "read_config",
               "turn_hv_on", "turn_hv_off", "get_hv_status", "get_12v_status",
@@ -1032,6 +1037,7 @@ class TestCommandWhitelist(unittest.TestCase):
         calls = [tx.ping, tx.get_version, tx.get_hardware_id, tx.read_config,
                  lambda: tx.refresh_metadata(module_count=1), tx.get_temperature,
                  tx.get_ambient_temperature, tx.get_trigger_json, tx.start_trigger, tx.stop_trigger,
+                 tx.pause_trigger, tx.resume_trigger,
                  lambda: tx.get_preset(0), lambda: tx.load_preset(0, 1, settings_crc=2),
                  tx.unload_preset, tx.get_module_count,
                  hv.ping, hv.get_version, hv.read_config, hv.get_temperature1, hv.get_temperature2,
