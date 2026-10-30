@@ -187,7 +187,7 @@ def test_several_presets_link_the_console_hv_table(flash, tmp_path):
     tree = _tree(tmp_path)
     flash.write_preset_headers(tree, "console", True, _context(tmp_path))
     text = (tree / "Core/Inc/presets/preset_hv_table.h").read_text(encoding="utf-8")
-    assert "#define PRESET_HV_COUNT 2u" in text and "PRESET_HV_TABLE[" in text
+    assert "#define PRESET_HV_COUNT 2u" in text and "PRESET_HV_RECORDS[" in text
 
 
 @pytest.mark.parametrize("board", ["transmitter", "console"])
