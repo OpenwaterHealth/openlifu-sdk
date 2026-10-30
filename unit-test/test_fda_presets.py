@@ -543,12 +543,13 @@ class TestConsolePresets(unittest.TestCase):
             console_preset_record(dict(mc, sensitivity=None))
 
     def test_fda_headers_put_the_preset_in_its_section(self):
-        mc = _compiled(id="diathermy", voltage=40.0, sensitivity=3728)
+        mc = _compiled(id="diathermy", voltage=40.0, sensitivity=3728, voltage_range=[35, 45])
         with tempfile.TemporaryDirectory() as d:
             tx = generate_fda_preset(d, mc).read_text()
             con = generate_console_fda_preset(Path(d) / "console", mc).read_text()
+        # The console holds the select to the record's own range (v2; Peter, 2026-10-30).
         for text, symbol, data in ((tx, "FDA_PRESET_BLOB", preset_blob(mc)),
-                                   (con, "FDA_PRESET_HV", console_preset_record(mc))):
+                                   (con, "FDA_PRESET_HV", console_preset_record(mc, version=2))):
             self.assertIn('__attribute__((section(".fda_preset"), used))\nstatic const uint8_t %s[%d] = {'
                           % (symbol, len(data)), text)
             body = text[text.index(symbol):]

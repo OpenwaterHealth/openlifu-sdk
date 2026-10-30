@@ -335,8 +335,8 @@ class DeviceInterface:
         ``LIFUTXPresets.preset_voltage_range``), is checked against the
         voltage the console reports applying. A select outside it is refused
         like a device refusal. That is the host's check of the preset's range.
-        An FDA_MODE console never sees the range; it holds every select to its
-        own fixed 35-45 V hard stop as a second line.
+        A presets-only console checks it too, from its own PRESET_HV_RECORD v2,
+        under the image's 45 V ceiling (console-fw#21).
 
         Raises:
             LIFUError: The preset's module count differs from the

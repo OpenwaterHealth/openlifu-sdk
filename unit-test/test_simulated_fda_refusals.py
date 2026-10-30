@@ -6,7 +6,8 @@ Firmware behaviour mirrored here:
   nothing loaded (OW_NO_PRESET) or above the loaded preset's start_C
   (OW_TEMP_TOO_HIGH).
 - Console ``hv_presets.c``: no HV on with nothing selected (OW_HV_NO_PRESET);
-  a select whose rescaled voltage is outside 35-45 V is refused, not
+  a select whose rescaled voltage is outside the record's own
+  voltage_range, or above the image's 45 V ceiling, is refused, not
   clamped (OW_HV_RANGE); no select or deselect while HV is on
   (OW_HV_FDA_REFUSED); a non-positive sensitivity is refused (0xFE).
 
@@ -42,7 +43,7 @@ from openlifu_sdk.ui.simulated_interface import (  # noqa: E402 -- reason: after
 
 @pytest.fixture
 def iface():
-    mc, regs = flash_entry()
+    mc, regs = flash_entry(voltage_range=[35.0, 45.0])   # the FDA preset's range
     interface = SimulatedDeviceInterface(preset_flash=[(mc, regs)])
     interface.preset = (mc["settings_crc"], regs)
     yield interface
@@ -98,7 +99,7 @@ def test_select_returns_the_applied_voltage(iface):
 
 
 @pytest.mark.parametrize("sensitivity", [2267.0, 3500.0])   # 47.99 V and 31.09 V
-def test_select_outside_the_fda_window_is_refused_not_clamped(iface, sensitivity):
+def test_select_outside_the_records_range_is_refused_not_clamped(iface, sensitivity):
     settings_crc, _ = iface.preset
     with pytest.raises(LIFUDeviceError) as excinfo:
         iface.hvcontroller.select_preset(0, settings_crc, sensitivity)
@@ -247,19 +248,28 @@ def test_preset_37_42_loads_within_its_range(interface_cls):
 
 @pytest.mark.parametrize("interface_cls", [SimulatedDeviceInterface, SimulatedLIFUInterface])
 def test_the_host_holds_a_load_to_the_presets_own_range(interface_cls):
-    # Calibration 2507 at 400 kHz: 43.4 V, inside the FDA hard stop, outside this preset's [37, 42].
+    # Calibration 2507 at 400 kHz: 43.4 V, under the 45 V ceiling, outside this preset's [37, 42].
     mc, regs = flash_entry(voltage_range=[37.0, 42.0])
     interface = interface_cls(preset_flash=[(mc, regs)])
     try:
         interface.txdevice._user_configs[0]["module"]["sensitivity"] = [[400000, 2507]]
-        with pytest.raises(LIFUSolutionError, match="voltage_range"):
+        # A presets-only console refuses the select from its own record first;
+        # an RUO console applies it, and the host's check of the range refuses.
+        refusal = LIFUDeviceError if interface_cls is SimulatedDeviceInterface else LIFUSolutionError
+        with pytest.raises(refusal):
             interface.load_preset(0, mc["settings_crc"], regs, 400_000.0,
                                   voltage_range=tuple(mc["voltage_range"]), turn_hv_on=True)
         assert interface.hvcontroller.get_hv_status() is False
         assert interface.txdevice.get_loaded_preset() == (None, None)
-        # The consoles themselves never see the range: without it, the same load goes through.
-        interface.load_preset(0, mc["settings_crc"], regs, 400_000.0)
-        assert interface.hvcontroller.supply_voltage == pytest.approx(43.4, abs=0.01)
+        if interface_cls is SimulatedDeviceInterface:
+            # Without the host's range, the console still refuses.
+            with pytest.raises(LIFUDeviceError) as excinfo:
+                interface.load_preset(0, mc["settings_crc"], regs, 400_000.0)
+            assert _code(excinfo) == OW_HV_RANGE
+        else:
+            # An RUO console has no record rules: without the host's range, it applies it.
+            interface.load_preset(0, mc["settings_crc"], regs, 400_000.0)
+            assert interface.hvcontroller.supply_voltage == pytest.approx(43.4, abs=0.01)
     finally:
         interface.close()
 
@@ -282,13 +292,17 @@ def test_preset_35_55_works_unless_the_fda_hard_stop_is_crossed():
         fda.close()
 
 
-def test_preset_data_cannot_widen_the_fda_hard_stop(iface):
+def test_a_record_cannot_raise_the_45_v_ceiling(iface):
+    """Peter, 2026-10-30: a ceiling only, no fixed floor. A record's range
+    is held to, but its top is capped at 45 V."""
     console = iface.hvcontroller.get_preset(0)
-    iface.hvcontroller.configure_presets([dict(console, voltage_range=[5.0, 100.0], min_voltage=5.0, max_voltage=100.0)])
+    iface.hvcontroller.configure_presets([dict(console, voltage_range=[5.0, 100.0])])
     with pytest.raises(LIFUDeviceError) as excinfo:
         iface.hvcontroller.select_preset(0, iface.preset[0], 2267.0)   # 47.99 V
     assert _code(excinfo) == OW_HV_RANGE
-    assert (iface.hvcontroller.get_preset(0)["min_voltage"], iface.hvcontroller.get_preset(0)["max_voltage"]) == (35.0, 45.0)
+    assert (iface.hvcontroller.get_preset(0)["min_voltage"], iface.hvcontroller.get_preset(0)["max_voltage"]) == (5.0, 45.0)
+    # No fixed floor: 31.09 V is inside this record's range, so it applies.
+    assert iface.hvcontroller.select_preset(0, iface.preset[0], 3500.0) == pytest.approx(31.09, abs=0.01)
 
 
 def test_non_fda_console_has_no_fda_image_rules():
@@ -311,10 +325,11 @@ def test_non_fda_console_has_no_fda_image_rules():
     (45.0, 2720.0, True),                 # exactly 45.0 V
     (45.0, 2719.9995, False),             # next float32 sensitivity down: 45.000008 V
 ])
-def test_fda_hard_stop_boundaries_in_float32(voltage, transmitter, accepted):
+def test_record_range_boundaries_in_float32(voltage, transmitter, accepted):
     # The console computes voltage x preset sensitivity / transmitter in float32 and compares
-    # with 35.0f / 45.0f; the simulator does the same, so edge presets agree with hardware.
-    mc, regs = flash_entry(voltage=voltage)
+    # with the record's float32 range, [35.0f, 45.0f] here; the simulator does the same, so
+    # edge presets agree with hardware.
+    mc, regs = flash_entry(voltage=voltage, voltage_range=[35.0, 45.0])
     interface = SimulatedDeviceInterface(preset_flash=[(mc, regs)])
     try:
         if accepted:
