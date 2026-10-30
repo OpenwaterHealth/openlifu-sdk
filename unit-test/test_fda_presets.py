@@ -405,7 +405,7 @@ class TestConsolePresets(unittest.TestCase):
                    _compiled(id="b", voltage=20, sensitivity=2719.6, voltage_range=[15, 25])]
         with tempfile.TemporaryDirectory() as d:
             text = generate_console_presets(d, presets, "test").read_text()
-        body = re.search(r"PRESET_HV_RECORDS\[(\d+)\] = \{(.*?)\};", text, re.S)
+        body = re.search(r"PRESET_HV_TABLE\[(\d+)\] = \{(.*?)\};", text, re.S)
         table = bytes(int(b, 16) for b in re.findall(r"0x([0-9a-f]{2})", body.group(2)))
         self.assertEqual(int(body.group(1)), len(table))
         self.assertEqual(table, b"".join(console_preset_record(mc, version=2) for mc in presets))
@@ -477,9 +477,9 @@ class TestConsolePresets(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             tx = generate_fda_preset(d, mc).read_text()
             con = generate_console_fda_preset(Path(d) / "console", mc).read_text()
-        # The +fda console keeps its v1 record (console-fw#37); only +test links v2.
+        # The console holds the select to the record's own range (v2; Peter, 2026-10-30).
         for text, symbol, data in ((tx, "FDA_PRESET_BLOB", preset_blob(mc)),
-                                   (con, "FDA_PRESET_HV", console_preset_record(mc))):
+                                   (con, "FDA_PRESET_HV", console_preset_record(mc, version=2))):
             self.assertIn('__attribute__((section(".fda_preset"), used))\nstatic const uint8_t %s[%d] = {'
                           % (symbol, len(data)), text)
             body = text[text.index(symbol):]
