@@ -29,7 +29,7 @@ Connectivity/status
 - `close()` — close the UART connection.
 - `ping(module:int=0) -> bool` — simple ping command.
 - `get_version(module:int=0) -> str` — firmware version string.
-- `get_hardware_id(module:int=0) -> str` — formatted HWID.
+- `get_hardware_id(module:int=0, raw_hex=False, base58=False, legacy_6byte=False) -> str` — the addressed module's 12-byte MCU UID, in the same forms as `LIFUHVController.get_hardware_id`.
 
 Triggering and profiles
 - `set_trigger(...)` / `set_trigger_json(data)` — configure trigger parameters (pulse interval/count, mode, profile index, etc.).
