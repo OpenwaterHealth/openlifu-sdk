@@ -502,8 +502,10 @@ class TxDevice(OWComponent):
 
         Raises:
             LIFUDeviceError: Firmware without OW_PRESET_LOADED.
-            LIFUProtocolError: The reply is fewer than 16 bytes, or says
-                loaded while naming modules without the load.
+            LIFUProtocolError: The reply is fewer than 16 bytes, or is
+                one the firmware does not send: a loaded byte other than 0
+                or 1, loaded with modules missing or not loaded with none,
+                or a lone module naming another.
         """
         r = self.send_checked(packet_type=OW_CONTROLLER, command=OW_PRESET_LOADED,
                               addr=0 if module is None else module, op="get_loaded_preset")
@@ -511,19 +513,22 @@ class TxDevice(OWComponent):
             raise LIFUProtocolError(f"TX: get_loaded_preset payload too short ({r.data_len} < 16)",
                                     code=LIFU_ERR_BAD_PAYLOAD_LENGTH)
         d = bytes(r.data)
-        loaded = d[0] == 1
         train_count, settings_crc, regs_crc = struct.unpack("<III", d[3:15])
-        # Bit 0 is the replying module: the master, or *module* answering alone.
-        missing = [m for m in range(8) if d[15] & (1 << m)]
+        mask = d[15]
+        # SR-003 trusts this before Start, so only a reply the firmware can
+        # send is decoded: byte 0 is 1 exactly when no module is missing,
+        # and a module answering alone has only its own bit, bit 0.
+        if d[0] not in (0, 1) or (d[0] == 1) == bool(mask) or (module is not None and mask > 1):
+            raise LIFUProtocolError(
+                f"TX: get_loaded_preset reply is inconsistent (loaded byte {d[0]}, mask 0x{mask:02x})",
+                code=LIFU_ERR_BAD_PAYLOAD_FORMAT)
         if module is not None:
-            missing = [module] if missing else []
-        if not loaded:
+            missing = [module] if mask else []
+        else:
+            missing = [m for m in range(8) if mask & (1 << m)]
+        if missing:
             return {"loaded": False, "index": None, "duration_index": None, "train_count": None,
                     "settings_crc": None, "regs_crc": None, "missing_modules": missing}
-        if missing:
-            # SR-003 trusts this before Start: an inconsistent reply is not a load.
-            raise LIFUProtocolError(f"TX: get_loaded_preset says loaded but modules {missing} miss it",
-                                    code=LIFU_ERR_BAD_PAYLOAD_FORMAT)
         return {"loaded": True, "index": d[1], "duration_index": d[2], "train_count": train_count,
                 "settings_crc": settings_crc, "regs_crc": regs_crc, "missing_modules": missing}
 

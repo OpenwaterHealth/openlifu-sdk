@@ -90,8 +90,20 @@ def test_a_loaded_reply_naming_missing_modules_is_a_protocol_error():
     # SR-003 trusts the load before Start; an inconsistent reply is not one.
     tx, uart = _with_uart(TxDevice())
     uart.send_packet.return_value = _packet(_loaded_reply(True, 0, 0, 5, 1, 2, missing=0b10))
-    with pytest.raises(LIFUProtocolError, match=r"\[1\]"):
+    with pytest.raises(LIFUProtocolError, match="inconsistent"):
         tx.get_loaded_preset_state()
+
+
+@pytest.mark.parametrize(("reply", "module"), [
+    (_loaded_reply(False), None),                      # not loaded, yet no module missing
+    (bytes([2]) + bytes(15), None),                    # loaded byte neither 0 nor 1
+    (_loaded_reply(False, missing=0b10), 1),           # a lone module naming another
+])
+def test_a_reply_the_firmware_does_not_send_is_a_protocol_error(reply, module):
+    tx, uart = _with_uart(TxDevice())
+    uart.send_packet.return_value = _packet(reply)
+    with pytest.raises(LIFUProtocolError, match="inconsistent"):
+        tx.get_loaded_preset_state(module=module)
 
 
 def test_a_short_loaded_reply_is_a_protocol_error():

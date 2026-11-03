@@ -224,8 +224,6 @@ class SimulatedTxDevice:
             list(preset_flash) if preset_flash is not None
             else [self._default_flash_entry()]
         )
-        self._loaded_preset_index: Optional[int] = None
-        self._loaded_duration_index: Optional[int] = None
         # module -> (preset index, duration index) it holds loaded; each module
         # loads its own part of the preset, as on hardware.
         self._module_loads: dict[int, tuple[int, int]] = {}
@@ -376,17 +374,11 @@ class SimulatedTxDevice:
         self._pulse["duration"] = float(machine_config.get("pulse_length_us", 100.0)) / 1_000_000.0
         self._normalize_train_interval()
         self._module_loads[module] = (index, duration_index)
-        if module == 0:
-            self._loaded_preset_index = index
-            self._loaded_duration_index = duration_index
         return True
 
     def unload_preset(self, module: int = 0) -> bool:
         """Same contract as :meth:`TxDevice.unload_preset`."""
         self._module_loads.pop(module, None)
-        if module == 0:
-            self._loaded_preset_index = None
-            self._loaded_duration_index = None
         return True
 
     @property
@@ -598,12 +590,13 @@ class SimulatedTxDevice:
 
     def start_trigger(self):
         """Same refusals as an FDA_MODE transmitter (presets_start_check in
-        the firmware): nothing loaded, or module 0 above the loaded preset's
-        start_C. The simulator always has a temperature reading, so it never
-        reports OW_TEMP_UNKNOWN."""
-        if self._loaded_preset_index is None:
+        the firmware): nothing loaded on module 0, the master, or module 0
+        above the loaded preset's start_C. The simulator always has a
+        temperature reading, so it never reports OW_TEMP_UNKNOWN."""
+        load = self._module_loads.get(0)
+        if load is None:
             raise LIFUDeviceError("TX: no preset loaded", device_error_code=OW_NO_PRESET)
-        start_c = self._preset_flash[self._loaded_preset_index][0].get("start_C")
+        start_c = self._preset_flash[load[0]][0].get("start_C")
         if start_c is not None and self._modules[0].read_temp() > float(start_c):
             raise LIFUDeviceError(f"TX above start_C {float(start_c):.1f} C",
                                   device_error_code=OW_TEMP_TOO_HIGH)
