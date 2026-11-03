@@ -227,8 +227,9 @@ class SimulatedTxDevice:
         )
         self._loaded_preset_index: Optional[int] = None
         self._loaded_duration_index: Optional[int] = None
-        # Modules holding a loaded part of the preset (each loads its own, as on hardware).
-        self._loaded_modules: set[int] = set()
+        # module -> (preset index, duration index) it holds loaded; each module
+        # loads its own part of the preset, as on hardware.
+        self._loaded_modules: dict[int, tuple[int, int]] = {}
 
         # Reported firmware version. Mutable so an app-side debug UI
         # (or a test) can flip it to simulate an incompatible firmware
@@ -375,7 +376,7 @@ class SimulatedTxDevice:
         }
         self._pulse["duration"] = float(machine_config.get("pulse_length_us", 100.0)) / 1_000_000.0
         self._normalize_train_interval()
-        self._loaded_modules.add(module)
+        self._loaded_modules[module] = (index, duration_index)
         if module == 0:
             self._loaded_preset_index = index
             self._loaded_duration_index = duration_index
@@ -383,7 +384,7 @@ class SimulatedTxDevice:
 
     def unload_preset(self, module: int = 0) -> bool:
         """Same contract as :meth:`TxDevice.unload_preset`."""
-        self._loaded_modules.discard(module)
+        self._loaded_modules.pop(module, None)
         if module == 0:
             self._loaded_preset_index = None
             self._loaded_duration_index = None
@@ -396,21 +397,21 @@ class SimulatedTxDevice:
 
     def get_loaded_preset_state(self, module: Optional[int] = None) -> dict:
         """Same contract as :meth:`TxDevice.get_loaded_preset_state`
-        (OW_PRESET_LOADED): loaded only if module 0 and every other module
-        hold the load, with the modules that don't in ``missing_modules``."""
+        (OW_PRESET_LOADED): loaded only if every module holds module 0's
+        load, with the modules that don't in ``missing_modules``; with
+        *module*, that module's own load. ``train_count`` is the count the
+        load programmed."""
         modules = range(self.num_modules) if module is None else [module]
-        if self._loaded_preset_index is None:
-            missing = list(modules)
-        else:
-            missing = [m for m in modules if m not in self._loaded_modules]
+        load = self._loaded_modules.get(0 if module is None else module)
+        missing = [m for m in modules if load is None or self._loaded_modules.get(m) != load]
         if missing:
             return {"loaded": False, "index": None, "duration_index": None, "train_count": None,
                     "settings_crc": None, "regs_crc": None, "missing_modules": missing}
-        machine_config, flash_regs_crc = self._preset_flash[self._loaded_preset_index]
+        index, duration_index = load
+        machine_config, flash_regs_crc = self._preset_flash[index]
         crcs = self._module_crcs(flash_regs_crc)
-        return {"loaded": True, "index": self._loaded_preset_index,
-                "duration_index": self._loaded_duration_index,
-                "train_count": int(self._sequence["pulse_train_count"]),
+        return {"loaded": True, "index": index, "duration_index": duration_index,
+                "train_count": int(machine_config["pulse_train_count_selections"][duration_index]),
                 "settings_crc": int(machine_config["settings_crc"]),
                 "regs_crc": crcs[0 if module is None else module], "missing_modules": []}
 
@@ -660,7 +661,9 @@ class SimulatedLIFUTxDevice(SimulatedTxDevice):
     def _raw_write(self, what: str) -> None:
         """A register, profile or trigger write, as the DEV firmware gates it:
         refused while a loaded preset runs; otherwise it leaves nothing loaded
-        on any module."""
+        on any module. The firmware unloads the module a write runs on; the
+        simulator treats every raw write as reaching every module, so a
+        partial unload (one module in ``missing_modules``) is not modelled."""
         if self._loaded_modules and self._trigger_running:
             raise LIFUDeviceError(f"TX: {what} refused while a loaded preset runs",
                                   device_error_code=OW_PRESET_BUSY)

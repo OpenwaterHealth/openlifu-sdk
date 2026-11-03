@@ -80,6 +80,14 @@ def test_loaded_state_for_one_module_addresses_it():
     assert uart.send_packet.call_args.kwargs["addr"] == 1
 
 
+def test_a_loaded_reply_naming_missing_modules_is_a_protocol_error():
+    # SR-003 trusts the load before Start; an inconsistent reply is not one.
+    tx, uart = _with_uart(TxDevice())
+    uart.send_packet.return_value = _packet(_loaded_reply(True, 0, 0, 5, 1, 2, missing=0b10))
+    with pytest.raises(LIFUProtocolError, match=r"\[1\]"):
+        tx.get_loaded_preset_state()
+
+
 def test_a_short_loaded_reply_is_a_protocol_error():
     tx, uart = _with_uart(TxDevice())
     uart.send_packet.return_value = _packet(b"\x01\x00")

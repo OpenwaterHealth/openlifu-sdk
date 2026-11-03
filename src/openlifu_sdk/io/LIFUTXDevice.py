@@ -497,7 +497,8 @@ class TxDevice(OWComponent):
 
         Raises:
             LIFUDeviceError: Firmware without OW_PRESET_LOADED.
-            LIFUProtocolError: The reply is not 16 bytes.
+            LIFUProtocolError: The reply is not 16 bytes, or says loaded
+                while naming modules without the load.
         """
         r = self.send_checked(packet_type=OW_CONTROLLER, command=OW_PRESET_LOADED,
                               addr=0 if module is None else module, op="get_loaded_preset")
@@ -511,6 +512,10 @@ class TxDevice(OWComponent):
         if not loaded:
             return {"loaded": False, "index": None, "duration_index": None, "train_count": None,
                     "settings_crc": None, "regs_crc": None, "missing_modules": missing}
+        if missing:
+            # SR-003 trusts this before Start: an inconsistent reply is not a load.
+            raise LIFUProtocolError(f"TX: get_loaded_preset says loaded but modules {missing} miss it",
+                                    code=LIFU_ERR_BAD_PAYLOAD_FORMAT)
         return {"loaded": True, "index": d[1], "duration_index": d[2], "train_count": train_count,
                 "settings_crc": settings_crc, "regs_crc": regs_crc, "missing_modules": missing}
 

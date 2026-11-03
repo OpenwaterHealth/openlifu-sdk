@@ -14,7 +14,10 @@ pytest.importorskip("openlifu_sdk.ui._qt")
 from sr003_presets import flash_entry, two_module_flash_entry  # noqa: E402 -- reason: after the Qt importorskip
 
 from openlifu_sdk.io.exceptions import LIFUDeviceError  # noqa: E402 -- reason: after the Qt importorskip
-from openlifu_sdk.io.LIFUConfig import OW_PRESET_BUSY  # noqa: E402 -- reason: after the Qt importorskip
+from openlifu_sdk.io.LIFUConfig import (  # noqa: E402 -- reason: after the Qt importorskip
+    OW_PRESET_BUSY,
+    OW_TEMP_TOO_HIGH,
+)
 from openlifu_sdk.ui.simulated_interface import (  # noqa: E402 -- reason: after the Qt importorskip
     SimulatedLIFUTxDevice,
     SimulatedTxDevice,
@@ -62,15 +65,51 @@ def test_sim_one_module_without_the_load_reads_as_nothing_loaded():
     assert state["missing_modules"] == [1]
 
 
-def test_sim_dev_unlocked_raw_write_goes_through_and_unloads():
+def test_sim_one_module_reports_its_own_load():
+    tx, mc, regs = _sim(SimulatedTxDevice, two_module_flash_entry())
+    _load(tx, mc, regs, duration_index=1, modules=[1])
+
+    own = tx.get_loaded_preset_state(module=1)
+
+    assert own["loaded"] and own["missing_modules"] == []
+    assert (own["index"], own["duration_index"], own["regs_crc"]) == (0, 1, regs[1])
+    assert tx.get_loaded_preset_state(module=0)["missing_modules"] == [0]
+    assert tx.get_loaded_preset_state()["missing_modules"] == [0, 1]
+
+
+def test_sim_modules_holding_different_loads_are_not_loaded():
+    tx, mc, regs = _sim(SimulatedTxDevice, two_module_flash_entry())
+    _load(tx, mc, regs, duration_index=0, modules=[0])
+    _load(tx, mc, regs, duration_index=1, modules=[1])
+
+    assert tx.get_loaded_preset_state()["missing_modules"] == [1]
+
+
+@pytest.mark.parametrize("write", [
+    lambda tx: tx.set_trigger(pulse_train_count=99),
+    lambda tx: tx.set_trigger_json({"pulse_train_count": 99}),
+    lambda tx: tx.set_solution(sequence={"pulse_train_count": 99}),
+])
+def test_sim_dev_raw_write_goes_through_and_unloads(write):
     tx, mc, regs = _sim(SimulatedLIFUTxDevice, flash_entry())
     assert tx.is_preset_locked() is False
     _load(tx, mc, regs)
 
-    tx.set_trigger(pulse_train_count=99)
+    write(tx)
 
     assert tx.get_trigger()["pulse_train_count"] == 99
     assert tx.get_loaded_preset_state()["loaded"] is False
+
+
+def test_sim_dev_start_with_a_preset_loaded_is_gated_as_on_fda():
+    tx, mc, regs = _sim(SimulatedLIFUTxDevice, flash_entry())
+    _load(tx, mc, regs)
+    tx._modules[0].temp_c = float(mc["start_C"]) + 10
+
+    with pytest.raises(LIFUDeviceError) as excinfo:
+        tx.start_trigger()
+
+    assert _code(excinfo) == OW_TEMP_TOO_HIGH
 
 
 def test_sim_dev_unlocked_start_with_nothing_loaded_runs_the_host_config():
