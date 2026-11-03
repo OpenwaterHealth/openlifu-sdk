@@ -43,7 +43,6 @@ from openlifu_sdk.io.LIFUConfig import (
     OW_PRESET_GET,
     OW_PRESET_LOAD,
     OW_PRESET_LOADED,
-    OW_PRESET_LOCK,
     OW_PRESET_SLOT_TAIL,
     OW_PRESET_CAPACITY,
     OW_PRESET_WRITE,
@@ -493,8 +492,8 @@ class TxDevice(OWComponent):
 
         ``missing_modules`` lists the modules that do not hold the master's
         load (0 is the master): every module if the master holds nothing,
-        else each module holding nothing or another load. So a raw write that
-        unloaded one module on a DEV image shows up here. The firmware sends
+        else each module holding nothing or another load, for example one
+        that was reset after the load. The firmware sends
         it as byte 15, one bit per module, relative to the replying module
         (if_commands.c ``preset_loaded_reply``).
 
@@ -537,21 +536,6 @@ class TxDevice(OWComponent):
         """
         state = self.get_loaded_preset_state()
         return state["index"], state["duration_index"]
-
-    def is_preset_locked(self) -> bool:
-        """Is the preset lock on (OW_PRESET_LOCK, read)? Always, on an FDA
-        image. The host never sets it (openlifu-operator-interface#192).
-
-        Raises:
-            LIFUDeviceError: Firmware without the lock.
-            LIFUProtocolError: The reply is empty.
-        """
-        r = self.send_checked(packet_type=OW_CONTROLLER, command=OW_PRESET_LOCK,
-                              reserved=0, op="is_preset_locked")
-        if r.data_len < 1:
-            raise LIFUProtocolError("TX: is_preset_locked payload empty",
-                                    code=LIFU_ERR_BAD_PAYLOAD_LENGTH)
-        return r.data[0] == 1
 
     def get_module_count(self) -> int:
         """Return the number of connected LIFU transmitter modules.
@@ -964,14 +948,13 @@ class LIFUTxDevice(LIFUComponentMixin, TxDevice):
         return {**got, "state": "preset"}
 
     def get_preset_capacity(self) -> Dict | None:
-        """How many presets a DEV image can store (OW_PRESET_CAPACITY).
+        """How many presets a PRESET_MODE image can hold (OW_PRESET_CAPACITY).
 
         Returns ``slots``, ``free`` (slots holding neither a preset nor the
         second half of one), ``slot_size`` and ``blob_max`` (bytes), as the
-        firmware has them. None when the image cannot store presets: an FDA
-        image, a DEV image running under the bootloader, or firmware that
-        predates the query. The answer is the first module's; every module has
-        the same slots.
+        firmware has them. None when the image has no slots to describe: an
+        FDA_MODE image, or firmware that predates the query. The answer is
+        the first module's; every module has the same slots.
         """
         try:
             r = self.send_checked(packet_type=OW_CONTROLLER, command=OW_PRESET_CAPACITY, op="get_preset_capacity")

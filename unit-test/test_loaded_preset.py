@@ -1,10 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
-"""The preset lock and the loaded-preset query (transmitter-fw#41, #44).
+"""The loaded-preset query (OW_PRESET_LOADED; transmitter-fw#44), which a
+host confirms just before Start (SR-003).
 
-- Real components, mocked UART: the OW_PRESET_LOADED / OW_PRESET_LOCK
-  replies decode as the firmware writes them (if_commands.c), and the FDA
-  TxDevice may read the lock but not set it.
-The simulator's side is in test_simulated_preset_lock.py.
+Real components, mocked UART: the reply decodes as the firmware writes it
+(if_commands.c ``preset_loaded_reply``). The simulator's side is in
+test_simulated_loaded_preset.py.
 """
 
 from __future__ import annotations
@@ -18,10 +18,9 @@ from openlifu_sdk.io.exceptions import LIFUProtocolError
 from openlifu_sdk.io.LIFUConfig import (
     OW_CONTROLLER,
     OW_PRESET_LOADED,
-    OW_PRESET_LOCK,
     OW_RESP,
 )
-from openlifu_sdk.io.LIFUTXDevice import LIFUTxDevice, TxDevice
+from openlifu_sdk.io.LIFUTXDevice import TxDevice
 from openlifu_sdk.io.uart import OWUart
 
 
@@ -101,21 +100,3 @@ def test_a_short_loaded_reply_is_a_protocol_error():
     with pytest.raises(LIFUProtocolError):
         tx.get_loaded_preset_state()
 
-
-def test_the_fda_txdevice_reads_the_lock():
-    tx, uart = _with_uart(TxDevice())
-    uart.send_packet.return_value = _packet(b"\x01")
-    assert tx.is_preset_locked() is True
-    sent = uart.send_packet.call_args.kwargs
-    assert (sent["command"], sent["reserved"]) == (OW_PRESET_LOCK, 0)
-
-
-def test_the_fda_txdevice_cannot_set_the_lock():
-    tx, uart = _with_uart(TxDevice())
-    with pytest.raises(ValueError):
-        tx.send(OW_PRESET_LOCK, reserved=1, packet_type=OW_CONTROLLER)
-    uart.send_packet.assert_not_called()
-    assert not hasattr(TxDevice, "lock_presets")
-
-    # The host never sets the lock (openlifu-operator-interface#192).
-    assert not hasattr(LIFUTxDevice, "lock_presets")

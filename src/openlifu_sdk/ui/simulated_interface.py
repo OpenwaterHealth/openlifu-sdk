@@ -76,7 +76,6 @@ from openlifu_sdk.io.LIFUConfig import (
     OW_HV_RANGE,
     OW_HV_DATA_ERROR,
     OW_NO_PRESET,
-    OW_PRESET_BUSY,
     OW_TEMP_TOO_HIGH,
 )
 from openlifu_sdk.io.LIFUTXPresets import module_regs_crcs, preset_sensitivity, preset_voltage
@@ -229,7 +228,7 @@ class SimulatedTxDevice:
         self._loaded_duration_index: Optional[int] = None
         # module -> (preset index, duration index) it holds loaded; each module
         # loads its own part of the preset, as on hardware.
-        self._loaded_modules: dict[int, tuple[int, int]] = {}
+        self._module_loads: dict[int, tuple[int, int]] = {}
 
         # Reported firmware version. Mutable so an app-side debug UI
         # (or a test) can flip it to simulate an incompatible firmware
@@ -376,7 +375,7 @@ class SimulatedTxDevice:
         }
         self._pulse["duration"] = float(machine_config.get("pulse_length_us", 100.0)) / 1_000_000.0
         self._normalize_train_interval()
-        self._loaded_modules[module] = (index, duration_index)
+        self._module_loads[module] = (index, duration_index)
         if module == 0:
             self._loaded_preset_index = index
             self._loaded_duration_index = duration_index
@@ -384,11 +383,18 @@ class SimulatedTxDevice:
 
     def unload_preset(self, module: int = 0) -> bool:
         """Same contract as :meth:`TxDevice.unload_preset`."""
-        self._loaded_modules.pop(module, None)
+        self._module_loads.pop(module, None)
         if module == 0:
             self._loaded_preset_index = None
             self._loaded_duration_index = None
         return True
+
+    @property
+    def _loaded_modules(self) -> set[int]:
+        """The modules holding a load. Kept as a set for downstream tests
+        that inspect it (operator-interface tests/test_no_auto_restart.py);
+        :meth:`get_loaded_preset_state` with ``module`` is the public read."""
+        return set(self._module_loads)
 
     def get_loaded_preset(self) -> tuple[Optional[int], Optional[int]]:
         """Same contract as :meth:`TxDevice.get_loaded_preset`."""
@@ -402,8 +408,8 @@ class SimulatedTxDevice:
         *module*, that module's own load. ``train_count`` is the count the
         load programmed."""
         modules = range(self.num_modules) if module is None else [module]
-        load = self._loaded_modules.get(0 if module is None else module)
-        missing = [m for m in modules if load is None or self._loaded_modules.get(m) != load]
+        load = self._module_loads.get(0 if module is None else module)
+        missing = [m for m in modules if load is None or self._module_loads.get(m) != load]
         if missing:
             return {"loaded": False, "index": None, "duration_index": None, "train_count": None,
                     "settings_crc": None, "regs_crc": None, "missing_modules": missing}
@@ -414,11 +420,6 @@ class SimulatedTxDevice:
                 "train_count": int(machine_config["pulse_train_count_selections"][duration_index]),
                 "settings_crc": int(machine_config["settings_crc"]),
                 "regs_crc": crcs[0 if module is None else module], "missing_modules": []}
-
-    def is_preset_locked(self) -> bool:
-        """Same contract as :meth:`TxDevice.is_preset_locked`: an FDA image
-        is always locked."""
-        return True
 
     def is_connected(self) -> bool:
         return self._connected
@@ -647,39 +648,13 @@ class SimulatedTxDevice:
 
 
 class SimulatedLIFUTxDevice(SimulatedTxDevice):
-    """Fake of the RUO :class:`~openlifu_sdk.io.LIFUTXDevice.LIFUTxDevice`
-    on a DEV image (transmitter-fw presets.h): full host control, with
-    raw writes gated around a loaded preset."""
+    """Fake of the RUO :class:`~openlifu_sdk.io.LIFUTXDevice.LIFUTxDevice`."""
 
     _async_mode = False
 
-    def is_preset_locked(self) -> bool:
-        """Same contract as :meth:`TxDevice.is_preset_locked`: the host
-        never locks a DEV image."""
-        return False
-
-    def _raw_write(self, what: str) -> None:
-        """A register, profile or trigger write, as the DEV firmware gates it
-        (if_commands.c ``preset_gate``): the master, module 0, refuses it while
-        its loaded preset runs; otherwise it leaves nothing loaded. The
-        firmware unloads the module a write runs on; the simulator treats
-        every raw write as reaching every module, so a partial unload (one
-        module in ``missing_modules``) is not modelled."""
-        if 0 in self._loaded_modules and self._trigger_running:
-            raise LIFUDeviceError(f"TX: {what} refused while a loaded preset runs",
-                                  device_error_code=OW_PRESET_BUSY)
-        for module in list(self._loaded_modules):
-            self.unload_preset(module)
-
     def start_trigger(self):
-        """With nothing loaded, a DEV image starts whatever solution was
-        programmed. With a preset loaded, it gates the start as an FDA image
-        does. As in the firmware (if_commands.c ``start_sequence``), the
-        master's own load decides, as it does for the raw-write gate; a load
-        on another module alone does not gate the start."""
-        if self._loaded_preset_index is not None:
-            super().start_trigger()
-            return
+        """An RUO image starts whatever solution was programmed; there is no
+        preset gate."""
         self._trigger_running = True
 
     def get_tx_module_count(self) -> int:
@@ -697,7 +672,6 @@ class SimulatedLIFUTxDevice(SimulatedTxDevice):
     def set_solution(self, pulse=None, delays=None, apodizations=None,
                      sequence=None, profile_index=1, profile_increment=True,
                      trigger_mode="sequence"):
-        self._raw_write("set_solution")
         if pulse:
             self._pulse = dict(pulse)
         if sequence:
@@ -708,7 +682,6 @@ class SimulatedLIFUTxDevice(SimulatedTxDevice):
     def set_trigger(self, pulse_interval=None, pulse_count=None,
                     pulse_train_interval=None, pulse_train_count=None,
                     trigger_mode="sequence"):
-        self._raw_write("set_trigger")
         if pulse_interval is not None:
             self._sequence["pulse_interval"] = float(pulse_interval)
         if pulse_count is not None:
@@ -721,7 +694,6 @@ class SimulatedLIFUTxDevice(SimulatedTxDevice):
         return self.get_trigger_json()
 
     def set_trigger_json(self, data) -> dict:
-        self._raw_write("set_trigger_json")
         if isinstance(data, dict):
             for k in ("pulse_interval", "pulse_count",
                       "pulse_train_interval", "pulse_train_count"):

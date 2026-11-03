@@ -1,8 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
-"""The simulator's preset lock and loaded-preset query (transmitter-fw#41, #44).
-
-SimulatedTxDevice is an FDA image: always locked. SimulatedLIFUTxDevice is a
-DEV image the host never locks: raw writes leave nothing loaded.
+"""The simulator's loaded-preset query (OW_PRESET_LOADED; transmitter-fw#44),
+with the same contract as TxDevice.get_loaded_preset_state.
 """
 
 from __future__ import annotations
@@ -13,11 +11,6 @@ pytest.importorskip("openlifu_sdk.ui._qt")
 
 from sr003_presets import flash_entry, two_module_flash_entry  # noqa: E402 -- reason: after the Qt importorskip
 
-from openlifu_sdk.io.exceptions import LIFUDeviceError  # noqa: E402 -- reason: after the Qt importorskip
-from openlifu_sdk.io.LIFUConfig import (  # noqa: E402 -- reason: after the Qt importorskip
-    OW_PRESET_BUSY,
-    OW_TEMP_TOO_HIGH,
-)
 from openlifu_sdk.ui.simulated_interface import (  # noqa: E402 -- reason: after the Qt importorskip
     SimulatedLIFUTxDevice,
     SimulatedTxDevice,
@@ -36,13 +29,8 @@ def _load(tx, mc, regs, duration_index=0, modules=None):
         tx.load_preset(0, crcs[module], duration_index, settings_crc=mc["settings_crc"], module=module)
 
 
-def _code(excinfo):
-    return excinfo.value.device_error_code
-
-
-def test_sim_fda_reports_the_load_and_is_always_locked():
+def test_sim_reports_the_load():
     tx, mc, regs = _sim(SimulatedTxDevice, flash_entry())
-    assert tx.is_preset_locked() is True
     assert tx.get_loaded_preset_state()["loaded"] is False
 
     _load(tx, mc, regs, duration_index=1)
@@ -83,61 +71,6 @@ def test_sim_modules_holding_different_loads_are_not_loaded():
     _load(tx, mc, regs, duration_index=1, modules=[1])
 
     assert tx.get_loaded_preset_state()["missing_modules"] == [1]
-
-
-@pytest.mark.parametrize("write", [
-    lambda tx: tx.set_trigger(pulse_train_count=99),
-    lambda tx: tx.set_trigger_json({"pulse_train_count": 99}),
-    lambda tx: tx.set_solution(sequence={"pulse_train_count": 99}),
-])
-def test_sim_dev_raw_write_goes_through_and_unloads(write):
-    tx, mc, regs = _sim(SimulatedLIFUTxDevice, flash_entry())
-    assert tx.is_preset_locked() is False
-    _load(tx, mc, regs)
-
-    write(tx)
-
-    assert tx.get_trigger()["pulse_train_count"] == 99
-    assert tx.get_loaded_preset_state()["loaded"] is False
-
-
-def test_sim_dev_gates_follow_the_master_as_the_firmware_does():
-    # A load on module 1 alone: the master holds nothing, so neither the
-    # raw-write gate nor the Start gate applies (if_commands.c).
-    tx, mc, regs = _sim(SimulatedLIFUTxDevice, two_module_flash_entry())
-    _load(tx, mc, regs, modules=[1])
-    tx.start_trigger()
-    tx.set_trigger(pulse_train_count=99)
-    assert tx.get_loaded_preset_state(module=1)["loaded"] is False
-
-
-def test_sim_dev_start_with_a_preset_loaded_is_gated_as_on_fda():
-    tx, mc, regs = _sim(SimulatedLIFUTxDevice, flash_entry())
-    _load(tx, mc, regs)
-    tx._modules[0].temp_c = float(mc["start_C"]) + 10
-
-    with pytest.raises(LIFUDeviceError) as excinfo:
-        tx.start_trigger()
-
-    assert _code(excinfo) == OW_TEMP_TOO_HIGH
-
-
-def test_sim_dev_unlocked_start_with_nothing_loaded_runs_the_host_config():
-    tx, _, _ = _sim(SimulatedLIFUTxDevice, flash_entry())
-    tx.start_trigger()
-    assert tx.get_trigger()["trigger_status"] == "RUNNING"
-
-
-def test_sim_dev_raw_write_while_a_loaded_preset_runs_is_refused():
-    tx, mc, regs = _sim(SimulatedLIFUTxDevice, flash_entry())
-    _load(tx, mc, regs)
-    tx.start_trigger()
-
-    with pytest.raises(LIFUDeviceError) as excinfo:
-        tx.set_trigger(pulse_train_count=99)
-
-    assert _code(excinfo) == OW_PRESET_BUSY
-    assert tx.get_loaded_preset_state()["loaded"] is True
 
 
 def test_sim_console_reports_the_voltage_as_float32():

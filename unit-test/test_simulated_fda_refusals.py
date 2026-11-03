@@ -183,10 +183,10 @@ def test_a_two_module_preset_loads_on_a_two_module_transmitter(interface_cls):
     interface = interface_cls(num_modules=2, preset_flash=[(mc, regs)])
     try:
         interface.load_preset(0, mc["settings_crc"], regs, 400_000.0)
-        assert set(interface.txdevice._loaded_modules) == {0, 1}
+        assert interface.txdevice._loaded_modules == {0, 1}
         assert interface.get_status() == LIFUInterfaceStatus.STATUS_READY
         interface.unload_preset()
-        assert not interface.txdevice._loaded_modules
+        assert interface.txdevice._loaded_modules == set()
     finally:
         interface.close()
 
@@ -202,7 +202,7 @@ def test_a_preset_whose_module_count_differs_from_the_transmitter_is_refused(int
             with pytest.raises(LIFUError) as excinfo:
                 interface.load_preset(0, mc["settings_crc"], regs, 400_000.0)
             assert excinfo.value.code == LIFU_ERR_MODULE_COUNT_MISMATCH
-            assert not interface.txdevice._loaded_modules
+            assert interface.txdevice._loaded_modules == set()
             assert interface.get_status() == LIFUInterfaceStatus.STATUS_ERROR
         finally:
             interface.close()
@@ -215,7 +215,7 @@ def test_a_module_crc_from_another_preset_is_refused_by_that_module():
         with pytest.raises(LIFUDeviceError) as excinfo:
             interface.load_preset(0, mc["settings_crc"], [regs[0], regs[0]], 400_000.0)
         assert _code(excinfo) == OW_BAD_CRC
-        assert not interface.txdevice._loaded_modules   # on both or on neither
+        assert interface.txdevice._loaded_modules == set()   # on both or on neither
     finally:
         interface.close()
 
