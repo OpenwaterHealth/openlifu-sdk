@@ -76,8 +76,15 @@ def test_loaded_state_names_the_modules_without_the_load():
 def test_loaded_state_for_one_module_addresses_it():
     tx, uart = _with_uart(TxDevice())
     uart.send_packet.return_value = _packet(_loaded_reply(True, 0, 0, 5, 1, 2))
-    tx.get_loaded_preset_state(module=1)
+    assert tx.get_loaded_preset_state(module=1)["missing_modules"] == []
     assert uart.send_packet.call_args.kwargs["addr"] == 1
+
+
+def test_one_module_without_a_load_names_itself():
+    # The module answers alone, so its own bit is bit 0 (if_commands.c).
+    tx, uart = _with_uart(TxDevice())
+    uart.send_packet.return_value = _packet(_loaded_reply(False, missing=0b1))
+    assert tx.get_loaded_preset_state(module=1)["missing_modules"] == [1]
 
 
 def test_a_loaded_reply_naming_missing_modules_is_a_protocol_error():

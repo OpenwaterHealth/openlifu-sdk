@@ -489,16 +489,22 @@ class TxDevice(OWComponent):
         then the dict also carries ``index``, ``duration_index``,
         ``train_count`` (the pulse-train count the load programmed),
         ``settings_crc`` and ``regs_crc`` (the master's own part). Otherwise
-        those are None. ``missing_modules`` lists the modules that hold
-        nothing or another load (0 is the master), so a raw write that
-        unloaded one module on a DEV image shows up here.
+        those are None.
 
-        With *module*, that module's own state alone, for diagnostics.
+        ``missing_modules`` lists the modules that do not hold the master's
+        load (0 is the master): every module if the master holds nothing,
+        else each module holding nothing or another load. So a raw write that
+        unloaded one module on a DEV image shows up here. The firmware sends
+        it as byte 15, one bit per module, relative to the replying module
+        (if_commands.c ``preset_loaded_reply``).
+
+        With *module*, that module answers for itself alone, for diagnostics:
+        ``missing_modules`` is ``[module]`` if it holds nothing, else ``[]``.
 
         Raises:
             LIFUDeviceError: Firmware without OW_PRESET_LOADED.
-            LIFUProtocolError: The reply is not 16 bytes, or says loaded
-                while naming modules without the load.
+            LIFUProtocolError: The reply is fewer than 16 bytes, or says
+                loaded while naming modules without the load.
         """
         r = self.send_checked(packet_type=OW_CONTROLLER, command=OW_PRESET_LOADED,
                               addr=0 if module is None else module, op="get_loaded_preset")
@@ -508,7 +514,10 @@ class TxDevice(OWComponent):
         d = bytes(r.data)
         loaded = d[0] == 1
         train_count, settings_crc, regs_crc = struct.unpack("<III", d[3:15])
+        # Bit 0 is the replying module: the master, or *module* answering alone.
         missing = [m for m in range(8) if d[15] & (1 << m)]
+        if module is not None:
+            missing = [module] if missing else []
         if not loaded:
             return {"loaded": False, "index": None, "duration_index": None, "train_count": None,
                     "settings_crc": None, "regs_crc": None, "missing_modules": missing}
@@ -535,7 +544,7 @@ class TxDevice(OWComponent):
 
         Raises:
             LIFUDeviceError: Firmware without the lock.
-            LIFUProtocolError: The reply is not 1 byte.
+            LIFUProtocolError: The reply is empty.
         """
         r = self.send_checked(packet_type=OW_CONTROLLER, command=OW_PRESET_LOCK,
                               reserved=0, op="is_preset_locked")

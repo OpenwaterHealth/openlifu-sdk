@@ -101,6 +101,16 @@ def test_sim_dev_raw_write_goes_through_and_unloads(write):
     assert tx.get_loaded_preset_state()["loaded"] is False
 
 
+def test_sim_dev_gates_follow_the_master_as_the_firmware_does():
+    # A load on module 1 alone: the master holds nothing, so neither the
+    # raw-write gate nor the Start gate applies (if_commands.c).
+    tx, mc, regs = _sim(SimulatedLIFUTxDevice, two_module_flash_entry())
+    _load(tx, mc, regs, modules=[1])
+    tx.start_trigger()
+    tx.set_trigger(pulse_train_count=99)
+    assert tx.get_loaded_preset_state(module=1)["loaded"] is False
+
+
 def test_sim_dev_start_with_a_preset_loaded_is_gated_as_on_fda():
     tx, mc, regs = _sim(SimulatedLIFUTxDevice, flash_entry())
     _load(tx, mc, regs)

@@ -659,12 +659,13 @@ class SimulatedLIFUTxDevice(SimulatedTxDevice):
         return False
 
     def _raw_write(self, what: str) -> None:
-        """A register, profile or trigger write, as the DEV firmware gates it:
-        refused while a loaded preset runs; otherwise it leaves nothing loaded
-        on any module. The firmware unloads the module a write runs on; the
-        simulator treats every raw write as reaching every module, so a
-        partial unload (one module in ``missing_modules``) is not modelled."""
-        if self._loaded_modules and self._trigger_running:
+        """A register, profile or trigger write, as the DEV firmware gates it
+        (if_commands.c ``preset_gate``): the master, module 0, refuses it while
+        its loaded preset runs; otherwise it leaves nothing loaded. The
+        firmware unloads the module a write runs on; the simulator treats
+        every raw write as reaching every module, so a partial unload (one
+        module in ``missing_modules``) is not modelled."""
+        if 0 in self._loaded_modules and self._trigger_running:
             raise LIFUDeviceError(f"TX: {what} refused while a loaded preset runs",
                                   device_error_code=OW_PRESET_BUSY)
         for module in list(self._loaded_modules):
@@ -673,7 +674,9 @@ class SimulatedLIFUTxDevice(SimulatedTxDevice):
     def start_trigger(self):
         """With nothing loaded, a DEV image starts whatever solution was
         programmed. With a preset loaded, it gates the start as an FDA image
-        does."""
+        does. As in the firmware (if_commands.c ``start_sequence``), the
+        master's own load decides, as it does for the raw-write gate; a load
+        on another module alone does not gate the start."""
         if self._loaded_preset_index is not None:
             super().start_trigger()
             return
