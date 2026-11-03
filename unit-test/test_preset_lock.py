@@ -21,7 +21,6 @@ from openlifu_sdk.io.LIFUConfig import (
     OW_PRESET_LOCK,
     OW_RESP,
 )
-from openlifu_sdk.io.LIFUInterface import LIFUInterface
 from openlifu_sdk.io.LIFUTXDevice import LIFUTxDevice, TxDevice
 from openlifu_sdk.io.uart import OWUart
 
@@ -103,36 +102,5 @@ def test_the_fda_txdevice_cannot_set_the_lock():
     uart.send_packet.assert_not_called()
     assert not hasattr(TxDevice, "lock_presets")
 
-
-def test_lock_presets_sends_the_lock_and_checks_the_reply():
-    tx, uart = _with_uart(LIFUTxDevice())
-    uart.send_packet.return_value = _packet(b"\x01")
-    assert tx.lock_presets() is True
-    sent = uart.send_packet.call_args.kwargs
-    assert (sent["command"], sent["reserved"]) == (OW_PRESET_LOCK, 1)
-
-    uart.send_packet.return_value = _packet(b"\x00")
-    with pytest.raises(LIFUProtocolError):
-        tx.lock_presets()
-
-
-def test_preset_lock_needs_a_synchronous_interface():
-    with pytest.raises(ValueError):
-        LIFUInterface(preset_lock=True, run_async=True)
-
-
-def test_preset_lock_locks_the_transmitter_once_it_connects(monkeypatch):
-    # Build only the attributes _connect_devices uses; no USB involved.
-    iface = LIFUInterface.__new__(LIFUInterface)
-    iface._async_mode = False
-    iface._preset_lock = True
-    iface.txdevice = MagicMock()
-    iface.txdevice.is_connected.return_value = True
-    iface.hvcontroller = None
-    iface._connect_devices()
-    iface.txdevice.lock_presets.assert_called_once_with()
-
-    iface.txdevice.reset_mock()
-    iface.txdevice.is_connected.return_value = False
-    iface._connect_devices()
-    iface.txdevice.lock_presets.assert_not_called()
+    # The host never sets the lock (openlifu-operator-interface#192).
+    assert not hasattr(LIFUTxDevice, "lock_presets")

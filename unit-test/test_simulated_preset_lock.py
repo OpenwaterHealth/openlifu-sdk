@@ -2,8 +2,7 @@
 """The simulator's preset lock and loaded-preset query (transmitter-fw#41, #44).
 
 SimulatedTxDevice is an FDA image: always locked. SimulatedLIFUTxDevice is a
-DEV image: full control until locked, raw writes leave nothing loaded, and
-locked it refuses what an FDA image refuses.
+DEV image the host never locks: raw writes leave nothing loaded.
 """
 
 from __future__ import annotations
@@ -15,14 +14,8 @@ pytest.importorskip("openlifu_sdk.ui._qt")
 from sr003_presets import flash_entry, two_module_flash_entry  # noqa: E402 -- reason: after the Qt importorskip
 
 from openlifu_sdk.io.exceptions import LIFUDeviceError  # noqa: E402 -- reason: after the Qt importorskip
-from openlifu_sdk.io.LIFUConfig import (  # noqa: E402 -- reason: after the Qt importorskip
-    OW_FDA_REFUSED,
-    OW_INVALID_PACKET,
-    OW_NO_PRESET,
-    OW_PRESET_BUSY,
-)
+from openlifu_sdk.io.LIFUConfig import OW_PRESET_BUSY  # noqa: E402 -- reason: after the Qt importorskip
 from openlifu_sdk.ui.simulated_interface import (  # noqa: E402 -- reason: after the Qt importorskip
-    SimulatedLIFUInterface,
     SimulatedLIFUTxDevice,
     SimulatedTxDevice,
 )
@@ -96,43 +89,6 @@ def test_sim_dev_raw_write_while_a_loaded_preset_runs_is_refused():
 
     assert _code(excinfo) == OW_PRESET_BUSY
     assert tx.get_loaded_preset_state()["loaded"] is True
-
-
-def test_sim_dev_locked_refuses_what_fda_refuses():
-    tx, mc, regs = _sim(SimulatedLIFUTxDevice, flash_entry())
-    tx.lock_presets()
-    assert tx.is_preset_locked() is True
-
-    for write in (lambda: tx.set_trigger(pulse_train_count=99),
-                  lambda: tx.set_trigger_json({"pulse_train_count": 99}),
-                  lambda: tx.set_solution(sequence={"pulse_train_count": 99})):
-        with pytest.raises(LIFUDeviceError) as excinfo:
-            write()
-        assert _code(excinfo) == OW_INVALID_PACKET
-    with pytest.raises(LIFUDeviceError) as excinfo:
-        tx.write_config_json("{}")
-    assert _code(excinfo) == OW_FDA_REFUSED
-
-    # Presets still load and report; the trigger needs one.
-    with pytest.raises(LIFUDeviceError) as excinfo:
-        tx.start_trigger()
-    assert _code(excinfo) == OW_NO_PRESET
-    _load(tx, mc, regs)
-    assert tx.get_loaded_preset_state()["loaded"] is True
-
-
-def test_sim_lifu_interface_locks_on_request():
-    mc, regs = flash_entry()
-    iface = SimulatedLIFUInterface(preset_flash=[(mc, regs)], preset_lock=True)
-    try:
-        assert iface.txdevice.is_preset_locked() is True
-    finally:
-        iface.close()
-    iface = SimulatedLIFUInterface(preset_flash=[(mc, regs)])
-    try:
-        assert iface.txdevice.is_preset_locked() is False
-    finally:
-        iface.close()
 
 
 def test_sim_console_reports_the_voltage_as_float32():

@@ -70,13 +70,11 @@ from openlifu_sdk.io.exceptions import LIFUDeviceError, LIFUError, LIFUSolutionE
 from openlifu_sdk.io.LIFUConfig import (
     LIFU_ERR_MODULE_COUNT_MISMATCH,
     OW_BAD_CRC,
-    OW_FDA_REFUSED,
     OW_HV_FDA_REFUSED,
     OW_HV_NO_PRESET,
     OW_HV_PRESET_CRC,
     OW_HV_RANGE,
     OW_HV_DATA_ERROR,
-    OW_INVALID_PACKET,
     OW_NO_PRESET,
     OW_PRESET_BUSY,
     OW_TEMP_TOO_HIGH,
@@ -649,29 +647,20 @@ class SimulatedTxDevice:
 
 class SimulatedLIFUTxDevice(SimulatedTxDevice):
     """Fake of the RUO :class:`~openlifu_sdk.io.LIFUTXDevice.LIFUTxDevice`
-    on a DEV image (transmitter-fw presets.h): full host control until
-    :meth:`lock_presets`, then what an FDA image refuses is refused."""
+    on a DEV image (transmitter-fw presets.h): full host control, with
+    raw writes gated around a loaded preset."""
 
     _async_mode = False
-    _locked = False
 
     def is_preset_locked(self) -> bool:
-        """Same contract as :meth:`TxDevice.is_preset_locked`."""
-        return self._locked
-
-    def lock_presets(self) -> bool:
-        """Same contract as :meth:`LIFUTxDevice.lock_presets`; the simulator
-        has no reset, so it stays locked."""
-        self._locked = True
-        return True
+        """Same contract as :meth:`TxDevice.is_preset_locked`: the host
+        never locks a DEV image."""
+        return False
 
     def _raw_write(self, what: str) -> None:
         """A register, profile or trigger write, as the DEV firmware gates it:
-        refused while locked; refused while a loaded preset runs; otherwise
-        it leaves nothing loaded on any module."""
-        if self._locked:
-            raise LIFUDeviceError(f"TX: {what} refused by the preset lock",
-                                  device_error_code=OW_INVALID_PACKET)
+        refused while a loaded preset runs; otherwise it leaves nothing loaded
+        on any module."""
         if self._loaded_modules and self._trigger_running:
             raise LIFUDeviceError(f"TX: {what} refused while a loaded preset runs",
                                   device_error_code=OW_PRESET_BUSY)
@@ -679,10 +668,10 @@ class SimulatedLIFUTxDevice(SimulatedTxDevice):
             self.unload_preset(module)
 
     def start_trigger(self):
-        """Unlocked with nothing loaded, a DEV image starts whatever solution
-        was programmed. With a preset loaded, or locked, it gates the start as
-        an FDA image does."""
-        if self._locked or self._loaded_preset_index is not None:
+        """With nothing loaded, a DEV image starts whatever solution was
+        programmed. With a preset loaded, it gates the start as an FDA image
+        does."""
+        if self._loaded_preset_index is not None:
             super().start_trigger()
             return
         self._trigger_running = True
@@ -692,9 +681,6 @@ class SimulatedLIFUTxDevice(SimulatedTxDevice):
 
     def write_config_json(self, json_str: str, module: int = 0):
         from openlifu_sdk.io.LIFUUserConfig import LifuUserConfig
-        if self._locked:
-            raise LIFUDeviceError("TX: user config write refused by the preset lock",
-                                  device_error_code=OW_FDA_REFUSED)
         try:
             self._user_configs[module] = json.loads(json_str)
         except (TypeError, ValueError):
@@ -1435,13 +1421,10 @@ class SimulatedLIFUInterface(SimulatedDeviceInterface):
                  transducer=None,
                  voltage_table_selection: Optional[str] = None,
                  preset_flash: Optional[list[tuple[dict, int]]] = None,
-                 preset_lock: bool = False,
                  **_unused):
         super().__init__(num_modules=num_modules, transducer=transducer,
                          preset_flash=preset_flash)
         self.voltage_table_selection = voltage_table_selection
-        if preset_lock:
-            self.txdevice.lock_presets()
 
     def _create_devices(self, num_modules: int,
                         preset_flash: Optional[List[tuple[dict, int]]]):
