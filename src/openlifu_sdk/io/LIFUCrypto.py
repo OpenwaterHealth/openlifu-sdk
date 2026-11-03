@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """SBSFU firmware image signing, validation and inspection.
 
 Universal implementation of the LIFU secure-bootloader image format

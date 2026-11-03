@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """
 TxDevice Test Suite
 ===================
@@ -50,7 +51,7 @@ from openlifu_sdk.io.exceptions import (
     LIFUNotConnectedError,
     LIFUProtocolError,
 )
-from openlifu_sdk.io.component import format_hwid
+from openlifu_sdk.util.hwid import format_hwid
 from openlifu_sdk.io.uart import OWUart
 
 

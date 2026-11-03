@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """In-memory fake of :class:`openlifu_sdk.LIFUInterface` for ``--simulate`` modes.
 
 Drives a :class:`~openlifu_sdk.ui.base_connector.BaseConnector`
@@ -84,6 +85,7 @@ from openlifu_sdk.io.LIFUTXPresets import module_regs_crcs, preset_sensitivity, 
 from openlifu_sdk.io.LIFUUserConfig import sensitivity_at_frequency
 from openlifu_sdk.io.signal import OWSignal
 from openlifu_sdk.ui.status_frame import format_status_frame as _format_status_frame
+from openlifu_sdk.util.hwid import encode_hwid
 
 logger = logging.getLogger(__name__)
 logger.debug("openlifu_sdk.ui.simulated_interface using Qt backend: %s", _QT_BACKEND)
@@ -240,11 +242,17 @@ class SimulatedTxDevice:
 
     # ---- helpers --------------------------------------------------------
 
+    @staticmethod
+    def _uid(module: int) -> bytes:
+        """The 12-byte MCU unique ID simulated module *module* reports."""
+        return (0xA0A1A2A3A4A5A6A7B0B1B2B3 + module).to_bytes(12, "big")
+
     def _default_user_config(self, idx: int) -> dict:
-        # Plausible 100 - 1000 kHz sensitivity table, V/MPa-ish.
+        # Calibrated for this module (its own UID, in the record form), with a
+        # plausible 100 - 1000 kHz sensitivity table, V/MPa-ish.
         return {
             "sn": "SIMULATED",
-            "hwid": "ABCDEFGH",
+            "hwid": encode_hwid(self._uid(idx), base58=True),
             "freq": 400,
             "hw_ver": "SIM",
             "fw_ver": "2.0.5",
@@ -472,8 +480,9 @@ class SimulatedTxDevice:
         """
         self._fw_version = str(version)
 
-    def get_hardware_id(self, module: int = 0, raw_hex: bool = False) -> str:
-        return f"{0xA0A1A2A3A4A5A6A7B0B1B2B3B4B5B6B7 + module:032X}"
+    def get_hardware_id(self, module: int = 0, raw_hex: bool = False,
+                        base58: bool = False, legacy_6byte: bool = False) -> str:
+        return encode_hwid(self._uid(module), raw_hex, base58, legacy_6byte)
 
     def read_config(self, module: int = 0):
         from openlifu_sdk.io.LIFUUserConfig import LifuUserConfig
@@ -837,8 +846,10 @@ class SimulatedHVController:
         :meth:`SimulatedTxDevice.set_version` for rationale."""
         self._fw_version = str(version)
 
-    def get_hardware_id(self, raw_hex: bool = False) -> str:
-        return "C0C1C2C3C4C5C6C7D0D1D2D3D4D5D6D7"
+    def get_hardware_id(self, raw_hex: bool = False, base58: bool = False,
+                        legacy_6byte: bool = False) -> str:
+        return encode_hwid(bytes.fromhex("C0C1C2C3C4C5C6C7D0D1D2D3"), raw_hex,
+                           base58, legacy_6byte)
 
     def get_temperature1(self) -> float:
         return 30.0 + 0.05 * self._voltage_setpoint + _gauss(HV_TEMP_NOISE_SIGMA)

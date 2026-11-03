@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 from __future__ import annotations
 
 import json
@@ -23,6 +24,7 @@ from .LIFUUserConfig import LifuUserConfig, LifuUserConfigHeader
 from .uart import OWUart
 from .uart_packet import OWUartPacket
 from .signal import OWSignal
+from ..util.hwid import encode_hwid
 
 
 log = logging.getLogger(__name__)
@@ -30,14 +32,6 @@ log = logging.getLogger(__name__)
 # Build a command -> packet-type lookup so callers only need to specify the
 # command byte; the correct packet type is inferred automatically.
 _CMD_TO_PKT_TYPE: dict[int, int] = {cmd: OW_CMD for cmd in GLOBAL_COMMANDS}
-
-def format_hwid(hex_str: str) -> str:
-    """Format a raw hex string into a dash-separated hardware ID.
-
-    Example: 'deadbeefcafe' -> 'DEAD-BEEF-CAFE'
-    """
-    hex_str = hex_str.upper()
-    return "-".join(hex_str[i:i+4] for i in range(0, len(hex_str), 4))
 
 def register_command_packet_type(command: int, packet_type: int) -> None:
     _CMD_TO_PKT_TYPE[command] = packet_type
@@ -313,10 +307,18 @@ class OWComponent:
         log.info("%s version: %s", self._uart.desc, ver)
         return ver
 
-    def get_hardware_id(self, module: int = 0, raw_hex: bool = False) -> str:
-        """Read the device hardware ID.
+    def get_hardware_id(self, module: int = 0, raw_hex: bool = False,
+                        base58: bool = False, legacy_6byte: bool = False) -> str:
+        """Read the device hardware ID (the 12-byte MCU unique ID).
+
+        Returns dash-separated hex by default, lower-case hex with
+        ``raw_hex``, or base58 with ``base58`` -- the form calibration
+        records carry. ``legacy_6byte`` (with ``base58``) gives base58 of
+        the first 6 bytes, the form older records carry. See
+        :func:`openlifu_sdk.util.hwid.encode_hwid`.
 
         Raises:
+            ValueError: An invalid combination of forms.
             LIFUNotConnectedError, LIFUCommunicationError, LIFUDeviceError,
             LIFUProtocolError: If the payload length is wrong.
         """
@@ -327,8 +329,8 @@ class OWComponent:
                 f"(got {r.data_len}, expected {HW_ID_DATA_LENGTH})",
                 code=LIFU_ERR_BAD_PAYLOAD_LENGTH,
             )
-        hwid = r.data[:HW_ID_DATA_LENGTH].hex()
-        return hwid if raw_hex else format_hwid(hwid)
+        return encode_hwid(bytes(r.data[:HW_ID_DATA_LENGTH]), raw_hex, base58,
+                           legacy_6byte)
 
     # ------------------------------------------------------------------
     # User configuration helpers

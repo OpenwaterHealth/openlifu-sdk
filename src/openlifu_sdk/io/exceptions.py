@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """Custom exceptions raised by the openlifu-sdk I/O layer.
 
 All device-communication failures raise a subclass of :class:`LIFUError` so

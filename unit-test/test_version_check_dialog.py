@@ -54,6 +54,38 @@ def test_dialog_reports_on_stderr_for_a_qml_only_application(qt_api, binding):
     assert "not a QApplication" in result.stderr
 
 
+@pytest.mark.parametrize(
+    ("qt_api", "binding", "other"),
+    [
+        pytest.param("pyqt6", "PyQt6", "PySide6", marks=needs_pyqt6),
+        pytest.param("pyside6", "PySide6", "PyQt6", marks=needs_pyside6),
+    ],
+)
+def test_dialog_reports_on_stderr_for_an_application_on_the_other_binding(
+    qt_api, binding, other,
+):
+    # A stand-in plays the host's binding and its running application,
+    # so only one real Qt runtime loads. The dialog must not start a
+    # second application on the SDK's binding.
+    result = check(_RECORD_CRITICAL.format(binding=binding) + f"""
+    import logging, sys, types
+    logging.basicConfig(level=logging.ERROR)
+    other = types.ModuleType("{other}")
+    other.QtCore = types.ModuleType("{other}.QtCore")
+    other.QtCore.QCoreApplication = type(
+        "QCoreApplication", (), {{"instance": staticmethod(lambda: object())}},
+    )
+    sys.modules["{other}"] = other
+    sys.modules["{other}.QtCore"] = other.QtCore
+    from openlifu_sdk.ui.version_check import show_incompatible_version_dialog
+    show_incompatible_version_dialog("SDK too old")
+    assert calls == [], calls
+    assert QtWidgets.QApplication.instance() is None, "started a second application"
+    """, qt_api=qt_api)
+    assert "ERROR: SDK too old" in result.stderr
+    assert f"the application runs on {other}" in result.stderr
+
+
 @pytest.mark.parametrize(("qt_api", "binding"), BINDINGS)
 def test_dialog_falls_back_to_stderr_and_logs_when_qt_fails(qt_api, binding):
     result = check("""

@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """Minimal :class:`QObject` scaffolding that wires a
 :class:`~openlifu_sdk.LIFUInterface` to QML.
 

@@ -12,6 +12,7 @@
 #     language: python
 #     name: python3
 # ---
+# SPDX-License-Identifier: Apache-2.0
 
 # %% [markdown]
 # Once the environment has been set up, this notebook should be able to be run, cell-by-cell. One issue is that I've made modifications to k-wave-python (to cache and reuse gridweights, which saves a significant amount of time if you are running different simulations using the same array in the same position - it's being discussed in https://github.com/waltsims/k-wave-python/issues/342, but hasn't been merged yet, afaik).
