@@ -92,13 +92,14 @@ def test_sim_console_reports_the_voltage_as_float32():
 
 
 def test_sim_loads_through_the_sdk_preset_helper_on_every_module():
-    """LIFUTXPresets.load_preset passes module positionally, as
-    TxDevice.load_preset takes it."""
+    """LIFUTXPresets.load_preset passes module positionally and
+    settings_crc by keyword, as TxDevice.load_preset takes them. With
+    settings_crc as the simulator's 4th parameter, that call was a
+    TypeError (two values for settings_crc)."""
     from openlifu_sdk.io.LIFUTXPresets import load_preset
 
     tx, mc, regs = _sim(SimulatedLIFUTxDevice, two_module_flash_entry())
     load_preset(tx, 0, mc, 1)
-    state = tx.get_loaded_preset_state()
-    assert (state["loaded"], state["index"], state["duration_index"]) == (True, 0, 1)
-    # Each module took duration 1 itself; before the fix, module landed in settings_crc.
-    assert tx._module_loads == {0: (0, 1), 1: (0, 1)}
+    for module in (None, 1):
+        state = tx.get_loaded_preset_state(module=module)
+        assert (state["loaded"], state["index"], state["duration_index"]) == (True, 0, 1)

@@ -599,7 +599,9 @@ class SimulatedTxDevice:
         """Same refusals as an FDA_MODE transmitter (presets_start_check in
         the firmware): nothing loaded on module 0, the master, or module 0
         above the loaded preset's start_C. The simulator always has a
-        temperature reading, so it never reports OW_TEMP_UNKNOWN."""
+        temperature reading, so it never reports OW_TEMP_UNKNOWN. As in the
+        firmware, only the master's own load gates Start; the loaded read
+        (:meth:`get_loaded_preset_state`) is what asks every module."""
         load = self._module_loads.get(0)
         if load is None:
             raise LIFUDeviceError("TX: no preset loaded", device_error_code=OW_NO_PRESET)

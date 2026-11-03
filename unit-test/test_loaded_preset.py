@@ -61,6 +61,16 @@ def test_loaded_state_decodes_a_load_on_every_module():
     assert tx.get_loaded_preset() == (2, 1)
 
 
+def test_the_master_holding_nothing_names_every_module():
+    # The commonest reply: nothing loaded, so the master sends every module's bit.
+    tx, uart = _with_uart(TxDevice())
+    uart.send_packet.return_value = _packet(_loaded_reply(False, missing=0b11))
+    state = tx.get_loaded_preset_state()
+    assert state == {"loaded": False, "index": None, "duration_index": None, "train_count": None,
+                     "settings_crc": None, "regs_crc": None, "missing_modules": [0, 1]}
+    assert tx.get_loaded_preset() == (None, None)
+
+
 def test_loaded_state_names_the_modules_without_the_load():
     tx, uart = _with_uart(TxDevice())
     uart.send_packet.return_value = _packet(_loaded_reply(False, missing=0b10))

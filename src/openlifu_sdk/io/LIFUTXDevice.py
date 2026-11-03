@@ -512,12 +512,11 @@ class TxDevice(OWComponent):
                 with a module missing, or not loaded with none; not loaded
                 with non-zero load fields; or a lone module naming another.
         """
-        if module is not None and not 0 <= module <= 7:
+        addr = 0 if module is None else module   # module 0, the master, answers for every module
+        if addr not in range(8):
             raise ValueError(f"module must be 0-7, got {module}")
-        if module == 0:
-            module = None   # the master answers for every module
         r = self.send_checked(packet_type=OW_CONTROLLER, command=OW_PRESET_LOADED,
-                              addr=0 if module is None else module, op="get_loaded_preset")
+                              addr=addr, op="get_loaded_preset")
         if r.data_len != 16:
             raise LIFUProtocolError(f"TX: get_loaded_preset payload too "
                                     f"{'short' if r.data_len < 16 else 'long'} ({r.data_len}, not 16)",
@@ -531,16 +530,17 @@ class TxDevice(OWComponent):
         # fields, and a module answering alone has only its own bit, bit 0.
         # Mask bits above the module count are not checked: the reply does
         # not carry the count.
-        if (d[0] not in (0, 1) or (d[0] == 1) == bool(mask)
-                or (d[0] == 0 and any(d[1:15]))
-                or (module is not None and mask > 1)):
+        alone = addr != 0
+        broken = (d[0] not in (0, 1),
+                  (d[0] == 1) == bool(mask),
+                  d[0] == 0 and any(d[1:15]),
+                  alone and mask > 1)
+        if any(broken):
             raise LIFUProtocolError(
                 f"TX: get_loaded_preset reply is inconsistent (loaded byte {d[0]}, mask 0x{mask:02x})",
                 code=LIFU_ERR_BAD_PAYLOAD_FORMAT)
-        if module is not None:
-            missing = [module] if mask else []
-        else:
-            missing = [m for m in range(8) if mask & (1 << m)]
+        # A lone module's bit 0 is itself; the master's bit m is module m.
+        missing = [addr + m for m in range(8) if mask & (1 << m)]
         if missing:
             return {"loaded": False, "index": None, "duration_index": None, "train_count": None,
                     "settings_crc": None, "regs_crc": None, "missing_modules": missing}
