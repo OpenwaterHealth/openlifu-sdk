@@ -79,6 +79,16 @@ def test_loaded_state_for_one_module_addresses_it():
     assert uart.send_packet.call_args.kwargs["addr"] == 1
 
 
+@pytest.mark.parametrize("module", [None, 0])
+def test_the_master_names_every_module_without_the_load(module):
+    # Module 0 is the master, which asks every module (if_commands.c), so
+    # module=0 is the whole-device query and its mask names other modules.
+    tx, uart = _with_uart(TxDevice())
+    uart.send_packet.return_value = _packet(_loaded_reply(False, missing=0b110))
+    assert tx.get_loaded_preset_state(module=module)["missing_modules"] == [1, 2]
+    assert uart.send_packet.call_args.kwargs["addr"] == 0
+
+
 def test_one_module_without_a_load_names_itself():
     # The module answers alone, so its own bit is bit 0 (if_commands.c).
     tx, uart = _with_uart(TxDevice())

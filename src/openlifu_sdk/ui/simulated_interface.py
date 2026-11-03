@@ -397,8 +397,13 @@ class SimulatedTxDevice:
         """Same contract as :meth:`TxDevice.get_loaded_preset_state`
         (OW_PRESET_LOADED): loaded only if every module holds module 0's
         load, with the modules that don't in ``missing_modules``; with
-        *module*, that module's own load. ``train_count`` is the count the
-        load programmed."""
+        *module* 1 or above, that module's own load (module 0, the master,
+        answers for every module). ``train_count`` is the count the load
+        programmed."""
+        if module == 0:
+            module = None
+        if module is not None and not 0 < module < self.num_modules:
+            raise LIFUDeviceError(f"TX: no module {module} to ask what it has loaded")
         modules = range(self.num_modules) if module is None else [module]
         load = self._module_loads.get(0 if module is None else module)
         missing = [m for m in modules if load is None or self._module_loads.get(m) != load]

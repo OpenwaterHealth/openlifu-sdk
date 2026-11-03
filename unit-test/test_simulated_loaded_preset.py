@@ -11,6 +11,8 @@ pytest.importorskip("openlifu_sdk.ui._qt")
 
 from sr003_presets import flash_entry, two_module_flash_entry  # noqa: E402 -- reason: after the Qt importorskip
 
+from openlifu_sdk.io.exceptions import LIFUDeviceError  # noqa: E402 -- reason: after the Qt importorskip
+
 from openlifu_sdk.ui.simulated_interface import (  # noqa: E402 -- reason: after the Qt importorskip
     SimulatedLIFUTxDevice,
     SimulatedTxDevice,
@@ -61,7 +63,10 @@ def test_sim_one_module_reports_its_own_load():
 
     assert own["loaded"] and own["missing_modules"] == []
     assert (own["index"], own["duration_index"], own["regs_crc"]) == (0, 1, regs[1])
-    assert tx.get_loaded_preset_state(module=0)["missing_modules"] == [0]
+    # Module 0 is the master: it holds nothing, so it names every module.
+    assert tx.get_loaded_preset_state(module=0)["missing_modules"] == [0, 1]
+    with pytest.raises(LIFUDeviceError):
+        tx.get_loaded_preset_state(module=2)
     assert tx.get_loaded_preset_state()["missing_modules"] == [0, 1]
 
 

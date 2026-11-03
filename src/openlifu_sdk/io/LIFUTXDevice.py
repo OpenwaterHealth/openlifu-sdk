@@ -497,8 +497,10 @@ class TxDevice(OWComponent):
         it as byte 15, one bit per module, relative to the replying module
         (if_commands.c ``preset_loaded_reply``).
 
-        With *module*, that module answers for itself alone, for diagnostics:
-        ``missing_modules`` is ``[module]`` if it holds nothing, else ``[]``.
+        With *module* 1 or above, that module answers for itself alone, for
+        diagnostics: ``missing_modules`` is ``[module]`` if it holds nothing,
+        else ``[]``. Module 0 is the master, which asks every module, so
+        ``module=0`` is the same as no *module*.
 
         Raises:
             LIFUDeviceError: Firmware without OW_PRESET_LOADED.
@@ -507,6 +509,8 @@ class TxDevice(OWComponent):
                 or 1, loaded with modules missing or not loaded with none,
                 or a lone module naming another.
         """
+        if module == 0:
+            module = None   # the master answers for every module
         r = self.send_checked(packet_type=OW_CONTROLLER, command=OW_PRESET_LOADED,
                               addr=0 if module is None else module, op="get_loaded_preset")
         if r.data_len < 16:
