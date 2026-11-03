@@ -39,7 +39,7 @@ Triggering and profiles
 - `async_mode(enable: bool|None) -> bool` — enable/disable or read async mode state.
 
 Loaded preset (transmitter-fw `presets.h`)
-- `get_loaded_preset_state(module=None) -> dict` — what the firmware has loaded (`OW_PRESET_LOADED`): `loaded`, `index`, `duration_index`, `train_count`, `settings_crc`, `regs_crc`, `missing_modules`. The master asks every module; `loaded` is False unless all of them hold the same load, and `missing_modules` names the ones that don't (for example a module that was reset). With `module`, that module answers for itself: `missing_modules` is `[module]` if it holds nothing. A host confirms this just before Start (SR-003).
+- `get_loaded_preset_state(module=None) -> dict` — what the firmware has loaded (`OW_PRESET_LOADED`): `loaded`, `index`, `duration_index`, `train_count`, `settings_crc`, `regs_crc`, `missing_modules`. The master asks every module; `loaded` is False unless all of them hold the same load, and `missing_modules` names the ones that don't (for example a module that was reset). With `module` 1 or above, that module answers for itself: `missing_modules` is `[module]` if it holds nothing. Module 0 is the master, so `module=0` is the same as no `module`. A host confirms this just before Start (SR-003).
 - `get_loaded_preset() -> (index, duration_index)` — the same, or `(None, None)`; the simulator has the same method.
 
 TX registers and profiles

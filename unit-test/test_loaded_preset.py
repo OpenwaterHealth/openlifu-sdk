@@ -14,9 +14,10 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from openlifu_sdk.io.exceptions import LIFUProtocolError
+from openlifu_sdk.io.exceptions import LIFU_ERR_BAD_PAYLOAD_LENGTH, LIFUDeviceError, LIFUProtocolError
 from openlifu_sdk.io.LIFUConfig import (
     OW_CONTROLLER,
+    OW_ERROR,
     OW_PRESET_LOADED,
     OW_RESP,
 )
@@ -74,9 +75,34 @@ def test_loaded_state_names_the_modules_without_the_load():
 
 def test_loaded_state_for_one_module_addresses_it():
     tx, uart = _with_uart(TxDevice())
-    uart.send_packet.return_value = _packet(_loaded_reply(True, 0, 0, 5, 1, 2))
-    assert tx.get_loaded_preset_state(module=1)["missing_modules"] == []
+    uart.send_packet.return_value = _packet(_loaded_reply(True, 3, 1, 5, 0x11, 0x22))
+    state = tx.get_loaded_preset_state(module=1)
+    assert state == {"loaded": True, "index": 3, "duration_index": 1, "train_count": 5,
+                     "settings_crc": 0x11, "regs_crc": 0x22, "missing_modules": []}
     assert uart.send_packet.call_args.kwargs["addr"] == 1
+
+
+def test_module_0_is_the_whole_device_query_when_loaded():
+    tx, uart = _with_uart(TxDevice())
+    uart.send_packet.return_value = _packet(_loaded_reply(True, 2, 1, 30, 0x11, 0x22))
+    assert tx.get_loaded_preset_state(module=0)["index"] == 2
+    assert uart.send_packet.call_args.kwargs["addr"] == 0
+
+
+@pytest.mark.parametrize("module", [-1, 8])
+def test_a_module_the_mask_cannot_name_is_refused_before_sending(module):
+    tx, uart = _with_uart(TxDevice())
+    with pytest.raises(ValueError):
+        tx.get_loaded_preset_state(module=module)
+    uart.send_packet.assert_not_called()
+
+
+def test_a_firmware_refusal_is_a_device_error():
+    # Firmware without OW_PRESET_LOADED, or an absent module, replies OW_ERROR.
+    tx, uart = _with_uart(TxDevice())
+    uart.send_packet.return_value = _packet(packet_type=OW_ERROR)
+    with pytest.raises(LIFUDeviceError):
+        tx.get_loaded_preset_state(module=1)
 
 
 @pytest.mark.parametrize("module", [None, 0])
@@ -108,6 +134,7 @@ def test_a_loaded_reply_naming_missing_modules_is_a_protocol_error():
     (_loaded_reply(False), None),                      # not loaded, yet no module missing
     (bytes([2]) + bytes(15), None),                    # loaded byte neither 0 nor 1
     (_loaded_reply(False, missing=0b10), 1),           # a lone module naming another
+    (_loaded_reply(False, index=2, missing=0b1), None),  # not loaded, yet a load field set
 ])
 def test_a_reply_the_firmware_does_not_send_is_a_protocol_error(reply, module):
     tx, uart = _with_uart(TxDevice())
@@ -116,9 +143,11 @@ def test_a_reply_the_firmware_does_not_send_is_a_protocol_error(reply, module):
         tx.get_loaded_preset_state(module=module)
 
 
-def test_a_short_loaded_reply_is_a_protocol_error():
+@pytest.mark.parametrize("reply", [b"\x01\x00", _loaded_reply(True) + b"\x00"])
+def test_a_reply_of_the_wrong_length_is_a_protocol_error(reply):
     tx, uart = _with_uart(TxDevice())
-    uart.send_packet.return_value = _packet(b"\x01\x00")
-    with pytest.raises(LIFUProtocolError):
+    uart.send_packet.return_value = _packet(reply)
+    with pytest.raises(LIFUProtocolError) as excinfo:
         tx.get_loaded_preset_state()
+    assert excinfo.value.code == LIFU_ERR_BAD_PAYLOAD_LENGTH
 

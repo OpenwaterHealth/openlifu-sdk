@@ -67,6 +67,8 @@ def test_sim_one_module_reports_its_own_load():
     assert tx.get_loaded_preset_state(module=0)["missing_modules"] == [0, 1]
     with pytest.raises(LIFUDeviceError):
         tx.get_loaded_preset_state(module=2)
+    with pytest.raises(ValueError):
+        tx.get_loaded_preset_state(module=8)
     assert tx.get_loaded_preset_state()["missing_modules"] == [0, 1]
 
 
@@ -96,4 +98,7 @@ def test_sim_loads_through_the_sdk_preset_helper_on_every_module():
 
     tx, mc, regs = _sim(SimulatedLIFUTxDevice, two_module_flash_entry())
     load_preset(tx, 0, mc, 1)
-    assert tx.get_loaded_preset_state()["loaded"] is True
+    state = tx.get_loaded_preset_state()
+    assert (state["loaded"], state["index"], state["duration_index"]) == (True, 0, 1)
+    # Each module took duration 1 itself; before the fix, module landed in settings_crc.
+    assert tx._module_loads == {0: (0, 1), 1: (0, 1)}

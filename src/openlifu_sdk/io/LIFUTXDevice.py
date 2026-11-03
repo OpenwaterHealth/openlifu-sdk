@@ -503,26 +503,37 @@ class TxDevice(OWComponent):
         ``module=0`` is the same as no *module*.
 
         Raises:
-            LIFUDeviceError: Firmware without OW_PRESET_LOADED.
-            LIFUProtocolError: The reply is fewer than 16 bytes, or is
-                one the firmware does not send: a loaded byte other than 0
-                or 1, loaded with modules missing or not loaded with none,
-                or a lone module naming another.
+            ValueError: *module* outside 0-7, the modules the reply's mask
+                can name.
+            LIFUDeviceError: Firmware without OW_PRESET_LOADED, or no such
+                module.
+            LIFUProtocolError: The reply is not 16 bytes, or breaks the
+                reply's own rules: a loaded byte other than 0 or 1; loaded
+                with a module missing, or not loaded with none; not loaded
+                with non-zero load fields; or a lone module naming another.
         """
+        if module is not None and not 0 <= module <= 7:
+            raise ValueError(f"module must be 0-7, got {module}")
         if module == 0:
             module = None   # the master answers for every module
         r = self.send_checked(packet_type=OW_CONTROLLER, command=OW_PRESET_LOADED,
                               addr=0 if module is None else module, op="get_loaded_preset")
-        if r.data_len < 16:
-            raise LIFUProtocolError(f"TX: get_loaded_preset payload too short ({r.data_len} < 16)",
+        if r.data_len != 16:
+            raise LIFUProtocolError(f"TX: get_loaded_preset payload too "
+                                    f"{'short' if r.data_len < 16 else 'long'} ({r.data_len}, not 16)",
                                     code=LIFU_ERR_BAD_PAYLOAD_LENGTH)
         d = bytes(r.data)
         train_count, settings_crc, regs_crc = struct.unpack("<III", d[3:15])
         mask = d[15]
-        # SR-003 trusts this before Start, so only a reply the firmware can
-        # send is decoded: byte 0 is 1 exactly when no module is missing,
-        # and a module answering alone has only its own bit, bit 0.
-        if d[0] not in (0, 1) or (d[0] == 1) == bool(mask) or (module is not None and mask > 1):
+        # SR-003 trusts this before Start, so a reply that breaks its own
+        # rules (if_commands.c preset_loaded_reply) is refused: byte 0 is 1
+        # exactly when no module is missing, a not-loaded reply has zero load
+        # fields, and a module answering alone has only its own bit, bit 0.
+        # Mask bits above the module count are not checked: the reply does
+        # not carry the count.
+        if (d[0] not in (0, 1) or (d[0] == 1) == bool(mask)
+                or (d[0] == 0 and any(d[1:15]))
+                or (module is not None and mask > 1)):
             raise LIFUProtocolError(
                 f"TX: get_loaded_preset reply is inconsistent (loaded byte {d[0]}, mask 0x{mask:02x})",
                 code=LIFU_ERR_BAD_PAYLOAD_FORMAT)

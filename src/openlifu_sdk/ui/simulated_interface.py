@@ -402,7 +402,9 @@ class SimulatedTxDevice:
         programmed."""
         if module == 0:
             module = None
-        if module is not None and not 0 < module < self.num_modules:
+        if module is not None and not 0 <= module <= 7:
+            raise ValueError(f"module must be 0-7, got {module}")
+        if module is not None and module >= self.num_modules:
             raise LIFUDeviceError(f"TX: no module {module} to ask what it has loaded")
         modules = range(self.num_modules) if module is None else [module]
         load = self._module_loads.get(0 if module is None else module)
@@ -1251,11 +1253,10 @@ class SimulatedDeviceInterface(QObject):
                     "index": index,
                     "selected": None,
                     "settings_crc": int(machine_config.get("settings_crc", 0)),
-                    # As HVController.get_preset reports it: the console bakes it
-                    # as float32. preset_voltage refuses a missing or bad voltage.
-                    "voltage": preset_voltage(machine_config),
                     "id": machine_config.get("id", f"preset-{index}"),
-                    # As HVController.get_preset reports it: the console bakes it as float32.
+                    # As HVController.get_preset reports them: the console bakes
+                    # both as float32. preset_voltage refuses a missing or bad voltage.
+                    "voltage": preset_voltage(machine_config),
                     "sensitivity": preset_sensitivity(machine_config),
                 })
             self.hvcontroller.configure_presets(hv_presets)
