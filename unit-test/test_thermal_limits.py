@@ -165,9 +165,8 @@ def test_sim_load_arms_and_unload_keeps_the_limits(sim):
     assert dev.get_thermal_limits()["source"] == "none"
     dev.load_preset(0, regs, settings_crc=mc["settings_crc"])
     armed = dev.get_thermal_limits()
-    # The preset's own timeout: 1800 once compile_preset() carries it (SDK #102).
     assert armed == {"source": "preset", "preset_index": 0, "start_c": 40.0, "shutoff_c": 43.0,
-                     "treatment_timeout_s": mc.get("treatment_timeout_s", 0)}
+                     "treatment_timeout_s": 1800}
     dev.unload_preset()
     assert dev.get_thermal_limits() == armed
 
