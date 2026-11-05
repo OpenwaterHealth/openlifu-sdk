@@ -76,9 +76,10 @@ from openlifu_sdk.io.LIFUConfig import (
     OW_HV_RANGE,
     OW_HV_DATA_ERROR,
     OW_NO_PRESET,
+    OW_PRESET_BUSY,
     OW_TEMP_TOO_HIGH,
 )
-from openlifu_sdk.io.LIFUTXPresets import module_regs_crcs, preset_sensitivity, preset_voltage
+from openlifu_sdk.io.LIFUTXPresets import module_regs_crcs, preset_sensitivity, preset_voltage, thermal_limits
 from openlifu_sdk.io.LIFUUserConfig import sensitivity_at_frequency
 from openlifu_sdk.io.signal import OWSignal
 from openlifu_sdk.ui.status_frame import format_status_frame as _format_status_frame
@@ -227,6 +228,9 @@ class SimulatedTxDevice:
         # module -> (preset index, duration index) it holds loaded; each module
         # loads its own part of the preset, as on hardware.
         self._module_loads: dict[int, tuple[int, int]] = {}
+        # The master's start_C / shutoff_C, apart from the load as on the
+        # firmware (thermal_limits.h): a load arms them, an unload leaves them.
+        self._thermal_limits: dict = self._no_thermal_limits()
 
         # Reported firmware version. Mutable so an app-side debug UI
         # (or a test) can flip it to simulate an incompatible firmware
@@ -375,6 +379,11 @@ class SimulatedTxDevice:
         self._pulse["duration"] = float(machine_config.get("pulse_length_us", 100.0)) / 1_000_000.0
         self._normalize_train_interval()
         self._module_loads[module] = (index, duration_index)
+        if module == 0:
+            self._thermal_limits = {
+                "source": "preset", "preset_index": index,
+                "start_c": machine_config.get("start_C"), "shutoff_c": machine_config.get("shutoff_C"),
+            }
         return True
 
     def unload_preset(self, module: int = 0) -> bool:
@@ -388,6 +397,23 @@ class SimulatedTxDevice:
         that inspect it (operator-interface tests/test_no_auto_restart.py);
         :meth:`get_loaded_preset_state` with ``module`` is the public read."""
         return set(self._module_loads)
+
+    @staticmethod
+    def _no_thermal_limits() -> dict:
+        return {"source": "none", "preset_index": None, "start_c": None, "shutoff_c": None}
+
+    def get_thermal_limits(self) -> dict:
+        """Same shape as :meth:`TxDevice.get_thermal_limits`."""
+        return dict(self._thermal_limits)
+
+    def _start_check(self) -> None:
+        """The armed start_C, as the firmware's thermal_limits_start_check.
+        The simulator always has a temperature reading, so it never reports
+        OW_TEMP_UNKNOWN."""
+        start_c = self._thermal_limits["start_c"]
+        if start_c is not None and self._modules[0].read_temp() > float(start_c):
+            raise LIFUDeviceError(f"TX above start_C {float(start_c):.1f} C",
+                                  device_error_code=OW_TEMP_TOO_HIGH)
 
     def get_loaded_preset(self) -> tuple[Optional[int], Optional[int]]:
         """Same contract as :meth:`TxDevice.get_loaded_preset`."""
@@ -597,19 +623,14 @@ class SimulatedTxDevice:
     def start_trigger(self):
         """Same refusals as an FDA_MODE transmitter (presets_start_check in
         the firmware): nothing loaded on module 0, the master, or module 0
-        above the loaded preset's start_C. The simulator always has a
-        temperature reading, so it never reports OW_TEMP_UNKNOWN. As in the
-        firmware, only the master's own load gates Start; the loaded read
-        (:meth:`get_loaded_preset_state`) is what asks every module."""
-        load = self._module_loads.get(0)
-        if load is None:
+        above the armed start_C. As in the firmware, only the master's own
+        load gates Start; the loaded read (:meth:`get_loaded_preset_state`)
+        is what asks every module."""
+        if self._module_loads.get(0) is None:
             raise LIFUDeviceError("TX: no preset loaded", device_error_code=OW_NO_PRESET)
         if self._trigger_status == "PAUSED":
             raise LIFUDeviceError("TX: trigger is paused")
-        start_c = self._preset_flash[load[0]][0].get("start_C")
-        if start_c is not None and self._modules[0].read_temp() > float(start_c):
-            raise LIFUDeviceError(f"TX above start_C {float(start_c):.1f} C",
-                                  device_error_code=OW_TEMP_TOO_HIGH)
+        self._start_check()
         self._trigger_status = "RUNNING"
 
     def stop_trigger(self):
@@ -631,13 +652,13 @@ class SimulatedTxDevice:
 
         Per SR-023 item 8: refused at or above the loaded preset's
         shutoff_C, and not gated by start_C, as the firmware does since
-        openlifu-transmitter-fw#42.
+        openlifu-transmitter-fw#42. The shutoff_C is the armed one, which
+        outlasts the load (openlifu-transmitter-fw#60).
         """
         if self._trigger_status != "PAUSED":
             raise LIFUDeviceError("TX: sequence is not paused")
-        load = self._module_loads.get(0)
-        if load is not None:
-            shutoff_c = self._preset_flash[load[0]][0].get("shutoff_C")
+        shutoff_c = self._thermal_limits["shutoff_c"]
+        if shutoff_c is not None:
             hottest = max(m.read_temp() for m in self._modules)
             if shutoff_c is not None and hottest >= float(shutoff_c):
                 raise LIFUDeviceError(f"TX at shutoff_C {float(shutoff_c):.1f} C",
@@ -689,9 +710,34 @@ class SimulatedLIFUTxDevice(SimulatedTxDevice):
     _async_mode = False
 
     def start_trigger(self):
-        """An RUO image starts whatever solution was programmed; there is no
-        preset gate."""
+        """An RUO image starts whatever solution was programmed, with no
+        preset gate; only armed thermal limits can refuse it."""
+        self._start_check()
         self._trigger_status = "RUNNING"
+
+    def _thermal_limits_write(self) -> None:
+        # As the firmware: refused while a sequence runs or is paused;
+        # otherwise the master unloads its preset, as on a raw write, since
+        # its limits are about to change.
+        if self._trigger_status in ("RUNNING", "PAUSED"):
+            raise LIFUDeviceError("TX: a sequence is running or paused",
+                                  device_error_code=OW_PRESET_BUSY)
+        self.unload_preset(0)
+
+    def set_thermal_limits(self, start_c: float, shutoff_c: float) -> dict:
+        """Same contract as :meth:`LIFUTxDevice.set_thermal_limits`."""
+        start_x10, shutoff_x10 = thermal_limits(
+            {"id": "set_thermal_limits", "start_C": start_c, "shutoff_C": shutoff_c})
+        self._thermal_limits_write()
+        self._thermal_limits = {"source": "host", "preset_index": None,
+                                "start_c": start_x10 / 10, "shutoff_c": shutoff_x10 / 10}
+        return self.get_thermal_limits()
+
+    def clear_thermal_limits(self) -> dict:
+        """Same contract as :meth:`LIFUTxDevice.clear_thermal_limits`."""
+        self._thermal_limits_write()
+        self._thermal_limits = self._no_thermal_limits()
+        return self.get_thermal_limits()
 
     def get_tx_module_count(self) -> int:
         return self.num_modules

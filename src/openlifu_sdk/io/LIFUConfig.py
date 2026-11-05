@@ -102,6 +102,14 @@ OW_PRESET_CAPACITY = 0x55
 # What every module has loaded (16 bytes; TxDevice.get_loaded_preset_state).
 OW_PRESET_LOADED = 0x57
 
+# Thermal limits, start_C / shutoff_C (transmitter-fw thermal_limits.h): armed
+# by a preset load and kept apart from it, so a raw write or an unload leaves
+# them armed. A standard image's host may also set or clear them while no
+# preset is loaded; an FDA_MODE image refuses SET and CLEAR (OW_FDA_REFUSED).
+OW_CTRL_GET_THERMAL_LIMITS = 0x60
+OW_CTRL_SET_THERMAL_LIMITS = 0x61
+OW_CTRL_CLEAR_THERMAL_LIMITS = 0x62
+
 # TX7332 Commands
 OW_TX7332_STATUS = 0x20
 OW_TX7332_ENUM = 0x21
@@ -178,6 +186,7 @@ CONTROLLER_COMMANDS = {
     OW_PRESET_GET, OW_PRESET_LOAD,
     OW_PRESET_WRITE, OW_PRESET_COMMIT, OW_PRESET_DELETE, OW_PRESET_CAPACITY,
     OW_PRESET_LOADED,
+    OW_CTRL_GET_THERMAL_LIMITS, OW_CTRL_SET_THERMAL_LIMITS, OW_CTRL_CLEAR_THERMAL_LIMITS,
 }
 
 POWER_COMMANDS = {
@@ -210,6 +219,7 @@ TX_FDA_PACKETS = {
         OW_CTRL_PAUSE_SWTRIG, OW_CTRL_RESUME_SWTRIG,
         OW_CTRL_GET_MODULE_COUNT,
         OW_PRESET_GET, OW_PRESET_LOAD, OW_PRESET_LOADED,
+        OW_CTRL_GET_THERMAL_LIMITS,
     }),
     OW_TX7332: frozenset({OW_TX7332_DEVICE_COUNT}),  # get_module_count fallback on older images
 }
