@@ -6,7 +6,7 @@ The wire format of OW_CTRL_GET / SET / CLEAR_THERMAL_LIMITS against a mocked
 UART, the FDA whitelist (TxDevice may read the limits, never set or clear
 them), and the simulator's copy of the firmware rules: a load arms the
 preset's limits and an unload leaves them; the host may set or clear them
-only with no preset loaded and nothing running; armed limits gate start.
+while nothing runs, which unloads a loaded preset; armed limits gate start.
 """
 
 from __future__ import annotations
@@ -171,21 +171,30 @@ def test_sim_host_set_and_clear(sim):
     dev.stop_trigger()
 
 
-def test_sim_set_and_clear_refused_while_loaded_or_running(sim):
+def test_sim_set_and_clear_unload_a_loaded_preset(sim):
     dev, mc, regs = sim
     dev.load_preset(0, regs, settings_crc=mc["settings_crc"])
+    assert dev.get_loaded_preset()[0] == 0
+    armed = dev.set_thermal_limits(30.0, 35.0)
+    assert (armed["source"], armed["start_c"], armed["shutoff_c"]) == ("host", 30.0, 35.0)
+    assert dev.get_loaded_preset() == (None, None)
+
+    dev.load_preset(0, regs, settings_crc=mc["settings_crc"])
+    assert dev.get_thermal_limits()["source"] == "preset"
+    assert dev.clear_thermal_limits()["source"] == "none"
+    assert dev.get_loaded_preset() == (None, None)
+
+
+def test_sim_set_and_clear_refused_while_running(sim):
+    dev, mc, regs = sim
+    assert dev.set_thermal_limits(30.0, 35.0)["source"] == "host"
     armed = dev.get_thermal_limits()
-    for call in (lambda: dev.set_thermal_limits(30.0, 35.0), dev.clear_thermal_limits):
+    _set_temp(dev, 25.0)
+    dev.start_trigger()
+    for call in (lambda: dev.set_thermal_limits(31.0, 36.0), dev.clear_thermal_limits):
         with pytest.raises(LIFUDeviceError) as e:
             call()
         assert e.value.device_error_code == OW_PRESET_BUSY
     assert dev.get_thermal_limits() == armed
-
-    dev.unload_preset()
-    _set_temp(dev, 25.0)
-    dev.start_trigger()
-    with pytest.raises(LIFUDeviceError) as e:
-        dev.clear_thermal_limits()
-    assert e.value.device_error_code == OW_PRESET_BUSY
     dev.stop_trigger()
     assert dev.clear_thermal_limits()["source"] == "none"

@@ -927,21 +927,24 @@ class LIFUTxDevice(LIFUComponentMixin, TxDevice):
     def set_thermal_limits(self, start_c: float, shutoff_c: float) -> Dict:
         """Arm the host's own start_C / shutoff_C (OW_CTRL_SET_THERMAL_LIMITS).
 
-        For research use without a preset: once armed, start_trigger() is
-        refused above *start_c* and a running sequence stops at *shutoff_c*,
-        as with a loaded preset's limits (get_thermal_limits()). Both travel
-        as tenths of a degree, so they must be multiples of 0.1 C, and
-        *start_c* must be below *shutoff_c*.
+        For research use without a preset, or to change a loaded preset's:
+        once armed, start_trigger() is refused above *start_c* and a running
+        sequence stops at *shutoff_c*, as with a loaded preset's limits
+        (get_thermal_limits()). Both travel as tenths of a degree, so they
+        must be multiples of 0.1 C, and *start_c* must be below *shutoff_c*.
+
+        Like a raw register or trigger write, this unloads a preset loaded on
+        the master (get_preset_loaded()), even if the firmware then refuses
+        the limits: the preset no longer describes what is armed.
 
         Returns what is armed afterwards, as get_thermal_limits().
 
         Raises:
             ValueError: A limit finer than 0.1 C or out of range, or start_c
                 not below shutoff_c (nothing is sent).
-            LIFUDeviceError: OW_PRESET_BUSY while a preset is loaded (unload
-                it first: its limits are part of what it was loaded as) or a
-                sequence runs; OW_FDA_REFUSED from an FDA_MODE image; or
-                firmware that predates the command.
+            LIFUDeviceError: OW_PRESET_BUSY while a sequence runs;
+                OW_FDA_REFUSED from an FDA_MODE image; or firmware that
+                predates the command.
         """
         from openlifu_sdk.io.LIFUTXPresets import thermal_limits  # lazy: it imports this module
         raw = thermal_limits({"id": "set_thermal_limits", "start_C": start_c, "shutoff_C": shutoff_c})
@@ -954,13 +957,14 @@ class LIFUTxDevice(LIFUComponentMixin, TxDevice):
 
         With none armed, start_trigger() runs the host's configuration with
         only the firmware's global overheat protection. Clearing with none
-        armed is not an error. Returns what is armed afterwards (``source``
-        "none"), as get_thermal_limits().
+        armed is not an error. Like set_thermal_limits(), it unloads a
+        preset loaded on the master. Returns what is armed afterwards
+        (``source`` "none"), as get_thermal_limits().
 
         Raises:
-            LIFUDeviceError: OW_PRESET_BUSY while a preset is loaded or a
-                sequence runs; OW_FDA_REFUSED from an FDA_MODE image; or
-                firmware that predates the command.
+            LIFUDeviceError: OW_PRESET_BUSY while a sequence runs;
+                OW_FDA_REFUSED from an FDA_MODE image; or firmware that
+                predates the command.
         """
         r = self.send_checked(packet_type=OW_CONTROLLER, command=OW_CTRL_CLEAR_THERMAL_LIMITS,
                               op="clear_thermal_limits")

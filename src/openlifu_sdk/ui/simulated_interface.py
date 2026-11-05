@@ -650,24 +650,26 @@ class SimulatedLIFUTxDevice(SimulatedTxDevice):
         self._start_check()
         self._trigger_running = True
 
-    def _thermal_limits_busy(self) -> None:
-        # As the firmware: not over a loaded preset's own limits, nor mid-run.
-        if self._loaded_preset_index is not None or self._trigger_running:
-            raise LIFUDeviceError("TX: a preset is loaded or the trigger is running",
+    def _thermal_limits_write(self) -> None:
+        # As the firmware: refused mid-run; otherwise the master unloads its
+        # preset, as on a raw write, since its limits are about to change.
+        if self._trigger_running:
+            raise LIFUDeviceError("TX: the trigger is running",
                                   device_error_code=OW_PRESET_BUSY)
+        self.unload_preset(0)
 
     def set_thermal_limits(self, start_c: float, shutoff_c: float) -> dict:
         """Same contract as :meth:`LIFUTxDevice.set_thermal_limits`."""
         start_x10, shutoff_x10 = thermal_limits(
             {"id": "set_thermal_limits", "start_C": start_c, "shutoff_C": shutoff_c})
-        self._thermal_limits_busy()
+        self._thermal_limits_write()
         self._thermal_limits = {"source": "host", "preset_index": None,
                                 "start_c": start_x10 / 10, "shutoff_c": shutoff_x10 / 10}
         return self.get_thermal_limits()
 
     def clear_thermal_limits(self) -> dict:
         """Same contract as :meth:`LIFUTxDevice.clear_thermal_limits`."""
-        self._thermal_limits_busy()
+        self._thermal_limits_write()
         self._thermal_limits = self._no_thermal_limits()
         return self.get_thermal_limits()
 
