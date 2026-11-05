@@ -76,13 +76,18 @@ from openlifu_sdk.io.LIFUConfig import (
     OW_HV_RANGE,
     OW_HV_DATA_ERROR,
     OW_NO_PRESET,
+    OW_PRESET_BUSY,
     OW_TEMP_TOO_HIGH,
 )
+from openlifu_sdk.io.LIFUTXDevice import PRESET_TEMP_SCALE
 from openlifu_sdk.io.LIFUTXPresets import (
+    host_treatment_timeout,
     module_regs_crcs,
     preset_sensitivity,
     preset_voltage,
     preset_voltage_range,
+    thermal_limits,
+    treatment_timeout,
 )
 from openlifu_sdk.io.LIFUUserConfig import sensitivity_at_frequency
 from openlifu_sdk.io.signal import OWSignal
@@ -201,7 +206,7 @@ class SimulatedTxDevice:
             "pulse_train_count": 1,
         }
         self._pulse = {"frequency": 400_000.0, "duration": 100e-6, "amplitude": 1.0}
-        self._trigger_running = False
+        self._trigger_status = "STOPPED"
         self.serial_number: Optional[str] = None
         self.hwid: Optional[str] = None
         self.hardware_id: Optional[str] = None
@@ -231,6 +236,12 @@ class SimulatedTxDevice:
         # module -> (preset index, duration index) it holds loaded; each module
         # loads its own part of the preset, as on hardware.
         self._module_loads: dict[int, tuple[int, int]] = {}
+        # The master's start_C / shutoff_C and treatment timeout, apart from
+        # the load as on the firmware (thermal_limits.h): a load arms them, an
+        # unload leaves them, a reset clears them. The simulator gates Start
+        # and Resume on them, but does not end a run at shutoff_C or on the
+        # timeout.
+        self._thermal_limits: dict = self._no_thermal_limits()
 
         # Reported firmware version. Mutable so an app-side debug UI
         # (or a test) can flip it to simulate an incompatible firmware
@@ -370,6 +381,13 @@ class SimulatedTxDevice:
         selections = list(machine_config.get("pulse_train_count_selections") or [])
         if not 0 <= duration_index < len(selections):
             raise LIFUDeviceError(f"TX: preset {index} has no duration index {duration_index}")
+        # The firmware refuses a blob without valid limits or a timeout of at
+        # least 1 s (presets.c), so a preset never arms a disabled gate.
+        try:
+            start_x10, shutoff_x10 = thermal_limits(machine_config)
+            timeout_s = treatment_timeout(machine_config)
+        except ValueError as e:
+            raise LIFUDeviceError(f"TX: preset {index} cannot be loaded: {e}") from e
         self._sequence = {
             "pulse_interval": float(machine_config.get("pulse_interval_ms", 0.0)) / 1000.0,
             "pulse_count": int(machine_config.get("pulse_count", 1)),
@@ -379,6 +397,12 @@ class SimulatedTxDevice:
         self._pulse["duration"] = float(machine_config.get("pulse_length_us", 100.0)) / 1_000_000.0
         self._normalize_train_interval()
         self._module_loads[module] = (index, duration_index)
+        if module == 0:
+            self._thermal_limits = {
+                "source": "preset", "preset_index": index,
+                "start_c": start_x10 / PRESET_TEMP_SCALE, "shutoff_c": shutoff_x10 / PRESET_TEMP_SCALE,
+                "treatment_timeout_s": timeout_s,
+            }
         return True
 
     def unload_preset(self, module: int = 0) -> bool:
@@ -392,6 +416,24 @@ class SimulatedTxDevice:
         that inspect it (operator-interface tests/test_no_auto_restart.py);
         :meth:`get_loaded_preset_state` with ``module`` is the public read."""
         return set(self._module_loads)
+
+    @staticmethod
+    def _no_thermal_limits() -> dict:
+        return {"source": "none", "preset_index": None, "start_c": None, "shutoff_c": None,
+                "treatment_timeout_s": 0}
+
+    def get_thermal_limits(self) -> dict:
+        """Same shape as :meth:`TxDevice.get_thermal_limits`."""
+        return dict(self._thermal_limits)
+
+    def _start_check(self) -> None:
+        """The armed start_C, as the firmware's thermal_limits_start_check.
+        The simulator always has a temperature reading, so it never reports
+        OW_TEMP_UNKNOWN."""
+        start_c = self._thermal_limits["start_c"]
+        if start_c is not None and self._modules[0].read_temp() > float(start_c):
+            raise LIFUDeviceError(f"TX above start_C {float(start_c):.1f} C",
+                                  device_error_code=OW_TEMP_TOO_HIGH)
 
     def get_loaded_preset(self) -> tuple[Optional[int], Optional[int]]:
         """Same contract as :meth:`TxDevice.get_loaded_preset`."""
@@ -561,7 +603,7 @@ class SimulatedTxDevice:
 
     def get_trigger_json(self) -> dict:
         return {
-            "TriggerStatus": "RUNNING" if self._trigger_running else "STOPPED",
+            "TriggerStatus": self._trigger_status,
             "TriggerMode": "SEQUENCE",
             "TrainCount": self._train_curr,
             **self._sequence,
@@ -580,10 +622,8 @@ class SimulatedTxDevice:
         * ``train_count`` -- current pulse-train counter, 0 before
           an engine starts, incremented each train tick, equal to
           ``pulse_train_count`` on natural completion.
-        * ``trigger_status`` -- ``"RUNNING"`` or ``"STOPPED"``;
-          flips to ``"STOPPED"`` on both operator stop and natural
-          completion so a polled host sees a single stop edge
-          either way.
+        * ``trigger_status`` -- ``"RUNNING"``, ``"PAUSED"``,
+          ``"TIMEOUT"``, or ``"STOPPED"``.
         """
         seq = self._sequence
         pulse_interval = seq.get("pulse_interval", 0.1)
@@ -597,27 +637,57 @@ class SimulatedTxDevice:
             "profile_index": 1,
             "profile_increment": True,
             "train_count": self._train_curr,
-            "trigger_status": "RUNNING" if self._trigger_running else "STOPPED",
+            "trigger_status": self._trigger_status,
         }
 
     def start_trigger(self):
         """Same refusals as an FDA_MODE transmitter (presets_start_check in
         the firmware): nothing loaded on module 0, the master, or module 0
-        above the loaded preset's start_C. The simulator always has a
-        temperature reading, so it never reports OW_TEMP_UNKNOWN. As in the
+        above the armed start_C (_start_check). As in the
         firmware, only the master's own load gates Start; the loaded read
         (:meth:`get_loaded_preset_state`) is what asks every module."""
-        load = self._module_loads.get(0)
-        if load is None:
+        if self._module_loads.get(0) is None:
             raise LIFUDeviceError("TX: no preset loaded", device_error_code=OW_NO_PRESET)
-        start_c = self._preset_flash[load[0]][0].get("start_C")
-        if start_c is not None and self._modules[0].read_temp() > float(start_c):
-            raise LIFUDeviceError(f"TX above start_C {float(start_c):.1f} C",
-                                  device_error_code=OW_TEMP_TOO_HIGH)
-        self._trigger_running = True
+        if self._trigger_status == "PAUSED":
+            raise LIFUDeviceError("TX: trigger is paused")
+        self._start_check()
+        self._trigger_status = "RUNNING"
 
     def stop_trigger(self):
-        self._trigger_running = False
+        self._trigger_status = "STOPPED"
+
+    def pause_trigger(self):
+        """Device-level trigger flag only, like :meth:`start_trigger`:
+        a run is paused through ``SimulatedDeviceInterface.pause_sonication``,
+        which drives the run engine."""
+        if self._trigger_status == "PAUSED":
+            return True
+        if self._trigger_status != "RUNNING":
+            raise LIFUDeviceError("TX: no sequence is running")
+        self._trigger_status = "PAUSED"
+        return True
+
+    def resume_trigger(self):
+        """Device-level trigger flag only (see :meth:`pause_trigger`).
+
+        Per SR-023 item 8: refused at or above shutoff_C, and not gated by
+        start_C, as the firmware does since openlifu-transmitter-fw#42. The
+        shutoff_C is the armed one, which outlasts the load
+        (openlifu-transmitter-fw#60).
+        """
+        if self._trigger_status != "PAUSED":
+            raise LIFUDeviceError("TX: sequence is not paused")
+        shutoff_c = self._thermal_limits["shutoff_c"]
+        if shutoff_c is not None:
+            hottest = max(m.read_temp() for m in self._modules)
+            if hottest >= float(shutoff_c):
+                raise LIFUDeviceError(f"TX at shutoff_C {float(shutoff_c):.1f} C",
+                                      device_error_code=OW_TEMP_TOO_HIGH)
+        self._trigger_status = "RUNNING"
+        return True
+
+    def timeout_trigger(self):
+        self._trigger_status = "TIMEOUT"
 
     def ping(self, module: int = 0):
         return True
@@ -660,9 +730,40 @@ class SimulatedLIFUTxDevice(SimulatedTxDevice):
     _async_mode = False
 
     def start_trigger(self):
-        """An RUO image starts whatever solution was programmed; there is no
-        preset gate."""
-        self._trigger_running = True
+        """An RUO image starts whatever solution was programmed, with no
+        preset gate; only armed thermal limits can refuse it, and, as in the
+        firmware, a paused sequence (resume or stop it)."""
+        if self._trigger_status == "PAUSED":
+            raise LIFUDeviceError("TX: trigger is paused")
+        self._start_check()
+        self._trigger_status = "RUNNING"
+
+    def _thermal_limits_write(self) -> None:
+        # As the firmware: refused while a sequence runs or is paused;
+        # otherwise the master unloads its preset, as on a raw write, since
+        # its limits are about to change.
+        if self._trigger_status in ("RUNNING", "PAUSED"):
+            raise LIFUDeviceError("TX: a sequence is running or paused",
+                                  device_error_code=OW_PRESET_BUSY)
+        self.unload_preset(0)
+
+    def set_thermal_limits(self, start_c: float, shutoff_c: float, treatment_timeout_s: int) -> dict:
+        """Same contract as :meth:`LIFUTxDevice.set_thermal_limits`."""
+        start_x10, shutoff_x10 = thermal_limits(
+            {"id": "set_thermal_limits", "start_C": start_c, "shutoff_C": shutoff_c})
+        timeout_s = host_treatment_timeout(treatment_timeout_s)
+        self._thermal_limits_write()
+        self._thermal_limits = {"source": "host", "preset_index": None,
+                                "start_c": start_x10 / PRESET_TEMP_SCALE,
+                                "shutoff_c": shutoff_x10 / PRESET_TEMP_SCALE,
+                                "treatment_timeout_s": timeout_s}
+        return self.get_thermal_limits()
+
+    def clear_thermal_limits(self) -> dict:
+        """Same contract as :meth:`LIFUTxDevice.clear_thermal_limits`."""
+        self._thermal_limits_write()
+        self._thermal_limits = self._no_thermal_limits()
+        return self.get_thermal_limits()
 
     def get_tx_module_count(self) -> int:
         return self.num_modules
@@ -724,6 +825,9 @@ class SimulatedLIFUTxDevice(SimulatedTxDevice):
         return (echo_data, len(echo_data))
 
     def soft_reset(self, module: Optional[int] = None):
+        """The limits are RAM state on the master: its reset leaves none armed."""
+        if module in (None, 0):
+            self._thermal_limits = self._no_thermal_limits()
         return True
 
     async def start_monitoring(self, interval: int = 1):
@@ -1043,12 +1147,14 @@ class _SimulatedRunEngine(QObject):
 
     def __init__(self, txdevice: SimulatedTxDevice, hvcontroller: SimulatedHVController,
                  sequence: dict, pulse: dict, voltage: float,
-                 trigger_mode: str = "sequence", parent=None):
+                 trigger_mode: str = "sequence",
+                 treatment_timeout_s: float = 1800.0, parent=None):
         super().__init__(parent)
         self._finished_cb: Optional[callable] = None
         self._tx = txdevice
         self._hv = hvcontroller
         self._voltage = float(voltage)
+        self._treatment_timeout_s = float(treatment_timeout_s)
         self._trigger_mode = str(trigger_mode).lower()
         self._mode_label = {
             "sequence": "SEQUENCE",
@@ -1088,14 +1194,23 @@ class _SimulatedRunEngine(QObject):
 
         self._train_curr = 0
         self.alive = True
+        self.paused = False
+        self.pause_pending = False
+        self._paused_at = 0.0
+        self._timeout_deadline: Optional[float] = None
+        self._train_period_ms = max(20, int(round(self._train_period_s * 1000)))
 
         self._train_timer = QTimer(self)
-        self._train_timer.setSingleShot(False)
+        self._train_timer.setSingleShot(True)
         self._train_timer.timeout.connect(self._on_train_tick)
 
         self._heartbeat = QTimer(self)
         self._heartbeat.setSingleShot(False)
         self._heartbeat.timeout.connect(self._on_heartbeat)
+
+        self._timeout_timer = QTimer(self)
+        self._timeout_timer.setSingleShot(True)
+        self._timeout_timer.timeout.connect(self._on_timeout)
 
     def start(self):
         self._tx.start_trigger()
@@ -1104,7 +1219,8 @@ class _SimulatedRunEngine(QObject):
         self._tx._train_curr = 0
         # Apply heating for the very first train period as it elapses;
         # speed-clamp to avoid pegging the GUI on tiny periods.
-        period_ms = max(20, int(round(self._train_period_s * 1000)))
+        period_ms = self._train_period_ms
+        self._timeout_deadline = time.monotonic() + self._treatment_timeout_s
         if self._infinite:
             est_duration = "infinite"
         else:
@@ -1127,6 +1243,7 @@ class _SimulatedRunEngine(QObject):
             status="RUNNING", mode=self._mode_label,
         )
         self._train_timer.start(period_ms)
+        self._timeout_timer.start(max(0, int(round(self._treatment_timeout_s * 1000))))
         # The heartbeat exists to carry temperature updates between
         # long train ticks. When the train period is already <= the
         # heartbeat interval, running both produces interleaved
@@ -1135,12 +1252,53 @@ class _SimulatedRunEngine(QObject):
         if period_ms > HEARTBEAT_INTERVAL_MS:
             self._heartbeat.start(HEARTBEAT_INTERVAL_MS)
 
+    def pause(self):
+        """Request a pause, as the firmware does (SR-023): it lands at
+        the next train tick, and not at all if that tick completes the
+        sequence. Until it lands the status stays RUNNING. Pausing
+        while paused is a no-op. Like the firmware, only a SEQUENCE run
+        can be paused."""
+        if not self.alive:
+            raise LIFUDeviceError("TX: no sequence is running")
+        if self._trigger_mode != "sequence":
+            raise LIFUDeviceError(f"TX: cannot pause a {self._mode_label} run")
+        if not self.paused:
+            self.pause_pending = True
+        return True
+
+    def resume(self):
+        """Resume with the count retained. As in the firmware, the time
+        paused counts toward the train period, so the next train comes
+        once the rest of the period has passed (at once after a pause of
+        a full period or more). Before the pause lands, Resume withdraws
+        it. Refused after a timeout or at shutoff_C."""
+        if self._timeout_deadline is not None and time.monotonic() >= self._timeout_deadline:
+            self._on_timeout()
+        if self.alive and self.pause_pending:
+            self.pause_pending = False
+            return True
+        if not self.alive or not self.paused:
+            raise LIFUDeviceError("TX: sequence is not paused or treatment timed out")
+        self._tx.resume_trigger()
+        self.paused = False
+        self._tx.emit_status_frame(
+            self._train_curr, self._frame_train_total(),
+            status="RUNNING", mode=self._mode_label,
+        )
+        paused_ms = int((time.monotonic() - self._paused_at) * 1000)
+        self._train_timer.start(max(0, self._train_period_ms - paused_ms))
+        if self._train_period_ms > HEARTBEAT_INTERVAL_MS:
+            self._heartbeat.start(HEARTBEAT_INTERVAL_MS)
+        self.parent().set_status(LIFUInterfaceStatus.STATUS_RUNNING)
+        return True
+
     def stop(self):
         was_alive = self.alive
         # Mark inactive first so any queued timer ticks become no-ops.
         self.alive = False
         self._train_timer.stop()
         self._heartbeat.stop()
+        self._timeout_timer.stop()
         self._tx.stop_trigger()
         # Emit a final STOPPED frame so the connector's STATUS-based
         # trigger-state machine flips cleanly (especially in continuous
@@ -1155,9 +1313,37 @@ class _SimulatedRunEngine(QObject):
                 status="STOPPED", mode=self._mode_label,
             )
 
-    def _on_train_tick(self):
+    def _frame_train_total(self) -> int:
+        if self._infinite and self._train_curr > 0:
+            return self._train_curr
+        return max(1, self._train_total)
+
+    def _on_timeout(self):
         if not self.alive:
             return
+        self.alive = False
+        self.paused = False
+        self.pause_pending = False
+        self._train_timer.stop()
+        self._heartbeat.stop()
+        self._timeout_timer.stop()
+        self._tx.timeout_trigger()
+        self._tx.emit_status_frame(
+            self._train_curr, self._frame_train_total(),
+            status="TIMEOUT", mode=self._mode_label,
+        )
+        self.parent().set_status(LIFUInterfaceStatus.STATUS_TIMEOUT)
+        # The run has ended, as on natural completion.
+        if self._finished_cb is not None:
+            try:
+                self._finished_cb()
+            except Exception:  # noqa: BLE001 -- reason: the caller's callback must not stop the run engine's own timeout handling; logged
+                logger.exception("_SimulatedRunEngine finished callback raised")
+
+    def _on_train_tick(self):
+        if not self.alive or self.paused:
+            return
+        self._train_timer.start(self._train_period_ms)
         self._train_curr += 1
         # Mirror the running counter back to the TxDevice so a
         # polled host (:meth:`SimulatedTxDevice.get_trigger`) sees
@@ -1173,23 +1359,38 @@ class _SimulatedRunEngine(QObject):
                 self._train_curr, self._train_curr,
                 status="RUNNING", mode=self._mode_label,
             )
+        else:
+            self._tx.emit_status_frame(
+                self._train_curr, self._train_total,
+                status="RUNNING", mode=self._mode_label,
+            )
+        if self.pause_pending and self._train_curr < self._train_total:
+            # A requested pause lands at this train boundary (SR-023).
+            self.pause_pending = False
+            self.paused = True
+            self._paused_at = time.monotonic()
+            self._train_timer.stop()
+            self._heartbeat.stop()
+            self._tx.pause_trigger()
+            self._tx.emit_status_frame(
+                self._train_curr, self._frame_train_total(),
+                status="PAUSED", mode=self._mode_label,
+            )
+            self.parent().set_status(LIFUInterfaceStatus.STATUS_PAUSED)
             return
-        self._tx.emit_status_frame(
-            self._train_curr, self._train_total,
-            status="RUNNING", mode=self._mode_label,
-        )
-        if self._train_curr >= self._train_total:
+        if not self._infinite and self._train_curr >= self._train_total:
             # Mark inactive BEFORE emitting so a queued heartbeat tick
             # cannot race past us and re-emit a RUNNING frame that
             # would clobber the state reset on the connector side.
             self.alive = False
             self._train_timer.stop()
             self._heartbeat.stop()
-            # Flip the TxDevice's trigger_running flag so a polled
-            # host's :meth:`get_trigger` sees ``trigger_status ==
+            self._timeout_timer.stop()
+            # Update the TxDevice's trigger status so a polled host's
+            # :meth:`get_trigger` sees ``trigger_status ==
             # "STOPPED"`` on the natural-completion edge, matching
             # the operator-initiated stop edge. (Pre-2026-10-01 the
-            # sim left trigger_running=True after natural end --
+            # sim left the trigger status at "RUNNING" after natural end --
             # that only mattered for callers that subscribed to the
             # STOPPED status frame, not for a polled host.)
             self._tx.stop_trigger()
@@ -1199,6 +1400,8 @@ class _SimulatedRunEngine(QObject):
                 self._train_curr, self._train_total,
                 status="STOPPED", mode=self._mode_label,
             )
+            # As DeviceInterface.get_status() reports on STOPPED.
+            self.parent().set_status(LIFUInterfaceStatus.STATUS_FINISHED)
             if self._finished_cb is not None:
                 try:
                     self._finished_cb()
@@ -1238,6 +1441,7 @@ class SimulatedDeviceInterface(QObject):
     def __init__(self, num_modules: int = 1,
                  transducer=None,
                  preset_flash: Optional[List[tuple[dict, int]]] = None,
+                 treatment_timeout_s: float = 1800.0,
                  **_unused):
         # When a transducer (array) is supplied, derive num_modules from it
         # so the TX device is built with the right module count up front.
@@ -1247,6 +1451,12 @@ class SimulatedDeviceInterface(QObject):
                 num_modules = max(1, len(list(modules_attr)))
         _check_host_binding()
         super().__init__()
+        # SR-024 defines a positive timeout per preset (1800 s released);
+        # there is no "disabled" value. The upper bound is the simulator's
+        # QTimer range (int32 milliseconds), far above any preset.
+        if not 0 < treatment_timeout_s <= 2_000_000:
+            raise ValueError("treatment_timeout_s must be > 0 and <= 2,000,000 s")
+        self.treatment_timeout_s = float(treatment_timeout_s)
         self.txdevice, self.hvcontroller = self._create_devices(num_modules, preset_flash)
         self.status = LIFUInterfaceStatus.STATUS_SYS_OFF
         self._preset_modules = 1
@@ -1298,6 +1508,9 @@ class SimulatedDeviceInterface(QObject):
         """Same contract as :meth:`DeviceInterface.load_preset`: the preset
         must span the modules the transmitter reports, and it ends up on
         both devices or, if either refuses, on neither."""
+        status = self.txdevice._trigger_status
+        if status in ("PAUSED", "TIMEOUT"):
+            raise LIFUError(f"load_preset: the sequence is {status.lower()}; stop it first")
         self.set_status(LIFUInterfaceStatus.STATUS_PROGRAMMING)
         regs_crcs = module_regs_crcs(regs_crc)
         try:
@@ -1338,8 +1551,10 @@ class SimulatedDeviceInterface(QObject):
                          wait_for_settle: bool = True) -> bool:
         """Same contract as :meth:`DeviceInterface.start_sonication`: a
         refusal from either device is raised with HV turned back off."""
-        # Stop any previous engine before starting a new one (pause/resume
-        # rebuilds the trigger then re-calls start_sonication).
+        status = self.txdevice._trigger_status
+        if status in ("PAUSED", "TIMEOUT"):
+            raise LIFUError(f"start_sonication: the sequence is {status.lower()}; stop it first")
+        # Stop any previous engine before starting a new one.
         if self._engine is not None and self._engine.alive:
             self._engine.stop()
         try:
@@ -1356,6 +1571,7 @@ class SimulatedDeviceInterface(QObject):
                 pulse=self.txdevice._pulse,
                 voltage=self._last_solution_voltage,
                 trigger_mode=self._last_trigger_mode,
+                treatment_timeout_s=self.treatment_timeout_s,
                 parent=self,
             )
             self._engine.start()
@@ -1377,8 +1593,18 @@ class SimulatedDeviceInterface(QObject):
         self.set_status(LIFUInterfaceStatus.STATUS_READY)
         return True
 
+    def pause_sonication(self) -> bool:
+        if self._engine is None:
+            raise LIFUDeviceError("TX: no sequence is running")
+        return self._engine.pause()
+
+    def resume_sonication(self) -> bool:
+        if self._engine is None:
+            raise LIFUDeviceError("TX: sequence is not paused")
+        return self._engine.resume()
+
     def is_running(self) -> bool:
-        return self._engine is not None and self._engine.alive
+        return self._engine is not None and self._engine.alive and not self._engine.paused
 
     # ---- misc -----------------------------------------------------------
 
@@ -1410,9 +1636,11 @@ class SimulatedLIFUInterface(SimulatedDeviceInterface):
                  transducer=None,
                  voltage_table_selection: Optional[str] = None,
                  preset_flash: Optional[list[tuple[dict, int]]] = None,
+                 treatment_timeout_s: float = 1800.0,
                  **_unused):
         super().__init__(num_modules=num_modules, transducer=transducer,
-                         preset_flash=preset_flash)
+                         preset_flash=preset_flash,
+                         treatment_timeout_s=treatment_timeout_s)
         self.voltage_table_selection = voltage_table_selection
 
     def _create_devices(self, num_modules: int,

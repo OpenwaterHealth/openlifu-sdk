@@ -34,6 +34,7 @@ def _compiled(elements: int) -> dict:
         "apodization": [[1.0] * elements],
         "start_C": 35,
         "shutoff_C": 75,
+        "treatment_timeout_s": 1800,
         "voltage": 20.0,
     }
     return compile_preset(doc, settings_bytes=json.dumps(doc).encode())

@@ -63,6 +63,10 @@ Configuration and telemetry
 - `get_temperature(module=0) -> float` — module temperature.
 - `get_ambient_temperature(module=0) -> float` — ambient temperature.
 
+Thermal limits (`start_C` / `shutoff_C`) and treatment timeout
+- `get_thermal_limits() -> dict` — what the transmitter enforces now: `source` (`"preset"`, `"host"` or `"none"`), `preset_index`, `start_c`, `shutoff_c`, `treatment_timeout_s` (0: none). A load arms the preset's limits; a raw write or an unload leaves them armed. While armed, `start_trigger()` is refused above `start_c`, a running sequence stops at `shutoff_c`, and a running or paused one ends as `TIMEOUT` after `treatment_timeout_s`, whether or not a preset is still loaded. The transmitter firmware enforces these (openlifu-transmitter-fw#60, not yet HIL-tested); the SDK only reports them, and the simulator models the Start and Resume gates but not the `shutoff_c` stop or the timeout. A reply that breaks the firmware's own rules raises `LIFUProtocolError`. On `TxDevice` too.
+- `set_thermal_limits(start_c, shutoff_c, treatment_timeout_s) -> dict` / `clear_thermal_limits() -> dict` — RUO only: arm the host's own limits for research use, or disarm them. `treatment_timeout_s` is whole seconds up to 65535, and 0 disables it (a preset's is always at least 1). Like a raw write, either one unloads a preset loaded on the master, so a researcher can load a preset and then change its limits. Refused (`OW_PRESET_BUSY`) while a sequence runs or is paused, and by an FDA_MODE image (`OW_FDA_REFUSED`); a refused call unloads nothing. A soft reset leaves none armed.
+
 DFU / firmware update
 - `get_module_count() -> int` — number of logical LIFU modules reported by firmware.
 - `update_firmware(module, package_file, ...) -> bool` — high-level helper that delegates to `openlifu_sdk.io.LIFUDFU.LIFUDFUManager` to program a signed package. See `LIFUDFU` docs for details.

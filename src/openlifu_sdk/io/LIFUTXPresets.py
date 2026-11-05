@@ -149,6 +149,19 @@ def treatment_timeout(machine_config: Dict) -> int:
     return int(value)
 
 
+def host_treatment_timeout(value) -> int:
+    """A host's treatment_timeout_s for LIFUTxDevice.set_thermal_limits():
+    a preset's (:func:`treatment_timeout`), or 0, which a standard image's
+    host may set to run with no timeout.
+
+    Raises:
+        ValueError: As :func:`treatment_timeout`, 0 aside.
+    """
+    if value == 0 and not isinstance(value, bool):
+        return 0
+    return treatment_timeout({"id": "set_thermal_limits", "treatment_timeout_s": value})
+
+
 def preset_voltage(machine_config: Dict) -> float:
     """The HV voltage the console bakes for this preset, as float32: what a
     transmitter of the preset's sensitivity needs.

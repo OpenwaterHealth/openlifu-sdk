@@ -36,7 +36,10 @@ from openlifu_sdk.io.LIFUConfig import (
     OW_CTRL_GET_MODULE_MODE,
     OW_CTRL_ENUMERATE,
     NODE_MODE_UNKNOWN,
+    OW_CTRL_CLEAR_THERMAL_LIMITS,
     OW_CTRL_GET_PATTERN_PROFILE,
+    OW_CTRL_GET_THERMAL_LIMITS,
+    OW_CTRL_SET_THERMAL_LIMITS,
     OW_PRESET_COMMIT,
     OW_PRESET_DELETE,
     OW_PRESET_EMPTY,
@@ -56,6 +59,8 @@ from openlifu_sdk.io.LIFUConfig import (
     OW_CTRL_SET_SWTRIG,
     OW_CTRL_START_SWTRIG,
     OW_CTRL_STOP_SWTRIG,
+    OW_CTRL_PAUSE_SWTRIG,
+    OW_CTRL_RESUME_SWTRIG,
     OW_TRANSMITTER_PID,
     OW_TX7332,
     OW_TX7332_DEMO,
@@ -212,11 +217,57 @@ PRESET_WRITE_CHUNK = 512
 # commit in thirty stores the preset but its reply never reaches the host.
 PRESET_WRITE_ATTEMPTS = 3
 TEMPERATURE_DATA_LENGTH = 4
+# OW_CTRL_GET/SET/CLEAR_THERMAL_LIMITS reply: source, preset index (0xFF unless
+# the limits came from a preset), start_C and shutoff_C as i16 tenths, then
+# treatment_timeout_s as a u16 (0: none). SET sends the last three.
+THERMAL_LIMITS_SOURCES = {0: "none", 1: "preset", 2: "host"}
+THERMAL_LIMITS_NO_PRESET = 0xFF
+THERMAL_LIMITS_DATA_LENGTH = 8
 
 if TYPE_CHECKING:
     pass
 
 logger = logging.getLogger(__name__)
+
+
+def _decode_thermal_limits(r) -> Dict:
+    """What every OW_CTRL_*_THERMAL_LIMITS reply carries: the limits armed now.
+
+    The safety gates are read from this, so a reply that breaks the
+    firmware's own rules (thermal_limits.c) is refused rather than passed
+    on: none armed with any value set; a host's with a preset index; a
+    preset's without one, or with no timeout (a preset always has one); or
+    armed limits whose start_C is not below shutoff_C.
+    """
+    d = bytes(r.data or b"")
+    if len(d) < THERMAL_LIMITS_DATA_LENGTH:
+        raise LIFUProtocolError(
+            f"TX: thermal limits payload too short ({len(d)} < {THERMAL_LIMITS_DATA_LENGTH})",
+            code=LIFU_ERR_BAD_PAYLOAD_LENGTH)
+    source = THERMAL_LIMITS_SOURCES.get(d[0])
+    if source is None:
+        raise LIFUProtocolError(f"TX: unknown thermal limits source {d[0]}",
+                                code=LIFU_ERR_BAD_PAYLOAD_FORMAT)
+    raw_start, raw_shutoff, timeout_s = struct.unpack("<hhH", d[2:8])
+    armed = source != "none"
+    indexed = d[1] != THERMAL_LIMITS_NO_PRESET
+    # Only a preset's carry an index, only none are all zeros.
+    broken = (indexed != (source == "preset"),
+              not armed and any((raw_start, raw_shutoff, timeout_s)),
+              source == "preset" and timeout_s == 0,
+              armed and raw_start >= raw_shutoff)
+    if any(broken):
+        raise LIFUProtocolError(
+            f"TX: thermal limits reply is inconsistent ({source}, index 0x{d[1]:02x}, "
+            f"{raw_start}/{raw_shutoff}, {timeout_s} s)",
+            code=LIFU_ERR_BAD_PAYLOAD_FORMAT)
+    return {
+        "source": source,
+        "preset_index": None if d[1] == THERMAL_LIMITS_NO_PRESET else d[1],
+        "start_c": raw_start / PRESET_TEMP_SCALE if armed else None,
+        "shutoff_c": raw_shutoff / PRESET_TEMP_SCALE if armed else None,
+        "treatment_timeout_s": timeout_s,
+    }
 
 class TxDevice(OWComponent):
     """FDA transmitter component: preset load, trigger start/stop/status and
@@ -390,6 +441,26 @@ class TxDevice(OWComponent):
         r.print_packet()
         return True
 
+    def pause_trigger(self) -> bool:
+        """Pause the running software trigger at a pulse-train boundary.
+
+        Raises:
+            LIFUNotConnectedError, LIFUCommunicationError, LIFUDeviceError.
+        """
+        self.send_checked(packet_type=OW_CONTROLLER, command=OW_CTRL_PAUSE_SWTRIG,
+                          addr=0, op="pause_trigger")
+        return True
+
+    def resume_trigger(self) -> bool:
+        """Resume a paused software trigger.
+
+        Raises:
+            LIFUNotConnectedError, LIFUCommunicationError, LIFUDeviceError.
+        """
+        self.send_checked(packet_type=OW_CONTROLLER, command=OW_CTRL_RESUME_SWTRIG,
+                          addr=0, op="resume_trigger")
+        return True
+
     def get_preset(self, index: int) -> Dict:
         """Describe a preset an FDA_MODE or PRESET_MODE image holds (OW_PRESET_GET).
 
@@ -457,10 +528,12 @@ class TxDevice(OWComponent):
         run length from the preset's stored pulse-train counts
         (get_preset()["train_counts"]); a raw count cannot be sent.
 
-        In FDA mode the trigger only starts once a preset is loaded, and only
-        while the TX is at or below that preset's start_C; it stops itself at
-        shutoff_C. start_trigger() reports a refusal as a LIFUDeviceError
-        carrying OW_NO_PRESET, OW_TEMP_TOO_HIGH or OW_TEMP_UNKNOWN.
+        The load also arms the preset's start_C and shutoff_C, which outlast
+        it (get_thermal_limits()): the trigger starts only while the TX is at
+        or below start_C, and stops itself at shutoff_C. In FDA mode it also
+        starts only once a preset is loaded. start_trigger() reports a
+        refusal as a LIFUDeviceError carrying OW_NO_PRESET, OW_TEMP_TOO_HIGH
+        or OW_TEMP_UNKNOWN.
 
         Raises:
             LIFUDeviceError: Either CRC differs (OW_BAD_CRC), bad index, a
@@ -477,6 +550,7 @@ class TxDevice(OWComponent):
         """Leave one module with no preset loaded, so the trigger will not start
         (OW_PRESET_LOAD with no payload). What a host does when the other
         half of a load, the console's select_preset, did not go through.
+        The thermal limits the load armed stay armed (get_thermal_limits()).
 
         Raises:
             LIFUDeviceError: Trigger running (OW_PRESET_BUSY), or firmware
@@ -562,6 +636,34 @@ class TxDevice(OWComponent):
         """
         state = self.get_loaded_preset_state()
         return state["index"], state["duration_index"]
+
+    def get_thermal_limits(self) -> Dict:
+        """The start_C / shutoff_C and treatment timeout the transmitter
+        enforces now (OW_CTRL_GET_THERMAL_LIMITS).
+
+        Returns ``source`` -- "preset" (armed by the last load), "host"
+        (LIFUTxDevice.set_thermal_limits) or "none" -- ``preset_index`` (the
+        preset that armed them, else None), ``start_c`` / ``shutoff_c`` in
+        degrees C (None when none are armed) and ``treatment_timeout_s``
+        (seconds from start, pauses included; 0 when there is none).
+
+        The limits are their own state, apart from the load: a raw write or
+        an unload leaves them armed. While armed, start_trigger() is refused
+        above start_C (OW_TEMP_TOO_HIGH) or without a fresh reading
+        (OW_TEMP_UNKNOWN), a running sequence stops at shutoff_C, and a
+        running or paused one ends as TIMEOUT once the treatment timeout has
+        passed, whether or not a preset is still loaded. Those gates are
+        enforced by the transmitter firmware (openlifu-transmitter-fw#60, whose HIL tests have not yet run); the SDK and its simulator only report them. They are the master's (module 0), which runs the trigger;
+        a reset leaves none armed.
+
+        Raises:
+            LIFUDeviceError: Firmware that predates the command.
+            LIFUProtocolError: Short reply, or one that breaks the
+                firmware's rules (see _decode_thermal_limits).
+        """
+        r = self.send_checked(packet_type=OW_CONTROLLER, command=OW_CTRL_GET_THERMAL_LIMITS,
+                              op="get_thermal_limits")
+        return _decode_thermal_limits(r)
 
     def get_module_count(self) -> int:
         """Return the number of connected LIFU transmitter modules.
@@ -952,6 +1054,65 @@ class LIFUTxDevice(LIFUComponentMixin, TxDevice):
                           addr=identifier, data=data, op="write_register")
         logger.debug("Wrote 0x%08X to chip %d reg 0x%04X", value, identifier, address)
         return True
+
+    def set_thermal_limits(self, start_c: float, shutoff_c: float, treatment_timeout_s: int) -> Dict:
+        """Arm the host's own start_C / shutoff_C and treatment timeout
+        (OW_CTRL_SET_THERMAL_LIMITS).
+
+        For research use without a preset, or to change a loaded preset's:
+        once armed, start_trigger() is refused above *start_c*, a running
+        sequence stops at *shutoff_c*, and a running or paused one ends as
+        TIMEOUT *treatment_timeout_s* after start, as with a loaded preset's
+        limits (get_thermal_limits()), enforced by the transmitter firmware (openlifu-transmitter-fw#60, whose HIL tests have not yet run); the SDK and its simulator only report them. The temperatures travel as tenths of a
+        degree, so they must be multiples of 0.1 C, and *start_c* must be
+        below *shutoff_c*. *treatment_timeout_s* is whole seconds up to
+        65535; 0 runs with no timeout. It has no default, so a timeout is
+        never dropped by leaving it out.
+
+        Like a raw register or trigger write, this unloads a preset loaded on
+        the master (get_loaded_preset_state()): the preset no longer
+        describes what is armed. The firmware unloads before it checks the
+        payload, so a payload it refuses (OW_INVALID_PACKET) still unloads;
+        this method checks the limits first, so it never sends one. Refused
+        as OW_PRESET_BUSY or OW_FDA_REFUSED, nothing is unloaded.
+
+        Returns what is armed afterwards, as get_thermal_limits().
+
+        Raises:
+            ValueError: A limit finer than 0.1 C or out of range, start_c
+                not below shutoff_c, or a timeout that is not whole seconds in
+                0..65535 (nothing is sent).
+            LIFUDeviceError: OW_PRESET_BUSY while a sequence runs or is paused;
+                OW_FDA_REFUSED from an FDA_MODE image; or firmware that
+                predates the command.
+        """
+        # lazy: it imports this module
+        from openlifu_sdk.io.LIFUTXPresets import host_treatment_timeout, thermal_limits
+        raw = thermal_limits({"id": "set_thermal_limits", "start_C": start_c, "shutoff_C": shutoff_c})
+        timeout_s = host_treatment_timeout(treatment_timeout_s)
+        r = self.send_checked(packet_type=OW_CONTROLLER, command=OW_CTRL_SET_THERMAL_LIMITS,
+                              data=bytearray(struct.pack("<hhH", *raw, timeout_s)), op="set_thermal_limits")
+        return _decode_thermal_limits(r)
+
+    def clear_thermal_limits(self) -> Dict:
+        """Disarm start_C / shutoff_C and the treatment timeout
+        (OW_CTRL_CLEAR_THERMAL_LIMITS).
+
+        With none armed, start_trigger() runs the host's configuration with
+        only the firmware's global overheat protection, and no timeout. Clearing with none
+        armed is not an error. Like set_thermal_limits(), it unloads a
+        preset loaded on the master, except when refused (OW_PRESET_BUSY,
+        OW_FDA_REFUSED). Returns what is armed afterwards
+        (``source`` "none"), as get_thermal_limits().
+
+        Raises:
+            LIFUDeviceError: OW_PRESET_BUSY while a sequence runs or is
+                paused; OW_FDA_REFUSED from an FDA_MODE image; or firmware
+                that predates the command.
+        """
+        r = self.send_checked(packet_type=OW_CONTROLLER, command=OW_CTRL_CLEAR_THERMAL_LIMITS,
+                              op="clear_thermal_limits")
+        return _decode_thermal_limits(r)
 
     def get_preset_slot(self, slot: int) -> Dict:
         """Describe one of a PRESET_MODE image's preset slots.
