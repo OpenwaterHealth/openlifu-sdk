@@ -42,6 +42,7 @@ from openlifu_sdk.io.LIFUConfig import (
     OW_PRESET_EMPTY,
     OW_PRESET_GET,
     OW_PRESET_LOAD,
+    OW_PRESET_LOADED,
     OW_PRESET_SLOT_TAIL,
     OW_PRESET_CAPACITY,
     OW_PRESET_WRITE,
@@ -484,6 +485,83 @@ class TxDevice(OWComponent):
         self.send_checked(packet_type=OW_CONTROLLER, command=OW_PRESET_LOAD, addr=module,
                           op="unload_preset")
         return True
+
+    def get_loaded_preset_state(self, module: Optional[int] = None) -> Dict:
+        """What the transmitter has loaded, as the firmware sees it (OW_PRESET_LOADED).
+
+        The master asks every module. ``loaded`` is True only if all of them
+        hold the same load -- same index, run length and settings_crc -- and
+        then the dict also carries ``index``, ``duration_index``,
+        ``train_count`` (the pulse-train count the load programmed),
+        ``settings_crc`` and ``regs_crc`` (the master's own part). Otherwise
+        those are None.
+
+        ``missing_modules`` lists the modules that do not hold the master's
+        load (0 is the master): every module if the master holds nothing,
+        else each module holding nothing or another load, for example one
+        that was reset after the load. The firmware sends
+        it as byte 15, one bit per module, relative to the replying module
+        (if_commands.c ``preset_loaded_reply``).
+
+        With *module* 1 or above, that module answers for itself alone, for
+        diagnostics: ``missing_modules`` is ``[module]`` if it holds nothing,
+        else ``[]``. Module 0 is the master, which asks every module, so
+        ``module=0`` is the same as no *module*.
+
+        Raises:
+            ValueError: *module* outside 0-7, the modules the reply's mask
+                can name.
+            LIFUDeviceError: Firmware without OW_PRESET_LOADED, or no such
+                module.
+            LIFUProtocolError: The reply is not 16 bytes, or breaks the
+                reply's own rules: a loaded byte other than 0 or 1; loaded
+                with a module missing, or not loaded with none; not loaded
+                with non-zero load fields; or a lone module naming another.
+        """
+        addr = 0 if module is None else module   # module 0, the master, answers for every module
+        if addr not in range(8):
+            raise ValueError(f"module must be 0-7, got {module}")
+        r = self.send_checked(packet_type=OW_CONTROLLER, command=OW_PRESET_LOADED,
+                              addr=addr, op="get_loaded_preset")
+        if r.data_len != 16:
+            raise LIFUProtocolError(f"TX: get_loaded_preset payload too "
+                                    f"{'short' if r.data_len < 16 else 'long'} ({r.data_len}, not 16)",
+                                    code=LIFU_ERR_BAD_PAYLOAD_LENGTH)
+        d = bytes(r.data)
+        train_count, settings_crc, regs_crc = struct.unpack("<III", d[3:15])
+        mask = d[15]
+        # SR-003 trusts this before Start, so a reply that breaks its own
+        # rules (if_commands.c preset_loaded_reply) is refused: byte 0 is 1
+        # exactly when no module is missing, a not-loaded reply has zero load
+        # fields, and a module answering alone has only its own bit, bit 0.
+        # Mask bits above the module count are not checked: the reply does
+        # not carry the count.
+        alone = addr != 0
+        broken = (d[0] not in (0, 1),
+                  (d[0] == 1) == bool(mask),
+                  d[0] == 0 and any(d[1:15]),
+                  alone and mask > 1)
+        if any(broken):
+            raise LIFUProtocolError(
+                f"TX: get_loaded_preset reply is inconsistent (loaded byte {d[0]}, mask 0x{mask:02x})",
+                code=LIFU_ERR_BAD_PAYLOAD_FORMAT)
+        # A lone module's bit 0 is itself; the master's bit m is module m.
+        missing = [addr + m for m in range(8) if mask & (1 << m)]
+        if missing:
+            return {"loaded": False, "index": None, "duration_index": None, "train_count": None,
+                    "settings_crc": None, "regs_crc": None, "missing_modules": missing}
+        return {"loaded": True, "index": d[1], "duration_index": d[2], "train_count": train_count,
+                "settings_crc": settings_crc, "regs_crc": regs_crc, "missing_modules": missing}
+
+    def get_loaded_preset(self) -> tuple[Optional[int], Optional[int]]:
+        """``(preset_index, duration_index)`` loaded on every module, or
+        ``(None, None)``. See :meth:`get_loaded_preset_state` for the rest.
+
+        Raises:
+            LIFUDeviceError, LIFUProtocolError: As :meth:`get_loaded_preset_state`.
+        """
+        state = self.get_loaded_preset_state()
+        return state["index"], state["duration_index"]
 
     def get_module_count(self) -> int:
         """Return the number of connected LIFU transmitter modules.
