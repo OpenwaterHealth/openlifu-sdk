@@ -81,7 +81,7 @@ from openlifu_sdk.io.LIFUConfig import (
 )
 from openlifu_sdk.io.LIFUTXDevice import PRESET_TEMP_SCALE
 from openlifu_sdk.io.LIFUTXPresets import (
-    CONSOLE_HV_CEILING_V,
+    console_record_window,
     host_treatment_timeout,
     module_regs_crcs,
     preset_sensitivity,
@@ -957,17 +957,16 @@ class SimulatedHVController:
 
     def _select_window(self, preset: dict) -> tuple[float, float] | None:
         """The window a select's rescaled voltage must land in: the record's
-        own voltage_range. As the firmware's parse_record (hv_presets.c,
-        console-fw#37), a record whose range is missing, not positive and in
-        order, or above the 45 V ceiling is treated as absent, so reading or
-        selecting it is refused (OW_HV_DATA_ERROR, "no preset stored"): no
-        record can raise the ceiling, and none goes unchecked (Peter,
-        2026-10-30, console-fw#21)."""
-        rng = preset.get("voltage_range") or (math.nan, math.nan)
-        low, high = float(rng[0]), float(rng[1])
-        if not 0.0 < low <= high <= CONSOLE_HV_CEILING_V:
+        own voltage_range, in float32. As the firmware's parse_record
+        (hv_presets.c, console-fw#37), a record whose range is missing, or not
+        0 < low <= high <= 45 V in float32 (console_record_window), is treated
+        as absent, so reading or selecting it is refused (OW_HV_DATA_ERROR,
+        "no preset stored"): no record can raise the ceiling, and none goes
+        unchecked (Peter, 2026-10-30, console-fw#21)."""
+        window = console_record_window(preset.get("voltage_range"))
+        if window is None:
             raise LIFUDeviceError("HV: no preset stored", device_error_code=OW_HV_DATA_ERROR)
-        return low, high
+        return window
 
     def get_preset(self, index: int) -> dict | None:
         """Same shape as :meth:`HVController.get_preset`; ``min_voltage`` /

@@ -308,7 +308,6 @@ def test_only_a_non_fda_build_is_stamped(flash, tmp_path, monkeypatch, stamp):
     text = header.read_text(encoding="utf-8")
     assert text == ('#define FW_VERSION "2.0.8-4-g0bad0e8+fda%s"\n' % ("+b1" if stamp else ""))
     assert (tree / "build/.localbuild").exists() is stamp
-    # A presets-only image reports its context as its suffix.
     # A presets-only image reports its context as its suffix; any other build
     # clears a cached one, so it cannot report an earlier set's suffix.
     assert commands[0] == ["cmake", "--preset", "Release",

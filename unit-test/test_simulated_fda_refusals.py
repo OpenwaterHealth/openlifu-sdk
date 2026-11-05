@@ -256,10 +256,15 @@ def test_the_host_holds_a_load_to_the_presets_own_range(interface_cls):
         interface.txdevice._user_configs[0]["module"]["sensitivity"] = [[400000, 2507]]
         # A presets-only console refuses the select from its own record first;
         # an RUO console applies it, and the host's check of the range refuses.
-        refusal = LIFUDeviceError if interface_cls is SimulatedDeviceInterface else LIFUSolutionError
-        with pytest.raises(refusal):
-            interface.load_preset(0, mc["settings_crc"], regs, 400_000.0,
-                                  voltage_range=tuple(mc["voltage_range"]), turn_hv_on=True)
+        if interface_cls is SimulatedDeviceInterface:
+            with pytest.raises(LIFUDeviceError) as excinfo:
+                interface.load_preset(0, mc["settings_crc"], regs, 400_000.0,
+                                      voltage_range=tuple(mc["voltage_range"]), turn_hv_on=True)
+            assert _code(excinfo) == OW_HV_RANGE
+        else:
+            with pytest.raises(LIFUSolutionError, match="voltage_range"):
+                interface.load_preset(0, mc["settings_crc"], regs, 400_000.0,
+                                      voltage_range=tuple(mc["voltage_range"]), turn_hv_on=True)
         assert interface.hvcontroller.get_hv_status() is False
         assert interface.txdevice.get_loaded_preset() == (None, None)
         if interface_cls is SimulatedDeviceInterface:
@@ -295,8 +300,10 @@ def test_a_35_55_record_is_absent_on_a_presets_only_console():
         fda.close()
 
 
-@pytest.mark.parametrize("voltage_range", [[5.0, 100.0], None, [0.0, 45.0], [42.0, 37.0]],
-                         ids=["above-ceiling", "missing", "zero-floor", "reversed"])
+@pytest.mark.parametrize("voltage_range", [[5.0, 100.0], None, [0.0, 45.0], [42.0, 37.0],
+                                           [1e-50, 45.0], [35.0, 45.00001]],
+                         ids=["above-ceiling", "missing", "zero-floor", "reversed",
+                              "floor-0.0f", "above-ceiling-in-float32"])
 def test_a_record_without_a_valid_range_is_absent(iface, voltage_range):
     """Peter, 2026-10-30 (console-fw#21): a 45 V ceiling no record can raise.
     As console-fw#37's parse_record, a record whose range is missing, not
@@ -309,6 +316,14 @@ def test_a_record_without_a_valid_range_is_absent(iface, voltage_range):
         with pytest.raises(LIFUDeviceError) as excinfo:
             call()
         assert _code(excinfo) == OW_HV_DATA_ERROR
+
+
+def test_a_bound_at_the_ceiling_in_float32_is_present(iface):
+    """45.000001 is 45.0f in the record, so the console, and the sim, accept it."""
+    console = iface.hvcontroller.get_preset(0)
+    iface.hvcontroller.configure_presets([dict(console, voltage_range=[35.0, 45.000001])])
+    assert iface.hvcontroller.get_preset(0)["max_voltage"] == 45.0
+    assert iface.hvcontroller.select_preset(0, iface.preset[0], 2720.0) == pytest.approx(40.0)
 
 
 def test_no_fixed_floor_under_the_ceiling(iface):

@@ -50,13 +50,13 @@ from openlifu_sdk.io.LIFUHVController import HVController, LIFUHVController
 from openlifu_sdk.io.LIFUInterface import DeviceInterface, LIFUInterface, LIFUInterfaceStatus
 from openlifu_sdk.io.LIFUTXDevice import LIFUTxDevice, TxDevice, pattern_select_registers
 from openlifu_sdk.io.LIFUTXPresets import (
+    CONSOLE_HV_CEILING_V,
     adjusted_voltage,
     compile_preset,
     console_preset_record,
     device_sensitivity,
     generate_console_fda_preset,
     generate_console_presets,
-    CONSOLE_HV_CEILING_V,
     generate_fda_preset,
     generate_header_files,
     generate_preset_set,
@@ -478,8 +478,12 @@ class TestConsolePresets(unittest.TestCase):
         self.assertEqual(CONSOLE_HV_CEILING_V, 45.0)
         ok = _compiled(id="ok", voltage=40, sensitivity=3728, voltage_range=[35, 45])
         console_preset_record(ok, version=2)   # exactly at the ceiling is fine
+        # 45.000001 is 45.0f, as the console reads it: written.
+        at_ceiling = console_preset_record(dict(ok, voltage_range=[35, 45.000001]), version=2)
+        self.assertEqual(struct.unpack_from("<ff", at_ceiling, 20), (35.0, 45.0))
         bad_ranges = {"over": [35, 45.01], "far_over": [35, 100], "zero": [0, 45],
-                      "negative": [-5, 45], "reversed": [42, 37], "missing": None}
+                      "negative": [-5, 45], "reversed": [42, 37], "missing": None,
+                      "floor_0f": [1e-50, 45]}    # positive in float64, 0.0f in the record
         for name, rng in bad_ranges.items():
             mc = dict(ok, id=name, voltage_range=rng)
             if rng is None:

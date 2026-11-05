@@ -205,10 +205,11 @@ def preset_voltage_range(machine_config: Dict) -> tuple[float, float] | None:
     Preset data: the range the applied (sensitivity-rescaled) voltage may
     take for this preset. The host checks it: pass it to
     ``DeviceInterface.load_preset(voltage_range=...)``, which refuses a select
-    whose applied voltage is outside it. The console checks it too: a
-    presets-only image carries it in each PRESET_HV_RECORD v2 and holds every
-    select to it, under the image's 45 V ceiling (console-fw#21; Peter,
-    2026-10-30: a ceiling only, no fixed floor).
+    whose applied voltage is outside it. A presets-only console built from
+    console-fw's feature/fda-hv-presets branch, where console-fw#37 (console-fw#21's records) merged on 2026-11-05, and the console release cut from it checks it too: it carries it in each PRESET_HV_RECORD v2 and
+    holds every select to it, under the image's 45 V ceiling (console-fw#21;
+    Peter, 2026-10-30: a ceiling only, no fixed floor). An older console has
+    no such check.
 
     Raises:
         ValueError: Not two finite positive numbers with low <= high.
@@ -910,6 +911,23 @@ CONSOLE_PRESET_VERSION = 1
 CONSOLE_HV_CEILING_V = 45.0
 
 
+def console_record_window(voltage_range) -> tuple[float, float] | None:
+    """*voltage_range* as a v2 console record carries it, float32 [low,
+    high], or None if the console would treat the record as absent: not two
+    numbers, or not 0 < low <= high <= CONSOLE_HV_CEILING_V once each is cast
+    to float32, as console-fw#37's parse_record compares them. So a low of
+    1e-50 (0.0f) or a high of 45.000001 (45.0f) is judged as the console
+    judges it. The generator and the simulator both use this."""
+    try:
+        low, high = struct.unpack("<ff", struct.pack("<ff", *voltage_range))
+    except (TypeError, ValueError, OverflowError, struct.error):
+        return None
+    # Also false for a NaN bound.
+    if not 0.0 < low <= high <= CONSOLE_HV_CEILING_V:
+        return None
+    return low, high
+
+
 def console_preset_record(machine_config: Dict, version: int = CONSOLE_PRESET_VERSION) -> bytes:
     """The console's half of a preset as a presets-only console reads it from
     flash (PRESET_HV_RECORD in its hv_presets.h): the preset's voltage and the
@@ -920,16 +938,14 @@ def console_preset_record(machine_config: Dict, version: int = CONSOLE_PRESET_VE
     low and high, after the sensitivity. Both :func:`generate_console_fda_preset`
     (the FDA image's one record) and :func:`generate_console_presets` (a
     +test image's table) write v2, so a preset without a voltage_range no
-    longer generates for the console. The console reads v2 once
-    openlifu-console-fw#37 (console-fw#21's records) is in; an older console
-    reads only v1, which ``version=1`` still writes.
+    longer generates for the console. A console reads v2 on console-fw's feature/fda-hv-presets branch, where console-fw#37 (console-fw#21's records) merged on 2026-11-05, and the console release cut from it;
+    an older console reads only v1, which ``version=1`` still writes.
 
     Raises:
         ValueError: No settings_crc, voltage or sensitivity, an unusable id,
             an unknown version, or a v2 record for a preset whose
-            voltage_range the console would treat as absent: missing, not
-            positive and in order, or above CONSOLE_HV_CEILING_V (compared
-            as the float32 the record carries).
+            voltage_range the console would treat as absent
+            (:func:`console_record_window`).
     """
     if "settings_crc" not in machine_config:
         raise ValueError("%s has no settings_crc; pass settings_bytes to compile_preset"
@@ -946,11 +962,11 @@ def console_preset_record(machine_config: Dict, version: int = CONSOLE_PRESET_VE
         rng = preset_voltage_range(machine_config)
         if rng is None:
             raise ValueError("%s has no voltage_range; a v2 console record carries it" % pid)
-        packed = struct.pack("<ff", *rng)
-        if struct.unpack("<ff", packed)[1] > CONSOLE_HV_CEILING_V:
-            raise ValueError("%s: voltage_range %r tops the console's %g V ceiling, so the console "
-                             "would treat the record as absent" % (pid, list(rng), CONSOLE_HV_CEILING_V))
-        head += packed
+        window = console_record_window(rng)
+        if window is None:
+            raise ValueError("%s: voltage_range %r is not 0 < low <= high <= %g V as float32, so the "
+                             "console would treat the record as absent" % (pid, list(rng), CONSOLE_HV_CEILING_V))
+        head += struct.pack("<ff", *window)
     head += pid.encode("ascii")
     return head + struct.pack("<I", zlib.crc32(head) & 0xFFFFFFFF)
 
