@@ -56,6 +56,8 @@ def tx():
 
 def _sent(tx):
     kwargs = tx._uart.send_packet.call_args.kwargs
+    # Only the master runs the trigger: every limits command addresses module 0.
+    assert kwargs.get("addr", 0) == 0
     return kwargs["packet_type"], kwargs["command"], kwargs.get("data")
 
 
@@ -139,6 +141,32 @@ def test_get_refuses_a_reply_that_breaks_the_firmware_rules(tx, source, index, s
     tx._uart.send_packet.return_value = _reply(source, index, start_x10, shutoff_x10, timeout_s)
     with pytest.raises(LIFUProtocolError):
         tx.get_thermal_limits()
+
+
+def test_get_refuses_an_overlong_reply(tx):
+    long = _reply(2, 0xFF, 400, 430, 60)
+    long.data = long.data + bytearray(2)
+    long.data_len = len(long.data)
+    tx._uart.send_packet.return_value = long
+    with pytest.raises(LIFUProtocolError):
+        tx.get_thermal_limits()
+
+
+@pytest.mark.parametrize("reply", [
+    (2, 0xFF, 400, 431, 60),   # shutoff_C not what was asked
+    (2, 0xFF, 400, 430, 0),    # the timeout dropped
+    (1, 0, 400, 430, 60),      # a preset's, not the host's
+])
+def test_set_refuses_a_reply_that_is_not_what_was_asked(tx, reply):
+    tx._uart.send_packet.return_value = _reply(*reply)
+    with pytest.raises(LIFUProtocolError):
+        tx.set_thermal_limits(40.0, 43.0, 60)
+
+
+def test_clear_refuses_a_reply_with_limits_still_armed(tx):
+    tx._uart.send_packet.return_value = _reply(2, 0xFF, 400, 430, 60)
+    with pytest.raises(LIFUProtocolError):
+        tx.clear_thermal_limits()
 
 
 def test_get_refuses_data_shorter_than_its_length(tx):
@@ -332,6 +360,21 @@ def test_sim_refused_set_unloads_nothing(sim):
     assert dev.get_loaded_preset()[0] == 0
     assert dev.get_thermal_limits()["source"] == "preset"
     dev.stop_trigger()
+
+
+def test_sim_a_slave_load_arms_nothing():
+    # Only the master's limits act, so only its load arms them.
+    pytest.importorskip("openlifu_sdk.ui._qt")
+    from sr003_presets import two_module_flash_entry
+
+    from openlifu_sdk.ui.simulated_interface import SimulatedLIFUTxDevice
+
+    mc, regs = two_module_flash_entry(start_C=40.0, shutoff_C=43.0, treatment_timeout_s=1800)
+    dev = SimulatedLIFUTxDevice(num_modules=2, preset_flash=[(mc, regs)])
+    dev.load_preset(0, regs[1], module=1, settings_crc=mc["settings_crc"])
+    assert dev.get_thermal_limits()["source"] == "none"
+    dev.load_preset(0, regs[0], module=0, settings_crc=mc["settings_crc"])
+    assert dev.get_thermal_limits()["source"] == "preset"
 
 
 def test_sim_soft_reset_clears_the_limits(sim):
