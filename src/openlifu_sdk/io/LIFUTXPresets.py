@@ -901,6 +901,13 @@ def generate_console_fda_preset(output_directory, machine_config: Dict, context:
 # The console's half of a preset, as its presets-only image carries it.
 CONSOLE_PRESET_MAGIC = b"OWHV"
 CONSOLE_PRESET_VERSION = 1
+# A presets-only console's hard ceiling, HV_PRESET_CEILING_VOLTS (Peter,
+# 2026-10-30, recorded at
+# https://github.com/OpenwaterHealth/openlifu-console-fw/issues/21#issuecomment-6525593208):
+# a v2 record whose voltage_range tops it is treated as absent
+# (console-fw#37 parse_record). There is no fixed floor: each select is held
+# to its record's own range, inside this ceiling.
+CONSOLE_HV_CEILING_V = 45.0
 
 
 def console_preset_record(machine_config: Dict, version: int = CONSOLE_PRESET_VERSION) -> bytes:
@@ -919,8 +926,10 @@ def console_preset_record(machine_config: Dict, version: int = CONSOLE_PRESET_VE
 
     Raises:
         ValueError: No settings_crc, voltage or sensitivity, an unusable id,
-            an unknown version, or a v2 record for a preset without a
-            voltage_range.
+            an unknown version, or a v2 record for a preset whose
+            voltage_range the console would treat as absent: missing, not
+            positive and in order, or above CONSOLE_HV_CEILING_V (compared
+            as the float32 the record carries).
     """
     if "settings_crc" not in machine_config:
         raise ValueError("%s has no settings_crc; pass settings_bytes to compile_preset"
@@ -937,7 +946,11 @@ def console_preset_record(machine_config: Dict, version: int = CONSOLE_PRESET_VE
         rng = preset_voltage_range(machine_config)
         if rng is None:
             raise ValueError("%s has no voltage_range; a v2 console record carries it" % pid)
-        head += struct.pack("<ff", *rng)
+        packed = struct.pack("<ff", *rng)
+        if struct.unpack("<ff", packed)[1] > CONSOLE_HV_CEILING_V:
+            raise ValueError("%s: voltage_range %r tops the console's %g V ceiling, so the console "
+                             "would treat the record as absent" % (pid, list(rng), CONSOLE_HV_CEILING_V))
+        head += packed
     head += pid.encode("ascii")
     return head + struct.pack("<I", zlib.crc32(head) & 0xFFFFFFFF)
 

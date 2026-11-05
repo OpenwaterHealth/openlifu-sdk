@@ -81,6 +81,7 @@ from openlifu_sdk.io.LIFUConfig import (
 )
 from openlifu_sdk.io.LIFUTXDevice import PRESET_TEMP_SCALE
 from openlifu_sdk.io.LIFUTXPresets import (
+    CONSOLE_HV_CEILING_V,
     host_treatment_timeout,
     module_regs_crcs,
     preset_sensitivity,
@@ -101,14 +102,6 @@ if _QT_BACKEND == "PythonQt":
     def _check_host_binding() -> None:
         """PythonQt is Slicer's own Qt, so there is nothing to check. The
         Qt6 path imports :func:`openlifu_sdk.ui._qt.check_host_binding`."""
-
-# A presets-only console's hard ceiling (Peter, 2026-10-30, recorded at
-# https://github.com/OpenwaterHealth/openlifu-console-fw/issues/21#issuecomment-6525593208):
-# a record above it is treated as absent. There is no fixed floor: each select
-# is held to its preset record's own voltage_range (PRESET_HV_RECORD v2,
-# console-fw#21), inside this ceiling.
-HV_CEILING_V = 45.0
-
 
 def _f32(value: float) -> float:
     """*value* rounded to float32, as the console firmware computes."""
@@ -972,7 +965,7 @@ class SimulatedHVController:
         2026-10-30, console-fw#21)."""
         rng = preset.get("voltage_range") or (math.nan, math.nan)
         low, high = float(rng[0]), float(rng[1])
-        if not 0.0 < low <= high <= HV_CEILING_V:
+        if not 0.0 < low <= high <= CONSOLE_HV_CEILING_V:
             raise LIFUDeviceError("HV: no preset stored", device_error_code=OW_HV_DATA_ERROR)
         return low, high
 

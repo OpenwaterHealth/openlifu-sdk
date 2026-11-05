@@ -56,6 +56,7 @@ from openlifu_sdk.io.LIFUTXPresets import (
     device_sensitivity,
     generate_console_fda_preset,
     generate_console_presets,
+    CONSOLE_HV_CEILING_V,
     generate_fda_preset,
     generate_header_files,
     generate_preset_set,
@@ -469,6 +470,26 @@ class TestConsolePresets(unittest.TestCase):
             console_preset_record(_compiled(sensitivity=3600), version=2)
         with self.assertRaisesRegex(ValueError, "version"):
             console_preset_record(_compiled(sensitivity=3600, voltage_range=[35, 45]), version=3)
+
+    def test_console_generators_refuse_a_range_the_console_treats_as_absent(self):
+        """console-fw#37's parse_record treats a record whose range is not
+        positive, in order and at most 45 V as absent, so neither generator
+        writes one: it names the preset instead."""
+        self.assertEqual(CONSOLE_HV_CEILING_V, 45.0)
+        ok = _compiled(id="ok", voltage=40, sensitivity=3728, voltage_range=[35, 45])
+        console_preset_record(ok, version=2)   # exactly at the ceiling is fine
+        bad_ranges = {"over": [35, 45.01], "far_over": [35, 100], "zero": [0, 45],
+                      "negative": [-5, 45], "reversed": [42, 37], "missing": None}
+        for name, rng in bad_ranges.items():
+            mc = dict(ok, id=name, voltage_range=rng)
+            if rng is None:
+                del mc["voltage_range"]
+            with tempfile.TemporaryDirectory() as d:
+                for generate in (lambda: generate_console_fda_preset(d, mc),
+                                 lambda: generate_console_presets(d, [ok, mc], "test")):
+                    with self.assertRaisesRegex(ValueError, name, msg=name):
+                        generate()
+                self.assertEqual(list(Path(d).iterdir()), [], name)
 
     def test_table_is_v2_records_in_index_order(self):
         presets = [_compiled(id="a", voltage=40, sensitivity=3728, voltage_range=[35, 45]),
