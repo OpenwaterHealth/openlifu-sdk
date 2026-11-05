@@ -185,12 +185,17 @@ def test_sim_set_and_clear_unload_a_loaded_preset(sim):
     assert dev.get_loaded_preset() == (None, None)
 
 
-def test_sim_set_and_clear_refused_while_running(sim):
+@pytest.mark.parametrize("paused", [False, True], ids=["running", "paused"])
+def test_sim_set_and_clear_refused_while_running(sim, paused):
+    # A paused sequence resumes on its load and limits, so it counts as
+    # running here (openlifu-transmitter-fw#60).
     dev, mc, regs = sim
     assert dev.set_thermal_limits(30.0, 35.0)["source"] == "host"
     armed = dev.get_thermal_limits()
     _set_temp(dev, 25.0)
     dev.start_trigger()
+    if paused:
+        dev.pause_trigger()
     for call in (lambda: dev.set_thermal_limits(31.0, 36.0), dev.clear_thermal_limits):
         with pytest.raises(LIFUDeviceError) as e:
             call()
@@ -198,3 +203,19 @@ def test_sim_set_and_clear_refused_while_running(sim):
     assert dev.get_thermal_limits() == armed
     dev.stop_trigger()
     assert dev.clear_thermal_limits()["source"] == "none"
+
+
+def test_sim_resume_held_to_the_armed_shutoff(sim):
+    # The armed shutoff_C, not the preset's: it outlasts the load.
+    dev, mc, regs = sim
+    dev.set_thermal_limits(30.0, 35.0)
+    _set_temp(dev, 25.0)
+    dev.start_trigger()
+    dev.pause_trigger()
+    _set_temp(dev, 36.0)
+    with pytest.raises(LIFUDeviceError) as e:
+        dev.resume_trigger()
+    assert e.value.device_error_code == OW_TEMP_TOO_HIGH
+    _set_temp(dev, 34.0)
+    assert dev.resume_trigger()
+    dev.stop_trigger()
