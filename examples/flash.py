@@ -30,7 +30,9 @@ the host matches its version exactly.
 preset context folder (presets.json listing the presets, each in
 <id>/<id>_settings.json), and its folder name is the image's suffix
 (-DFW_PRESET_VARIANT, which the firmware accepts as fda or test,
-transmitter-fw#36 / console-fw#32). Each preset is compiled as the operator interface
+transmitter-fw#36 / console-fw#32, so any other name is refused before the
+tree is touched). A build without --presets clears that cache entry, so an
+image never keeps the suffix of an earlier set. Each preset is compiled as the operator interface
 compiles it, so the CRCs in the image are the ones the host verifies. This is
 how presets reach a device: the operator interface never writes them. One
 preset is linked as fda_preset.h; several as the transmitter's preset table
@@ -209,6 +211,12 @@ def stamp_build_number(repo: Path, preset: str, number: int | None) -> None:
     header.write_bytes(patched)
 
 
+# The preset contexts the firmware builds a suffix for (FW_PRESET_VARIANT).
+PRESET_VARIANTS = ("fda", "test")
+# What the SDK's generators write into PRESET_DIR: one preset as fda_preset.h,
+# several as the board's table, plus (transmitter) the per-preset headers the
+# table includes. Only these are replaced; nothing else there is touched.
+GENERATED_TABLES = ("fda_preset.h", "preset_table.h", "preset_hv_table.h")
 PRESET_DIR = Path("Core/Inc/presets")
 
 
@@ -270,8 +278,13 @@ def write_preset_headers(repo: Path, name: str, presets_only: bool, context: Pat
             sys.exit("cannot generate the %s preset headers: %s" % (name, e))
         out = repo / PRESET_DIR
         out.mkdir(parents=True, exist_ok=True)
-        for old in out.glob("*.h"):
-            old.unlink()   # a header left from another set must not be linked in
+        # A header left from another set must not be linked in: the tables,
+        # and the per-preset headers the old transmitter table includes.
+        table = out / "preset_table.h"
+        included = re.findall(r'#include "presets/([\w.-]+\.h)"',
+                              table.read_text(encoding="utf-8")) if table.is_file() else []
+        for old in {*GENERATED_TABLES, *included}:
+            (out / old).unlink(missing_ok=True)
         for new in Path(staging).glob("*.h"):
             shutil.copy2(new, out / new.name)
     print("Presets    : %s from %s (+%s, %d preset(s))" % (", ".join(mc["id"] for mc in configs),
@@ -296,7 +309,9 @@ def build(repo: Path, preset: str, increment: bool, stamp: bool = True,
               % preset)
     # Configure first, on its own: left to ninja, the regeneration would rewrite
     # version.h mid-build and drop the stamp. cmake reads presets from the cwd.
-    suffix = ["-DFW_PRESET_VARIANT=%s" % variant] if variant else []
+    # Without a variant, clear the cached one: cmake keeps a -D value, and a
+    # later build would otherwise report an earlier set's suffix.
+    suffix = ["-DFW_PRESET_VARIANT=%s" % variant] if variant else ["-UFW_PRESET_VARIANT"]
     subprocess.run(["cmake", "--preset", preset, *suffix], cwd=repo, check=True)
     stamp_build_number(repo, preset, number)
     subprocess.run(["cmake", "--build", "--preset", preset], cwd=repo, check=True)
@@ -492,6 +507,9 @@ def main() -> int:
         ap.error("--presets bakes presets into a build, so it needs --build")
     if args.presets and not (args.presets / "presets.json").is_file():
         ap.error("%s has no presets.json" % args.presets)
+    if args.presets and args.presets.resolve().name not in PRESET_VARIANTS:
+        ap.error("%s: a preset context folder is named for the image's suffix, one of %s"
+                 % (args.presets, ", ".join(PRESET_VARIANTS)))
     if args.address is not None and (args.image is None or args.image.suffix.lower() != ".bin"):
         ap.error("--address only applies to a .bin --image")
 

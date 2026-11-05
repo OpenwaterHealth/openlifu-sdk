@@ -35,9 +35,10 @@ def flash():
     return module
 
 
-def _context(root: Path, ids=("bench_a", "bench_b")) -> Path:
-    """A preset context folder: presets.json plus one settings file per id."""
-    context = root / "bench"
+def _context(root: Path, ids=("bench_a", "bench_b"), variant: str = "test") -> Path:
+    """A preset context folder: presets.json plus one settings file per id,
+    named for the image suffix it builds (FW_PRESET_VARIANT: fda or test)."""
+    context = root / variant
     for n, preset_id in enumerate(ids):
         (context / preset_id).mkdir(parents=True)
         doc = dict(DEFAULTS, pulse_count=DEFAULTS["pulse_count"] + n,   # a distinct settings_crc each
@@ -80,11 +81,11 @@ def _blob_bytes(header: Path, symbol: str) -> bytes:
     return bytes(int(b, 16) for b in re.findall(r"0x([0-9a-fA-F]{2})", body))
 
 
-def test_test_slot_1_is_byte_identical_to_the_fda_preset(flash, tmp_path):
+def test_test_slot_0_is_byte_identical_to_the_fda_preset(flash, tmp_path):
     """#192: the test context's first preset is the FDA preset's settings
     file, so its linked blob is the FDA image's, byte for byte."""
     dev_context = _context(tmp_path / "dev", ids=("diathermy", "extended"))
-    fda_context = tmp_path / "fda" / "diathermy_ctx"
+    fda_context = tmp_path / "fda" / "fda"
     (fda_context / "diathermy").mkdir(parents=True)
     shutil.copy2(dev_context / "diathermy" / "diathermy_settings.json", fda_context / "diathermy")
     (fda_context / "presets.json").write_text(json.dumps({"presets": ["diathermy"]}), encoding="utf-8")
@@ -95,7 +96,7 @@ def test_test_slot_1_is_byte_identical_to_the_fda_preset(flash, tmp_path):
 
     fda_blob = _blob_bytes(fda_tree / "Core/Inc/presets/fda_preset.h", "FDA_PRESET_BLOB")
     dev_header = next((dev_tree / "Core/Inc/presets").glob("*diathermy.h"))
-    dev_blob = _blob_bytes(dev_header, "PRESET_BENCH_DIATHERMY_BLOB")
+    dev_blob = _blob_bytes(dev_header, "PRESET_TEST_DIATHERMY_BLOB")
     assert dev_blob == fda_blob == preset_blob(flash.load_preset_set(fda_context)[0])
 
 
@@ -170,9 +171,53 @@ def test_main_builds_by_the_presets_fda_mode(flash, tmp_path, monkeypatch, fda):
         flash.main()
     if fda:
         assert calls == {"headers": ("transmitter", True, context.resolve()),
-                         "stamp": False, "variant": "bench"}
+                         "stamp": False, "variant": "test"}
     else:
         assert calls == {"stamp": True, "variant": None}
+
+
+def _plain_or_fda_tree(root: Path, fda: bool) -> Path:
+    tree = _tree(root)
+    (tree / "CMakePresets.json").write_text(json.dumps({
+        "configurePresets": [{"name": "P", "cacheVariables": {
+            "FDA_MODE": {"type": "BOOL", "value": "ON" if fda else "OFF"}, "BARE_METAL": "ON"}}],
+        "buildPresets": [{"name": "P"}],
+    }), encoding="utf-8")
+    return tree
+
+
+def _run_main(flash, monkeypatch, tree, *extra):
+    built = []
+    monkeypatch.setattr(flash, "find_programmer", lambda: "cli")
+    monkeypatch.setattr(flash, "pick_target", lambda *_: ("sn", "transmitter"))
+    monkeypatch.setattr(flash, "build", lambda *a, **k: built.append((a, k)))
+    monkeypatch.setattr("sys.argv", ["flash.py", "--board", "transmitter", "--preset", "P", "--build",
+                                     "--transmitter-fw", str(tree), *extra])
+    return built
+
+
+def test_main_refuses_presets_for_a_plain_image(flash, tmp_path, monkeypatch):
+    """Through main(), with the real header writer: a plain image takes no presets."""
+    tree = _plain_or_fda_tree(tmp_path, fda=False)
+    built = _run_main(flash, monkeypatch, tree, "--presets", str(_context(tmp_path)))
+    with pytest.raises(SystemExit, match="a plain image links no presets"):
+        flash.main()
+    assert not built and not list((tree / "Core/Inc/presets").glob("*.h"))
+
+
+@pytest.mark.parametrize("name", ["bench", "engineering", "fda_ctx"])
+def test_main_refuses_a_context_not_named_for_a_variant(flash, tmp_path, monkeypatch, capsys, name):
+    """The firmware builds a suffix only for fda or test, so any other folder
+    name is refused before the tree's headers are touched."""
+    tree = _plain_or_fda_tree(tmp_path, fda=True)
+    kept = tree / "Core/Inc/presets/fda_preset.h"
+    kept.write_text("// the last FDA build\n", encoding="utf-8")
+    built = _run_main(flash, monkeypatch, tree, "--presets", str(_context(tmp_path, variant=name)))
+    with pytest.raises(SystemExit):
+        flash.main()
+    assert "one of fda, test" in capsys.readouterr().err
+    assert not built
+    assert kept.read_text(encoding="utf-8") == "// the last FDA build\n"
 
 
 def test_several_presets_link_the_transmitter_table(flash, tmp_path):
@@ -208,6 +253,20 @@ def test_headers_from_another_set_are_removed(flash, tmp_path):
     stale.write_text("// from an earlier FDA build\n", encoding="utf-8")
     flash.write_preset_headers(tree, "transmitter", True, _context(tmp_path))
     assert not stale.exists()
+
+
+def test_only_the_generators_headers_are_replaced(flash, tmp_path):
+    """A set's per-preset headers (the ones its table includes) go with it;
+    any other header in the folder is left alone."""
+    tree = _tree(tmp_path)
+    presets = tree / "Core/Inc/presets"
+    flash.write_preset_headers(tree, "transmitter", True, _context(tmp_path / "a"))
+    per_preset = sorted(p.name for p in presets.glob("*.h") if p.name != "preset_table.h")
+    assert len(per_preset) == 2
+    other = presets / "notes.h"
+    other.write_text("// someone's own header\n", encoding="utf-8")
+    flash.write_preset_headers(tree, "transmitter", True, _context(tmp_path / "b", ids=("fda",)))
+    assert sorted(p.name for p in presets.glob("*.h")) == ["fda_preset.h", "notes.h"]
 
 
 def test_a_refused_set_leaves_the_tree_as_it_was(flash, tmp_path):
@@ -250,4 +309,23 @@ def test_only_a_non_fda_build_is_stamped(flash, tmp_path, monkeypatch, stamp):
     assert text == ('#define FW_VERSION "2.0.8-4-g0bad0e8+fda%s"\n' % ("+b1" if stamp else ""))
     assert (tree / "build/.localbuild").exists() is stamp
     # A presets-only image reports its context as its suffix.
-    assert commands[0] == ["cmake", "--preset", "Release", *([] if stamp else ["-DFW_PRESET_VARIANT=fda"])]
+    # A presets-only image reports its context as its suffix; any other build
+    # clears a cached one, so it cannot report an earlier set's suffix.
+    assert commands[0] == ["cmake", "--preset", "Release",
+                           "-UFW_PRESET_VARIANT" if stamp else "-DFW_PRESET_VARIANT=fda"]
+
+
+def test_an_fda_build_without_presets_clears_the_cached_variant(flash, tmp_path, monkeypatch):
+    """After a --presets .../test build, an FDA build without --presets must
+    not keep reporting +test from the CMake cache."""
+    header = tmp_path / "build/Release-FDA/generated/version.h"
+    header.parent.mkdir(parents=True)
+    header.write_text('#define FW_VERSION "2.0.8+test"\n', encoding="utf-8")
+    monkeypatch.setattr(flash, "add_toolchain_to_path", lambda: None)
+    commands = []
+    monkeypatch.setattr(flash.subprocess, "run", lambda cmd, **k: commands.append(cmd))
+    flash.build(tmp_path, "Release-FDA", True, stamp=False, variant="test")
+    flash.build(tmp_path, "Release-FDA", True, stamp=False, variant=None)
+    configures = [c for c in commands if c[:2] == ["cmake", "--preset"]]
+    assert configures == [["cmake", "--preset", "Release-FDA", "-DFW_PRESET_VARIANT=test"],
+                          ["cmake", "--preset", "Release-FDA", "-UFW_PRESET_VARIANT"]]

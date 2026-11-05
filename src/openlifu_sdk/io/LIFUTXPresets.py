@@ -907,12 +907,15 @@ def console_preset_record(machine_config: Dict, version: int = CONSOLE_PRESET_VE
     """The console's half of a preset as a presets-only console reads it from
     flash (PRESET_HV_RECORD in its hv_presets.h): the preset's voltage and the
     sensitivity it suits, each as float32, the .json's settings_crc and the
-    id, closed by a CRC-32 of all of that. :func:`generate_console_fda_preset`
-    writes a v1 record into the console's FDA image.
+    id, closed by a CRC-32 of all of that.
 
     Version 2 (console-fw#21) inserts the preset's voltage_range, as float32
-    low and high, after the sensitivity; :func:`generate_console_presets`
-    writes v2 records.
+    low and high, after the sensitivity. Both :func:`generate_console_fda_preset`
+    (the FDA image's one record) and :func:`generate_console_presets` (a
+    +test image's table) write v2, so a preset without a voltage_range no
+    longer generates for the console. The console reads v2 once
+    openlifu-console-fw#37 (console-fw#21's records) is in; an older console
+    reads only v1, which ``version=1`` still writes.
 
     Raises:
         ValueError: No settings_crc, voltage or sensitivity, an unusable id,

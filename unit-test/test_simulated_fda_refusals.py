@@ -7,8 +7,9 @@ Firmware behaviour mirrored here:
   (OW_TEMP_TOO_HIGH).
 - Console ``hv_presets.c``: no HV on with nothing selected (OW_HV_NO_PRESET);
   a select whose rescaled voltage is outside the record's own
-  voltage_range, or above the image's 45 V ceiling, is refused, not
-  clamped (OW_HV_RANGE); no select or deselect while HV is on
+  voltage_range is refused, not clamped (OW_HV_RANGE); a record whose range
+  is missing, not positive and in order, or above the image's 45 V ceiling
+  is treated as absent (OW_HV_DATA_ERROR, console-fw#37 parse_record); no select or deselect while HV is on
   (OW_HV_FDA_REFUSED); a non-positive sensitivity is refused (0xFE).
 
 The RUO simulator (``SimulatedLIFUInterface``) has none of these gates, as
@@ -274,34 +275,52 @@ def test_the_host_holds_a_load_to_the_presets_own_range(interface_cls):
         interface.close()
 
 
-def test_preset_35_55_works_unless_the_fda_hard_stop_is_crossed():
+def test_a_35_55_record_is_absent_on_a_presets_only_console():
+    """A record above the 45 V ceiling is treated as absent, as parse_record
+    in console-fw#37 does: not capped, so no select of it goes through."""
     mc, regs = flash_entry(voltage_range=[35.0, 55.0])
     ruo = SimulatedLIFUInterface(preset_flash=[(mc, regs)])
     fda = SimulatedDeviceInterface(preset_flash=[(mc, regs)])
     try:
         # 47.99 V: within the preset's range, so a non-FDA console applies it ...
         assert ruo.hvcontroller.select_preset(0, mc["settings_crc"], 2267.0) == pytest.approx(47.99, abs=0.01)
-        # ... but over the FDA image's 45 V hard stop.
-        with pytest.raises(LIFUDeviceError) as excinfo:
-            fda.hvcontroller.select_preset(0, mc["settings_crc"], 2267.0)
-        assert _code(excinfo) == OW_HV_RANGE
-        # Within both, both apply it.
-        assert fda.hvcontroller.select_preset(0, mc["settings_crc"], 2744.0) == pytest.approx(39.65, abs=0.01)
+        # ... but a presets-only console holds no such record, even for 39.65 V.
+        for transmitter in (2267.0, 2744.0):
+            with pytest.raises(LIFUDeviceError) as excinfo:
+                fda.hvcontroller.select_preset(0, mc["settings_crc"], transmitter)
+            assert _code(excinfo) == OW_HV_DATA_ERROR
+        assert fda.hvcontroller.supply_voltage is None
     finally:
         ruo.close()
         fda.close()
 
 
-def test_a_record_cannot_raise_the_45_v_ceiling(iface):
-    """Peter, 2026-10-30: a ceiling only, no fixed floor. A record's range
-    is held to, but its top is capped at 45 V."""
+@pytest.mark.parametrize("voltage_range", [[5.0, 100.0], None, [0.0, 45.0], [42.0, 37.0]],
+                         ids=["above-ceiling", "missing", "zero-floor", "reversed"])
+def test_a_record_without_a_valid_range_is_absent(iface, voltage_range):
+    """Peter, 2026-10-30 (console-fw#21): a 45 V ceiling no record can raise.
+    As console-fw#37's parse_record, a record whose range is missing, not
+    positive and in order, or above the ceiling is treated as absent: reading
+    or selecting it is refused, rather than held to a default window."""
     console = iface.hvcontroller.get_preset(0)
-    iface.hvcontroller.configure_presets([dict(console, voltage_range=[5.0, 100.0])])
+    iface.hvcontroller.configure_presets([dict(console, voltage_range=voltage_range)])
+    for call in (lambda: iface.hvcontroller.get_preset(0),
+                 lambda: iface.hvcontroller.select_preset(0, iface.preset[0], 2720.0)):   # 40 V
+        with pytest.raises(LIFUDeviceError) as excinfo:
+            call()
+        assert _code(excinfo) == OW_HV_DATA_ERROR
+
+
+def test_no_fixed_floor_under_the_ceiling(iface):
+    """Peter, 2026-10-30: a ceiling only, no fixed floor. A [5, 45] record is
+    held to its own range."""
+    console = iface.hvcontroller.get_preset(0)
+    iface.hvcontroller.configure_presets([dict(console, voltage_range=[5.0, 45.0])])
+    assert (iface.hvcontroller.get_preset(0)["min_voltage"], iface.hvcontroller.get_preset(0)["max_voltage"]) == (5.0, 45.0)
     with pytest.raises(LIFUDeviceError) as excinfo:
         iface.hvcontroller.select_preset(0, iface.preset[0], 2267.0)   # 47.99 V
     assert _code(excinfo) == OW_HV_RANGE
-    assert (iface.hvcontroller.get_preset(0)["min_voltage"], iface.hvcontroller.get_preset(0)["max_voltage"]) == (5.0, 45.0)
-    # No fixed floor: 31.09 V is inside this record's range, so it applies.
+    # 31.09 V is inside this record's range, so it applies.
     assert iface.hvcontroller.select_preset(0, iface.preset[0], 3500.0) == pytest.approx(31.09, abs=0.01)
 
 
