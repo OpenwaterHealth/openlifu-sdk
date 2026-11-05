@@ -79,6 +79,7 @@ from openlifu_sdk.io.LIFUConfig import (
     OW_PRESET_BUSY,
     OW_TEMP_TOO_HIGH,
 )
+from openlifu_sdk.io.LIFUTXDevice import host_treatment_timeout
 from openlifu_sdk.io.LIFUTXPresets import module_regs_crcs, preset_sensitivity, thermal_limits
 from openlifu_sdk.io.LIFUUserConfig import sensitivity_at_frequency
 from openlifu_sdk.io.signal import OWSignal
@@ -229,8 +230,9 @@ class SimulatedTxDevice:
         self._loaded_duration_index: Optional[int] = None
         # Modules holding a loaded part of the preset (each loads its own, as on hardware).
         self._loaded_modules: set[int] = set()
-        # The master's start_C / shutoff_C, apart from the load as on the
-        # firmware (thermal_limits.h): a load arms them, an unload leaves them.
+        # The master's start_C / shutoff_C and treatment timeout, apart from
+        # the load as on the firmware (thermal_limits.h): a load arms them, an
+        # unload leaves them. The simulator does not end a run on either.
         self._thermal_limits: dict = self._no_thermal_limits()
 
         # Reported firmware version. Mutable so an app-side debug UI
@@ -385,6 +387,7 @@ class SimulatedTxDevice:
             self._thermal_limits = {
                 "source": "preset", "preset_index": index,
                 "start_c": machine_config.get("start_C"), "shutoff_c": machine_config.get("shutoff_C"),
+                "treatment_timeout_s": int(machine_config.get("treatment_timeout_s", 0)),
             }
         return True
 
@@ -398,7 +401,8 @@ class SimulatedTxDevice:
 
     @staticmethod
     def _no_thermal_limits() -> dict:
-        return {"source": "none", "preset_index": None, "start_c": None, "shutoff_c": None}
+        return {"source": "none", "preset_index": None, "start_c": None, "shutoff_c": None,
+                "treatment_timeout_s": 0}
 
     def get_thermal_limits(self) -> dict:
         """Same shape as :meth:`TxDevice.get_thermal_limits`."""
@@ -658,13 +662,15 @@ class SimulatedLIFUTxDevice(SimulatedTxDevice):
                                   device_error_code=OW_PRESET_BUSY)
         self.unload_preset(0)
 
-    def set_thermal_limits(self, start_c: float, shutoff_c: float) -> dict:
+    def set_thermal_limits(self, start_c: float, shutoff_c: float, treatment_timeout_s: int) -> dict:
         """Same contract as :meth:`LIFUTxDevice.set_thermal_limits`."""
         start_x10, shutoff_x10 = thermal_limits(
             {"id": "set_thermal_limits", "start_C": start_c, "shutoff_C": shutoff_c})
+        timeout_s = host_treatment_timeout(treatment_timeout_s)
         self._thermal_limits_write()
         self._thermal_limits = {"source": "host", "preset_index": None,
-                                "start_c": start_x10 / 10, "shutoff_c": shutoff_x10 / 10}
+                                "start_c": start_x10 / 10, "shutoff_c": shutoff_x10 / 10,
+                                "treatment_timeout_s": timeout_s}
         return self.get_thermal_limits()
 
     def clear_thermal_limits(self) -> dict:
