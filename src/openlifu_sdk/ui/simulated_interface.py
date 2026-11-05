@@ -79,12 +79,14 @@ from openlifu_sdk.io.LIFUConfig import (
     OW_PRESET_BUSY,
     OW_TEMP_TOO_HIGH,
 )
+from openlifu_sdk.io.LIFUTXDevice import PRESET_TEMP_SCALE
 from openlifu_sdk.io.LIFUTXPresets import (
     host_treatment_timeout,
     module_regs_crcs,
     preset_sensitivity,
     preset_voltage,
     thermal_limits,
+    treatment_timeout,
 )
 from openlifu_sdk.io.LIFUUserConfig import sensitivity_at_frequency
 from openlifu_sdk.io.signal import OWSignal
@@ -236,7 +238,9 @@ class SimulatedTxDevice:
         self._module_loads: dict[int, tuple[int, int]] = {}
         # The master's start_C / shutoff_C and treatment timeout, apart from
         # the load as on the firmware (thermal_limits.h): a load arms them, an
-        # unload leaves them. The simulator does not end a run on either.
+        # unload leaves them, a reset clears them. The simulator gates Start
+        # and Resume on them, but does not end a run at shutoff_C or on the
+        # timeout.
         self._thermal_limits: dict = self._no_thermal_limits()
 
         # Reported firmware version. Mutable so an app-side debug UI
@@ -377,6 +381,13 @@ class SimulatedTxDevice:
         selections = list(machine_config.get("pulse_train_count_selections") or [])
         if not 0 <= duration_index < len(selections):
             raise LIFUDeviceError(f"TX: preset {index} has no duration index {duration_index}")
+        # The firmware refuses a blob without valid limits or a timeout of at
+        # least 1 s (presets.c), so a preset never arms a disabled gate.
+        try:
+            start_x10, shutoff_x10 = thermal_limits(machine_config)
+            timeout_s = treatment_timeout(machine_config)
+        except ValueError as e:
+            raise LIFUDeviceError(f"TX: preset {index} cannot be loaded: {e}") from e
         self._sequence = {
             "pulse_interval": float(machine_config.get("pulse_interval_ms", 0.0)) / 1000.0,
             "pulse_count": int(machine_config.get("pulse_count", 1)),
@@ -389,8 +400,8 @@ class SimulatedTxDevice:
         if module == 0:
             self._thermal_limits = {
                 "source": "preset", "preset_index": index,
-                "start_c": machine_config.get("start_C"), "shutoff_c": machine_config.get("shutoff_C"),
-                "treatment_timeout_s": int(machine_config.get("treatment_timeout_s", 0)),
+                "start_c": start_x10 / PRESET_TEMP_SCALE, "shutoff_c": shutoff_x10 / PRESET_TEMP_SCALE,
+                "treatment_timeout_s": timeout_s,
             }
         return True
 
@@ -743,7 +754,8 @@ class SimulatedLIFUTxDevice(SimulatedTxDevice):
         timeout_s = host_treatment_timeout(treatment_timeout_s)
         self._thermal_limits_write()
         self._thermal_limits = {"source": "host", "preset_index": None,
-                                "start_c": start_x10 / 10, "shutoff_c": shutoff_x10 / 10,
+                                "start_c": start_x10 / PRESET_TEMP_SCALE,
+                                "shutoff_c": shutoff_x10 / PRESET_TEMP_SCALE,
                                 "treatment_timeout_s": timeout_s}
         return self.get_thermal_limits()
 
@@ -813,6 +825,9 @@ class SimulatedLIFUTxDevice(SimulatedTxDevice):
         return (echo_data, len(echo_data))
 
     def soft_reset(self, module: Optional[int] = None):
+        """The limits are RAM state on the master: its reset leaves none armed."""
+        if module in (None, 0):
+            self._thermal_limits = self._no_thermal_limits()
         return True
 
     async def start_monitoring(self, interval: int = 1):

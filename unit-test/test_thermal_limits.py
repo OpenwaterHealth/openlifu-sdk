@@ -22,6 +22,8 @@ from openlifu_sdk.io.LIFUConfig import (
     OW_CTRL_CLEAR_THERMAL_LIMITS,
     OW_CTRL_GET_THERMAL_LIMITS,
     OW_CTRL_SET_THERMAL_LIMITS,
+    OW_ERROR,
+    OW_FDA_REFUSED,
     OW_PRESET_BUSY,
     OW_RESP,
     OW_TEMP_TOO_HIGH,
@@ -118,8 +120,48 @@ def test_set_refuses_bad_limits_without_sending(tx, start_c, shutoff_c, timeout_
 
 def test_set_has_no_default_timeout(tx):
     with pytest.raises(TypeError):
-        tx.set_thermal_limits(40.0, 43.0)  # pylint: disable=no-value-for-parameter
+        # pylint: disable-next=no-value-for-parameter  # reason: leaving the timeout out is the case under test
+        tx.set_thermal_limits(40.0, 43.0)
     tx._uart.send_packet.assert_not_called()
+
+
+@pytest.mark.parametrize("source, index, start_x10, shutoff_x10, timeout_s", [
+    (0, 0xFF, 0, 0, 1800),      # none armed, yet a timeout
+    (0, 0xFF, 400, 430, 0),     # none armed, yet limits
+    (0, 3, 0, 0, 0),            # none armed, yet a preset index
+    (1, 0xFF, 400, 430, 1800),  # a preset's, with no index
+    (1, 3, 400, 430, 0),        # a preset's, with no timeout
+    (2, 3, 400, 430, 0),        # a host's, with a preset index
+    (2, 0xFF, 430, 430, 0),     # start_C not below shutoff_C
+])
+def test_get_refuses_a_reply_that_breaks_the_firmware_rules(tx, source, index, start_x10, shutoff_x10,
+                                                            timeout_s):
+    tx._uart.send_packet.return_value = _reply(source, index, start_x10, shutoff_x10, timeout_s)
+    with pytest.raises(LIFUProtocolError):
+        tx.get_thermal_limits()
+
+
+def test_get_refuses_data_shorter_than_its_length(tx):
+    # data_len says 8, the bytes are fewer: a protocol error, not struct.error.
+    reply = _reply(2, 0xFF, 400, 430, 60)
+    reply.data = reply.data[:5]
+    tx._uart.send_packet.return_value = reply
+    with pytest.raises(LIFUProtocolError):
+        tx.get_thermal_limits()
+
+
+@pytest.mark.parametrize("code", [OW_PRESET_BUSY, OW_FDA_REFUSED])
+def test_set_and_clear_surface_the_firmware_refusal(tx, code):
+    refused = _reply(0, 0xFF, 0, 0)
+    refused.packet_type = OW_ERROR
+    refused.reserved = code
+    refused.data = bytearray()
+    refused.data_len = 0
+    tx._uart.send_packet.return_value = refused
+    for call in (lambda: tx.set_thermal_limits(40.0, 43.0, 60), tx.clear_thermal_limits):
+        with pytest.raises(LIFUDeviceError) as e:
+            call()
+        assert e.value.device_error_code == code
 
 
 def test_clear(tx):
@@ -248,5 +290,71 @@ def test_sim_resume_held_to_the_armed_shutoff(sim):
         dev.resume_trigger()
     assert e.value.device_error_code == OW_TEMP_TOO_HIGH
     _set_temp(dev, 34.0)
+    assert dev.resume_trigger()
+    dev.stop_trigger()
+
+
+def test_sim_refused_set_unloads_nothing(sim):
+    # As the firmware: OW_PRESET_BUSY is checked before the unload.
+    dev, mc, regs = sim
+    dev.load_preset(0, regs, settings_crc=mc["settings_crc"])
+    _set_temp(dev, 25.0)
+    dev.start_trigger()
+    with pytest.raises(LIFUDeviceError) as e:
+        dev.set_thermal_limits(30.0, 35.0, 0)
+    assert e.value.device_error_code == OW_PRESET_BUSY
+    assert dev.get_loaded_preset()[0] == 0
+    assert dev.get_thermal_limits()["source"] == "preset"
+    dev.stop_trigger()
+
+
+def test_sim_soft_reset_clears_the_limits(sim):
+    dev, mc, regs = sim
+    dev.set_thermal_limits(30.0, 35.0, 600)
+    dev.soft_reset(module=1)
+    assert dev.get_thermal_limits()["source"] == "host", "a slave's reset leaves the master's"
+    dev.soft_reset()
+    assert dev.get_thermal_limits() == {"source": "none", "preset_index": None, "start_c": None,
+                                        "shutoff_c": None, "treatment_timeout_s": 0}
+
+
+@pytest.mark.parametrize("field, value", [("treatment_timeout_s", 0), ("treatment_timeout_s", None),
+                                          ("start_C", None), ("shutoff_C", None)])
+def test_sim_load_refuses_a_preset_with_a_disabled_gate(field, value):
+    # The firmware refuses such a blob, so a load never arms a disabled gate.
+    pytest.importorskip("openlifu_sdk.ui._qt")
+    from sr003_presets import flash_entry
+
+    from openlifu_sdk.ui.simulated_interface import SimulatedLIFUTxDevice
+
+    mc, regs = flash_entry(start_C=40.0, shutoff_C=43.0, treatment_timeout_s=1800)
+    mc = dict(mc, **{field: value})
+    dev = SimulatedLIFUTxDevice(preset_flash=[(mc, regs)])
+    with pytest.raises(LIFUDeviceError):
+        dev.load_preset(0, regs, settings_crc=mc["settings_crc"])
+    assert dev.get_loaded_preset() == (None, None)
+    assert dev.get_thermal_limits()["source"] == "none"
+
+
+def test_fda_sim_resume_held_to_the_armed_shutoff_after_an_unload():
+    # Unloaded while paused, the FDA sim still holds Resume to the armed shutoff_C.
+    pytest.importorskip("openlifu_sdk.ui._qt")
+    from sr003_presets import flash_entry
+
+    from openlifu_sdk.ui.simulated_interface import SimulatedTxDevice
+
+    mc, regs = flash_entry(start_C=40.0, shutoff_C=43.0, treatment_timeout_s=1800)
+    dev = SimulatedTxDevice(preset_flash=[(mc, regs)])
+    dev.load_preset(0, regs, settings_crc=mc["settings_crc"])
+    _set_temp(dev, 35.0)
+    dev.start_trigger()
+    dev.pause_trigger()
+    dev.unload_preset()
+    assert dev.get_thermal_limits()["shutoff_c"] == 43.0
+    _set_temp(dev, 43.0)
+    with pytest.raises(LIFUDeviceError) as e:
+        dev.resume_trigger()
+    assert e.value.device_error_code == OW_TEMP_TOO_HIGH
+    _set_temp(dev, 42.9)
     assert dev.resume_trigger()
     dev.stop_trigger()

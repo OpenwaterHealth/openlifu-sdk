@@ -231,18 +231,36 @@ logger = logging.getLogger(__name__)
 
 
 def _decode_thermal_limits(r) -> Dict:
-    """What every OW_CTRL_*_THERMAL_LIMITS reply carries: the limits armed now."""
-    if r.data_len < THERMAL_LIMITS_DATA_LENGTH:
+    """What every OW_CTRL_*_THERMAL_LIMITS reply carries: the limits armed now.
+
+    The safety gates are read from this, so a reply that breaks the
+    firmware's own rules (thermal_limits.c) is refused rather than passed
+    on: none armed with any value set; a host's with a preset index; a
+    preset's without one, or with no timeout (a preset always has one); or
+    armed limits whose start_C is not below shutoff_C.
+    """
+    d = bytes(r.data or b"")
+    if len(d) < THERMAL_LIMITS_DATA_LENGTH:
         raise LIFUProtocolError(
-            f"TX: thermal limits payload too short ({r.data_len} < {THERMAL_LIMITS_DATA_LENGTH})",
+            f"TX: thermal limits payload too short ({len(d)} < {THERMAL_LIMITS_DATA_LENGTH})",
             code=LIFU_ERR_BAD_PAYLOAD_LENGTH)
-    d = bytes(r.data)
     source = THERMAL_LIMITS_SOURCES.get(d[0])
     if source is None:
         raise LIFUProtocolError(f"TX: unknown thermal limits source {d[0]}",
                                 code=LIFU_ERR_BAD_PAYLOAD_FORMAT)
     raw_start, raw_shutoff, timeout_s = struct.unpack("<hhH", d[2:8])
     armed = source != "none"
+    indexed = d[1] != THERMAL_LIMITS_NO_PRESET
+    # Only a preset's carry an index, only none are all zeros.
+    broken = (indexed != (source == "preset"),
+              not armed and any((raw_start, raw_shutoff, timeout_s)),
+              source == "preset" and timeout_s == 0,
+              armed and raw_start >= raw_shutoff)
+    if any(broken):
+        raise LIFUProtocolError(
+            f"TX: thermal limits reply is inconsistent ({source}, index 0x{d[1]:02x}, "
+            f"{raw_start}/{raw_shutoff}, {timeout_s} s)",
+            code=LIFU_ERR_BAD_PAYLOAD_FORMAT)
     return {
         "source": source,
         "preset_index": None if d[1] == THERMAL_LIMITS_NO_PRESET else d[1],
@@ -634,12 +652,14 @@ class TxDevice(OWComponent):
         above start_C (OW_TEMP_TOO_HIGH) or without a fresh reading
         (OW_TEMP_UNKNOWN), a running sequence stops at shutoff_C, and a
         running or paused one ends as TIMEOUT once the treatment timeout has
-        passed, whether or not a preset is still loaded. They are the master's (module 0),
-        which runs the trigger; a reset leaves none armed.
+        passed, whether or not a preset is still loaded. Those gates are
+        enforced by the transmitter firmware (openlifu-transmitter-fw#60, whose HIL tests have not yet run); the SDK and its simulator only report them. They are the master's (module 0), which runs the trigger;
+        a reset leaves none armed.
 
         Raises:
             LIFUDeviceError: Firmware that predates the command.
-            LIFUProtocolError: Short or malformed reply.
+            LIFUProtocolError: Short reply, or one that breaks the
+                firmware's rules (see _decode_thermal_limits).
         """
         r = self.send_checked(packet_type=OW_CONTROLLER, command=OW_CTRL_GET_THERMAL_LIMITS,
                               op="get_thermal_limits")
@@ -1043,15 +1063,18 @@ class LIFUTxDevice(LIFUComponentMixin, TxDevice):
         once armed, start_trigger() is refused above *start_c*, a running
         sequence stops at *shutoff_c*, and a running or paused one ends as
         TIMEOUT *treatment_timeout_s* after start, as with a loaded preset's
-        limits (get_thermal_limits()). The temperatures travel as tenths of a
+        limits (get_thermal_limits()), enforced by the transmitter firmware (openlifu-transmitter-fw#60, whose HIL tests have not yet run); the SDK and its simulator only report them. The temperatures travel as tenths of a
         degree, so they must be multiples of 0.1 C, and *start_c* must be
         below *shutoff_c*. *treatment_timeout_s* is whole seconds up to
         65535; 0 runs with no timeout. It has no default, so a timeout is
         never dropped by leaving it out.
 
         Like a raw register or trigger write, this unloads a preset loaded on
-        the master (get_loaded_preset_state()), even if the firmware then refuses
-        the limits: the preset no longer describes what is armed.
+        the master (get_loaded_preset_state()): the preset no longer
+        describes what is armed. The firmware unloads before it checks the
+        payload, so a payload it refuses (OW_INVALID_PACKET) still unloads;
+        this method checks the limits first, so it never sends one. Refused
+        as OW_PRESET_BUSY or OW_FDA_REFUSED, nothing is unloaded.
 
         Returns what is armed afterwards, as get_thermal_limits().
 
@@ -1078,7 +1101,8 @@ class LIFUTxDevice(LIFUComponentMixin, TxDevice):
         With none armed, start_trigger() runs the host's configuration with
         only the firmware's global overheat protection, and no timeout. Clearing with none
         armed is not an error. Like set_thermal_limits(), it unloads a
-        preset loaded on the master. Returns what is armed afterwards
+        preset loaded on the master, except when refused (OW_PRESET_BUSY,
+        OW_FDA_REFUSED). Returns what is armed afterwards
         (``source`` "none"), as get_thermal_limits().
 
         Raises:
