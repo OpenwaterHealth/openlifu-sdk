@@ -23,6 +23,7 @@ QCoreApplication = _qt.import_qt_module("QtCore").QCoreApplication
 from sr003_presets import flash_entry  # noqa: E402 -- reason: after the Qt importorskip
 
 from openlifu_sdk.io.exceptions import LIFUDeviceError, LIFUError  # noqa: E402 -- reason: after the Qt importorskip
+from openlifu_sdk.io.LIFUConfig import OW_TEMP_TOO_HIGH  # noqa: E402 -- reason: after the Qt importorskip
 from openlifu_sdk.io.LIFUInterface import LIFUInterfaceStatus  # noqa: E402 -- reason: after the Qt importorskip
 from openlifu_sdk.ui.simulated_interface import (  # noqa: E402 -- reason: after the Qt importorskip
     SimulatedDeviceInterface,
@@ -355,8 +356,8 @@ def test_resume_ignores_start_c_but_not_shutoff_c(qt_app):
         module.temp_c = 80.0
         with pytest.raises(LIFUDeviceError) as excinfo:
             interface.resume_sonication()
-        # As transmitter-fw#60's RESUME: OW_ERROR with reserved 0, no reason code.
-        assert excinfo.value.device_error_code == 0
+        # As transmitter-fw#60's RESUME: the code START gives above start_C.
+        assert excinfo.value.device_error_code == OW_TEMP_TOO_HIGH
         assert _trigger(interface)["trigger_status"] == "PAUSED"
     finally:
         interface.close()
