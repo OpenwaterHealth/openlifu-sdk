@@ -81,6 +81,7 @@ from openlifu_sdk.io.LIFUConfig import (
 )
 from openlifu_sdk.io.LIFUTXDevice import PRESET_TEMP_SCALE
 from openlifu_sdk.io.LIFUTXPresets import (
+    console_record_window,
     host_treatment_timeout,
     module_regs_crcs,
     preset_sensitivity,
@@ -100,14 +101,6 @@ if _QT_BACKEND == "PythonQt":
     def _check_host_binding() -> None:
         """PythonQt is Slicer's own Qt, so there is nothing to check. The
         Qt6 path imports :func:`openlifu_sdk.ui._qt.check_host_binding`."""
-
-# The FDA image's second-line hard stop: the only HV setpoints an FDA_MODE
-# console's select may arrive at (FDA_HV_MIN_VOLTS / FDA_HV_MAX_VOLTS in the
-# console firmware's hv_presets.h). Fixed in that image. A preset's own
-# voltage_range is preset data that no console sees: the host checks it
-# (DeviceInterface.load_preset(voltage_range=...)).
-FDA_HV_WINDOW_V = (35.0, 45.0)
-
 
 def _f32(value: float) -> float:
     """*value* rounded to float32, as the console firmware computes."""
@@ -306,6 +299,7 @@ class SimulatedTxDevice:
             "start_C": 35.0,
             "shutoff_C": 75.0,
             "treatment_timeout_s": 1800,
+            "voltage_range": [35.0, 45.0],   # the console's v2 record needs it
         }
         return machine_config, 0x87654321
 
@@ -871,6 +865,7 @@ class SimulatedHVController:
             "voltage": 40.0,
             "id": "sim-default",
             "sensitivity": 2720.0,
+            "voltage_range": [35.0, 45.0],
         }]
 
         # Reported firmware version. See
@@ -935,8 +930,9 @@ class SimulatedHVController:
     def get_temperature2(self) -> float:
         return 31.0 + 0.05 * self._voltage_setpoint + _gauss(HV_TEMP_NOISE_SIGMA)
 
-    #: This console is an FDA image: the 35-45 V hard stop applies and the
-    #: selection cannot change while HV is on. SimulatedLIFUHVController is not.
+    #: This console is a presets-only image: each select is held to its
+    #: record's voltage_range under the 45 V ceiling, and the selection
+    #: cannot change while HV is on. SimulatedLIFUHVController is not.
     fda_image: bool = True
 
     def configure_presets(self, presets: List[dict]) -> None:
@@ -959,9 +955,17 @@ class SimulatedHVController:
         self._presets = [dict(preset) for preset in presets]
 
     def _select_window(self, preset: dict) -> tuple[float, float] | None:
-        """The window a select's rescaled voltage must land in: the FDA image's
-        fixed hard stop. Not read from the preset, so preset data cannot widen it."""
-        return FDA_HV_WINDOW_V
+        """The window a select's rescaled voltage must land in: the record's
+        own voltage_range, in float32. As the firmware's parse_record
+        (hv_presets.c, console-fw#37), a record whose range is missing, or not
+        0 < low <= high <= 45 V in float32 (console_record_window), is treated
+        as absent, so reading or selecting it is refused (OW_HV_DATA_ERROR,
+        "no preset stored"): no record can raise the ceiling, and none goes
+        unchecked (Peter, 2026-10-30, console-fw#21)."""
+        window = console_record_window(preset.get("voltage_range"))
+        if window is None:
+            raise LIFUDeviceError("HV: no preset stored", device_error_code=OW_HV_DATA_ERROR)
+        return window
 
     def get_preset(self, index: int) -> dict | None:
         """Same shape as :meth:`HVController.get_preset`; ``min_voltage`` /
@@ -1065,9 +1069,9 @@ class SimulatedHVController:
 class SimulatedLIFUHVController(SimulatedHVController):
     """Fake of the RUO :class:`~openlifu_sdk.io.LIFUHVController.LIFUHVController`.
 
-    Not an FDA image, so none of the FDA image's rules: HV on and
-    ``set_voltage`` are ungated, there is no 35-45 V hard stop, and the
-    selection may change with HV on. A select applies whatever it
+    Not a presets-only image, so none of its rules: HV on and
+    ``set_voltage`` are ungated, a select is not held to a record's range or
+    the 45 V ceiling, and the selection may change with HV on. A select applies whatever it
     rescales to; the preset's own ``voltage_range`` is the host's to check
     (``load_preset(voltage_range=...)``), as on real consoles.
     """
@@ -1478,6 +1482,9 @@ class SimulatedDeviceInterface(QObject):
                     # both as float32. preset_voltage refuses a missing or bad voltage.
                     "voltage": preset_voltage(machine_config),
                     "sensitivity": preset_sensitivity(machine_config),
+                    # The record's own range (v2), as given: the console judges it
+                    # (_select_window), so a malformed one is absent here too.
+                    "voltage_range": machine_config.get("voltage_range"),
                 })
             self.hvcontroller.configure_presets(hv_presets)
 

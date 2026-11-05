@@ -29,6 +29,7 @@ DEFAULTS = {
     "shutoff_C": 75,
     "treatment_timeout_s": 1800,
     "voltage": 40.0,
+    "voltage_range": [35.0, 45.0],   # the console's v2 record carries it (console-fw#21)
     "sensitivity": 2720,
 }
 

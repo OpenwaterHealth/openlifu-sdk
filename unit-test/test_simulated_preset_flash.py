@@ -48,6 +48,7 @@ def _mc(preset_id: str, settings_crc: int, **extra) -> dict:
         "start_C": 40.0,
         "shutoff_C": 43.0,
         "treatment_timeout_s": 1800,
+        "voltage_range": [35.0, 45.0],   # the console's v2 record carries it
     }
     base.update(extra)
     return base

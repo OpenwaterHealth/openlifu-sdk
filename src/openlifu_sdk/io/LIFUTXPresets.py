@@ -205,9 +205,12 @@ def preset_voltage_range(machine_config: Dict) -> tuple[float, float] | None:
     Preset data: the range the applied (sensitivity-rescaled) voltage may
     take for this preset. The host checks it: pass it to
     ``DeviceInterface.load_preset(voltage_range=...)``, which refuses a select
-    whose applied voltage is outside it. No console sees it; an FDA_MODE
-    console holds every select to its own fixed 35-45 V hard stop as a
-    second line.
+    whose applied voltage is outside it. A presets-only console checks it too
+    if its firmware has openlifu-console-fw#37 (on console-fw's
+    feature/fda-hv-presets): it carries the range in each PRESET_HV_RECORD v2
+    and holds every select to it, under the image's 45 V ceiling
+    (console-fw#21; Peter, 2026-10-30: a ceiling only, no fixed floor). Older
+    console firmware has no such check.
 
     Raises:
         ValueError: Not two finite positive numbers with low <= high.
@@ -381,8 +384,8 @@ def compile_preset(preset: Dict, preset_id: str | None = None,
     captured["frequency_khz"] = preset["frequency_khz"]
     if "sensitivity" in preset:
         captured["sensitivity"] = preset["sensitivity"]
-    # Preset data only (not in the blob, so neither CRC changes): consoles that are not
-    # FDA images check the applied voltage against it.
+    # Preset data only (not in the blob, so neither CRC changes): the host checks the
+    # applied voltage against it, and a presets-only console's v2 record carries it.
     if preset.get("voltage_range") is not None:
         captured["voltage_range"] = list(preset_voltage_range(preset))
     # Refuse bad run lengths or limits now, not at emit time.
@@ -780,14 +783,14 @@ def _c_float(value: float) -> str:
 
 
 def generate_console_presets(output_directory, presets: Sequence[Dict], context: str | None = None) -> Path:
-    """Write the console's ``preset_hv_table.h`` for a preset set.
-
-    One entry per preset -- id, voltage, sensitivity, settings_crc -- in the
-    same order as :func:`generate_preset_set` gives the transmitter, so index N
-    is the same preset on both. An FDA_MODE console applies entry N's voltage,
-    rescaled from its sensitivity to the connected transmitter's, when the
-    host selects N (with that preset's settings_crc), and refuses any voltage
-    the host sends itself. Each value is emitted as its exact float32.
+    """Write the console's ``preset_hv_table.h`` for a preset set: one
+    PRESET_HV_RECORD v2 per preset (:func:`console_preset_record`), back to
+    back as ``PRESET_HV_TABLE`` in the ``.fda_preset`` section (page 61), in
+    the same order as :func:`generate_preset_set` gives the transmitter, so
+    index N is the same preset on both (console-fw#21). A presets-only console
+    applies record N's voltage, rescaled from its sensitivity to the connected
+    transmitter's, when the host selects N with that preset's settings_crc,
+    and holds it to that record's own voltage_range.
 
     Args:
         output_directory: Destination directory, Core/Inc/presets/ in the
@@ -799,15 +802,13 @@ def generate_console_presets(output_directory, presets: Sequence[Dict], context:
         The path written.
 
     Raises:
-        ValueError: No presets, or one without a settings_crc, voltage or
-            sensitivity.
+        ValueError: No presets, or one without a settings_crc, voltage,
+            sensitivity or voltage_range, or with an unusable id.
     """
     if not presets:
         raise ValueError("a preset set needs at least one preset")
-    for mc in presets:
-        if "settings_crc" not in mc:
-            raise ValueError("%s has no settings_crc; pass settings_bytes to compile_preset" % mc["id"])
-    rows = [(mc, preset_voltage(mc), preset_sensitivity(mc)) for mc in presets]
+    records = [console_preset_record(mc, version=2) for mc in presets]
+    table = b"".join(records)
     guard = _table_guard("PRESET_HV_TABLE", context)
     lines = [
         _generated_by(context),
@@ -815,7 +816,7 @@ def generate_console_presets(output_directory, presets: Sequence[Dict], context:
         "#ifndef %s" % guard,
         "#define %s" % guard,
         "",
-        '#include "hv_presets.h"',
+        "#include <stdint.h>",
         "",
     ]
     if context:
@@ -823,19 +824,23 @@ def generate_console_presets(output_directory, presets: Sequence[Dict], context:
     lines += [
         "#define PRESET_HV_COUNT %uu" % len(presets),
         "",
-        "// Each preset's HV voltage and the transmitter sensitivity it suits, indexed",
-        "// exactly as the transmitter image's preset_table: OW_POWER_PRESET_SELECT N",
-        "// applies entry N's voltage, rescaled to the connected transmitter.",
-        "static const HvPreset hv_preset_table[PRESET_HV_COUNT] = {",
+        "// N PRESET_HV_RECORD v2 records back to back, in slot order (index 0 first),",
+        "// indexed exactly as the transmitter image's preset_table:",
     ]
-    lines += ['\t{ "%s", %s, %s, 0x%08xu },' % (mc["id"], _c_float(v), _c_float(sens), mc["settings_crc"])
-              for mc, v, sens in rows]
+    lines += ["//   %u: %s, %g V in [%g, %g], settings_crc 0x%08x"
+              % ((i, mc["id"], preset_voltage(mc)) + preset_voltage_range(mc) + (mc["settings_crc"],))
+              for i, mc in enumerate(presets)]
+    lines += [
+        '__attribute__((section(".fda_preset"), used))',
+        "static const uint8_t PRESET_HV_TABLE[%u] = {" % len(table),
+    ]
+    lines += ["\t" + " ".join("0x%02x," % b for b in table[i:i + 16]) for i in range(0, len(table), 16)]
     lines += ["};", "", "#endif  // %s" % guard, ""]
 
     path = Path(output_directory) / "preset_hv_table.h"
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text("\n".join(lines), encoding="utf-8")
-    logger.info("wrote %s (%d preset(s))", path, len(presets))
+    logger.info("wrote %s (%d preset(s), %d bytes)", path, len(presets), len(table))
     return path
 
 
@@ -858,14 +863,15 @@ def generate_fda_preset(output_directory, machine_config: Dict, context: str | N
 
 def generate_console_fda_preset(output_directory, machine_config: Dict, context: str | None = None) -> Path:
     """Write the console's FDA preset header, ``fda_preset.h``: the preset's HV
-    entry (:func:`console_preset_record`) as ``FDA_PRESET_HV``, in the
-    ``.fda_preset`` section the console's FDA linker scripts put at the end of
-    its application slot (page 61).
+    record (:func:`console_preset_record`, v2, carrying its voltage_range) as
+    ``FDA_PRESET_HV``, in the ``.fda_preset`` section the console's FDA linker
+    scripts put at the end of its application slot (page 61).
 
     Raises:
-        ValueError: No settings_crc, voltage or sensitivity, or an unusable id.
+        ValueError: No settings_crc, voltage, sensitivity or voltage_range, or
+            an unusable id.
     """
-    record = console_preset_record(machine_config)
+    record = console_preset_record(machine_config, version=2)
     guard = "FDA_PRESET_HV_H_"
     lines = [
         "// Generated by openlifu_sdk from preset '%s'." % machine_config["id"],
@@ -875,9 +881,10 @@ def generate_console_fda_preset(output_directory, machine_config: Dict, context:
         "",
         "#include <stdint.h>",
         "",
-        "// %g V for a transmitter of sensitivity %g, settings_crc 0x%08x. Laid out as"
-        % (preset_voltage(machine_config), preset_sensitivity(machine_config), machine_config["settings_crc"]),
-        "// PRESET_HV_RECORD in hv_presets.h.",
+        "// %g V in [%g, %g] for a transmitter of sensitivity %g, settings_crc 0x%08x."
+        % ((preset_voltage(machine_config),) + preset_voltage_range(machine_config)
+           + (preset_sensitivity(machine_config), machine_config["settings_crc"])),
+        "// Laid out as PRESET_HV_RECORD v2 in hv_presets.h.",
         "// The linker puts it at the end of the application slot (the FDA_PRESET",
         "// region of the FDA linker scripts), so it is written with the image, the",
         "// bootloader's signature covers it, and the firmware only reads it.",
@@ -893,20 +900,54 @@ def generate_console_fda_preset(output_directory, machine_config: Dict, context:
     return path
 
 
-# The console's half of a preset, as its FDA image carries it.
+# The console's half of a preset, as its presets-only image carries it.
 CONSOLE_PRESET_MAGIC = b"OWHV"
-CONSOLE_PRESET_VERSION = 1
+# A presets-only console's hard ceiling, HV_PRESET_CEILING_VOLTS (Peter,
+# 2026-10-30, recorded at
+# https://github.com/OpenwaterHealth/openlifu-console-fw/issues/21#issuecomment-6525593208):
+# a v2 record whose voltage_range tops it is treated as absent
+# (console-fw#37 parse_record). There is no fixed floor: each select is held
+# to its record's own range, inside this ceiling.
+CONSOLE_HV_CEILING_V = 45.0
 
 
-def console_preset_record(machine_config: Dict) -> bytes:
-    """The console's half of a preset as an FDA_MODE console reads it from flash
-    (PRESET_HV_RECORD in its hv_presets.h): the preset's voltage and the
+def console_record_window(voltage_range) -> tuple[float, float] | None:
+    """*voltage_range* as a v2 console record carries it, float32 [low,
+    high], or None if the console would treat the record as absent: not two
+    numbers, or not 0 < low <= high <= CONSOLE_HV_CEILING_V once each is cast
+    to float32, as console-fw#37's parse_record compares them. So a low of
+    1e-50 (0.0f) or a high of 45.000001 (45.0f) is judged as the console
+    judges it. The generator and the simulator both use this."""
+    try:
+        low, high = struct.unpack("<ff", struct.pack("<ff", *voltage_range))
+    except (TypeError, ValueError, OverflowError, struct.error):
+        return None
+    # Also false for a NaN bound.
+    if not 0.0 < low <= high <= CONSOLE_HV_CEILING_V:
+        return None
+    return low, high
+
+
+def console_preset_record(machine_config: Dict, *, version: int) -> bytes:
+    """The console's half of a preset as a presets-only console reads it from
+    flash (PRESET_HV_RECORD in its hv_presets.h): the preset's voltage and the
     sensitivity it suits, each as float32, the .json's settings_crc and the
-    id, closed by a CRC-32 of all of that. :func:`generate_console_fda_preset`
-    writes it into the console's FDA image.
+    id, closed by a CRC-32 of all of that.
+
+    Version 2 (console-fw#21) inserts the preset's voltage_range, as float32
+    low and high, after the sensitivity. *version* has no default, so no
+    caller gets a format by accident. Both :func:`generate_console_fda_preset`
+    (the FDA image's one record) and :func:`generate_console_presets` (a
+    +test image's table) write v2, so a preset without a voltage_range no
+    longer generates for the console. Reading v2 requires console firmware
+    with openlifu-console-fw#37 (on console-fw's feature/fda-hv-presets); an
+    older console reads only v1, which ``version=1`` still writes.
 
     Raises:
-        ValueError: No settings_crc, voltage or sensitivity, or an unusable id.
+        ValueError: No settings_crc, voltage or sensitivity, an unusable id,
+            an unknown version, or a v2 record for a preset whose
+            voltage_range the console would treat as absent
+            (:func:`console_record_window`).
     """
     if "settings_crc" not in machine_config:
         raise ValueError("%s has no settings_crc; pass settings_bytes to compile_preset"
@@ -914,10 +955,21 @@ def console_preset_record(machine_config: Dict) -> bytes:
     pid = str(machine_config["id"])
     if not 1 <= len(pid) <= PRESET_ID_MAX or any(not 0x20 <= ord(ch) <= 0x7E for ch in pid):
         raise ValueError("preset id %r must be 1..%d printable ASCII characters" % (pid, PRESET_ID_MAX))
-    head = (CONSOLE_PRESET_MAGIC + bytes([CONSOLE_PRESET_VERSION, len(pid), 0, 0])
+    if version not in (1, 2):
+        raise ValueError("console preset record version must be 1 or 2, got %r" % (version,))
+    head = (CONSOLE_PRESET_MAGIC + bytes([version, len(pid), 0, 0])
             + struct.pack("<Iff", machine_config["settings_crc"], preset_voltage(machine_config),
-                          preset_sensitivity(machine_config))
-            + pid.encode("ascii"))
+                          preset_sensitivity(machine_config)))
+    if version == 2:
+        rng = preset_voltage_range(machine_config)
+        if rng is None:
+            raise ValueError("%s has no voltage_range; a v2 console record carries it" % pid)
+        window = console_record_window(rng)
+        if window is None:
+            raise ValueError("%s: voltage_range %r is not 0 < low <= high <= %g V as float32, so the "
+                             "console would treat the record as absent" % (pid, list(rng), CONSOLE_HV_CEILING_V))
+        head += struct.pack("<ff", *window)
+    head += pid.encode("ascii")
     return head + struct.pack("<I", zlib.crc32(head) & 0xFFFFFFFF)
 
 
