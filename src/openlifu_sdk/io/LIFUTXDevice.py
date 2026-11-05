@@ -221,17 +221,6 @@ TEMPERATURE_DATA_LENGTH = 4
 THERMAL_LIMITS_SOURCES = {0: "none", 1: "preset", 2: "host"}
 THERMAL_LIMITS_NO_PRESET = 0xFF
 THERMAL_LIMITS_DATA_LENGTH = 8
-THERMAL_LIMITS_TIMEOUT_MAX_S = 0xFFFF
-
-
-def host_treatment_timeout(value) -> int:
-    """A host's treatment_timeout_s for set_thermal_limits(): whole seconds
-    in 0..65535, the u16 the firmware takes, where 0 arms no timeout. (A
-    preset's must be at least 1; the host's may disable it.)"""
-    if isinstance(value, bool) or not isinstance(value, int) or not 0 <= value <= THERMAL_LIMITS_TIMEOUT_MAX_S:
-        raise ValueError("treatment_timeout_s must be whole seconds in 0..%d (0: none), got %r"
-                         % (THERMAL_LIMITS_TIMEOUT_MAX_S, value))
-    return value
 
 if TYPE_CHECKING:
     pass
@@ -1052,7 +1041,8 @@ class LIFUTxDevice(LIFUComponentMixin, TxDevice):
                 OW_FDA_REFUSED from an FDA_MODE image; or firmware that
                 predates the command.
         """
-        from openlifu_sdk.io.LIFUTXPresets import thermal_limits  # lazy: it imports this module
+        # lazy: it imports this module
+        from openlifu_sdk.io.LIFUTXPresets import host_treatment_timeout, thermal_limits
         raw = thermal_limits({"id": "set_thermal_limits", "start_C": start_c, "shutoff_C": shutoff_c})
         timeout_s = host_treatment_timeout(treatment_timeout_s)
         r = self.send_checked(packet_type=OW_CONTROLLER, command=OW_CTRL_SET_THERMAL_LIMITS,

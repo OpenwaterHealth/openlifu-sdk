@@ -79,8 +79,13 @@ from openlifu_sdk.io.LIFUConfig import (
     OW_PRESET_BUSY,
     OW_TEMP_TOO_HIGH,
 )
-from openlifu_sdk.io.LIFUTXDevice import host_treatment_timeout
-from openlifu_sdk.io.LIFUTXPresets import module_regs_crcs, preset_sensitivity, preset_voltage, thermal_limits
+from openlifu_sdk.io.LIFUTXPresets import (
+    host_treatment_timeout,
+    module_regs_crcs,
+    preset_sensitivity,
+    preset_voltage,
+    thermal_limits,
+)
 from openlifu_sdk.io.LIFUUserConfig import sensitivity_at_frequency
 from openlifu_sdk.io.signal import OWSignal
 from openlifu_sdk.ui.status_frame import format_status_frame as _format_status_frame
