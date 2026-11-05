@@ -330,8 +330,8 @@ def test_sim_resume_held_to_the_armed_shutoff(sim):
     _set_temp(dev, 36.0)
     with pytest.raises(LIFUDeviceError) as e:
         dev.resume_trigger()
-    # As transmitter-fw#60: OW_ERROR with reserved 0, no reason code.
-    assert e.value.device_error_code == 0
+    # As transmitter-fw#60's RESUME: the code START gives above start_C.
+    assert e.value.device_error_code == OW_TEMP_TOO_HIGH
     _set_temp(dev, 34.0)
     assert dev.resume_trigger()
     dev.stop_trigger()
@@ -424,7 +424,7 @@ def test_fda_sim_resume_held_to_the_armed_shutoff_after_an_unload():
     _set_temp(dev, 43.0)
     with pytest.raises(LIFUDeviceError) as e:
         dev.resume_trigger()
-    assert e.value.device_error_code == 0
+    assert e.value.device_error_code == OW_TEMP_TOO_HIGH
     _set_temp(dev, 42.9)
     assert dev.resume_trigger()
     dev.stop_trigger()

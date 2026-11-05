@@ -673,9 +673,10 @@ class SimulatedTxDevice:
         Per SR-023 item 8: refused at or above shutoff_C, and not gated by
         start_C, as the firmware does since openlifu-transmitter-fw#42. The
         shutoff_C is the armed one, which outlasts the load
-        (openlifu-transmitter-fw#60). Like the firmware's (if_commands.c,
-        OW_CTRL_RESUME_SWTRIG), the refusal is an OW_ERROR with no reason
-        code: device_error_code 0, not OW_TEMP_TOO_HIGH as a Start refusal.
+        (openlifu-transmitter-fw#60). The refusal carries OW_TEMP_TOO_HIGH,
+        the code a Start refusal above start_C carries, as the firmware's
+        does (#60, 1eb9d97). The simulator always has a reading, so it never
+        reports OW_TEMP_UNKNOWN, and it does not model the 75 C overheat trip.
         """
         if self._trigger_status != "PAUSED":
             raise LIFUDeviceError("TX: sequence is not paused")
@@ -684,7 +685,7 @@ class SimulatedTxDevice:
             hottest = max(m.read_temp() for m in self._modules)
             if hottest >= float(shutoff_c):
                 raise LIFUDeviceError(f"TX at shutoff_C {float(shutoff_c):.1f} C",
-                                      device_error_code=0)
+                                      device_error_code=OW_TEMP_TOO_HIGH)
         self._trigger_status = "RUNNING"
         return True
 
