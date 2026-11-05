@@ -37,7 +37,7 @@ OW_HV_NO_PRESET = 0xF7     # console: HV on before any preset was selected
 OW_HV_FDA_REFUSED = 0xF8   # console: host-set voltage / raw DACs, or select while HV on
 OW_FDA_REFUSED = 0xF8      # TX: a user config write in FDA mode, where it is read-only
 OW_TEMP_UNKNOWN = 0xF9     # TX: no fresh thermistor reading
-OW_TEMP_TOO_HIGH = 0xFA    # TX: above the loaded preset's start_C
+OW_TEMP_TOO_HIGH = 0xFA    # TX: above the armed start_C (OW_CTRL_GET_THERMAL_LIMITS)
 OW_NO_PRESET = 0xFB        # TX: no preset loaded
 OW_UNKNOWN_COMMAND = 0xFC
 OW_BAD_CRC = 0xFD
@@ -101,6 +101,16 @@ OW_PRESET_DELETE = 0x54
 OW_PRESET_CAPACITY = 0x55
 # What every module has loaded (16 bytes; TxDevice.get_loaded_preset_state).
 OW_PRESET_LOADED = 0x57
+
+# Thermal limits, start_C / shutoff_C, and the treatment timeout, the third
+# limit (transmitter-fw thermal_limits.h): armed by a preset load and kept
+# apart from it, so a raw write or an unload leaves them armed. A standard
+# image's host may also set or clear them while no sequence runs or is paused;
+# like a raw write, that unloads a preset loaded on the master. An FDA_MODE
+# image refuses SET and CLEAR (OW_FDA_REFUSED).
+OW_CTRL_GET_THERMAL_LIMITS = 0x60
+OW_CTRL_SET_THERMAL_LIMITS = 0x61
+OW_CTRL_CLEAR_THERMAL_LIMITS = 0x62
 
 # TX7332 Commands
 OW_TX7332_STATUS = 0x20
@@ -178,6 +188,7 @@ CONTROLLER_COMMANDS = {
     OW_PRESET_GET, OW_PRESET_LOAD,
     OW_PRESET_WRITE, OW_PRESET_COMMIT, OW_PRESET_DELETE, OW_PRESET_CAPACITY,
     OW_PRESET_LOADED,
+    OW_CTRL_GET_THERMAL_LIMITS, OW_CTRL_SET_THERMAL_LIMITS, OW_CTRL_CLEAR_THERMAL_LIMITS,
 }
 
 POWER_COMMANDS = {
@@ -210,6 +221,7 @@ TX_FDA_PACKETS = {
         OW_CTRL_PAUSE_SWTRIG, OW_CTRL_RESUME_SWTRIG,
         OW_CTRL_GET_MODULE_COUNT,
         OW_PRESET_GET, OW_PRESET_LOAD, OW_PRESET_LOADED,
+        OW_CTRL_GET_THERMAL_LIMITS,
     }),
     OW_TX7332: frozenset({OW_TX7332_DEVICE_COUNT}),  # get_module_count fallback on older images
 }

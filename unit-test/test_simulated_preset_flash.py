@@ -34,7 +34,9 @@ def _mc(preset_id: str, settings_crc: int, **extra) -> dict:
     """Minimal machine_config for tests -- ``id`` + ``settings_crc``
     are what ``get_preset`` reports; ``pulse_train_count_selections``
     (+ supporting trigger-config fields) are what ``load_preset``
-    applies to the sim's ``_sequence``. Overridable via ``**extra``."""
+    applies to the sim's ``_sequence``; ``start_C`` / ``shutoff_C`` /
+    ``treatment_timeout_s`` are what it arms, without which the firmware,
+    and so the sim, refuses the load. Overridable via ``**extra``."""
     base = {
         "id": preset_id,
         "settings_crc": settings_crc,
@@ -43,6 +45,9 @@ def _mc(preset_id: str, settings_crc: int, **extra) -> dict:
         "pulse_train_interval_s": 0.0,
         "pulse_train_count_selections": [1, 2, 3, 4, 5],
         "pulse_length_us": 100.0,
+        "start_C": 40.0,
+        "shutoff_C": 43.0,
+        "treatment_timeout_s": 1800,
     }
     base.update(extra)
     return base

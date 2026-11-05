@@ -356,6 +356,7 @@ def test_resume_ignores_start_c_but_not_shutoff_c(qt_app):
         module.temp_c = 80.0
         with pytest.raises(LIFUDeviceError) as excinfo:
             interface.resume_sonication()
+        # As transmitter-fw#60's RESUME: the code START gives above start_C.
         assert excinfo.value.device_error_code == OW_TEMP_TOO_HIGH
         assert _trigger(interface)["trigger_status"] == "PAUSED"
     finally:
