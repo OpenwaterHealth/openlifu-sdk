@@ -86,7 +86,6 @@ from openlifu_sdk.io.LIFUTXPresets import (
     module_regs_crcs,
     preset_sensitivity,
     preset_voltage,
-    preset_voltage_range,
     thermal_limits,
     treatment_timeout,
 )
@@ -1070,9 +1069,9 @@ class SimulatedHVController:
 class SimulatedLIFUHVController(SimulatedHVController):
     """Fake of the RUO :class:`~openlifu_sdk.io.LIFUHVController.LIFUHVController`.
 
-    Not an FDA image, so none of the FDA image's rules: HV on and
-    ``set_voltage`` are ungated, there is no 35-45 V hard stop, and the
-    selection may change with HV on. A select applies whatever it
+    Not a presets-only image, so none of its rules: HV on and
+    ``set_voltage`` are ungated, a select is not held to a record's range or
+    the 45 V ceiling, and the selection may change with HV on. A select applies whatever it
     rescales to; the preset's own ``voltage_range`` is the host's to check
     (``load_preset(voltage_range=...)``), as on real consoles.
     """
@@ -1483,8 +1482,9 @@ class SimulatedDeviceInterface(QObject):
                     # both as float32. preset_voltage refuses a missing or bad voltage.
                     "voltage": preset_voltage(machine_config),
                     "sensitivity": preset_sensitivity(machine_config),
-                    # The record's own range (v2), which the console holds a select to.
-                    "voltage_range": preset_voltage_range(machine_config),
+                    # The record's own range (v2), as given: the console judges it
+                    # (_select_window), so a malformed one is absent here too.
+                    "voltage_range": machine_config.get("voltage_range"),
                 })
             self.hvcontroller.configure_presets(hv_presets)
 

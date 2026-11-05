@@ -461,9 +461,11 @@ class TestConsolePresets(unittest.TestCase):
         self.assertEqual(rec[28:32], b"lowv")
         self.assertEqual(struct.unpack_from("<I", rec, 32)[0], zlib.crc32(rec[:32]))
         self.assertEqual(len(rec), 36)
-        # v1 is unchanged by the version argument's default.
-        self.assertEqual(console_preset_record(mc), console_preset_record(mc, version=1))
+        # The first 20 bytes after the magic match v1's.
         self.assertEqual(rec[8:20], console_preset_record(mc, version=1)[8:20])
+        # No default version: a caller says which format it writes.
+        with self.assertRaises(TypeError):
+            console_preset_record(mc)   # pylint: disable=missing-kwoa  # reason: the call under test
 
     def test_v2_record_needs_a_voltage_range(self):
         with self.assertRaisesRegex(ValueError, "voltage_range"):
@@ -559,13 +561,13 @@ class TestConsolePresets(unittest.TestCase):
 
     def test_console_record_layout(self):
         mc = _compiled(id="diathermy", voltage=40.0, sensitivity=3728)
-        rec = console_preset_record(mc)
+        rec = console_preset_record(mc, version=1)
         self.assertEqual(rec[:8], b"OWHV" + bytes([1, 9, 0, 0]))
         self.assertEqual(struct.unpack("<Iff", rec[8:20]), (mc["settings_crc"], 40.0, 3728.0))
         self.assertEqual(rec[20:29], b"diathermy")
         self.assertEqual(struct.unpack("<I", rec[29:]), (zlib.crc32(rec[:29]) & 0xFFFFFFFF,))
         with self.assertRaisesRegex(ValueError, "sensitivity"):
-            console_preset_record(dict(mc, sensitivity=None))
+            console_preset_record(dict(mc, sensitivity=None), version=1)
 
     def test_fda_headers_put_the_preset_in_its_section(self):
         mc = _compiled(id="diathermy", voltage=40.0, sensitivity=3728, voltage_range=[35, 45])

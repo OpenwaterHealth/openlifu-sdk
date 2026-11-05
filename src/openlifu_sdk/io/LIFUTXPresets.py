@@ -205,11 +205,12 @@ def preset_voltage_range(machine_config: Dict) -> tuple[float, float] | None:
     Preset data: the range the applied (sensitivity-rescaled) voltage may
     take for this preset. The host checks it: pass it to
     ``DeviceInterface.load_preset(voltage_range=...)``, which refuses a select
-    whose applied voltage is outside it. A presets-only console built from
-    console-fw's feature/fda-hv-presets branch, where console-fw#37 (console-fw#21's records) merged on 2026-11-05, and the console release cut from it checks it too: it carries it in each PRESET_HV_RECORD v2 and
-    holds every select to it, under the image's 45 V ceiling (console-fw#21;
-    Peter, 2026-10-30: a ceiling only, no fixed floor). An older console has
-    no such check.
+    whose applied voltage is outside it. A presets-only console checks it too
+    if its firmware has openlifu-console-fw#37 (on console-fw's
+    feature/fda-hv-presets): it carries the range in each PRESET_HV_RECORD v2
+    and holds every select to it, under the image's 45 V ceiling
+    (console-fw#21; Peter, 2026-10-30: a ceiling only, no fixed floor). Older
+    console firmware has no such check.
 
     Raises:
         ValueError: Not two finite positive numbers with low <= high.
@@ -383,8 +384,8 @@ def compile_preset(preset: Dict, preset_id: str | None = None,
     captured["frequency_khz"] = preset["frequency_khz"]
     if "sensitivity" in preset:
         captured["sensitivity"] = preset["sensitivity"]
-    # Preset data only (not in the blob, so neither CRC changes): consoles that are not
-    # FDA images check the applied voltage against it.
+    # Preset data only (not in the blob, so neither CRC changes): the host checks the
+    # applied voltage against it, and a presets-only console's v2 record carries it.
     if preset.get("voltage_range") is not None:
         captured["voltage_range"] = list(preset_voltage_range(preset))
     # Refuse bad run lengths or limits now, not at emit time.
@@ -901,7 +902,6 @@ def generate_console_fda_preset(output_directory, machine_config: Dict, context:
 
 # The console's half of a preset, as its presets-only image carries it.
 CONSOLE_PRESET_MAGIC = b"OWHV"
-CONSOLE_PRESET_VERSION = 1
 # A presets-only console's hard ceiling, HV_PRESET_CEILING_VOLTS (Peter,
 # 2026-10-30, recorded at
 # https://github.com/OpenwaterHealth/openlifu-console-fw/issues/21#issuecomment-6525593208):
@@ -928,18 +928,20 @@ def console_record_window(voltage_range) -> tuple[float, float] | None:
     return low, high
 
 
-def console_preset_record(machine_config: Dict, version: int = CONSOLE_PRESET_VERSION) -> bytes:
+def console_preset_record(machine_config: Dict, *, version: int) -> bytes:
     """The console's half of a preset as a presets-only console reads it from
     flash (PRESET_HV_RECORD in its hv_presets.h): the preset's voltage and the
     sensitivity it suits, each as float32, the .json's settings_crc and the
     id, closed by a CRC-32 of all of that.
 
     Version 2 (console-fw#21) inserts the preset's voltage_range, as float32
-    low and high, after the sensitivity. Both :func:`generate_console_fda_preset`
+    low and high, after the sensitivity. *version* has no default, so no
+    caller gets a format by accident. Both :func:`generate_console_fda_preset`
     (the FDA image's one record) and :func:`generate_console_presets` (a
     +test image's table) write v2, so a preset without a voltage_range no
-    longer generates for the console. A console reads v2 on console-fw's feature/fda-hv-presets branch, where console-fw#37 (console-fw#21's records) merged on 2026-11-05, and the console release cut from it;
-    an older console reads only v1, which ``version=1`` still writes.
+    longer generates for the console. Reading v2 requires console firmware
+    with openlifu-console-fw#37 (on console-fw's feature/fda-hv-presets); an
+    older console reads only v1, which ``version=1`` still writes.
 
     Raises:
         ValueError: No settings_crc, voltage or sensitivity, an unusable id,

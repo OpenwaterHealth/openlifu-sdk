@@ -137,18 +137,12 @@ def test_an_unreadable_fda_mode_is_refused(flash):
 
 @pytest.mark.parametrize("fda", [True, False], ids=["presets-only", "plain"])
 def test_main_builds_by_the_presets_fda_mode(flash, tmp_path, monkeypatch, fda):
-    """#108 done-when, end to end through main(): an FDA_MODE preset links
-    the context, reports it as its suffix and gets no build number; a plain
-    preset takes no presets and gets one."""
-    tree = tmp_path / "fw"
-    tree.mkdir()
-    (tree / "CMakePresets.json").write_text(json.dumps({
-        "configurePresets": [{"name": "P", "cacheVariables": {
-            "FDA_MODE": {"type": "BOOL", "value": "ON" if fda else "OFF"}, "BARE_METAL": "ON"}}],
-        "buildPresets": [{"name": "P"}],
-    }), encoding="utf-8")
+    """#108 done-when, end to end through main() with the real header
+    writer (only the build is stubbed): an FDA_MODE preset links the context,
+    reports it as its suffix and gets no build number; a plain preset takes
+    no presets and gets one."""
+    tree = _plain_or_fda_tree(tmp_path, fda=fda)
     context = _context(tmp_path, ids=("only",))
-    calls = {}
 
     class Built(Exception):
         pass
@@ -156,24 +150,17 @@ def test_main_builds_by_the_presets_fda_mode(flash, tmp_path, monkeypatch, fda):
     def newest_hex(*_):
         raise Built
 
-    monkeypatch.setattr(flash, "find_programmer", lambda: "cli")
-    monkeypatch.setattr(flash, "pick_target", lambda *_: ("sn", "transmitter"))
-    monkeypatch.setattr(flash, "write_preset_headers",
-                        lambda repo, name, is_fda, ctx: calls.update(headers=(name, is_fda, ctx)))
-    monkeypatch.setattr(flash, "build",
-                        lambda repo, preset, increment, stamp=True, variant=None:
-                        calls.update(stamp=stamp, variant=variant))
     monkeypatch.setattr(flash, "newest_hex", newest_hex)
-    monkeypatch.setattr("sys.argv", ["flash.py", "--board", "transmitter", "--preset", "P", "--build",
-                                     *(["--presets", str(context)] if fda else []),
-                                     "--transmitter-fw", str(tree)])
+    built = _run_main(flash, monkeypatch, tree, *(["--presets", str(context)] if fda else []))
     with pytest.raises(Built):
         flash.main()
+    headers = [p.name for p in (tree / "Core/Inc/presets").glob("*.h")]
     if fda:
-        assert calls == {"headers": ("transmitter", True, context.resolve()),
-                         "stamp": False, "variant": "test"}
+        assert headers == ["fda_preset.h"]
+        assert [k for _, k in built] == [{"stamp": False, "variant": "test"}]
     else:
-        assert calls == {"stamp": True, "variant": None}
+        assert headers == []
+        assert [k for _, k in built] == [{"stamp": True, "variant": None}]
 
 
 def _plain_or_fda_tree(root: Path, fda: bool) -> Path:
@@ -201,6 +188,36 @@ def test_main_refuses_presets_for_a_plain_image(flash, tmp_path, monkeypatch):
     tree = _plain_or_fda_tree(tmp_path, fda=False)
     built = _run_main(flash, monkeypatch, tree, "--presets", str(_context(tmp_path)))
     with pytest.raises(SystemExit, match="a plain image links no presets"):
+        flash.main()
+    assert not built and not list((tree / "Core/Inc/presets").glob("*.h"))
+
+
+def test_main_links_and_configures_a_presets_only_image(flash, tmp_path, monkeypatch):
+    """A successful main() with the real header writer: the tree gets the
+    context's header and the build is configured with its suffix. Only the
+    build (the compiler) is stubbed."""
+    tree = _plain_or_fda_tree(tmp_path, fda=True)
+
+    class Built(Exception):
+        pass
+
+    def newest_hex(*_):
+        raise Built
+
+    monkeypatch.setattr(flash, "newest_hex", newest_hex)
+    built = _run_main(flash, monkeypatch, tree, "--presets", str(_context(tmp_path, ids=("only",), variant="fda")))
+    with pytest.raises(Built):
+        flash.main()
+    assert [p.name for p in (tree / "Core/Inc/presets").glob("*.h")] == ["fda_preset.h"]
+    assert len(built) == 1 and built[0][1] == {"stamp": False, "variant": "fda"}
+
+
+def test_main_refuses_an_fda_context_with_several_presets(flash, tmp_path, monkeypatch):
+    """+fda carries the one cleared preset; only +test takes several
+    (2026-10-29, operator-interface#192)."""
+    tree = _plain_or_fda_tree(tmp_path, fda=True)
+    built = _run_main(flash, monkeypatch, tree, "--presets", str(_context(tmp_path, variant="fda")))
+    with pytest.raises(SystemExit, match="an fda image links exactly one preset"):
         flash.main()
     assert not built and not list((tree / "Core/Inc/presets").glob("*.h"))
 

@@ -326,6 +326,38 @@ def test_a_bound_at_the_ceiling_in_float32_is_present(iface):
     assert iface.hvcontroller.select_preset(0, iface.preset[0], 2720.0) == pytest.approx(40.0)
 
 
+@pytest.mark.parametrize("voltage_range", [[0.0, 45.0], [42.0, 37.0], [5.0, 100.0]],
+                         ids=["zero-floor", "reversed", "above-ceiling"])
+def test_a_flash_entry_with_a_bad_range_is_absent_too(voltage_range):
+    """The same record, given through preset_flash rather than
+    configure_presets, is judged the same way: absent, not a construction error."""
+    mc, regs = flash_entry(voltage_range=[35.0, 45.0])
+    interface = SimulatedDeviceInterface(preset_flash=[(dict(mc, voltage_range=voltage_range), regs)])
+    try:
+        with pytest.raises(LIFUDeviceError) as excinfo:
+            interface.hvcontroller.get_preset(0)
+        assert _code(excinfo) == OW_HV_DATA_ERROR
+    finally:
+        interface.close()
+
+
+def test_the_host_range_check_holds_where_the_console_accepts():
+    """A presets-only console whose record allows 43.4 V ([35, 45]) applies
+    it, but the host's own check of a narrower range refuses the load: the
+    check every console gets, older firmware included."""
+    mc, regs = flash_entry(voltage_range=[35.0, 45.0])
+    interface = SimulatedDeviceInterface(preset_flash=[(mc, regs)])
+    try:
+        interface.txdevice._user_configs[0]["module"]["sensitivity"] = [[400000, 2507]]   # 43.4 V
+        with pytest.raises(LIFUSolutionError, match="voltage_range"):
+            interface.load_preset(0, mc["settings_crc"], regs, 400_000.0,
+                                  voltage_range=(37.0, 42.0), turn_hv_on=True)
+        assert interface.hvcontroller.get_hv_status() is False
+        assert interface.txdevice.get_loaded_preset() == (None, None)
+    finally:
+        interface.close()
+
+
 def test_no_fixed_floor_under_the_ceiling(iface):
     """Peter, 2026-10-30: a ceiling only, no fixed floor. A [5, 45] record is
     held to its own range."""

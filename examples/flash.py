@@ -265,6 +265,10 @@ def write_preset_headers(repo: Path, name: str, presets_only: bool, context: Pat
         sys.exit("%s tracks its own preset headers (%s); refusing to overwrite them"
                  % (repo, ", ".join(listed.stdout.split())))
     configs = load_preset_set(context)
+    # +fda carries the one cleared preset, +test any number (Peter and Alex,
+    # 2026-10-29, operator-interface#192).
+    if context.name == "fda" and len(configs) != 1:
+        sys.exit("an fda image links exactly one preset; %s lists %d" % (context, len(configs)))
     with tempfile.TemporaryDirectory() as staging:
         try:
             if len(configs) == 1:
@@ -561,6 +565,9 @@ def main() -> int:
             sys.exit("%s has no preset %r. It has: %s" % (repo, preset, ", ".join(sorted(presets))))
         slot_preset = not cache_flag(presets[preset], "BARE_METAL")
         fda_preset = cache_flag(presets[preset], "FDA_MODE")
+        if args.presets and not fda_preset:
+            # Before any prompt: the command could never succeed.
+            sys.exit("a plain image links no presets; --presets needs an FDA_MODE (presets-only) preset")
         # Asked before building, so the answer is not kept waiting on the compiler.
         if slot_preset and not args.force:
             print(SLOT_WARNING % ("'%s'" % preset))
