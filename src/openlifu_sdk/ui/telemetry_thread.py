@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """Background QThread that periodically calls polling hooks on a
 :class:`~openlifu_sdk.ui.base_connector.BaseConnector`.
 
@@ -17,7 +18,7 @@ from __future__ import annotations
 import logging
 import threading
 
-from openlifu_sdk.ui._qt import QThread
+from openlifu_sdk.ui._qt import QThread, check_host_binding
 
 logger = logging.getLogger(__name__)
 
@@ -41,9 +42,13 @@ class TelemetryPollThread(QThread):
 
     The thread exits when :meth:`stop` is called (and the connector is
     expected to ``wait()`` on it during shutdown).
+
+    Raises :class:`RuntimeError` if the host's application runs on the
+    other Qt binding (see :func:`~openlifu_sdk.ui._qt.check_host_binding`).
     """
 
     def __init__(self, connector, interval_s: float = 1.0):
+        check_host_binding()
         super().__init__()
         self._connector = connector
         self._interval_s = float(interval_s)

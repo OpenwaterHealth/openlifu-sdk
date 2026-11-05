@@ -12,6 +12,7 @@
 #     language: python
 #     name: python3
 # ---
+# SPDX-License-Identifier: Apache-2.0
 
 # %%
 """QA verification for set_solution() single-profile and multi-profile paths.

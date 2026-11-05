@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """
 Unit tests for the cross-process OPENLIFU_HW_INTERFACE_PID lock used by
 LIFUInterface.

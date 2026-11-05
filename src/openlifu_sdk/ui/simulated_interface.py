@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """In-memory fake of :class:`openlifu_sdk.LIFUInterface` for ``--simulate`` modes.
 
 Drives a :class:`~openlifu_sdk.ui.base_connector.BaseConnector`
@@ -77,10 +78,11 @@ from openlifu_sdk.io.LIFUConfig import (
     OW_NO_PRESET,
     OW_TEMP_TOO_HIGH,
 )
-from openlifu_sdk.io.LIFUTXPresets import module_regs_crcs, preset_sensitivity
+from openlifu_sdk.io.LIFUTXPresets import module_regs_crcs, preset_sensitivity, preset_voltage
 from openlifu_sdk.io.LIFUUserConfig import sensitivity_at_frequency
 from openlifu_sdk.io.signal import OWSignal
 from openlifu_sdk.ui.status_frame import format_status_frame as _format_status_frame
+from openlifu_sdk.util.hwid import encode_hwid
 
 logger = logging.getLogger(__name__)
 logger.debug("openlifu_sdk.ui.simulated_interface using Qt backend: %s", _QT_BACKEND)
@@ -222,10 +224,9 @@ class SimulatedTxDevice:
             list(preset_flash) if preset_flash is not None
             else [self._default_flash_entry()]
         )
-        self._loaded_preset_index: Optional[int] = None
-        self._loaded_duration_index: Optional[int] = None
-        # Modules holding a loaded part of the preset (each loads its own, as on hardware).
-        self._loaded_modules: set[int] = set()
+        # module -> (preset index, duration index) it holds loaded; each module
+        # loads its own part of the preset, as on hardware.
+        self._module_loads: dict[int, tuple[int, int]] = {}
 
         # Reported firmware version. Mutable so an app-side debug UI
         # (or a test) can flip it to simulate an incompatible firmware
@@ -237,11 +238,17 @@ class SimulatedTxDevice:
 
     # ---- helpers --------------------------------------------------------
 
+    @staticmethod
+    def _uid(module: int) -> bytes:
+        """The 12-byte MCU unique ID simulated module *module* reports."""
+        return (0xA0A1A2A3A4A5A6A7B0B1B2B3 + module).to_bytes(12, "big")
+
     def _default_user_config(self, idx: int) -> dict:
-        # Plausible 100 - 1000 kHz sensitivity table, V/MPa-ish.
+        # Calibrated for this module (its own UID, in the record form), with a
+        # plausible 100 - 1000 kHz sensitivity table, V/MPa-ish.
         return {
             "sn": "SIMULATED",
-            "hwid": "ABCDEFGH",
+            "hwid": encode_hwid(self._uid(idx), base58=True),
             "freq": 400,
             "hw_ver": "SIM",
             "fw_ver": "2.0.5",
@@ -283,6 +290,7 @@ class SimulatedTxDevice:
             "pulse_train_count_selections": [1],
             "start_C": 35.0,
             "shutoff_C": 75.0,
+            "treatment_timeout_s": 1800,
         }
         return machine_config, 0x87654321
 
@@ -329,7 +337,7 @@ class SimulatedTxDevice:
         }
 
     def load_preset(self, index: int, regs_crc: int, duration_index: int = 0,
-                    settings_crc: int | None = None, module: int = 0) -> bool:
+                    module: int = 0, *, settings_crc: int | None = None) -> bool:
         """Same contract as :meth:`TxDevice.load_preset` (OW_PRESET_LOAD).
 
         Like the firmware, loading applies the preset's trigger and pulse
@@ -366,24 +374,52 @@ class SimulatedTxDevice:
         }
         self._pulse["duration"] = float(machine_config.get("pulse_length_us", 100.0)) / 1_000_000.0
         self._normalize_train_interval()
-        self._loaded_modules.add(module)
-        if module == 0:
-            self._loaded_preset_index = index
-            self._loaded_duration_index = duration_index
+        self._module_loads[module] = (index, duration_index)
         return True
 
     def unload_preset(self, module: int = 0) -> bool:
         """Same contract as :meth:`TxDevice.unload_preset`."""
-        self._loaded_modules.discard(module)
-        if module == 0:
-            self._loaded_preset_index = None
-            self._loaded_duration_index = None
+        self._module_loads.pop(module, None)
         return True
 
+    @property
+    def _loaded_modules(self) -> set[int]:
+        """The modules holding a load. Kept as a set for downstream tests
+        that inspect it (operator-interface tests/test_no_auto_restart.py);
+        :meth:`get_loaded_preset_state` with ``module`` is the public read."""
+        return set(self._module_loads)
+
     def get_loaded_preset(self) -> tuple[Optional[int], Optional[int]]:
-        """``(preset_index, duration_index)`` of the last successful
-        :meth:`load_preset`, or ``(None, None)``. Simulator inspection only."""
-        return self._loaded_preset_index, self._loaded_duration_index
+        """Same contract as :meth:`TxDevice.get_loaded_preset`."""
+        state = self.get_loaded_preset_state()
+        return state["index"], state["duration_index"]
+
+    def get_loaded_preset_state(self, module: Optional[int] = None) -> dict:
+        """Same contract as :meth:`TxDevice.get_loaded_preset_state`
+        (OW_PRESET_LOADED): loaded only if every module holds module 0's
+        load, with the modules that don't in ``missing_modules``; with
+        *module* 1 or above, that module's own load (module 0, the master,
+        answers for every module). ``train_count`` is the count the load
+        programmed."""
+        if module == 0:
+            module = None
+        if module is not None and not 0 <= module <= 7:
+            raise ValueError(f"module must be 0-7, got {module}")
+        if module is not None and module >= self.num_modules:
+            raise LIFUDeviceError(f"TX: no module {module} to ask what it has loaded")
+        modules = range(self.num_modules) if module is None else [module]
+        load = self._module_loads.get(0 if module is None else module)
+        missing = [m for m in modules if load is None or self._module_loads.get(m) != load]
+        if missing:
+            return {"loaded": False, "index": None, "duration_index": None, "train_count": None,
+                    "settings_crc": None, "regs_crc": None, "missing_modules": missing}
+        index, duration_index = load
+        machine_config, flash_regs_crc = self._preset_flash[index]
+        crcs = self._module_crcs(flash_regs_crc)
+        return {"loaded": True, "index": index, "duration_index": duration_index,
+                "train_count": int(machine_config["pulse_train_count_selections"][duration_index]),
+                "settings_crc": int(machine_config["settings_crc"]),
+                "regs_crc": crcs[0 if module is None else module], "missing_modules": []}
 
     def is_connected(self) -> bool:
         return self._connected
@@ -444,8 +480,9 @@ class SimulatedTxDevice:
         """
         self._fw_version = str(version)
 
-    def get_hardware_id(self, module: int = 0, raw_hex: bool = False) -> str:
-        return f"{0xA0A1A2A3A4A5A6A7B0B1B2B3B4B5B6B7 + module:032X}"
+    def get_hardware_id(self, module: int = 0, raw_hex: bool = False,
+                        base58: bool = False, legacy_6byte: bool = False) -> str:
+        return encode_hwid(self._uid(module), raw_hex, base58, legacy_6byte)
 
     def read_config(self, module: int = 0):
         from openlifu_sdk.io.LIFUUserConfig import LifuUserConfig
@@ -559,14 +596,17 @@ class SimulatedTxDevice:
 
     def start_trigger(self):
         """Same refusals as an FDA_MODE transmitter (presets_start_check in
-        the firmware): nothing loaded, or module 0 above the loaded preset's
-        start_C. The simulator always has a temperature reading, so it never
-        reports OW_TEMP_UNKNOWN."""
-        if self._loaded_preset_index is None:
+        the firmware): nothing loaded on module 0, the master, or module 0
+        above the loaded preset's start_C. The simulator always has a
+        temperature reading, so it never reports OW_TEMP_UNKNOWN. As in the
+        firmware, only the master's own load gates Start; the loaded read
+        (:meth:`get_loaded_preset_state`) is what asks every module."""
+        load = self._module_loads.get(0)
+        if load is None:
             raise LIFUDeviceError("TX: no preset loaded", device_error_code=OW_NO_PRESET)
         if self._trigger_status == "PAUSED":
             raise LIFUDeviceError("TX: trigger is paused")
-        start_c = self._preset_flash[self._loaded_preset_index][0].get("start_C")
+        start_c = self._preset_flash[load[0]][0].get("start_C")
         if start_c is not None and self._modules[0].read_temp() > float(start_c):
             raise LIFUDeviceError(f"TX above start_C {float(start_c):.1f} C",
                                   device_error_code=OW_TEMP_TOO_HIGH)
@@ -590,14 +630,14 @@ class SimulatedTxDevice:
         """Device-level trigger flag only (see :meth:`pause_trigger`).
 
         Per SR-023 item 8: refused at or above the loaded preset's
-        shutoff_C, and not gated by start_C. The firmware branch
-        (``feature/trigger-pause-resume``) still applies the start_C check
-        on Resume; that gap is tracked on openlifu-transmitter-fw#22.
+        shutoff_C, and not gated by start_C, as the firmware does since
+        openlifu-transmitter-fw#42.
         """
         if self._trigger_status != "PAUSED":
             raise LIFUDeviceError("TX: sequence is not paused")
-        if self._loaded_preset_index is not None:
-            shutoff_c = self._preset_flash[self._loaded_preset_index][0].get("shutoff_C")
+        load = self._module_loads.get(0)
+        if load is not None:
+            shutoff_c = self._preset_flash[load[0]][0].get("shutoff_C")
             hottest = max(m.read_temp() for m in self._modules)
             if shutoff_c is not None and hottest >= float(shutoff_c):
                 raise LIFUDeviceError(f"TX at shutoff_C {float(shutoff_c):.1f} C",
@@ -806,8 +846,10 @@ class SimulatedHVController:
         :meth:`SimulatedTxDevice.set_version` for rationale."""
         self._fw_version = str(version)
 
-    def get_hardware_id(self, raw_hex: bool = False) -> str:
-        return "C0C1C2C3C4C5C6C7D0D1D2D3D4D5D6D7"
+    def get_hardware_id(self, raw_hex: bool = False, base58: bool = False,
+                        legacy_6byte: bool = False) -> str:
+        return encode_hwid(bytes.fromhex("C0C1C2C3C4C5C6C7D0D1D2D3"), raw_hex,
+                           base58, legacy_6byte)
 
     def get_temperature1(self) -> float:
         return 30.0 + 0.05 * self._voltage_setpoint + _gauss(HV_TEMP_NOISE_SIGMA)
@@ -1353,9 +1395,10 @@ class SimulatedDeviceInterface(QObject):
                     "index": index,
                     "selected": None,
                     "settings_crc": int(machine_config.get("settings_crc", 0)),
-                    "voltage": machine_config.get("voltage"),   # configure_presets checks it
                     "id": machine_config.get("id", f"preset-{index}"),
-                    # As HVController.get_preset reports it: the console bakes it as float32.
+                    # As HVController.get_preset reports them: the console bakes
+                    # both as float32. preset_voltage refuses a missing or bad voltage.
+                    "voltage": preset_voltage(machine_config),
                     "sensitivity": preset_sensitivity(machine_config),
                 })
             self.hvcontroller.configure_presets(hv_presets)

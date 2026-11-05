@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """
 LIFU Thermal Stress Test Script
 

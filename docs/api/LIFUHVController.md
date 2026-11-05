@@ -25,7 +25,7 @@ Connectivity and basic
 - `close()` — close UART transport.
 - `ping() -> bool` — ping console.
 - `get_version() -> str` — firmware version string.
-- `get_hardware_id() -> str` — formatted HWID.
+- `get_hardware_id(raw_hex=False, base58=False, legacy_6byte=False) -> str` — the 12-byte MCU UID. Returns dash-separated hex by default, lower-case hex with `raw_hex`, or base58 with `base58` (the form calibration records carry). Adding `legacy_6byte` to `base58` returns base58 of the first 6 bytes, the form older records carry.
 
 Power and HV control
 - `turn_12v_on()` / `turn_12v_off()` — control 12V rail.

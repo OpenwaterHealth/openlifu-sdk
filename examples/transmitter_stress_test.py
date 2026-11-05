@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """txdevice TX7332 block write/read-back stress test.
 
 Enumerates all TX7332 chips, then for each iteration picks a random chip,

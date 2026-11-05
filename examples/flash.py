@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """Build (optionally) and flash the transmitter or console firmware over ST-LINK.
 
     python examples/flash.py                              # the one board wired to a probe

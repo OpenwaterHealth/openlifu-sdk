@@ -66,7 +66,9 @@ from openlifu_sdk.io.LIFUTXPresets import (
     preset_sensitivity,
     preset_voltage,
     regs_crc,
+    store_preset,
     thermal_limits,
+    treatment_timeout,
     verify_console_preset,
 )
 from openlifu_sdk.io.LIFUUserConfig import LifuUserConfig, sensitivity_at_frequency
@@ -87,6 +89,7 @@ def _preset(**overrides) -> dict:
         "apodization": [[1.0] * 64],
         "start_C": 35,
         "shutoff_C": 75,
+        "treatment_timeout_s": 1800,
         "voltage": 20.0,
     }
     doc.update(overrides)
@@ -154,6 +157,71 @@ class TestThermalLimits(unittest.TestCase):
         self.assertEqual((got["start_c_x10"], got["shutoff_c_x10"]), (365, 410))
 
 
+class TestTreatmentTimeout(unittest.TestCase):
+    """SR-024: the preset's treatment_timeout_s, a u16 right after shutoff_C, inside regs_crc."""
+
+    def test_whole_seconds(self):
+        self.assertEqual(treatment_timeout(_compiled()), 1800)
+        self.assertEqual(treatment_timeout(_compiled(treatment_timeout_s=1800.0)), 1800)
+        self.assertEqual(treatment_timeout(_compiled(treatment_timeout_s=1)), 1)
+        self.assertEqual(treatment_timeout(_compiled(treatment_timeout_s=0xFFFF)), 0xFFFF)
+
+    def test_missing_is_refused_not_defaulted(self):
+        doc = _preset()
+        del doc["treatment_timeout_s"]
+        with self.assertRaisesRegex(ValueError, "lacks treatment_timeout_s"):
+            compile_preset(doc)
+
+    def test_out_of_range_or_not_whole_refused(self):
+        for bad in (0, -1, 0x10000, 1800.5, "1800", True, None, float("nan"), float("inf")):
+            with self.assertRaisesRegex(ValueError, "treatment_timeout_s", msg=repr(bad)):
+                _compiled(treatment_timeout_s=bad)
+
+    def test_layout_follows_shutoff(self):
+        # i16 start_C, i16 shutoff_C, then u16 treatment_timeout_s LE, then chip 0's run count.
+        mc = _compiled(treatment_timeout_s=0x1234)
+        blob = preset_blob(mc)
+        thermal = struct.pack("<B2I", 2, 1, 5) + struct.pack("<hh", 350, 750)
+        at = blob.index(thermal) + len(thermal)
+        self.assertEqual(blob[at:at + 2], b"\x34\x12")
+        self.assertEqual(struct.unpack_from("<H", blob, at + 2)[0], len(mc["chips"][0]["registers"]))
+
+    def test_regs_crc_covers_it(self):
+        base = _compiled()
+        changed = _compiled(treatment_timeout_s=1799)
+        self.assertNotEqual(regs_crc(base), regs_crc(changed))
+        self.assertEqual(parse_preset_blob(preset_blob(changed))["body_crc"], regs_crc(changed))
+
+    def test_round_trip(self):
+        for mc in (_compiled(treatment_timeout_s=60), _rastered(treatment_timeout_s=60)):
+            got = parse_preset_blob(preset_blob(mc))
+            self.assertEqual(got["treatment_timeout_s"], 60)
+            self.assertEqual(got["chips"], mc["chips"])
+
+    def test_every_module_carries_it(self):
+        wide = _compiled(id="wide", delays=[[0.0] * 128], apodization=[[1.0] * 128], treatment_timeout_s=900)
+        self.assertEqual([parse_preset_blob(preset_blob(wide, m))["treatment_timeout_s"] for m in (0, 1)],
+                         [900, 900])
+
+    def test_header_names_it(self):
+        with tempfile.TemporaryDirectory() as d:
+            text = generate_fda_preset(d, _compiled()).read_text()
+        self.assertIn("treatment_timeout_s 1800,", text)
+        # 1800 = 0x0708, little-endian
+        self.assertIn("\t// treatment_timeout_s: seconds from Start, pauses included\n\t0x08, 0x07,\n", text)
+
+    def test_store_preset_writes_it(self):
+        mc = _compiled(treatment_timeout_s=600)
+        tx = MagicMock()
+        tx.get_module_count.return_value = 1
+        tx.get_preset.return_value = {"id": mc["id"], "settings_crc": mc["settings_crc"],
+                                      "regs_crc": regs_crc(mc), "start_c": 35.0, "shutoff_c": 75.0}
+        store_preset(tx, 3, mc)
+        slot, blob, module = tx.write_preset.call_args.args
+        self.assertEqual((slot, module), (3, 0))
+        self.assertEqual((blob[4], parse_preset_blob(blob)["treatment_timeout_s"]), (2, 600))
+
+
 def _rastered(**overrides) -> dict:
     """Three delay profiles cycled 1, 2, 3, 1 -- per-profile registers and a real order."""
     return _compiled(delays=[[i * 1e-7] * 64 for i in range(3)], apodization=[[1.0] * 64] * 3,
@@ -186,7 +254,7 @@ class TestPresetBlob(unittest.TestCase):
     def test_header_layout(self):
         mc = _compiled(id="unit")
         blob = preset_blob(mc)
-        self.assertEqual(blob[:8], b"OWPR" + bytes([1, 4, 0, 1]))   # version, id length, module 0 of 1
+        self.assertEqual(blob[:8], b"OWPR" + bytes([2, 4, 0, 1]))   # version, id length, module 0 of 1
         self.assertEqual(struct.unpack_from("<III", blob, 8), (len(blob), mc["settings_crc"], regs_crc(mc)))
         self.assertEqual(blob[20:24], b"unit")
 
@@ -207,7 +275,8 @@ class TestPresetBlob(unittest.TestCase):
 
     def test_parser_refuses_damage(self):
         blob = preset_blob(_rastered())
-        for bad in (blob[:-1], blob + b"\0", b"XXXX" + blob[4:], blob[:4] + b"\x02" + blob[5:], blob[:40]):
+        # A version 1 blob has no treatment_timeout_s: refused, as the firmware refuses it.
+        for bad in (blob[:-1], blob + b"\0", b"XXXX" + blob[4:], blob[:4] + b"\x01" + blob[5:], blob[:40]):
             with self.assertRaises(ValueError):
                 parse_preset_blob(bad)
 

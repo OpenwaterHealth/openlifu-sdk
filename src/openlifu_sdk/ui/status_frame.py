@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """STATUS-frame parser shared by real firmware and the simulator.
 
 The firmware (and :class:`~openlifu_sdk.ui.simulated_interface.SimulatedTxDevice`)

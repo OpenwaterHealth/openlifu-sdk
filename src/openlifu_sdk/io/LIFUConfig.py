@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 
 # Packet Types
 from __future__ import annotations
@@ -98,6 +99,8 @@ OW_PRESET_WRITE = 0x52
 OW_PRESET_COMMIT = 0x53
 OW_PRESET_DELETE = 0x54
 OW_PRESET_CAPACITY = 0x55
+# What every module has loaded (16 bytes; TxDevice.get_loaded_preset_state).
+OW_PRESET_LOADED = 0x57
 
 # TX7332 Commands
 OW_TX7332_STATUS = 0x20
@@ -174,6 +177,7 @@ CONTROLLER_COMMANDS = {
     OW_CTRL_SET_PROFILE_CYCLE,
     OW_PRESET_GET, OW_PRESET_LOAD,
     OW_PRESET_WRITE, OW_PRESET_COMMIT, OW_PRESET_DELETE, OW_PRESET_CAPACITY,
+    OW_PRESET_LOADED,
 }
 
 POWER_COMMANDS = {
@@ -205,7 +209,7 @@ TX_FDA_PACKETS = {
         OW_CTRL_GET_SWTRIG, OW_CTRL_START_SWTRIG, OW_CTRL_STOP_SWTRIG,
         OW_CTRL_PAUSE_SWTRIG, OW_CTRL_RESUME_SWTRIG,
         OW_CTRL_GET_MODULE_COUNT,
-        OW_PRESET_GET, OW_PRESET_LOAD,
+        OW_PRESET_GET, OW_PRESET_LOAD, OW_PRESET_LOADED,
     }),
     OW_TX7332: frozenset({OW_TX7332_DEVICE_COUNT}),  # get_module_count fallback on older images
 }
