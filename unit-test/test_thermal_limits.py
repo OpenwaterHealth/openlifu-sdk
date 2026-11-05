@@ -173,6 +173,18 @@ def test_clear(tx):
 # ---- FDA whitelist -----------------------------------------------------------
 
 
+def test_fda_txdevice_reads_the_limits_through_its_whitelist(tx):
+    # The FDA class itself, end to end through ALLOWED_PACKETS and the mocked UART.
+    fda = TxDevice()
+    fda._uart = tx._uart
+    fda._uart.send_packet.return_value = _reply(1, 2, 400, 430, 1800)
+    assert fda.get_thermal_limits() == {
+        "source": "preset", "preset_index": 2, "start_c": 40.0, "shutoff_c": 43.0,
+        "treatment_timeout_s": 1800,
+    }
+    assert _sent(fda)[:2] == (OW_CONTROLLER, OW_CTRL_GET_THERMAL_LIMITS)
+
+
 def test_fda_txdevice_may_read_but_not_change_the_limits():
     allowed = TX_FDA_PACKETS[OW_CONTROLLER]
     assert OW_CTRL_GET_THERMAL_LIMITS in allowed
@@ -227,10 +239,12 @@ def test_sim_host_set_and_clear(sim):
     with pytest.raises(LIFUDeviceError) as e:
         dev.start_trigger()
     assert e.value.device_error_code == OW_TEMP_TOO_HIGH
-    assert dev.set_thermal_limits(30.0, 45.0, 0)["treatment_timeout_s"] == 0
-    with pytest.raises(ValueError):
-        dev.set_thermal_limits(30.0, 45.0, -1)
-    assert dev.get_thermal_limits()["treatment_timeout_s"] == 0, "a refused set changes nothing"
+    before = dev.set_thermal_limits(30.0, 45.0, 0)
+    assert before["treatment_timeout_s"] == 0
+    for bad in ((31.0, 46.0, -1), (46.0, 45.0, 600), (31.05, 46.0, 600)):
+        with pytest.raises(ValueError):
+            dev.set_thermal_limits(*bad)
+        assert dev.get_thermal_limits() == before, "a refused set changes nothing"
 
     cleared = dev.clear_thermal_limits()
     assert (cleared["source"], cleared["treatment_timeout_s"]) == ("none", 0)
@@ -292,6 +306,18 @@ def test_sim_resume_held_to_the_armed_shutoff(sim):
     _set_temp(dev, 34.0)
     assert dev.resume_trigger()
     dev.stop_trigger()
+
+
+def test_sim_invalid_set_unloads_nothing(sim):
+    # Refused before anything is sent, as on the real device, so the preset stays.
+    dev, mc, regs = sim
+    dev.load_preset(0, regs, settings_crc=mc["settings_crc"])
+    armed = dev.get_thermal_limits()
+    for bad in ((46.0, 45.0, 600), (31.0, 46.0, -1)):
+        with pytest.raises(ValueError):
+            dev.set_thermal_limits(*bad)
+    assert dev.get_loaded_preset()[0] == 0
+    assert dev.get_thermal_limits() == armed
 
 
 def test_sim_refused_set_unloads_nothing(sim):

@@ -652,9 +652,12 @@ class TxDevice(OWComponent):
         above start_C (OW_TEMP_TOO_HIGH) or without a fresh reading
         (OW_TEMP_UNKNOWN), a running sequence stops at shutoff_C, and a
         running or paused one ends as TIMEOUT once the treatment timeout has
-        passed, whether or not a preset is still loaded. Those gates are
-        enforced by the transmitter firmware (openlifu-transmitter-fw#60, whose HIL tests have not yet run); the SDK and its simulator only report them. They are the master's (module 0), which runs the trigger;
-        a reset leaves none armed.
+        passed, whether or not a preset is still loaded. The transmitter
+        firmware enforces those gates (openlifu-transmitter-fw#60, whose HIL
+        tests have not run yet); this method only reports what is armed. The
+        simulator models the Start and Resume gates, but not the shutoff_C
+        stop or the timeout. They are the master's (module 0), which runs
+        the trigger; a reset leaves none armed.
 
         Raises:
             LIFUDeviceError: Firmware that predates the command.
@@ -1063,8 +1066,11 @@ class LIFUTxDevice(LIFUComponentMixin, TxDevice):
         once armed, start_trigger() is refused above *start_c*, a running
         sequence stops at *shutoff_c*, and a running or paused one ends as
         TIMEOUT *treatment_timeout_s* after start, as with a loaded preset's
-        limits (get_thermal_limits()), enforced by the transmitter firmware (openlifu-transmitter-fw#60, whose HIL tests have not yet run); the SDK and its simulator only report them. The temperatures travel as tenths of a
-        degree, so they must be multiples of 0.1 C, and *start_c* must be
+        limits (get_thermal_limits()). The transmitter firmware enforces
+        those gates (openlifu-transmitter-fw#60, whose HIL tests have not run
+        yet); the simulator models Start and Resume only. The temperatures
+        travel as tenths of a degree, so they must be multiples of 0.1 C, and
+        *start_c* must be
         below *shutoff_c*. *treatment_timeout_s* is whole seconds up to
         65535; 0 runs with no timeout. It has no default, so a timeout is
         never dropped by leaving it out.
@@ -1099,8 +1105,11 @@ class LIFUTxDevice(LIFUComponentMixin, TxDevice):
         (OW_CTRL_CLEAR_THERMAL_LIMITS).
 
         With none armed, start_trigger() runs the host's configuration with
-        only the firmware's global overheat protection, and no timeout. Clearing with none
-        armed is not an error. Like set_thermal_limits(), it unloads a
+        no timeout and only the firmware's fixed overheat trip: a sequence
+        stops, and none starts, once the TX reads 75 C, until it cools to
+        70 C (TX_OVERHEAT_TRIP_POINT / TX_OVERHEAT_HYSTERESIS in the
+        transmitter firmware's Core/Src/main.c). Clearing with none armed is
+        not an error. Like set_thermal_limits(), it unloads a
         preset loaded on the master, except when refused (OW_PRESET_BUSY,
         OW_FDA_REFUSED). Returns what is armed afterwards
         (``source`` "none"), as get_thermal_limits().
