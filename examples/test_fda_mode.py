@@ -68,6 +68,7 @@ from pathlib import Path
 
 from openlifu_sdk.io.exceptions import LIFUDeviceError, LIFUError
 from openlifu_sdk.io.LIFUConfig import (
+    LIFU_ERR_MODULE_COUNT_MISMATCH,
     OW_BAD_CRC,
     OW_CONTROLLER,
     OW_FDA_REFUSED,
@@ -191,7 +192,10 @@ def test_transmitter(tx, host, duration):
     test_gates(tx, *pairs[-1])
     try:
         load_preset(tx, pairs[-1][0]["index"], pairs[-1][1], duration)
-    except LIFUDeviceError as e:
+    except LIFUError as e:
+        # A device refusal, or a preset made for another module count (sent nothing).
+        if not isinstance(e, LIFUDeviceError) and e.code != LIFU_ERR_MODULE_COUNT_MISMATCH:
+            raise
         check("preset loads again after the refusals", False, reason(e))
         return
     test_raster(tx, pairs[-1][1])
