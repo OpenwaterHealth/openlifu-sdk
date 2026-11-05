@@ -56,6 +56,8 @@ def tx():
 
 def _sent(tx):
     kwargs = tx._uart.send_packet.call_args.kwargs
+    # Only the master runs the trigger: every limits command addresses module 0.
+    assert kwargs.get("addr", 0) == 0
     return kwargs["packet_type"], kwargs["command"], kwargs.get("data")
 
 
@@ -141,6 +143,32 @@ def test_get_refuses_a_reply_that_breaks_the_firmware_rules(tx, source, index, s
         tx.get_thermal_limits()
 
 
+def test_get_refuses_an_overlong_reply(tx):
+    long = _reply(2, 0xFF, 400, 430, 60)
+    long.data = long.data + bytearray(2)
+    long.data_len = len(long.data)
+    tx._uart.send_packet.return_value = long
+    with pytest.raises(LIFUProtocolError):
+        tx.get_thermal_limits()
+
+
+@pytest.mark.parametrize("reply", [
+    (2, 0xFF, 400, 431, 60),   # shutoff_C not what was asked
+    (2, 0xFF, 400, 430, 0),    # the timeout dropped
+    (1, 0, 400, 430, 60),      # a preset's, not the host's
+])
+def test_set_refuses_a_reply_that_is_not_what_was_asked(tx, reply):
+    tx._uart.send_packet.return_value = _reply(*reply)
+    with pytest.raises(LIFUProtocolError):
+        tx.set_thermal_limits(40.0, 43.0, 60)
+
+
+def test_clear_refuses_a_reply_with_limits_still_armed(tx):
+    tx._uart.send_packet.return_value = _reply(2, 0xFF, 400, 430, 60)
+    with pytest.raises(LIFUProtocolError):
+        tx.clear_thermal_limits()
+
+
 def test_get_refuses_data_shorter_than_its_length(tx):
     # data_len says 8, the bytes are fewer: a protocol error, not struct.error.
     reply = _reply(2, 0xFF, 400, 430, 60)
@@ -171,6 +199,18 @@ def test_clear(tx):
 
 
 # ---- FDA whitelist -----------------------------------------------------------
+
+
+def test_fda_txdevice_reads_the_limits_through_its_whitelist(tx):
+    # The FDA class itself, end to end through ALLOWED_PACKETS and the mocked UART.
+    fda = TxDevice()
+    fda._uart = tx._uart
+    fda._uart.send_packet.return_value = _reply(1, 2, 400, 430, 1800)
+    assert fda.get_thermal_limits() == {
+        "source": "preset", "preset_index": 2, "start_c": 40.0, "shutoff_c": 43.0,
+        "treatment_timeout_s": 1800,
+    }
+    assert _sent(fda)[:2] == (OW_CONTROLLER, OW_CTRL_GET_THERMAL_LIMITS)
 
 
 def test_fda_txdevice_may_read_but_not_change_the_limits():
@@ -227,10 +267,12 @@ def test_sim_host_set_and_clear(sim):
     with pytest.raises(LIFUDeviceError) as e:
         dev.start_trigger()
     assert e.value.device_error_code == OW_TEMP_TOO_HIGH
-    assert dev.set_thermal_limits(30.0, 45.0, 0)["treatment_timeout_s"] == 0
-    with pytest.raises(ValueError):
-        dev.set_thermal_limits(30.0, 45.0, -1)
-    assert dev.get_thermal_limits()["treatment_timeout_s"] == 0, "a refused set changes nothing"
+    before = dev.set_thermal_limits(30.0, 45.0, 0)
+    assert before["treatment_timeout_s"] == 0
+    for bad in ((31.0, 46.0, -1), (46.0, 45.0, 600), (31.05, 46.0, 600)):
+        with pytest.raises(ValueError):
+            dev.set_thermal_limits(*bad)
+        assert dev.get_thermal_limits() == before, "a refused set changes nothing"
 
     cleared = dev.clear_thermal_limits()
     assert (cleared["source"], cleared["treatment_timeout_s"]) == ("none", 0)
@@ -294,6 +336,18 @@ def test_sim_resume_held_to_the_armed_shutoff(sim):
     dev.stop_trigger()
 
 
+def test_sim_invalid_set_unloads_nothing(sim):
+    # Refused before anything is sent, as on the real device, so the preset stays.
+    dev, mc, regs = sim
+    dev.load_preset(0, regs, settings_crc=mc["settings_crc"])
+    armed = dev.get_thermal_limits()
+    for bad in ((46.0, 45.0, 600), (31.0, 46.0, -1)):
+        with pytest.raises(ValueError):
+            dev.set_thermal_limits(*bad)
+    assert dev.get_loaded_preset()[0] == 0
+    assert dev.get_thermal_limits() == armed
+
+
 def test_sim_refused_set_unloads_nothing(sim):
     # As the firmware: OW_PRESET_BUSY is checked before the unload.
     dev, mc, regs = sim
@@ -306,6 +360,21 @@ def test_sim_refused_set_unloads_nothing(sim):
     assert dev.get_loaded_preset()[0] == 0
     assert dev.get_thermal_limits()["source"] == "preset"
     dev.stop_trigger()
+
+
+def test_sim_a_slave_load_arms_nothing():
+    # Only the master's limits act, so only its load arms them.
+    pytest.importorskip("openlifu_sdk.ui._qt")
+    from sr003_presets import two_module_flash_entry
+
+    from openlifu_sdk.ui.simulated_interface import SimulatedLIFUTxDevice
+
+    mc, regs = two_module_flash_entry(start_C=40.0, shutoff_C=43.0, treatment_timeout_s=1800)
+    dev = SimulatedLIFUTxDevice(num_modules=2, preset_flash=[(mc, regs)])
+    dev.load_preset(0, regs[1], module=1, settings_crc=mc["settings_crc"])
+    assert dev.get_thermal_limits()["source"] == "none"
+    dev.load_preset(0, regs[0], module=0, settings_crc=mc["settings_crc"])
+    assert dev.get_thermal_limits()["source"] == "preset"
 
 
 def test_sim_soft_reset_clears_the_limits(sim):
