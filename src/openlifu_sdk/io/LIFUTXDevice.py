@@ -1119,12 +1119,21 @@ class LIFUTxDevice(LIFUComponentMixin, TxDevice):
         """Disarm start_C / shutoff_C and the treatment timeout
         (OW_CTRL_CLEAR_THERMAL_LIMITS).
 
-        With none armed, start_trigger() runs the host's configuration with
-        no timeout and only the firmware's fixed overheat trip: a sequence
-        stops, and none starts, once the TX reads 75 C, until it cools to
-        70 C (TX_OVERHEAT_TRIP_POINT / TX_OVERHEAT_HYSTERESIS in the
-        transmitter firmware's Core/Src/main.c). Clearing with none armed is
-        not an error. Like set_thermal_limits(), it unloads a
+        With none armed, start_trigger() runs the host's configuration
+        with only the firmware's fixed overheat trip (TX_OVERHEAT_TRIP_POINT
+        75 C, TX_OVERHEAT_HYSTERESIS 5 C, in the transmitter firmware's
+        Core/Src/main.c): a running sequence stops once the TX reads 75 C,
+        and none starts again until it reads 70 C. While tripped, START
+        reports success but runs nothing, so check get_trigger(). What no
+        longer acts once cleared:
+
+        - start_C: nothing refuses a start below 75 C;
+        - shutoff_C: nothing stops a run below 75 C;
+        - the stale-reading stop: the trip compares the last valid reading,
+          so a thermistor that fails or goes quiet stops nothing;
+        - the treatment timeout: a run goes on until stopped.
+
+        Clearing with none armed is not an error. Like set_thermal_limits(), it unloads a
         preset loaded on the master, except when refused (OW_PRESET_BUSY,
         OW_FDA_REFUSED). Returns what is armed afterwards
         (``source`` "none"), as get_thermal_limits().
