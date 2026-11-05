@@ -41,8 +41,9 @@ import sys
 import time
 from pathlib import Path
 
-from openlifu_sdk.io.exceptions import LIFUCommunicationError, LIFUDeviceError, LIFUNotConnectedError
+from openlifu_sdk.io.exceptions import LIFUCommunicationError, LIFUDeviceError, LIFUError, LIFUNotConnectedError
 from openlifu_sdk.io.LIFUConfig import (
+    LIFU_ERR_MODULE_COUNT_MISMATCH,
     OW_BAD_CRC,
     OW_INVALID_PACKET,
     OW_PRESET_BUSY,
@@ -282,6 +283,13 @@ def load_presets(tx, path, slot):
     if slot is not None and len(presets) > 1:
         sys.exit("--slot places one preset; %s holds %d, which go to the first available slots" % (path, len(presets)))
     slot_size = slot_layout(tx)[1]
+    # store_preset refuses a module-count mismatch; check them all first
+    # so a folder is stored whole or not at all.
+    modules = tx.get_module_count()
+    wrong = ["%s (%d)" % (mc["id"], preset_modules(mc)) for mc in presets if preset_modules(mc) != modules]
+    if wrong:
+        sys.exit("refused before writing: the TX has %d module(s); made for another count: %s"
+                 % (modules, ", ".join(wrong)))
     for mc in presets:
         need = preset_slots(mc, slot_size)
         where, how = slot, "stored"
@@ -343,7 +351,10 @@ def examine(tx, e, mc, duration):
                          "it offers %s" % counts)], False
     try:
         load_preset(tx, e["index"], mc, duration)
-    except LIFUDeviceError as err:
+    except LIFUError as err:
+        # A device refusal, or a preset made for another module count (sent nothing).
+        if not isinstance(err, LIFUDeviceError) and err.code != LIFU_ERR_MODULE_COUNT_MISMATCH:
+            raise
         return found + [(name + ": loads on the host's CRC", False, reason(err))], False
     found.append((name + ": loads on the host's CRC", True,
                   "run length %d = %d train(s)" % (duration, counts[duration])))
