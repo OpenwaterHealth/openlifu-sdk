@@ -84,8 +84,8 @@ jobs:
       # rc tags and next builds take each repo's latest pre-release
       # (when it is at least as new as the latest stable); everything
       # else -- and rc/next builds with no usable pre-release -- takes
-      # the latest stable release. The dfu-stub and legacy-updater
-      # images have no publishing CI and stay as committed.
+      # the latest stable release. The signed dfu-stub image has no
+      # publishing CI and stays as committed.
       # Skipping the refresh (manual runs, update_firmware=false) bundles
       # whatever firmware images are committed in the repo.
       - name: Resolve firmware releases
