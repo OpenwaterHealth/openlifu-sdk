@@ -2,7 +2,7 @@
 import struct
 import json
 from dataclasses import dataclass
-from typing import Optional, Any, Dict, Iterable
+from typing import Optional, Any, Dict, Sequence
 import logging
 import math
 
@@ -196,7 +196,7 @@ def _module_sensitivity(config: Optional[Dict[str, Any]], freq_hz: float) -> Opt
     return None
 
 
-def sensitivity_at_frequency(module_configs: Iterable[Dict[str, Any]], freq_hz: float) -> Optional[float]:
+def sensitivity_at_frequency(module_configs: Sequence[Dict[str, Any]], freq_hz: float) -> Optional[float]:
     """Return a transmitter's sensitivity at *freq_hz* from its module user configs.
 
     Each config's ``module.sensitivity`` is a ``[[freq_hz, sensitivity], ...]``
@@ -210,9 +210,12 @@ def sensitivity_at_frequency(module_configs: Iterable[Dict[str, Any]], freq_hz: 
     This is the match the FDA bench check (``examples/test_fda_mode.py``,
     via ``LIFUTXPresets.device_sensitivity``) already used.
 
-    Every module must have its own entry (SR-004): one with a blank page, a
-    failed CRC (an empty config) or no entry at *freq_hz* makes the whole
-    transmitter uncalibrated there, rather than being left out of the mean.
+    Every module must have its own entry (SR-004): one whose config is empty
+    (a blank page, or a page the firmware returns empty), has no table, or
+    has no usable entry at *freq_hz* makes the whole transmitter
+    uncalibrated there, rather than being left out of the mean. (A page the
+    host cannot parse never gets here: ``read_config`` raises
+    ``LIFUProtocolError``, and ``load_preset`` refuses on that.)
     :func:`uncalibrated_modules` names which.
 
     Returns:
@@ -226,7 +229,7 @@ def sensitivity_at_frequency(module_configs: Iterable[Dict[str, Any]], freq_hz: 
     return sum(values) / len(values)
 
 
-def uncalibrated_modules(module_configs: Iterable[Dict[str, Any]], freq_hz: float) -> list[int]:
+def uncalibrated_modules(module_configs: Sequence[Dict[str, Any]], freq_hz: float) -> list[int]:
     """The indexes of the modules in *module_configs* that have no calibrated
     sensitivity at *freq_hz*: what a refusal from
     :func:`sensitivity_at_frequency` names."""

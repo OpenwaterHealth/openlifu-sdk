@@ -422,7 +422,10 @@ class TestPresetVoltage(unittest.TestCase):
         got = adjusted_voltage(doc, [self._module((400000, 3000)), self._module((400000, 3600))])
         self.assertEqual(got["device_sensitivity"], 3300.0)
         self.assertAlmostEqual(got["voltage"], 36.0)
-        # SR-004: a module with no entry at the frequency is not left out of the mean.
+
+    def test_a_module_without_an_entry_is_not_left_out_of_the_mean(self):
+        # SR-004: the transmitter has no sensitivity, and the reason names the modules.
+        doc = _preset(voltage=33.0, sensitivity=3600)
         modules = [self._module((400000, 3000)), self._module((380000, 3600)), {}]
         self.assertIsNone(device_sensitivity(doc, modules))
         got = adjusted_voltage(doc, modules)
@@ -670,6 +673,22 @@ class TestTxMetadata(unittest.TestCase):
         # Between calibrated frequencies there is no value: no interpolation.
         self.assertIsNone(tx.get_sensitivity_for_frequency(425000.0))
 
+    def test_a_module_that_reads_back_empty_leaves_the_transmitter_uncalibrated(self):
+        # SR-004 through the real read: module 1's page comes back with no calibration.
+        tx = TxDevice()
+        tx.get_module_count = MagicMock(return_value=2)
+        tx.read_config = MagicMock(side_effect=[
+            LifuUserConfig(json_data={"module": {"sensitivity": [[400000.0, 4.0]]}}),
+            LifuUserConfig(json_data={}),
+        ])
+        tx.get_hardware_id = MagicMock(return_value="FALLBACK-HWID")
+
+        tx.refresh_metadata(module_count=2)
+
+        self.assertEqual([c.kwargs for c in tx.read_config.call_args_list], [{"module": 0}, {"module": 1}])
+        self.assertIsNone(tx.get_sensitivity_for_frequency(400000.0))
+        self.assertEqual(uncalibrated_modules(tx.module_user_configs, 400000.0), [1])
+
 
 class TestPresetVoltageRange(unittest.TestCase):
     """voltage_range is preset data, carried through compile_preset, not baked."""
@@ -725,7 +744,7 @@ class TestSensitivityLookup(unittest.TestCase):
     def test_one_uncalibrated_module_makes_the_transmitter_uncalibrated(self):
         # SR-004: a module with no entry is not left out of the mean; the lookup refuses.
         good = self._module((400000, 2720))
-        for name, bad in (("blank page / failed CRC", {}),
+        for name, bad in (("empty config (blank page)", {}),
                           ("no table", {"module": {}}),
                           ("no entry at the frequency", self._module((380000, 3110))),
                           ("unusable entry", self._module((400000, 0.0)))):
@@ -751,7 +770,7 @@ class TestInterfacePresetLoad(unittest.TestCase):
         iface = object.__new__(cls)
         iface.txdevice = MagicMock()
         iface.txdevice.get_module_count.return_value = modules
-        iface.txdevice.module_user_configs = [{"module": {"sensitivity": []}}]
+        iface.txdevice.module_user_configs = [{"module": {"sensitivity": [[400000, 2720]]}}] * max(modules, 1)
         iface.txdevice.get_sensitivity_for_frequency.return_value = 2720.0
         iface.hvcontroller = MagicMock()
         iface.status = LIFUInterfaceStatus.STATUS_SYS_OFF
