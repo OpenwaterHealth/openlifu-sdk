@@ -17,22 +17,6 @@ send_checked
 # with per-step error reporting; length from step count, not nesting.
 update_module
 
-# Legacy->secure bootloader migration orchestration (io/LIFUDFU.py) — the
-# sequential legacy-DFU steps (write updater+metadata, reset, wait for the
-# secure BL, flash the signed app) with per-step error reporting, kept inline
-# to preserve the ordering; length from step count + docstring, not nesting
-# (CCN 10).
-migrate_console_legacy
-
-# Transmitter twin of the above (io/LIFUDFU.py) — the USB recovery for a
-# master parked in its legacy bootloader's DFU: write updater+metadata to the
-# legacy slot, read-back verify, reset, wait for the swapped-in secure BL,
-# flash the signed app. Same reasoning as migrate_console_legacy: the steps
-# are strictly ordered and each carries its own failure message, so splitting
-# them would hide the sequence; CCN 12 (< 15), length from step count +
-# docstring, not nesting.
-migrate_transmitter_legacy_usb
-
 # Trigger timing (io/LIFUTXDevice.py) — validates the full trigger parameter
 # set and resolves the firmware's integer-Hz period, train duration and
 # back-to-back interval in one place, so set_trigger and the FDA preset
