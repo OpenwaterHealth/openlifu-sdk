@@ -28,6 +28,7 @@ from openlifu_sdk.io.exceptions import (
 )
 from openlifu_sdk.io.LIFUHVController import HVController, LIFUHVController
 from openlifu_sdk.io.LIFUTXPresets import module_regs_crcs
+from openlifu_sdk.io.LIFUUserConfig import uncalibrated_modules
 from openlifu_sdk.io.LIFUTXDevice import LIFUTxDevice, TriggerModeOpts, TxDevice
 
 # Maximum-voltage lookup tables keyed by hardware/test profile.
@@ -343,7 +344,7 @@ class DeviceInterface:
         Raises:
             LIFUError: The preset's module count differs from the
                 transmitter's (``LIFU_ERR_MODULE_COUNT_MISMATCH``), a refusal
-                from either device, a transmitter with no calibrated
+                from either device, a transmitter any of whose modules has no calibrated
                 sensitivity at *frequency_hz*, or an applied voltage outside
                 *voltage_range* (LIFUSolutionError).
             LIFUError: If a sequence is paused or timed out; see
@@ -418,8 +419,10 @@ class DeviceInterface:
             device_sensitivity = self.txdevice.get_sensitivity_for_frequency(frequency_hz)
             if device_sensitivity is None:
                 raise LIFUSolutionError(
-                    f"TX device sensitivity is unavailable at {frequency_hz:.3f} Hz; cannot select FDA preset on HV."
-                )
+                    f"TX device sensitivity is unavailable at {frequency_hz:.3f} Hz "
+                    f"(no calibration from module(s) "
+                    f"{uncalibrated_modules(self.txdevice.module_user_configs, frequency_hz) or 'none read'}); "
+                    "cannot select FDA preset on HV.")
 
             applied = self.hvcontroller.select_preset(preset_index, settings_crc, device_sensitivity)
             if voltage_range is not None and not voltage_range[0] <= applied <= voltage_range[1]:

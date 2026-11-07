@@ -183,6 +183,19 @@ class LifuUserConfig:
 SENSITIVITY_FREQ_TOLERANCE_HZ = 1e-3
 
 
+def _module_sensitivity(config: Optional[Dict[str, Any]], freq_hz: float) -> Optional[float]:
+    """One module's calibrated sensitivity at *freq_hz*, or ``None`` if its
+    table has no usable entry there (see :func:`sensitivity_at_frequency`)."""
+    for row in ((config or {}).get("module") or {}).get("sensitivity") or []:
+        try:
+            f, v = (float(x) for x in row)
+        except (TypeError, ValueError):
+            continue   # a malformed row (user config is RUO-writable) is no calibration point
+        if abs(f - freq_hz) <= SENSITIVITY_FREQ_TOLERANCE_HZ and math.isfinite(v) and v > 0:
+            return v
+    return None
+
+
 def sensitivity_at_frequency(module_configs: Iterable[Dict[str, Any]], freq_hz: float) -> Optional[float]:
     """Return a transmitter's sensitivity at *freq_hz* from its module user configs.
 
@@ -197,20 +210,24 @@ def sensitivity_at_frequency(module_configs: Iterable[Dict[str, Any]], freq_hz: 
     This is the match the FDA bench check (``examples/test_fda_mode.py``,
     via ``LIFUTXPresets.device_sensitivity``) already used.
 
+    Every module must have its own entry (SR-004): one with a blank page, a
+    failed CRC (an empty config) or no entry at *freq_hz* makes the whole
+    transmitter uncalibrated there, rather than being left out of the mean.
+    :func:`uncalibrated_modules` names which.
+
     Returns:
-        The mean over the modules that have a matching entry, or ``None`` if
-        none has (the caller must refuse to scale HV from it).
+        The mean over the modules, or ``None`` if there are none or any of
+        them has no matching entry (the caller must refuse to scale HV from
+        it).
     """
-    values = []
-    for config in module_configs:
-        for row in ((config or {}).get("module") or {}).get("sensitivity") or []:
-            try:
-                f, v = (float(x) for x in row)
-            except (TypeError, ValueError):
-                continue   # a malformed row (user config is RUO-writable) is no calibration point
-            if abs(f - freq_hz) <= SENSITIVITY_FREQ_TOLERANCE_HZ and math.isfinite(v) and v > 0:
-                values.append(v)
-                break
-    if not values:
+    values = [_module_sensitivity(config, freq_hz) for config in module_configs]
+    if not values or None in values:
         return None
     return sum(values) / len(values)
+
+
+def uncalibrated_modules(module_configs: Iterable[Dict[str, Any]], freq_hz: float) -> list[int]:
+    """The indexes of the modules in *module_configs* that have no calibrated
+    sensitivity at *freq_hz*: what a refusal from
+    :func:`sensitivity_at_frequency` names."""
+    return [m for m, config in enumerate(module_configs) if _module_sensitivity(config, freq_hz) is None]

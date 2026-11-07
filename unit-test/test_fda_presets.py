@@ -72,7 +72,7 @@ from openlifu_sdk.io.LIFUTXPresets import (
     treatment_timeout,
     verify_console_preset,
 )
-from openlifu_sdk.io.LIFUUserConfig import LifuUserConfig, sensitivity_at_frequency
+from openlifu_sdk.io.LIFUUserConfig import LifuUserConfig, sensitivity_at_frequency, uncalibrated_modules
 from openlifu_sdk.io.uart import OWUart
 
 
@@ -422,9 +422,12 @@ class TestPresetVoltage(unittest.TestCase):
         got = adjusted_voltage(doc, [self._module((400000, 3000)), self._module((400000, 3600))])
         self.assertEqual(got["device_sensitivity"], 3300.0)
         self.assertAlmostEqual(got["voltage"], 36.0)
-        # A module with no entry at the frequency is left out of the mean.
+        # SR-004: a module with no entry at the frequency is not left out of the mean.
         modules = [self._module((400000, 3000)), self._module((380000, 3600)), {}]
-        self.assertEqual(device_sensitivity(doc, modules), 3000.0)
+        self.assertIsNone(device_sensitivity(doc, modules))
+        got = adjusted_voltage(doc, modules)
+        self.assertFalse(got["adjusted"])
+        self.assertIn("module(s) [1, 2]", got["reason"])
         # None at all is no sensitivity, not a guess: an FDA console cannot be selected without one.
         self.assertIsNone(device_sensitivity(doc, [self._module((380000, 3600)), {}]))
 
@@ -714,6 +717,26 @@ class TestSensitivityLookup(unittest.TestCase):
         self.assertEqual(sensitivity_at_frequency([module], 400000.0), 2720.0)
         self.assertIsNone(sensitivity_at_frequency([{"module": {"sensitivity": [["x", 1]]}}], 400000.0))
 
+    def test_every_module_present_gives_their_mean(self):
+        modules = [self._module((400000, 3000)), self._module((380000, 1), (400000, 3600))]
+        self.assertEqual(sensitivity_at_frequency(modules, 400000.0), 3300.0)
+        self.assertEqual(uncalibrated_modules(modules, 400000.0), [])
+
+    def test_one_uncalibrated_module_makes_the_transmitter_uncalibrated(self):
+        # SR-004: a module with no entry is not left out of the mean; the lookup refuses.
+        good = self._module((400000, 2720))
+        for name, bad in (("blank page / failed CRC", {}),
+                          ("no table", {"module": {}}),
+                          ("no entry at the frequency", self._module((380000, 3110))),
+                          ("unusable entry", self._module((400000, 0.0)))):
+            for modules, missing in (([good, bad], [1]), ([bad, good], [0]), ([bad, bad], [0, 1])):
+                with self.subTest(case=name, missing=missing):
+                    self.assertIsNone(sensitivity_at_frequency(modules, 400000.0))
+                    self.assertEqual(uncalibrated_modules(modules, 400000.0), missing)
+
+    def test_no_modules_is_no_calibration(self):
+        self.assertIsNone(sensitivity_at_frequency([], 400000.0))
+
     def test_device_sensitivity_is_the_same_lookup(self):
         modules = [self._module((400000, 3000)), self._module((400000, 3600))]
         doc = _preset(voltage=40.0, sensitivity=3600)
@@ -778,6 +801,22 @@ class TestInterfacePresetLoad(unittest.TestCase):
                 iface.txdevice.refresh_metadata.assert_called_once_with(module_count=2)
                 iface.hvcontroller.select_preset.assert_called_once_with(0, 0xABCD, 2720.0)
                 self.assertEqual(iface.status, LIFUInterfaceStatus.STATUS_READY)
+
+    def test_a_two_module_load_with_one_uncalibrated_module_is_refused(self):
+        # SR-004: the real lookup over the configs read at load; module 1 has no entry at 400 kHz.
+        for cls in (DeviceInterface, LIFUInterface):
+            for configs, named in (([{"module": {"sensitivity": [[400000, 2720]]}}, {}], r"module\(s\) \[1\]"),
+                                   ([{}, {"module": {"sensitivity": [[400000, 2720]]}}], r"module\(s\) \[0\]")):
+                with self.subTest(cls=cls.__name__, named=named):
+                    iface = self._mocked(cls, modules=2)
+                    iface.txdevice.module_user_configs = configs
+                    iface.txdevice.get_sensitivity_for_frequency.side_effect = (
+                        lambda hz, tx=iface.txdevice: sensitivity_at_frequency(tx.module_user_configs, hz))
+                    with self.assertRaisesRegex(LIFUSolutionError, named):
+                        iface.load_preset(0, 0xABCD, [0x1111, 0x2222], 400000.0, turn_hv_on=True)
+                    iface.hvcontroller.select_preset.assert_not_called()
+                    iface.hvcontroller.turn_hv_on.assert_not_called()
+                    self._cleared(iface, modules=2)
 
     def test_a_refused_two_module_load_unloads_every_module(self):
         iface = self._mocked(modules=2)
