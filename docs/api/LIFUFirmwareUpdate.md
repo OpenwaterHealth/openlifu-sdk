@@ -7,7 +7,7 @@ the unit's state and runs the correct path — you don't choose the scenario:
 |---|---|---|---|
 | **No DFU support** | **< 1.1.0** | — the request never reaches a DFU | **Refused** (BOOT0 / SWD only) |
 | No bootloader | 1.1.0 – 1.2.2 | STM32 ROM DFU (plain `OW_CMD_DFU`) | `openlifu-console-fw-production.bin` |
-| **Legacy bootloader** | **1.2.3 – 1.2.5** | — | **Refused** (BOOT0 / SWD only; see below) |
+| **Legacy bootloader** | **1.2.3 – 1.2.5** | — | **Refused** (BOOT0 / SWD; or `--force-production` on a beta unit whose app runs — STM32 ROM loader, no key) |
 | Current bootloader | ≥ 1.2.6 | the current BL's own DFU | `openlifu-console-fw-signed.bin` |
 
 The app version picks the row, the DFU request is issued, and the bootloader

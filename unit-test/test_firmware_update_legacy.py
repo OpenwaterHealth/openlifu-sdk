@@ -62,6 +62,28 @@ class TestConsoleLegacyRefused(unittest.TestCase):
             fw.update()
         self.assertEqual([c[0] for c in fw._mgr.method_calls], ["detect_console_dfu_kind"])
 
+    def test_force_production_from_the_legacy_dfu_is_refused(self):
+        fw = self._fw(dfu_kind=(DFU_KIND_LEGACY, "0.0.3"))
+        with self.assertRaisesRegex(RuntimeError, r"LEGACY bootloader \(its DFU\).*SR-021"):
+            fw.update(force_production=True)
+        self.assertEqual([c[0] for c in fw._mgr.method_calls], ["detect_console_dfu_kind"])
+
+    def test_a_running_legacy_app_can_still_take_force_production(self):
+        # The ROM-loader reflash needs no key (beta/unlocked units; option 2b keeps it in the SDK).
+        hv = MagicMock()
+        hv.get_version.return_value = "1.2.4"
+        fw = self._fw(hv=hv)
+        self.assertEqual(fw.update(force_production=True).action, "force-production")
+        fw._mgr.migrate_console_full_image.assert_called_once()
+        self.assertEqual(fw._mgr.migrate_console_full_image.call_args.kwargs["enter_stm32_rom_dfu_fn"],
+                         fw._enter_rom)
+
+    def test_the_refusal_of_a_running_legacy_app_names_force_production(self):
+        hv = MagicMock()
+        hv.get_version.return_value = "1.2.4"
+        with self.assertRaisesRegex(RuntimeError, "--force-production"):
+            self._fw(hv=hv).update()
+
     def test_a_secure_unit_still_takes_the_app_update(self):
         hv = MagicMock()
         hv.get_version.return_value = "1.2.6"

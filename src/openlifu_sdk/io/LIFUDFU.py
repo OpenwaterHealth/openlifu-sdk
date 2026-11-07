@@ -258,7 +258,8 @@ CONSOLE_MIN_DFU_APP_VERSION = (1, 1, 0)
 # First console app shipped WITH the (legacy) custom bootloader. Below it the
 # app boots bare-metal and a DFU request lands in the STM32 ROM loader; from
 # here up to CONSOLE_SECURE_BL_APP_VERSION the legacy bootloader answers the
-# DFU request and the RAM-resident updater is required to move on.
+# DFU request; its DFU writes only the app slot, so this SDK has no update
+# path through it (SR-021) — only the ROM loader (0x77 switch, BOOT0) or SWD.
 CONSOLE_LEGACY_BL_APP_VERSION = (1, 2, 3)
 
 # First console app shipped with the current (secure/SBSFU) bootloader.
@@ -283,9 +284,10 @@ def infer_console_bootloader_from_app_version(app_version: str) -> str:
                                 its own DFU and the signed app is flashed.
       1.2.3 <= app < 1.2.6   -> LEGACY bootloader (``DFU_KIND_LEGACY``): the
                                 first custom bootloader. A DFU request enters
-                                ITS DFU, which can only write the app slot, so
-                                moving to the secure bootloader needs the
-                                RAM-resident updater.
+                                ITS DFU, which can only write the app slot;
+                                this SDK has no update path through it
+                                (SR-021). The ROM loader (0x77 switch from a
+                                running app, or BOOT0) or SWD remain.
       1.1.0 <= app < 1.2.3   -> NO bootloader (``DFU_KIND_NONE``): the app
                                 boots bare-metal and a DFU request reboots
                                 straight into the STM32 ROM DFU, where the
