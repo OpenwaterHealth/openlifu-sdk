@@ -6,7 +6,7 @@ shared, public, and let anyone authorize any image on a legacy-bootloader
 unit. It was removed together with every path that used it. These tests fail
 if it comes back under its old name, or under any name as raw bytes (in the
 package or a bundled binary) or spelled as ``0xNN``/``\\xNN`` literals, a hex
-string or base64 — in the package, ``examples/`` or ``docs/``. They do not
+string or base64 — anywhere in the repository. They do not
 catch a key split across strings, given as decimals, or built at run time.
 They guard this one key; they are not a general secret scan. Only the key's
 SHA-256 is held here, so the test itself carries no key material.
@@ -81,12 +81,19 @@ class TestNoLegacyTrustKey(unittest.TestCase):
                 self.assertTrue(_holds_key(blob, digest))
         self.assertFalse(_holds_key(raw[:-4] + b"\xff" * 4, digest))   # last key byte changed
 
-    def test_examples_and_docs_hold_no_key_either(self):
+    def test_no_other_repository_file_holds_the_key_either(self):
+        # Tests, workflows, examples, docs, root files: anything checked in.
         root = PACKAGE.parent.parent
-        files = [p for d in ("examples", "docs") for p in (root / d).rglob("*") if p.is_file()]
-        self.assertTrue(files)
+        skip = {".git", "__pycache__", "build", "dist", ".venv", "venv"}
+        files = [p for p in root.rglob("*")
+                 if p.is_file() and not skip.intersection(p.relative_to(root).parts)
+                 and not any(part.endswith(".egg-info") for part in p.parts)
+                 and PACKAGE not in p.parents]
+        self.assertTrue(any(p.parent.name == "workflows" for p in files))
+        this = Path(__file__).resolve()   # names the key to look for it; its bytes are still scanned
         self.assertEqual([str(p.relative_to(root)) for p in files
-                          if b"LEGACY_TRUST_HMAC_KEY" in p.read_bytes() or _holds_key(p.read_bytes())], [])
+                          if (p.resolve() != this and b"LEGACY_TRUST_HMAC_KEY" in p.read_bytes())
+                          or _holds_key(p.read_bytes())], [])
 
     def test_no_package_file_names_the_key(self):
         offenders = [str(p.relative_to(PACKAGE)) for p in _package_files()

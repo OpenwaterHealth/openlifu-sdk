@@ -9,7 +9,9 @@ running app on the other bootloader generations still take their paths.
 
 from __future__ import annotations
 
+import io
 import unittest
+from contextlib import redirect_stderr
 from unittest.mock import MagicMock
 
 from openlifu_sdk.io.LIFUDFU import DFU_KIND_LEGACY, LIFUDFUManager
@@ -68,21 +70,17 @@ class TestConsoleLegacyRefused(unittest.TestCase):
             fw.update(force_production=True)
         self.assertEqual([c[0] for c in fw._mgr.method_calls], ["detect_console_dfu_kind"])
 
-    def test_a_running_legacy_app_can_still_take_force_production(self):
-        # The ROM-loader reflash needs no key (beta/unlocked units; option 2b keeps it in the SDK).
+    def test_force_production_on_a_running_legacy_app_is_refused_without_entering_dfu(self):
+        # The legacy bootloader intercepts the 0x77 request and its IWDG would reset a ROM-DFU write.
         hv = MagicMock()
         hv.get_version.return_value = "1.2.4"
         fw = self._fw(hv=hv)
-        self.assertEqual(fw.update(force_production=True).action, "force-production")
-        fw._mgr.migrate_console_full_image.assert_called_once()
-        self.assertEqual(fw._mgr.migrate_console_full_image.call_args.kwargs["enter_stm32_rom_dfu_fn"],
-                         fw._enter_rom)
-
-    def test_the_refusal_of_a_running_legacy_app_names_force_production(self):
-        hv = MagicMock()
-        hv.get_version.return_value = "1.2.4"
-        with self.assertRaisesRegex(RuntimeError, "--force-production"):
-            self._fw(hv=hv).update()
+        with self.assertRaisesRegex(RuntimeError, r"LEGACY bootloader \(app 1\.2\.3 - 1\.2\.5\)") as raised:
+            fw.update(force_production=True)
+        hv.enter_stm32_rom_dfu.assert_not_called()
+        hv.enter_dfu.assert_not_called()
+        self.assertEqual(fw._mgr.method_calls, [])
+        self.assertNotIn("--force-production", str(raised.exception))
 
     def test_a_secure_unit_still_takes_the_app_update(self):
         hv = MagicMock()
@@ -91,6 +89,17 @@ class TestConsoleLegacyRefused(unittest.TestCase):
         fw._mgr.update_console.return_value = "OW DFU 1.0.3"
         self.assertEqual(fw.update().action, "app-update")
         fw._mgr.update_console.assert_called_once()
+
+
+class TestCliFlagsAreGone(unittest.TestCase):
+
+    def test_the_legacy_flags_are_rejected(self):
+        from openlifu_sdk.io.LIFUFirmwareUpdate import main
+        for flag in (["--updater", "x.bin"], ["--legacy"]):
+            with self.subTest(flag=flag[0]):
+                with redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as raised:
+                    main(["--detect", *flag])
+                self.assertEqual(raised.exception.code, 2)   # argparse: unrecognized arguments
 
 
 class TestTransmitterLegacyRefused(unittest.TestCase):

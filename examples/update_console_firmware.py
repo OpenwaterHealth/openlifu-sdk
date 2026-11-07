@@ -11,8 +11,7 @@ from openlifu_sdk.io.LIFUInterface import LIFUInterface
 # One-command console firmware update. Detects the unit's state and runs the
 # right path automatically:
 #   no bootloader (<1.2.0)     -> migrate to the secure bootloader
-#   legacy bootloader (1.2.3-1.2.5) -> refused (SR-021): BOOT0/SWD, or
-#                                 --force-production on a beta unit
+#   legacy bootloader (1.2.3-1.2.5) -> refused (SR-021): BOOT0 or SWD
 #   secure bootloader (>=1.2.6) -> normal app update
 #
 # Uses the firmware images bundled with the SDK and needs NO signing keys.

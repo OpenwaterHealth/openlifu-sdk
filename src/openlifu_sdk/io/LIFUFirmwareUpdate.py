@@ -11,9 +11,10 @@ console unit is in one of four states, each needing a different update path:
   - **legacy bootloader** (1.2.3–1.2.5) → REFUSED: its DFU can write only
     the app slot, and the RAM-resident self-updater that used to replace the
     bootloader from there needed the legacy bootloader's shared HMAC key,
-    which this SDK no longer carries (SR-021). Recover with BOOT0 (STM32 ROM
-    DFU, then re-run) or SWD; a beta (unlocked) unit whose app runs can
-    instead take ``force_production`` (STM32 ROM loader, no key).
+    which this SDK no longer carries (SR-021). ``force_production`` is
+    refused too: a legacy unit's bootloader intercepts the ROM-DFU force
+    request and its ~5 s IWDG would reset a ROM-DFU write mid-way. Recover
+    with BOOT0 (STM32 ROM DFU, then re-run) or SWD.
   - **secure bootloader** (≥ 1.2.6)     → normal signed-app update.
 
 :class:`LIFUFirmwareUpdate` auto-detects the state (from the running app
@@ -162,29 +163,24 @@ def _no_dfu_message(device: str, app_version: str | None,
         "or program it over SWD.")
 
 
-def _no_legacy_path_message(device: str, where: str, *, app_running: bool = False) -> str:
+def _no_legacy_path_message(device: str, where: str) -> str:
     """Why a *device* on the LEGACY (non-secure) bootloader is refused.
 
     Its DFU can write only the app slot, never the bootloader's own flash.
     The paths that used to get round that wrote an interim image into the
     slot and authorized it with the legacy bootloader's HMAC trust tag, whose
     key is shared and public; SR-021 removed that key from the SDK, and with
-    it every legacy-bootloader update path. With the app *running*, a beta
-    (unlocked) unit can still be reflashed whole through the STM32 ROM
-    loader (``force_production``), which needs no key.
+    it every legacy-bootloader update path.
     """
-    rom = ("If it is a beta (unlocked) unit, --force-production reflashes the "
-           "full production image through the STM32 ROM loader instead (run "
-           "the ROM-DFU dwell check first). Otherwise recover" if app_running
-           else "Recover")
     return (
         f"the {device} is on the LEGACY bootloader ({where}). This SDK has "
         "no legacy-bootloader update path: its DFU can write only the app "
         "slot, and the interim updaters that replaced the bootloader from "
         "there needed its shared HMAC trust key, which was removed (SR-021). "
-        f"{rom} the unit in hardware: hold BOOT0 while power-cycling it, so it "
-        "enumerates as 'STM32 BOOTLOADER', and re-run this command (the full "
-        "production image is written from there); or program it over SWD.")
+        "Recover the unit in hardware: hold BOOT0 while power-cycling it, so "
+        "it enumerates as 'STM32 BOOTLOADER', and re-run this command (the "
+        "full production image is written from there); or program it over "
+        "SWD.")
 
 
 @dataclass
@@ -353,17 +349,20 @@ class LIFUFirmwareUpdate:
         OW_CMD_DFU hidden switch (reserved=0x77). Beta/unlocked units only:
         after RDP/FDA lockdown the bootloader flash is protected and the
         switch is inert, so the flow aborts at the ROM-DFU gate without
-        touching flash. This is also the one path left for a LEGACY-bootloader
-        console whose app runs (no key involved; see
-        :meth:`LIFUDFUManager.dwell_rom_dfu_check`). One parked in the legacy
-        DFU is refused: the switch needs the app.
+        touching flash.
+
+        A LEGACY-bootloader console is refused before any DFU entry, with its
+        app running or not: its bootloader intercepts the force request, and
+        the ~5 s IWDG it arms would reset the unit in the middle of the
+        ROM-DFU write that follows the mass erase.
         """
         cohort, source = self.detect_cohort()
         in_rom_dfu = source == "dfu" and cohort == COHORT_NONE
         if cohort == COHORT_NO_DFU:
             raise RuntimeError(self._no_dfu_message("reflashed"))
-        if cohort == COHORT_LEGACY and source == "dfu":
-            raise RuntimeError(_no_legacy_path_message("console", "its DFU"))
+        if cohort == COHORT_LEGACY:
+            raise RuntimeError(_no_legacy_path_message(
+                "console", "app 1.2.3 - 1.2.5" if source == "app" else "its DFU"))
         if source == "dfu" and not in_rom_dfu:
             raise RuntimeError(
                 "cannot force a production reflash from bootloader DFU — the "
@@ -426,8 +425,7 @@ class LIFUFirmwareUpdate:
             raise RuntimeError(self._no_dfu_message())
         if cohort == COHORT_LEGACY:
             raise RuntimeError(_no_legacy_path_message(
-                "console", "app 1.2.3 - 1.2.5" if source == "app" else "its DFU",
-                app_running=source == "app"))
+                "console", "app 1.2.3 - 1.2.5" if source == "app" else "its DFU"))
         prod = str(production_image) if production_image else str(bundled_production_image())
         app = str(signed_app) if signed_app else str(bundled_signed_app())
         # When already in DFU we must not trigger another DFU entry.
