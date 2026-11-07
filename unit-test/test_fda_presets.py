@@ -24,7 +24,7 @@ _SRC = os.path.join(os.path.dirname(__file__), "..", "src")
 if _SRC not in sys.path:
     sys.path.insert(0, _SRC)
 
-from openlifu_sdk.io.exceptions import LIFUDeviceError, LIFUError, LIFUSolutionError
+from openlifu_sdk.io.exceptions import LIFUDeviceError, LIFUError, LIFUProtocolError, LIFUSolutionError
 from openlifu_sdk.io.LIFUConfig import (
     LIFU_ERR_MODULE_COUNT_MISMATCH,
     OW_BAD_CRC,
@@ -673,6 +673,29 @@ class TestTxMetadata(unittest.TestCase):
         # Between calibrated frequencies there is no value: no interpolation.
         self.assertIsNone(tx.get_sensitivity_for_frequency(425000.0))
 
+    def test_the_wire_pages_a_module_can_return(self):
+        # End to end through read_config: a valid page, a valid header with a JSON body that
+        # does not parse (-> {} -> uncalibrated), a non-object body, and an erased page (raises).
+        def page(body: bytes) -> bytes:
+            header = LifuUserConfig().header
+            header.json_len = len(body)
+            return header.to_bytes() + body
+
+        good = LifuUserConfig(json_data={"module": {"sensitivity": [[400000.0, 4.0]]}}).to_wire_bytes()
+        for second, uncalibrated in ((good, []), (page(b'{"module": {"sens'), [1]), (page(b"[1, 2]"), [1])):
+            with self.subTest(second=second[16:]):
+                tx = TxDevice()
+                tx.send_checked = MagicMock(side_effect=[MagicMock(data=good), MagicMock(data=second)])
+                tx.get_hardware_id = MagicMock(return_value="HWID")
+                tx.refresh_metadata(module_count=2)
+                self.assertEqual(uncalibrated_modules(tx.module_user_configs, 400000.0), uncalibrated)
+                self.assertEqual(tx.get_sensitivity_for_frequency(400000.0), None if uncalibrated else 4.0)
+
+        tx = TxDevice()
+        tx.send_checked = MagicMock(side_effect=[MagicMock(data=good), MagicMock(data=b"\xff" * 64)])
+        with self.assertRaises(LIFUProtocolError):
+            tx.refresh_metadata(module_count=2)
+
     def test_a_module_that_reads_back_empty_leaves_the_transmitter_uncalibrated(self):
         # SR-004 through the real read: module 1's page comes back with no calibration.
         tx = TxDevice()
@@ -752,6 +775,14 @@ class TestSensitivityLookup(unittest.TestCase):
                 with self.subTest(case=name, missing=missing):
                     self.assertIsNone(sensitivity_at_frequency(modules, 400000.0))
                     self.assertEqual(uncalibrated_modules(modules, 400000.0), missing)
+
+    def test_malformed_config_shapes_are_no_calibration_not_errors(self):
+        good = self._module((400000, 2720))
+        for bad in ([1], "x", None, {"module": []}, {"module": {"sensitivity": 5}},
+                    {"module": {"sensitivity": "ab"}}, {"module": {"sensitivity": ["12"]}}):
+            with self.subTest(bad=bad):
+                self.assertIsNone(sensitivity_at_frequency([good, bad], 400000.0))
+                self.assertEqual(uncalibrated_modules([good, bad], 400000.0), [1])
 
     def test_no_modules_is_no_calibration(self):
         self.assertIsNone(sensitivity_at_frequency([], 400000.0))
@@ -844,8 +875,9 @@ class TestInterfacePresetLoad(unittest.TestCase):
                 iface = self._mocked(cls, modules=2)
                 iface.txdevice.module_user_configs = iface.txdevice.module_user_configs[:1]
                 with self.assertRaisesRegex(LIFUSolutionError, "1 of the 2 transmitter module"):
-                    iface.load_preset(0, 0xABCD, [0x1111, 0x2222], 400000.0)
+                    iface.load_preset(0, 0xABCD, [0x1111, 0x2222], 400000.0, turn_hv_on=True)
                 iface.hvcontroller.select_preset.assert_not_called()
+                iface.hvcontroller.turn_hv_on.assert_not_called()
                 self._cleared(iface, modules=2)
 
     def test_a_refused_two_module_load_unloads_every_module(self):

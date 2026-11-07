@@ -183,20 +183,26 @@ class LifuUserConfig:
 SENSITIVITY_FREQ_TOLERANCE_HZ = 1e-3
 
 
-def _module_sensitivity(config: Optional[Dict[str, Any]], freq_hz: float) -> Optional[float]:
+def _module_sensitivity(config: Any, freq_hz: float) -> Optional[float]:
     """One module's calibrated sensitivity at *freq_hz*, or ``None`` if its
-    table has no usable entry there (see :func:`sensitivity_at_frequency`)."""
-    for row in ((config or {}).get("module") or {}).get("sensitivity") or []:
+    table has no usable entry there (see :func:`sensitivity_at_frequency`).
+    The user config is RUO-writable, so a config, ``module`` section, table
+    or row of the wrong shape is no calibration, not an error."""
+    module = config.get("module") if isinstance(config, dict) else None
+    table = module.get("sensitivity") if isinstance(module, dict) else None
+    for row in table if isinstance(table, list) else []:
+        if not isinstance(row, (list, tuple)):
+            continue
         try:
             f, v = (float(x) for x in row)
         except (TypeError, ValueError):
-            continue   # a malformed row (user config is RUO-writable) is no calibration point
+            continue   # a malformed row is no calibration point
         if abs(f - freq_hz) <= SENSITIVITY_FREQ_TOLERANCE_HZ and math.isfinite(v) and v > 0:
             return v
     return None
 
 
-def sensitivity_at_frequency(module_configs: Sequence[Dict[str, Any]], freq_hz: float) -> Optional[float]:
+def sensitivity_at_frequency(module_configs: Sequence[Any], freq_hz: float) -> Optional[float]:
     """Return a transmitter's sensitivity at *freq_hz* from its module user configs.
 
     Each config's ``module.sensitivity`` is a ``[[freq_hz, sensitivity], ...]``
@@ -231,7 +237,7 @@ def sensitivity_at_frequency(module_configs: Sequence[Dict[str, Any]], freq_hz: 
     return sum(values) / len(values)
 
 
-def uncalibrated_modules(module_configs: Sequence[Dict[str, Any]], freq_hz: float) -> list[int]:
+def uncalibrated_modules(module_configs: Sequence[Any], freq_hz: float) -> list[int]:
     """The indexes of the modules in *module_configs* that have no calibrated
     sensitivity at *freq_hz*: what a refusal from
     :func:`sensitivity_at_frequency` names."""

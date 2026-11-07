@@ -416,6 +416,9 @@ class DeviceInterface:
             # scales the HV. The modules just loaded, as load_preset has just
             # counted them: not a second count read.
             self.txdevice.refresh_metadata(module_count=len(regs_crcs))
+            # Defensive: the strict lookup covers only the configs it is
+            # given. TxDevice.refresh_metadata reads exactly module_count or
+            # raises; a simulated store can come up short.
             configs = self.txdevice.module_user_configs
             if len(configs) != len(regs_crcs):
                 raise LIFUSolutionError(

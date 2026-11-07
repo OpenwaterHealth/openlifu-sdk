@@ -219,8 +219,11 @@ def test_calibration_read_for_fewer_modules_than_loaded_is_refused(interface_cls
     try:
         del interface.txdevice._user_configs[1:]   # the store and the module count disagree
         with pytest.raises(LIFUSolutionError, match="1 of the 2 transmitter module"):
-            interface.load_preset(0, mc["settings_crc"], regs, 400_000.0)
+            interface.load_preset(0, mc["settings_crc"], regs, 400_000.0, turn_hv_on=True)
+        assert interface.txdevice._loaded_modules == set()
         assert interface.hvcontroller.get_preset(0)["selected"] is None
+        assert not interface.hvcontroller.get_hv_status()
+        assert interface.get_status() == LIFUInterfaceStatus.STATUS_ERROR
     finally:
         interface.close()
 
