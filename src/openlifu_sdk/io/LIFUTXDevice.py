@@ -326,7 +326,8 @@ class TxDevice(OWComponent):
         configs: list[dict] = []
         for module_idx in range(module_count):
             config = self.read_config(module=module_idx).to_dict()
-            configs.append(config)
+            # A JSON body that is not an object (RUO-writable) is no config.
+            configs.append(config if isinstance(config, dict) else {})
 
         self.module_user_configs = configs
         primary = configs[0] if configs else {}

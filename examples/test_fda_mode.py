@@ -89,6 +89,7 @@ from openlifu_sdk.io.LIFUTXPresets import (
     train_count_selections,
     verify_console_preset,
 )
+from openlifu_sdk.io.LIFUUserConfig import uncalibrated_modules
 
 from test_presets import (
     Link,
@@ -280,10 +281,14 @@ def test_console(hv, host=None, tx=None):
 
     if tx is not None and host is not None:
         mc = next((m for m in host if m["settings_crc"] == e["settings_crc"]), None)
-        sensitivity = None if mc is None else device_sensitivity(mc, module_user_configs(tx))
-        if sensitivity is None:
-            print("  [SKIP] this transmitter's user config has no sensitivity at the preset's frequency: "
-                  "it cannot be selected for until it is calibrated")
+        configs = module_user_configs(tx)
+        sensitivity = None if mc is None else device_sensitivity(mc, configs)
+        if mc is None:
+            print("  [SKIP] no host preset has this record's settings_crc: its frequency is unknown")
+        elif sensitivity is None:
+            print("  [SKIP] module(s) %s of this transmitter have no sensitivity at the preset's "
+                  "frequency: it cannot be selected for until every module is calibrated"
+                  % uncalibrated_modules(configs, float(mc["frequency_khz"]) * 1e3))
         else:
             select_check(hv, e, sensitivity, "this transmitter")
 

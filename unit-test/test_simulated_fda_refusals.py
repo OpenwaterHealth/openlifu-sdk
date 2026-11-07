@@ -194,6 +194,41 @@ def test_a_two_module_preset_loads_on_a_two_module_transmitter(interface_cls):
 
 
 @pytest.mark.parametrize("interface_cls", [SimulatedDeviceInterface, SimulatedLIFUInterface])
+@pytest.mark.parametrize("uncalibrated", [{}, {"module": {"sensitivity": [[380000, 3110]]}}],
+                         ids=["blank-config", "no-entry-at-frequency"])
+def test_a_two_module_load_with_one_uncalibrated_module_is_refused(interface_cls, uncalibrated):
+    # SR-004: module 0's calibration alone must not scale the HV for both.
+    mc, regs = two_module_flash_entry()
+    interface = interface_cls(num_modules=2, preset_flash=[(mc, regs)])
+    try:
+        interface.txdevice._user_configs[1] = uncalibrated
+        with pytest.raises(LIFUSolutionError, match=r"module\(s\) \[1\]"):
+            interface.load_preset(0, mc["settings_crc"], regs, 400_000.0, turn_hv_on=True)
+        assert interface.txdevice._loaded_modules == set()
+        assert interface.hvcontroller.get_preset(0)["selected"] is None
+        assert not interface.hvcontroller.get_hv_status()
+        assert interface.get_status() == LIFUInterfaceStatus.STATUS_ERROR
+    finally:
+        interface.close()
+
+
+@pytest.mark.parametrize("interface_cls", [SimulatedDeviceInterface, SimulatedLIFUInterface])
+def test_calibration_read_for_fewer_modules_than_loaded_is_refused(interface_cls):
+    mc, regs = two_module_flash_entry()
+    interface = interface_cls(num_modules=2, preset_flash=[(mc, regs)])
+    try:
+        del interface.txdevice._user_configs[1:]   # the store and the module count disagree
+        with pytest.raises(LIFUSolutionError, match="1 of the 2 transmitter module"):
+            interface.load_preset(0, mc["settings_crc"], regs, 400_000.0, turn_hv_on=True)
+        assert interface.txdevice._loaded_modules == set()
+        assert interface.hvcontroller.get_preset(0)["selected"] is None
+        assert not interface.hvcontroller.get_hv_status()
+        assert interface.get_status() == LIFUInterfaceStatus.STATUS_ERROR
+    finally:
+        interface.close()
+
+
+@pytest.mark.parametrize("interface_cls", [SimulatedDeviceInterface, SimulatedLIFUInterface])
 def test_a_preset_whose_module_count_differs_from_the_transmitter_is_refused(interface_cls):
     # The set-preset guard: the diathermy preset (64 elements, 1x) on a 2x transmitter, and the reverse.
     one, one_regs = flash_entry()

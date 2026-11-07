@@ -64,7 +64,7 @@ from openlifu_sdk.io.LIFUTXDevice import (
     build_solution_registers,
     resolve_trigger_timing,
 )
-from openlifu_sdk.io.LIFUUserConfig import sensitivity_at_frequency
+from openlifu_sdk.io.LIFUUserConfig import sensitivity_at_frequency, uncalibrated_modules
 
 logger = logging.getLogger(__name__)
 
@@ -256,7 +256,7 @@ def module_user_configs(txdevice) -> List[Dict]:
 def device_sensitivity(preset: Dict, user_configs: Sequence[Dict]) -> float | None:
     """The connected transmitter's sensitivity at *preset*'s frequency
     (:func:`~openlifu_sdk.io.LIFUUserConfig.sensitivity_at_frequency`, the one
-    lookup the SDK has), or None if no module lists that frequency.
+    lookup the SDK has), or None if any module does not list that frequency.
     *user_configs* is each module's user config (:func:`module_user_configs`).
     What HVController.select_preset is given."""
     return sensitivity_at_frequency(user_configs, float(preset.get("frequency_khz", 0.0)) * 1e3)
@@ -289,8 +289,9 @@ def adjusted_voltage(preset: Dict, user_configs: Sequence[Dict]) -> Dict:
         return {**out, "reason": "the preset has no sensitivity"}
     device = device_sensitivity(preset, user_configs)
     if device is None:
-        return {**out, "reason": "no module has a sensitivity at %g Hz"
-                                 % (float(preset.get("frequency_khz", 0.0)) * 1e3)}
+        hz = float(preset.get("frequency_khz", 0.0)) * 1e3
+        return {**out, "reason": "module(s) %s have no sensitivity at %g Hz"
+                                 % (uncalibrated_modules(user_configs, hz) or "(none read)", hz)}
     return {"voltage": raw * float(sens) / device, "preset_voltage": raw, "adjusted": True,
             "preset_sensitivity": float(sens), "device_sensitivity": device}
 
