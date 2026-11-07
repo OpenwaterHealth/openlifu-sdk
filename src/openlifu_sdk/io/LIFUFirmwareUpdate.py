@@ -192,7 +192,8 @@ class UpdateResult:
     """Outcome of an update run."""
 
     cohort: str            # detected cohort / DFU kind driving the choice
-    action: str            # "migrate-rom" | "force-production" | "app-update" | ...
+    action: str            # "migrate-rom" | "force-production" | "app-update"
+                           # | "app-update-i2c" | "force-production-i2c"
     summary: str           # human-readable one-liner
     reboot_required: bool  # True if a power-cycle is needed to run the app
     bl_version: str | None = None  # bootloader version string (DFU virtual

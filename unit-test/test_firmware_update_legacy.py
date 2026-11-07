@@ -123,6 +123,26 @@ class TestTransmitterLegacyRefused(unittest.TestCase):
                     fw.update_slave(1, force_production=force_production)
                 tx.enter_dfu.assert_not_called()
 
+    def test_a_secure_slave_still_takes_its_paths(self):
+        for force_production, path in ((False, "_update_slave_secure"),
+                                       (True, "_update_slave_force_production")):
+            with self.subTest(force_production=force_production):
+                tx = MagicMock()
+                tx.get_version.return_value = "2.0.8"
+                fw = LIFUTransmitterFirmwareUpdate(tx=tx)
+                setattr(fw, path, MagicMock(return_value="done"))
+                self.assertEqual(fw.update_slave(1, force_production=force_production), "done")
+                getattr(fw, path).assert_called_once()
+
+    def test_a_no_bootloader_slave_gets_its_own_message(self):
+        tx = MagicMock()
+        tx.get_version.return_value = "2.0.3"
+        fw = LIFUTransmitterFirmwareUpdate(tx=tx)
+        with self.assertRaisesRegex(RuntimeError, "NO bootloader") as raised:
+            fw.update_slave(1)
+        self.assertNotIn("LEGACY", str(raised.exception))
+        tx.enter_dfu.assert_not_called()
+
     def test_an_unreadable_slave_version_is_refused(self):
         tx = MagicMock()
         tx.get_version.side_effect = RuntimeError("no reply")

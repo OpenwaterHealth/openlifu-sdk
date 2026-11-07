@@ -1,12 +1,15 @@
 # SPDX-License-Identifier: Apache-2.0
-"""The SDK ships no hard-coded key material (SR-021, #91).
+"""The removed legacy trust key stays removed (SR-021, #91).
 
 The legacy bootloader's HMAC trust key (``LEGACY_TRUST_HMAC_KEY``) was
 shared, public, and let anyone authorize any image on a legacy-bootloader
 unit. It was removed together with every path that used it. These tests fail
-if it comes back, under its old name or under any other, in the package
-sources or in a bundled binary. Only the key's SHA-256 is held here, so the
-test itself carries no key material.
+if it comes back under its old name, or under any name as raw bytes (in the
+package or a bundled binary) or spelled as ``0xNN``/``\\xNN`` literals, a hex
+string or base64 — in the package, ``examples/`` or ``docs/``. They do not
+catch a key split across strings, given as decimals, or built at run time.
+They guard this one key; they are not a general secret scan. Only the key's
+SHA-256 is held here, so the test itself carries no key material.
 """
 
 from __future__ import annotations
@@ -62,7 +65,7 @@ def _holds_key(data: bytes, key_sha256: str = REMOVED_KEY_SHA256) -> bool:
 class TestNoLegacyTrustKey(unittest.TestCase):
 
     def test_the_scan_finds_a_planted_key(self):
-        # The scan must be able to fail: plant a stand-in key in both forms.
+        # The scan must be able to fail: plant a stand-in key in each form it decodes.
         key = bytes(range(0x40, 0x40 + KEY_LEN))
         digest = hashlib.sha256(key).hexdigest()
         raw = b"\x00" * 7 + key + b"\xff" * 3
