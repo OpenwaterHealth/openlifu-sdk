@@ -1530,12 +1530,17 @@ class SimulatedDeviceInterface(QObject):
                 self.txdevice.load_preset(preset_index, crc, duration_index,
                                           settings_crc=settings_crc, module=module)
             self.txdevice.refresh_metadata(module_count=len(regs_crcs))
+            configs = self.txdevice.module_user_configs
+            if len(configs) != len(regs_crcs):
+                raise LIFUSolutionError(
+                    f"read the calibration of {len(configs)} of the {len(regs_crcs)} "
+                    "transmitter module(s); cannot select FDA preset on HV.")
             device_sensitivity = self.txdevice.get_sensitivity_for_frequency(frequency_hz)
             if device_sensitivity is None:
                 raise LIFUSolutionError(
                     f"TX device sensitivity is unavailable at {frequency_hz:.3f} Hz "
                     f"(no calibration from module(s) "
-                    f"{uncalibrated_modules(self.txdevice.module_user_configs, frequency_hz) or 'none read'}); "
+                    f"{uncalibrated_modules(configs, frequency_hz)}); "
                     "cannot select FDA preset on HV.")
             applied = self.hvcontroller.select_preset(preset_index, settings_crc, device_sensitivity)
             if voltage_range is not None and not voltage_range[0] <= applied <= voltage_range[1]:

@@ -210,12 +210,14 @@ def sensitivity_at_frequency(module_configs: Sequence[Dict[str, Any]], freq_hz: 
     This is the match the FDA bench check (``examples/test_fda_mode.py``,
     via ``LIFUTXPresets.device_sensitivity``) already used.
 
-    Every module must have its own entry (SR-004): one whose config is empty
-    (a blank page, or a page the firmware returns empty), has no table, or
-    has no usable entry at *freq_hz* makes the whole transmitter
-    uncalibrated there, rather than being left out of the mean. (A page the
-    host cannot parse never gets here: ``read_config`` raises
-    ``LIFUProtocolError``, and ``load_preset`` refuses on that.)
+    Every module must have its own entry (SR-004): one whose config is empty,
+    has no table, or has no usable entry at *freq_hz* makes the whole
+    transmitter uncalibrated there, rather than being left out of the mean.
+    An empty config is what :meth:`LifuUserConfig.from_wire_bytes` gives for
+    a page whose header is valid but whose JSON body does not parse. A page
+    whose header is not (an erased page, a wrong magic or version) never
+    gets here: ``read_config`` raises ``LIFUProtocolError``, and
+    ``load_preset`` refuses on that.
     :func:`uncalibrated_modules` names which.
 
     Returns:

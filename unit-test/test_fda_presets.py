@@ -744,7 +744,7 @@ class TestSensitivityLookup(unittest.TestCase):
     def test_one_uncalibrated_module_makes_the_transmitter_uncalibrated(self):
         # SR-004: a module with no entry is not left out of the mean; the lookup refuses.
         good = self._module((400000, 2720))
-        for name, bad in (("empty config (blank page)", {}),
+        for name, bad in (("empty config (JSON body did not parse)", {}),
                           ("no table", {"module": {}}),
                           ("no entry at the frequency", self._module((380000, 3110))),
                           ("unusable entry", self._module((400000, 0.0)))):
@@ -836,6 +836,17 @@ class TestInterfacePresetLoad(unittest.TestCase):
                     iface.hvcontroller.select_preset.assert_not_called()
                     iface.hvcontroller.turn_hv_on.assert_not_called()
                     self._cleared(iface, modules=2)
+
+    def test_calibration_read_for_fewer_modules_than_loaded_is_refused(self):
+        # The strict lookup covers the modules it is given: the load checks it was given all of them.
+        for cls in (DeviceInterface, LIFUInterface):
+            with self.subTest(cls=cls.__name__):
+                iface = self._mocked(cls, modules=2)
+                iface.txdevice.module_user_configs = iface.txdevice.module_user_configs[:1]
+                with self.assertRaisesRegex(LIFUSolutionError, "1 of the 2 transmitter module"):
+                    iface.load_preset(0, 0xABCD, [0x1111, 0x2222], 400000.0)
+                iface.hvcontroller.select_preset.assert_not_called()
+                self._cleared(iface, modules=2)
 
     def test_a_refused_two_module_load_unloads_every_module(self):
         iface = self._mocked(modules=2)
