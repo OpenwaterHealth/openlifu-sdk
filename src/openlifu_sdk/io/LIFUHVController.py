@@ -18,6 +18,7 @@ from openlifu_sdk.io.LIFUConfig import (
     LIFU_ERR_BAD_PAYLOAD_FORMAT,
     LIFU_ERR_BAD_PAYLOAD_LENGTH,
     OW_CONSOLE_PID,
+    OW_HV_FAULT,
     OW_POWER,
     OW_POWER_12V_OFF,
     OW_POWER_12V_ON,
@@ -57,7 +58,7 @@ from openlifu_sdk.io.component import (
     OWComponent,
     register_command_packet_types,
 )
-from openlifu_sdk.io.exceptions import LIFUHVSettleError, LIFUProtocolError
+from openlifu_sdk.io.exceptions import LIFUDeviceError, LIFUHVSettleError, LIFUProtocolError
 
 logger = logging.getLogger(__name__)
 
@@ -503,18 +504,32 @@ class LIFUHVController(LIFUComponentMixin, HVController):
         voltage comes from the preset chosen with select_preset().
 
         With HV on, HV on is re-sent after the set. OW_POWER_SET_HV also
-        clears a latched HV rail fault (SR-025), so the fault is read
-        first: if the console has tripped, HV stays off.
+        clears a latched HV rail fault (SR-025, console-fw#43), so with
+        HV on the fault is read first, and a latched one is reported
+        (OW_HV_FAULT) without the set, leaving the latch for the caller
+        to see. This narrows, but does not close, the window: a trip
+        between that read and the SET_HV is cleared by the SET_HV, and
+        HV on is re-sent. Closing it needs the firmware (console-fw#43).
+        A set with HV off clears a latched fault, as the contract says.
 
         Raises:
             ValueError: If *voltage* is out of range.
-            LIFUNotConnectedError, LIFUCommunicationError, LIFUDeviceError,
+            LIFUDeviceError: ``device_error_code`` OW_HV_FAULT when HV was
+                on and the console has an HV fault latched; nothing is
+                set and :attr:`is_hv_on` is cleared.
+            LIFUNotConnectedError, LIFUCommunicationError,
             LIFUProtocolError.
         """
         if not 5.0 <= voltage <= 100.0:
             raise ValueError("HV voltage must be between 5 and 100 V")
         if self.is_hv_on:
-            self.get_hv_monitor()   # a latched fault clears is_hv_on
+            monitor = self.get_hv_monitor()   # a latched fault clears is_hv_on
+            if monitor["fault"]:
+                logger.warning("set_voltage: HV fault %s latched; not set", monitor["fault_name"])
+                raise LIFUDeviceError(
+                    f"HV: HV fault {monitor['fault_name']} latched; voltage not set",
+                    device_error_code=OW_HV_FAULT,
+                )
         logger.debug("Setting HV to %.2f", voltage)
         data = struct.pack('>f', voltage)
         self.send_checked(packet_type=OW_POWER, command=OW_POWER_SET_HV,

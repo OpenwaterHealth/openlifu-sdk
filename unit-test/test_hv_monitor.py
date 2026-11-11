@@ -178,18 +178,26 @@ class TestRuoSetVoltageAfterATrip(unittest.TestCase):
     """SET_HV clears the latch, so set_voltage must not re-send HV on
     over a trip the host has not read yet."""
 
-    def test_no_reassert_over_a_latched_fault(self):
+    def test_a_latched_fault_refuses_the_set_and_keeps_the_latch(self):
         hv = LIFUHVController()
         uart = _mock_uart(hv)
         hv.is_hv_on = True
-        uart.send_packet.side_effect = [
-            _packet(struct.pack("<f", 0.0), reserved=HV_FAULT_HVP_HIGH),  # GET_HV
-            _packet(),                                                     # SET_HV
-        ]
+        hv.supply_voltage = 25.0
+        uart.send_packet.return_value = _packet(struct.pack("<f", 0.0), reserved=HV_FAULT_HVP_HIGH)
+        with self.assertRaises(LIFUDeviceError) as ctx:
+            hv.set_voltage(30.0)
+        self.assertEqual(ctx.exception.device_error_code, OW_HV_FAULT)
+        self.assertIn("HVP_HIGH", str(ctx.exception))
+        # Only the GET_HV went out: no SET_HV to clear the latch, no HV on.
+        sent = [c.kwargs["command"] for c in uart.send_packet.call_args_list]
+        self.assertEqual(sent, [OW_POWER_GET_HV])
+        self.assertFalse(hv.is_hv_on)
+        self.assertEqual(hv.supply_voltage, 25.0)
+        # A set with HV now known off goes through (and, on the console, clears it).
+        uart.send_packet.return_value = _packet()
         hv.set_voltage(30.0)
         sent = [c.kwargs["command"] for c in uart.send_packet.call_args_list]
         self.assertEqual(sent, [OW_POWER_GET_HV, OW_POWER_SET_HV])
-        self.assertFalse(hv.is_hv_on)
 
     def test_reasserts_with_no_fault(self):
         hv = LIFUHVController()
