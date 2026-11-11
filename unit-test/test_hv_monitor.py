@@ -31,6 +31,8 @@ from openlifu_sdk.io.LIFUConfig import (
     OW_HV_FAULT,
     OW_POWER,
     OW_POWER_GET_HV,
+    OW_POWER_HV_ON,
+    OW_POWER_SET_HV,
     OW_POWER_STATUS,
     OW_RESP,
 )
@@ -149,12 +151,62 @@ class TestGetHvMonitorStatus(unittest.TestCase):
                 hv.get_hv_monitor_status()
             self.assertEqual(ctx.exception.code, LIFU_ERR_BAD_PAYLOAD_LENGTH)
 
-    def test_unknown_version_raises(self):
+    def test_unknown_version_raises_whatever_its_length(self):
         hv = HVController()
-        _mock_uart(hv).send_packet.return_value = _packet(_status(version=2))
-        with self.assertRaises(LIFUProtocolError) as ctx:
+        uart = _mock_uart(hv)
+        for data in (_status(version=2), _status(version=2) + b"\x00" * 8, b"\x02"):
+            uart.send_packet.return_value = _packet(data)
+            with self.assertRaises(LIFUProtocolError) as ctx:
+                hv.get_hv_monitor_status()
+            self.assertEqual(ctx.exception.code, LIFU_ERR_BAD_PAYLOAD_FORMAT)
+
+    def test_a_fault_clears_the_cached_hv_on(self):
+        for fault, still_on in ((HV_FAULT_NONE, True), (HV_FAULT_HVP_HIGH, False)):
+            hv = HVController()
+            uart = _mock_uart(hv)
+            hv.is_hv_on = True
+            uart.send_packet.return_value = _packet(_status(fault=fault, hv_on=int(still_on)))
             hv.get_hv_monitor_status()
-        self.assertEqual(ctx.exception.code, LIFU_ERR_BAD_PAYLOAD_FORMAT)
+            self.assertEqual(hv.is_hv_on, still_on)
+            hv.is_hv_on = True
+            uart.send_packet.return_value = _packet(struct.pack("<f", 0.0), reserved=fault)
+            hv.get_hv_monitor()
+            self.assertEqual(hv.is_hv_on, still_on)
+
+
+class TestRuoSetVoltageAfterATrip(unittest.TestCase):
+    """SET_HV clears the latch, so set_voltage must not re-send HV on
+    over a trip the host has not read yet."""
+
+    def test_no_reassert_over_a_latched_fault(self):
+        hv = LIFUHVController()
+        uart = _mock_uart(hv)
+        hv.is_hv_on = True
+        uart.send_packet.side_effect = [
+            _packet(struct.pack("<f", 0.0), reserved=HV_FAULT_HVP_HIGH),  # GET_HV
+            _packet(),                                                     # SET_HV
+        ]
+        hv.set_voltage(30.0)
+        sent = [c.kwargs["command"] for c in uart.send_packet.call_args_list]
+        self.assertEqual(sent, [OW_POWER_GET_HV, OW_POWER_SET_HV])
+        self.assertFalse(hv.is_hv_on)
+
+    def test_reasserts_with_no_fault(self):
+        hv = LIFUHVController()
+        uart = _mock_uart(hv)
+        hv.is_hv_on = True
+        uart.send_packet.side_effect = [_packet(struct.pack("<f", 30.0)), _packet(), _packet()]
+        hv.set_voltage(30.0)
+        sent = [c.kwargs["command"] for c in uart.send_packet.call_args_list]
+        self.assertEqual(sent, [OW_POWER_GET_HV, OW_POWER_SET_HV, OW_POWER_HV_ON])
+
+    def test_hv_off_skips_the_fault_read(self):
+        hv = LIFUHVController()
+        uart = _mock_uart(hv)
+        uart.send_packet.return_value = _packet()
+        hv.set_voltage(30.0)
+        sent = [c.kwargs["command"] for c in uart.send_packet.call_args_list]
+        self.assertEqual(sent, [OW_POWER_SET_HV])
 
 
 class TestTurnHvOnRefusal(unittest.TestCase):
@@ -167,7 +219,7 @@ class TestTurnHvOnRefusal(unittest.TestCase):
                 with self.assertRaises(LIFUDeviceError) as ctx:
                     component.turn_hv_on()
                 self.assertEqual(ctx.exception.device_error_code, OW_HV_FAULT)
-                self.assertFalse(component.is_hv_on)
+                self.assertIn(b"HV fault latched", ctx.exception.device_error_data)
 
 
 # ---- simulator -----------------------------------------------------------------
@@ -193,6 +245,17 @@ def ruo_hv():
     hv.set_voltage(30.0)
     hv.turn_hv_on()
     return hv
+
+
+def test_sim_has_the_real_parsers_keys(fda_hv):
+    hv = HVController()
+    uart = _mock_uart(hv)
+    uart.send_packet.return_value = _packet(_status())
+    real_status = hv.get_hv_monitor_status()
+    uart.send_packet.return_value = _packet(struct.pack("<f", 0.0))
+    real_monitor = hv.get_hv_monitor()
+    assert fda_hv.get_hv_monitor_status().keys() == real_status.keys()
+    assert fda_hv.get_hv_monitor().keys() == real_monitor.keys()
 
 
 def test_sim_healthy_reads(fda_hv):
@@ -263,6 +326,44 @@ def test_sim_ruo_set_voltage_clears(ruo_hv):
     ruo_hv.set_voltage(30.0)
     assert ruo_hv.get_hv_monitor()["fault"] == HV_FAULT_NONE
     ruo_hv.turn_hv_on()
+
+
+def test_sim_ruo_select_does_not_clear(ruo_hv):
+    """console-fw#43 names select / deselect as clearing on an FDA image
+    and set_voltage on an RUO one; the simulator clears on no more."""
+    ruo_hv.inject_hv_fault(HV_FAULT_HVM_LOW)
+    ruo_hv.select_preset(0, 0x12345678, 2720.0)
+    ruo_hv.deselect_preset()
+    assert ruo_hv.get_hv_monitor()["fault"] == HV_FAULT_HVM_LOW
+
+
+@pytest.mark.parametrize("cause", CAUSES)
+def test_sim_inject_with_hv_off_keeps_the_setpoints_rails(fda_hv, cause):
+    """A fault latched earlier: the at-trip rails are the setpoint's, so
+    the rail the cause names is still outside the window and the other
+    is inside it."""
+    fda_hv.turn_hv_off()
+    fda_hv.inject_hv_fault(cause)
+    status = fda_hv.get_hv_monitor_status()
+    low, high = status["window_low"], status["window_high"]
+    rails = {"HVP": status["hvp_at_trip"], "HVM": status["hvm_at_trip"]}
+    name = HV_FAULT_NAMES[cause]
+    for rail, value in rails.items():
+        if name == "ADC_FAIL":
+            assert value == 0.0
+        elif name.startswith(rail):
+            assert (value > high) if name.endswith("HIGH") else (value < low)
+        else:
+            assert low <= value <= high
+
+
+def test_sim_inject_refuses_with_no_setpoint():
+    pytest.importorskip("openlifu_sdk.ui._qt")
+    from openlifu_sdk.ui.simulated_interface import SimulatedLIFUHVController
+    hv = SimulatedLIFUHVController()
+    with pytest.raises(ValueError, match="no HV setpoint"):
+        hv.inject_hv_fault(HV_FAULT_HVP_HIGH)
+    assert hv.get_hv_monitor()["fault"] == HV_FAULT_NONE
 
 
 @pytest.mark.parametrize("cause", (HV_FAULT_NONE, 6, -1))

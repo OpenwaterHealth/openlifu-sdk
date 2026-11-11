@@ -935,14 +935,22 @@ class SimulatedHVController:
         off and latch *cause* (HV_FAULT_HVP_HIGH..HV_FAULT_ADC_FAIL) with
         the rails at the trip, as the firmware does. Test / debug-UI hook.
 
+        The firmware only trips with HV on at a setpoint. Injecting with HV
+        already off stands for a fault latched earlier (say, before a host
+        restart): the at-trip rails are still those of the applied
+        setpoint, as they were when it tripped.
+
         Raises:
             ValueError: *cause* is not a fault cause (HV_FAULT_NONE included:
-                only a select or set_voltage clears the latch).
+                only a select or set_voltage clears the latch), or no
+                setpoint has been applied, so there is no window to leave.
         """
         if cause not in (HV_FAULT_HVP_HIGH, HV_FAULT_HVP_LOW, HV_FAULT_HVM_HIGH,
                          HV_FAULT_HVM_LOW, HV_FAULT_ADC_FAIL):
             raise ValueError(f"not an HV fault cause: {cause!r}")
-        v = float(self._voltage_setpoint or 0.0) if self._hv_on else 0.0
+        v = float(self._voltage_setpoint or 0.0)
+        if v <= 0:
+            raise ValueError("no HV setpoint applied: nothing for the monitor to trip on")
         low, high = self._monitor_window()
         hvp, hvm = v, v
         if cause == HV_FAULT_HVP_HIGH:
@@ -1096,7 +1104,9 @@ class SimulatedHVController:
             raise LIFUDeviceError(f"HV: {volts:.2f} V for this transmitter is outside "
                                   f"{window[0]:g}-{window[1]:g} V", device_error_code=OW_HV_RANGE)
         self._selected_preset_index = index
-        self._clear_hv_fault()
+        if self.fda_image:
+            # console-fw#43: a select clears the latch on an FDA image.
+            self._clear_hv_fault()
         self.last_device_sensitivity = float(device_sensitivity)
         self._voltage_setpoint = volts
         self.supply_voltage = volts
@@ -1113,7 +1123,8 @@ class SimulatedHVController:
             raise LIFUDeviceError("HV: HV is on; turn it off to select a preset",
                                   device_error_code=OW_HV_FDA_REFUSED)
         self._clear_selection()
-        self._clear_hv_fault()
+        if self.fda_image:
+            self._clear_hv_fault()
         return True
 
     def get_voltage(self) -> float:

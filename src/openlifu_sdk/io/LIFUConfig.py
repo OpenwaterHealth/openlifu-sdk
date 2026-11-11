@@ -154,7 +154,8 @@ OW_POWER_PRESET_SELECT = 0x45  # reserved=index, data=settings_crc u32 + transmi
 
 # HV rail monitor (SR-025, console-fw#43 "Host contract"). The latched fault
 # cause rides in OW_POWER_GET_HV's reply reserved byte and in byte 1 of the
-# OW_POWER_STATUS v1 payload. A select (FDA) or set_voltage (RUO) clears it.
+# OW_POWER_STATUS v1 payload. A select or deselect (FDA) or set_voltage (RUO)
+# clears it; HV off does not.
 HV_FAULT_NONE = 0       # no fault latched
 HV_FAULT_HVP_HIGH = 1   # positive rail above the window
 HV_FAULT_HVP_LOW = 2    # positive rail below the window

@@ -342,7 +342,8 @@ class HVController(OWComponent):
             HV_FAULT_ADC_FAIL, 0 = none) and ``fault_name``. Firmware
             without the monitor always reports 0, so a fault of 0 alone does
             not prove a monitor is running; :meth:`get_hv_monitor_status`
-            does.
+            does. A fault clears :attr:`is_hv_on`: the console turned HV
+            off when it tripped.
 
         Raises:
             LIFUNotConnectedError, LIFUCommunicationError, LIFUDeviceError,
@@ -356,6 +357,8 @@ class HVController(OWComponent):
                 code=LIFU_ERR_BAD_PAYLOAD_LENGTH,
             )
         fault = int(r.reserved)
+        if fault:
+            self.is_hv_on = False   # the console turned HV off at the trip
         return {"voltage": round(struct.unpack("<f", r.data)[0], 2),
                 "fault": fault, "fault_name": hv_fault_name(fault)}
 
@@ -371,29 +374,34 @@ class HVController(OWComponent):
             (the window includes the preset's range), ``v_set``,
             ``window_low``, ``window_high``, ``hvp``, ``hvm`` (magnitude),
             ``hvp_at_trip``, ``hvm_at_trip`` and ``ms_since_trip`` (the last
-            three 0 with no fault).
+            three 0 with no fault). A fault clears :attr:`is_hv_on`.
 
         Raises:
-            LIFUProtocolError: A payload that is not 36 bytes, or a version
-                other than 1.
+            LIFUProtocolError: A version other than 1
+                (LIFU_ERR_BAD_PAYLOAD_FORMAT), or a v1 payload that is not
+                36 bytes (LIFU_ERR_BAD_PAYLOAD_LENGTH).
             LIFUNotConnectedError, LIFUCommunicationError, LIFUDeviceError.
         """
         r = self.send_checked(packet_type=OW_POWER, command=OW_POWER_STATUS,
                               op="get_hv_monitor_status")
         if r.data_len == 0:
             return None
-        if r.data_len != HV_MONITOR_STATUS_LEN:
-            raise LIFUProtocolError(
-                f"HV: status payload length {r.data_len} != {HV_MONITOR_STATUS_LEN}",
-                code=LIFU_ERR_BAD_PAYLOAD_LENGTH,
-            )
         d = bytes(r.data)
+        # Version first: another version is "unsupported", whatever its size.
         if d[0] != HV_MONITOR_STATUS_VERSION:
             raise LIFUProtocolError(
                 f"HV: status version {d[0]} != {HV_MONITOR_STATUS_VERSION}",
                 code=LIFU_ERR_BAD_PAYLOAD_FORMAT,
             )
-        version, fault, hv_on, flags, v_set, low, high, hvp, hvm, hvp_trip, hvm_trip, ms =             struct.unpack("<BBBB7fI", d)
+        if len(d) != HV_MONITOR_STATUS_LEN:
+            raise LIFUProtocolError(
+                f"HV: status payload length {len(d)} != {HV_MONITOR_STATUS_LEN}",
+                code=LIFU_ERR_BAD_PAYLOAD_LENGTH,
+            )
+        (version, fault, hv_on, flags, v_set, low, high,
+         hvp, hvm, hvp_trip, hvm_trip, ms) = struct.unpack("<BBBB7fI", d)
+        if fault:
+            self.is_hv_on = False   # the console turned HV off at the trip
         return {"version": version, "fault": fault, "fault_name": hv_fault_name(fault),
                 "hv_on": bool(hv_on), "armed": bool(flags & 0x01),
                 "preset_window": bool(flags & 0x02),
@@ -493,12 +501,19 @@ class LIFUHVController(LIFUComponentMixin, HVController):
         An FDA_MODE console refuses this outright (OW_HV_FDA_REFUSED): the
         voltage comes from the preset chosen with select_preset().
 
+        With HV on, HV on is re-sent after the set. OW_POWER_SET_HV also
+        clears a latched HV rail fault (SR-025), so the fault is read
+        first: if the console has tripped, HV stays off.
+
         Raises:
             ValueError: If *voltage* is out of range.
-            LIFUNotConnectedError, LIFUCommunicationError, LIFUDeviceError.
+            LIFUNotConnectedError, LIFUCommunicationError, LIFUDeviceError,
+            LIFUProtocolError.
         """
         if not 5.0 <= voltage <= 100.0:
             raise ValueError("HV voltage must be between 5 and 100 V")
+        if self.is_hv_on:
+            self.get_hv_monitor()   # a latched fault clears is_hv_on
         logger.debug("Setting HV to %.2f", voltage)
         data = struct.pack('>f', voltage)
         self.send_checked(packet_type=OW_POWER, command=OW_POWER_SET_HV,

@@ -56,6 +56,9 @@ HV rail monitor (SR-025; wire contract in console-fw#43)
   `device_error_code == OW_HV_FAULT` (0xF0). A successful `select_preset` /
   `deselect_preset` (FDA) or `set_voltage` (RUO) clears it; `turn_hv_off`
   does not. The simulator's `inject_hv_fault(cause)` trips it.
+- A read that sees a fault clears the cached `is_hv_on`. RUO `set_voltage`
+  reads the fault before re-sending HV on, so a set after a trip leaves HV
+  off.
 
 Cooling and LED
 - `set_fan_speed(fan_id=0, fan_speed=50) -> int` — set fan 0 or 1 speed (0–100).
