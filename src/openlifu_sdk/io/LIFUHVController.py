@@ -12,6 +12,10 @@ from openlifu_sdk.io.LIFUConfig import (
     FDA_READ_ONLY_COMMANDS,
     HV_FDA_COMMANDS,
     HV_FDA_PACKETS,
+    HV_FAULT_NAMES,
+    HV_MONITOR_STATUS_LEN,
+    HV_MONITOR_STATUS_VERSION,
+    LIFU_ERR_BAD_PAYLOAD_FORMAT,
     LIFU_ERR_BAD_PAYLOAD_LENGTH,
     OW_CONSOLE_PID,
     OW_POWER,
@@ -35,6 +39,7 @@ from openlifu_sdk.io.LIFUConfig import (
     OW_POWER_SET_HV,
     OW_POWER_SET_RGB,
     OW_POWER_SET_RGB_FX,
+    OW_POWER_STATUS,
     OW_POWER_VMON,
     OW_RGB_CYCLE_MAX_COLORS,
     OW_RGB_FX_BREATHE,
@@ -55,6 +60,13 @@ from openlifu_sdk.io.component import (
 from openlifu_sdk.io.exceptions import LIFUHVSettleError, LIFUProtocolError
 
 logger = logging.getLogger(__name__)
+
+
+def hv_fault_name(cause: int) -> str:
+    """Name of an HV monitor fault cause (HV_FAULT_NAMES), or
+    ``UNKNOWN(n)`` for a cause this SDK does not know."""
+    return HV_FAULT_NAMES.get(cause, f"UNKNOWN({cause})")
+
 
 class HVController(OWComponent):
     """FDA console component: HV on/off, preset select, and read-only
@@ -143,7 +155,11 @@ class HVController(OWComponent):
         """Turn on the high-voltage rail.
 
         Raises:
-            LIFUNotConnectedError, LIFUCommunicationError, LIFUDeviceError.
+            LIFUDeviceError: ``device_error_code`` OW_HV_FAULT (0xF0) while
+                the console has an HV rail fault latched (SR-025); a select
+                (FDA) or set_voltage (RUO) clears it. OW_HV_NO_PRESET on an
+                FDA console before any select.
+            LIFUNotConnectedError, LIFUCommunicationError.
         """
         self.send_checked(packet_type=OW_POWER, command=OW_POWER_HV_ON,
                           timeout=timeout, op="turn_hv_on")
@@ -315,6 +331,75 @@ class HVController(OWComponent):
                 code=LIFU_ERR_BAD_PAYLOAD_LENGTH,
             )
         return round(struct.unpack("<f", r.data)[0], 2)
+
+    def get_hv_monitor(self) -> dict:
+        """Read the measured HV output voltage and the console's latched HV
+        rail fault in one OW_POWER_GET_HV transaction (SR-025).
+
+        Returns:
+            ``voltage`` (rounded to 2 places, as :meth:`get_voltage`),
+            ``fault`` (the reply's reserved byte: HV_FAULT_NONE..
+            HV_FAULT_ADC_FAIL, 0 = none) and ``fault_name``. Firmware
+            without the monitor always reports 0, so a fault of 0 alone does
+            not prove a monitor is running; :meth:`get_hv_monitor_status`
+            does.
+
+        Raises:
+            LIFUNotConnectedError, LIFUCommunicationError, LIFUDeviceError,
+            LIFUProtocolError: If the payload length is invalid.
+        """
+        r = self.send_checked(packet_type=OW_POWER, command=OW_POWER_GET_HV,
+                              op="get_hv_monitor")
+        if r.data_len != 4:
+            raise LIFUProtocolError(
+                f"HV: get_hv_monitor payload length {r.data_len} != 4",
+                code=LIFU_ERR_BAD_PAYLOAD_LENGTH,
+            )
+        fault = int(r.reserved)
+        return {"voltage": round(struct.unpack("<f", r.data)[0], 2),
+                "fault": fault, "fault_name": hv_fault_name(fault)}
+
+    def get_hv_monitor_status(self) -> dict | None:
+        """Read the console's HV rail monitor detail (OW_POWER_STATUS v1,
+        SR-025; layout in console-fw#43 "Host contract").
+
+        Returns:
+            None when the payload is empty: firmware from before the
+            monitor. That is *no monitor*, never a healthy one. Otherwise
+            ``version``, ``fault``, ``fault_name``, ``hv_on`` (bool),
+            ``armed`` (HV on and past the settle time), ``preset_window``
+            (the window includes the preset's range), ``v_set``,
+            ``window_low``, ``window_high``, ``hvp``, ``hvm`` (magnitude),
+            ``hvp_at_trip``, ``hvm_at_trip`` and ``ms_since_trip`` (the last
+            three 0 with no fault).
+
+        Raises:
+            LIFUProtocolError: A payload that is not 36 bytes, or a version
+                other than 1.
+            LIFUNotConnectedError, LIFUCommunicationError, LIFUDeviceError.
+        """
+        r = self.send_checked(packet_type=OW_POWER, command=OW_POWER_STATUS,
+                              op="get_hv_monitor_status")
+        if r.data_len == 0:
+            return None
+        if r.data_len != HV_MONITOR_STATUS_LEN:
+            raise LIFUProtocolError(
+                f"HV: status payload length {r.data_len} != {HV_MONITOR_STATUS_LEN}",
+                code=LIFU_ERR_BAD_PAYLOAD_LENGTH,
+            )
+        d = bytes(r.data)
+        if d[0] != HV_MONITOR_STATUS_VERSION:
+            raise LIFUProtocolError(
+                f"HV: status version {d[0]} != {HV_MONITOR_STATUS_VERSION}",
+                code=LIFU_ERR_BAD_PAYLOAD_FORMAT,
+            )
+        version, fault, hv_on, flags, v_set, low, high, hvp, hvm, hvp_trip, hvm_trip, ms =             struct.unpack("<BBBB7fI", d)
+        return {"version": version, "fault": fault, "fault_name": hv_fault_name(fault),
+                "hv_on": bool(hv_on), "armed": bool(flags & 0x01),
+                "preset_window": bool(flags & 0x02),
+                "v_set": v_set, "window_low": low, "window_high": high,
+                "hvp": hvp, "hvm": hvm, "hvp_at_trip": hvp_trip, "hvm_at_trip": hvm_trip,
+                "ms_since_trip": ms}
 
     def get_fan_speed(self, fan_id: int = 0) -> int:
         """Read a fan's current duty-cycle percentage.

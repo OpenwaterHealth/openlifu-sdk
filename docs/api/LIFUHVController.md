@@ -41,6 +41,22 @@ Voltage and DACs
 - `set_raw_dac(dac_id:int, dac_value:int) -> int` — write raw DAC value.
 - `get_vmon_values() -> list[dict]` — read VMON channels and converted voltages.
 
+HV rail monitor (SR-025; wire contract in console-fw#43)
+- `get_hv_monitor() -> dict` — one `OW_POWER_GET_HV` read: `voltage`, plus
+  `fault` (the reply's `reserved`: the latched cause, 0 = none) and
+  `fault_name`. Causes are `HV_FAULT_NONE..HV_FAULT_ADC_FAIL` (0..5) in
+  `LIFUConfig`, names in `HV_FAULT_NAMES`.
+- `get_hv_monitor_status() -> dict | None` — the 36-byte `OW_POWER_STATUS` v1
+  detail: `version`, `fault`, `fault_name`, `hv_on`, `armed`,
+  `preset_window`, `v_set`, `window_low`, `window_high`, `hvp`, `hvm`,
+  `hvp_at_trip`, `hvm_at_trip`, `ms_since_trip`. `None` means firmware
+  without the monitor, never a healthy one. Another length or version
+  raises `LIFUProtocolError`.
+- While a fault is latched, `turn_hv_on()` raises `LIFUDeviceError` with
+  `device_error_code == OW_HV_FAULT` (0xF0). A successful `select_preset` /
+  `deselect_preset` (FDA) or `set_voltage` (RUO) clears it; `turn_hv_off`
+  does not. The simulator's `inject_hv_fault(cause)` trips it.
+
 Cooling and LED
 - `set_fan_speed(fan_id=0, fan_speed=50) -> int` — set fan 0 or 1 speed (0–100).
 - `get_fan_speed(fan_id=0) -> int` — read fan speed.
