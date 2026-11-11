@@ -137,6 +137,13 @@ class TestGetHvMonitorStatus(unittest.TestCase):
             self.assertEqual((got["armed"], got["preset_window"], got["hv_on"]),
                              (armed, preset_window, True))
 
+    def test_fda_sends_status_with_reserved_zero_only(self):
+        hv = HVController()
+        uart = _mock_uart(hv)
+        with self.assertRaisesRegex(ValueError, "only be read"):
+            hv.send_checked(OW_POWER_STATUS, packet_type=OW_POWER, reserved=1)
+        uart.send_packet.assert_not_called()
+
     def test_empty_payload_is_no_monitor(self):
         hv = HVController()
         _mock_uart(hv).send_packet.return_value = _packet(b"")

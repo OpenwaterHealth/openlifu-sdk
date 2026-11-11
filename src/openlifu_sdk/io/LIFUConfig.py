@@ -266,7 +266,9 @@ HV_FDA_COMMANDS = set().union(*HV_FDA_PACKETS.values())
 # config carries the sensitivity calibration that scales the HV, and its
 # write is reserved == 1. FDA_MODE firmware refuses that write too
 # (OW_FDA_REFUSED); this keeps an FDA host from sending it at all.
-FDA_READ_ONLY_COMMANDS = frozenset({OW_CMD_USR_CFG})
+# OW_POWER_STATUS (SR-025) is a read with no defined reserved value, so the
+# FDA console component sends it with reserved == 0 only.
+FDA_READ_ONLY_COMMANDS = frozenset({OW_CMD_USR_CFG, OW_POWER_STATUS})
 
 TRIGGER_MODE_SEQUENCE = 0
 TRIGGER_MODE_CONTINUOUS = 1

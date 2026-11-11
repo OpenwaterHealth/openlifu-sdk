@@ -342,9 +342,10 @@ class HVController(OWComponent):
             ``voltage`` (rounded to 2 places, as :meth:`get_voltage`),
             ``fault`` (the reply's reserved byte: HV_FAULT_NONE..
             HV_FAULT_ADC_FAIL, 0 = none) and ``fault_name``. Firmware
-            without the monitor always reports 0, so a fault of 0 alone does
-            not prove a monitor is running; :meth:`get_hv_monitor_status`
-            does. A fault clears :attr:`is_hv_on`: the console turned HV
+            without the monitor is expected to report 0 (console-fw#43;
+            not yet checked against every shipped image), so a fault of 0
+            alone does not prove a monitor is running;
+            :meth:`get_hv_monitor_status` does. A fault clears :attr:`is_hv_on`: the console turned HV
             off when it tripped.
 
         Raises:
@@ -369,8 +370,10 @@ class HVController(OWComponent):
         SR-025; layout in console-fw#43 "Host contract").
 
         Returns:
-            None when the payload is empty: firmware from before the
-            monitor. That is *no monitor*, never a healthy one. Otherwise
+            None when the payload is empty, which console-fw#43 gives as
+            firmware from before the monitor. That is *no monitor*, never a
+            healthy one; firmware that instead replies OW_ERROR raises
+            LIFUDeviceError, which callers must treat the same way. Otherwise
             ``version``, ``fault``, ``fault_name``, ``hv_on`` (bool),
             ``armed`` (HV on and past the settle time), ``preset_window``
             (the window includes the preset's range), ``v_set``,
@@ -516,7 +519,9 @@ class LIFUHVController(LIFUComponentMixin, HVController):
             ValueError: If *voltage* is out of range.
             LIFUDeviceError: ``device_error_code`` OW_HV_FAULT when HV was
                 on and the console has an HV fault latched; nothing is
-                set and :attr:`is_hv_on` is cleared.
+                set and :attr:`is_hv_on` is cleared. Raised by the host
+                from the GET_HV read, not an OW_ERROR from the console,
+                so its ``packet`` is None.
             LIFUNotConnectedError, LIFUCommunicationError,
             LIFUProtocolError.
         """
