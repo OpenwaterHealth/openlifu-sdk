@@ -865,8 +865,8 @@ class SimulatedHVController:
         self.last_device_sensitivity: Optional[float] = None
         self._selected_preset_index: Optional[int] = None
         # SR-025 HV rail monitor latch (console-fw#43): cause, the rails at
-        # the trip and when it tripped. inject_hv_fault() sets it; a select,
-        # a deselect or a set_voltage that succeeds clears it.
+        # the trip and when it tripped. inject_hv_fault() sets it; a select
+        # or deselect (FDA image) or a set_voltage that succeeds clears it.
         self._hv_fault = HV_FAULT_NONE
         self._hv_fault_rails = (0.0, 0.0)
         self._hv_fault_time: Optional[float] = None
@@ -942,7 +942,7 @@ class SimulatedHVController:
 
         Raises:
             ValueError: *cause* is not a fault cause (HV_FAULT_NONE included:
-                only a select or set_voltage clears the latch), or no
+                only a select, deselect or set_voltage clears the latch), or no
                 setpoint has been applied, so there is no window to leave.
         """
         if cause not in (HV_FAULT_HVP_HIGH, HV_FAULT_HVP_LOW, HV_FAULT_HVM_HIGH,

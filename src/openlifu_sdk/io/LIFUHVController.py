@@ -157,7 +157,8 @@ class HVController(OWComponent):
         Raises:
             LIFUDeviceError: ``device_error_code`` OW_HV_FAULT (0xF0) while
                 the console has an HV rail fault latched (SR-025); a select
-                (FDA) or set_voltage (RUO) clears it. OW_HV_NO_PRESET on an
+                or deselect (FDA) or set_voltage (RUO) that succeeds clears
+                it (console-fw#43). OW_HV_NO_PRESET on an
                 FDA console before any select.
             LIFUNotConnectedError, LIFUCommunicationError.
         """
