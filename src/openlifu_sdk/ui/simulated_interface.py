@@ -975,11 +975,11 @@ class SimulatedHVController:
         self._hv_fault_time = None
 
     def _monitor_window(self) -> tuple[float, float]:
-        """The window the monitor holds the rails to (console-fw#43): 3 %
+        """The window the monitor holds the rails to (console-fw#43): 5 %
         around the applied setpoint, narrowed to the selected record's
         range on an FDA image."""
         v_set = float(self._voltage_setpoint or 0.0)
-        low, high = 0.97 * v_set, 1.03 * v_set
+        low, high = 0.95 * v_set, 1.05 * v_set
         if self.fda_image and self._selected_preset_index is not None:
             window = self._select_window(self._presets[self._selected_preset_index])
             if window is not None:
