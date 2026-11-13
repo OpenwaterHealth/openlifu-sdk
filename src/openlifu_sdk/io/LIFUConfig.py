@@ -26,6 +26,7 @@ OW_ERROR = 0xEF
 
 OW_SUCCESS = 0x00
 # FDA mode refusals, carried in the OW_ERROR reply's reserved byte.
+OW_HV_FAULT = 0xF0         # console: HV on refused while an HV rail fault is latched (SR-025)
 OW_HV_RANGE = 0xF1         # console: select's rescaled voltage is outside the FDA window
 OW_PRESET_BUSY = 0xF2      # TX: trigger running, presets cannot be stored or deleted
 OW_PRESET_NO_ROOM = 0xF3   # TX: blob needs the next slot too, and it is taken or missing
@@ -45,7 +46,8 @@ OW_INVALID_PACKET = 0xFE
 OW_HV_DATA_ERROR = 0xFE     # console: malformed select (e.g. a sensitivity that is not positive); TX calls 0xFE OW_INVALID_PACKET
 # Console firmware names (hv_presets.c / common.h on feature/fda-hv-presets): OW_HV_RANGE = OW_CODE_HV_RANGE,
 # OW_HV_PRESET_CRC = OW_CODE_PRESET_CRC, OW_HV_NO_PRESET = OW_CODE_NO_PRESET,
-# OW_HV_FDA_REFUSED = OW_CODE_FDA_REFUSED, OW_HV_DATA_ERROR = OW_CODE_DATA_ERROR.
+# OW_HV_FDA_REFUSED = OW_CODE_FDA_REFUSED, OW_HV_DATA_ERROR = OW_CODE_DATA_ERROR,
+# OW_HV_FAULT = OW_CODE_HV_FAULT (console-fw#43).
 OW_UNKNOWN_ERROR = 0xFF
 
 # Global Commands
@@ -150,6 +152,27 @@ OW_POWER_SET_RGB_FX = 0x43
 OW_POWER_PRESET_GET = 0x44     # reserved=index
 OW_POWER_PRESET_SELECT = 0x45  # reserved=index, data=settings_crc u32 + transmitter sensitivity f32 (LE)
 
+# HV rail monitor (SR-025, console-fw#43 "Host contract"). The latched fault
+# cause rides in OW_POWER_GET_HV's reply reserved byte and in byte 1 of the
+# OW_POWER_STATUS v1 payload. A select or deselect (FDA) or set_voltage (RUO)
+# clears it; HV off does not.
+HV_FAULT_NONE = 0       # no fault latched
+HV_FAULT_HVP_HIGH = 1   # positive rail above the window
+HV_FAULT_HVP_LOW = 2    # positive rail below the window
+HV_FAULT_HVM_HIGH = 3   # negative rail magnitude above the window
+HV_FAULT_HVM_LOW = 4    # negative rail magnitude below the window
+HV_FAULT_ADC_FAIL = 5   # rail read failed
+HV_FAULT_NAMES = {
+    HV_FAULT_NONE: "NONE",
+    HV_FAULT_HVP_HIGH: "HVP_HIGH",
+    HV_FAULT_HVP_LOW: "HVP_LOW",
+    HV_FAULT_HVM_HIGH: "HVM_HIGH",
+    HV_FAULT_HVM_LOW: "HVM_LOW",
+    HV_FAULT_ADC_FAIL: "ADC_FAIL",
+}
+HV_MONITOR_STATUS_VERSION = 1
+HV_MONITOR_STATUS_LEN = 36
+
 # OW_POWER_SET_RGB_FX effect ids (payload byte 0 - see firmware common.h)
 OW_RGB_FX_STOP = 0
 OW_RGB_FX_SOLID = 1
@@ -231,7 +254,7 @@ HV_FDA_PACKETS = {
     OW_POWER: frozenset({
         OW_POWER_GET_HV, OW_POWER_HV_ON, OW_POWER_HV_OFF, OW_POWER_GET_HVON,
         OW_POWER_GET_12VON, OW_POWER_GET_TEMP1, OW_POWER_GET_TEMP2,
-        OW_POWER_GET_FAN, OW_POWER_VMON,
+        OW_POWER_GET_FAN, OW_POWER_VMON, OW_POWER_STATUS,
         OW_POWER_PRESET_GET, OW_POWER_PRESET_SELECT,
     }),
 }
@@ -243,7 +266,9 @@ HV_FDA_COMMANDS = set().union(*HV_FDA_PACKETS.values())
 # config carries the sensitivity calibration that scales the HV, and its
 # write is reserved == 1. FDA_MODE firmware refuses that write too
 # (OW_FDA_REFUSED); this keeps an FDA host from sending it at all.
-FDA_READ_ONLY_COMMANDS = frozenset({OW_CMD_USR_CFG})
+# OW_POWER_STATUS (SR-025) is a read with no defined reserved value, so the
+# FDA console component sends it with reserved == 0 only.
+FDA_READ_ONLY_COMMANDS = frozenset({OW_CMD_USR_CFG, OW_POWER_STATUS})
 
 TRIGGER_MODE_SEQUENCE = 0
 TRIGGER_MODE_CONTINUOUS = 1
