@@ -60,7 +60,7 @@ def _mock_uart(component) -> MagicMock:
 
 
 def _status(version=1, fault=HV_FAULT_HVP_HIGH, hv_on=0, flags=0x03, v_set=30.0,
-            low=28.5, high=31.5, hvp=0.25, hvm=0.5, hvp_trip=32.0, hvm_trip=30.0,
+            low=29.1, high=30.9, hvp=0.25, hvm=0.5, hvp_trip=32.0, hvm_trip=30.0,
             ms=1234) -> bytes:
     return struct.pack("<BBBB7fI", version, fault, hv_on, flags, v_set, low, high,
                        hvp, hvm, hvp_trip, hvm_trip, ms)
@@ -123,7 +123,7 @@ class TestGetHvMonitorStatus(unittest.TestCase):
                                          "preset_window", "ms_since_trip")},
                     {"version": 1, "fault": HV_FAULT_HVP_HIGH, "fault_name": "HVP_HIGH",
                      "hv_on": False, "armed": True, "preset_window": True, "ms_since_trip": 1234})
-                for key, want in (("v_set", 30.0), ("window_low", 28.5), ("window_high", 31.5),
+                for key, want in (("v_set", 30.0), ("window_low", 29.1), ("window_high", 30.9),
                                   ("hvp", 0.25), ("hvm", 0.5), ("hvp_at_trip", 32.0),
                                   ("hvm_at_trip", 30.0)):
                     self.assertAlmostEqual(got[key], want, places=5, msg=key)
@@ -278,9 +278,9 @@ def test_sim_healthy_reads(fda_hv):
     status = fda_hv.get_hv_monitor_status()
     assert (status["version"], status["fault"], status["hv_on"], status["armed"],
             status["preset_window"]) == (1, 0, True, True, True)
-    # 5 % of 40 V is 38.0-42.0 V, inside the record's 35-45 V.
-    assert status["window_low"] == pytest.approx(38.0)
-    assert status["window_high"] == pytest.approx(42.0)
+    # 3 % of 40 V is 38.8-41.2 V, inside the record's 35-45 V.
+    assert status["window_low"] == pytest.approx(38.8)
+    assert status["window_high"] == pytest.approx(41.2)
     assert (status["hvp_at_trip"], status["hvm_at_trip"], status["ms_since_trip"]) == (0.0, 0.0, 0)
 
 
@@ -337,7 +337,7 @@ def test_sim_ruo_set_voltage_clears(ruo_hv):
     assert excinfo.value.device_error_code == OW_HV_FAULT
     status = ruo_hv.get_hv_monitor_status()
     assert status["preset_window"] is False
-    assert status["window_low"] == pytest.approx(28.5)
+    assert status["window_low"] == pytest.approx(29.1)
     ruo_hv.set_voltage(30.0)
     assert ruo_hv.get_hv_monitor()["fault"] == HV_FAULT_NONE
     ruo_hv.turn_hv_on()
