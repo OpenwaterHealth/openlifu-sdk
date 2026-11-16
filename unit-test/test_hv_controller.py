@@ -38,6 +38,10 @@ from openlifu_sdk.io.exceptions import (
 from openlifu_sdk.io.LIFUConfig import (
     OW_ERROR,
     OW_POWER,
+    OW_POWER_GET_HV,
+    OW_POWER_GET_HVON,
+    OW_POWER_HV_ON,
+    OW_POWER_SET_HV,
     OW_RESP,
 )
 from openlifu_sdk.io.LIFUHVController import LIFUHVController
@@ -210,13 +214,14 @@ class TestHVControllerUnit(unittest.TestCase):
 
     def test_21_set_voltage_reasserts_hv_when_on(self):
         """set_voltage() sends a second HV_ON packet if HV was already on,
-        after checking no HV fault is latched (SR-025)."""
+        after checking no HV fault is latched and HV is still on (SR-025)."""
         self.uart.send_packet.side_effect = [
-            _make_packet(struct.pack("<f", 50.0)), _make_packet(), _make_packet()]
+            _make_packet(struct.pack("<f", 50.0)), _make_packet(), _make_packet(reserved=1),
+            _make_packet()]
         self.hv.is_hv_on = True
         self.hv.set_voltage(60.0)
-        # Expect 3 packets: GET_HV (fault check) + SET_HV + reassert HV_ON
-        self.assertEqual(self.uart.send_packet.call_count, 3)
+        sent = [c.kwargs["command"] for c in self.uart.send_packet.call_args_list]
+        self.assertEqual(sent, [OW_POWER_GET_HV, OW_POWER_SET_HV, OW_POWER_GET_HVON, OW_POWER_HV_ON])
 
     # --- get_voltage --------------------------------------------------------
 

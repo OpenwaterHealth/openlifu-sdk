@@ -18,7 +18,6 @@ from openlifu_sdk.io.LIFUConfig import (
     LIFU_ERR_BAD_PAYLOAD_FORMAT,
     LIFU_ERR_BAD_PAYLOAD_LENGTH,
     OW_CONSOLE_PID,
-    OW_HV_FAULT,
     OW_POWER,
     OW_POWER_12V_OFF,
     OW_POWER_12V_ON,
@@ -58,7 +57,7 @@ from openlifu_sdk.io.component import (
     OWComponent,
     register_command_packet_types,
 )
-from openlifu_sdk.io.exceptions import LIFUDeviceError, LIFUHVSettleError, LIFUProtocolError
+from openlifu_sdk.io.exceptions import LIFUHVFaultError, LIFUHVSettleError, LIFUProtocolError
 
 logger = logging.getLogger(__name__)
 
@@ -342,11 +341,14 @@ class HVController(OWComponent):
             ``voltage`` (rounded to 2 places, as :meth:`get_voltage`),
             ``fault`` (the reply's reserved byte: HV_FAULT_NONE..
             HV_FAULT_ADC_FAIL, 0 = none) and ``fault_name``. Firmware
-            without the monitor is expected to report 0 (console-fw#43;
-            not yet checked against every shipped image), so a fault of 0
-            alone does not prove a monitor is running;
-            :meth:`get_hv_monitor_status` does. A fault clears :attr:`is_hv_on`: the console turned HV
-            off when it tripped.
+            without the monitor reports 0: every console-fw tag from
+            v1.0.5 to 1.3.0-rc.1 zeroes the reply's reserved byte in
+            process_if_command (if_commands.c, ``uartResp.reserved = 0;``,
+            line 462 at 1.2.7 and 484 at 1.3.0-rc.1) and its GET_HV case
+            never writes it. So a fault of 0 alone does not prove a
+            monitor is running; :meth:`get_hv_monitor_status` does. A
+            fault clears :attr:`is_hv_on`: the console turned HV off when
+            it tripped.
 
         Raises:
             LIFUNotConnectedError, LIFUCommunicationError, LIFUDeviceError,
@@ -506,41 +508,61 @@ class LIFUHVController(LIFUComponentMixin, HVController):
         An FDA_MODE console refuses this outright (OW_HV_FDA_REFUSED): the
         voltage comes from the preset chosen with select_preset().
 
-        With HV on, HV on is re-sent after the set. OW_POWER_SET_HV also
-        clears a latched HV rail fault (SR-025, console-fw#43), so with
-        HV on the fault is read first, and a latched one is reported
-        (OW_HV_FAULT) without the set, leaving the latch for the caller
-        to see. This narrows, but does not close, the window: a trip
-        between that read and the SET_HV is cleared by the SET_HV, and
-        HV on is re-sent. Closing it needs the firmware (console-fw#43).
-        A set with HV off clears a latched fault, as the contract says.
+        With HV on, HV on is re-sent after the set, which ramps the rail
+        to the new voltage (the console's SET_HV only stores it).
+        OW_POWER_SET_HV also clears a latched HV rail fault (SR-025,
+        console-fw#43), so with HV on the set is bracketed:
+
+        1. Before it, the fault is read (GET_HV). A latched one is
+           reported without the set, leaving the latch for the caller.
+        2. After it, HV is read (GET_HVON). The console turns HV off by
+           itself only at a trip (or a reset), so HV found off means it
+           tripped after step 1 and the SET_HV cleared the cause. HV is
+           left off and that is reported.
+        3. Only then is HV on re-sent. A trip after step 2 stays latched,
+           and the console refuses that HV on (OW_HV_FAULT).
+
+        So no trip is cleared and followed by HV on without the host
+        seeing it. A set with HV off clears a latched fault, as the
+        contract says.
 
         Raises:
             ValueError: If *voltage* is out of range.
-            LIFUDeviceError: ``device_error_code`` OW_HV_FAULT when HV was
-                on and the console has an HV fault latched; nothing is
-                set and :attr:`is_hv_on` is cleared. Raised by the host
-                from the GET_HV read, not an OW_ERROR from the console,
-                so its ``packet`` is None.
+            LIFUHVFaultError: HV was on and the host found a trip: a fault
+                latched at step 1 (``fault`` is its cause; nothing is
+                set), or HV off at step 2 (``fault`` is None: the SET_HV
+                cleared it). Either way HV is off and :attr:`is_hv_on` is
+                cleared. Raised by the host from what it read, not an
+                OW_ERROR from the console.
+            LIFUDeviceError: ``device_error_code`` OW_HV_FAULT when the
+                console refuses the re-sent HV on (step 3).
             LIFUNotConnectedError, LIFUCommunicationError,
             LIFUProtocolError.
         """
         if not 5.0 <= voltage <= 100.0:
             raise ValueError("HV voltage must be between 5 and 100 V")
-        if self.is_hv_on:
+        hv_was_on = self.is_hv_on
+        if hv_was_on:
             monitor = self.get_hv_monitor()   # a latched fault clears is_hv_on
             if monitor["fault"]:
                 logger.warning("set_voltage: HV fault %s latched; not set", monitor["fault_name"])
-                raise LIFUDeviceError(
+                raise LIFUHVFaultError(
                     f"HV: HV fault {monitor['fault_name']} latched; voltage not set",
-                    device_error_code=OW_HV_FAULT,
+                    fault=monitor["fault"],
                 )
         logger.debug("Setting HV to %.2f", voltage)
         data = struct.pack('>f', voltage)
         self.send_checked(packet_type=OW_POWER, command=OW_POWER_SET_HV,
                           data=data, timeout=10.0, op="set_voltage")
         self.supply_voltage = voltage
-        if self.is_hv_on:
+        if hv_was_on:
+            if not self.get_hv_status():
+                self.is_hv_on = False
+                logger.warning("set_voltage: HV went off during the set; HV fault cleared by SET_HV, HV left off")
+                raise LIFUHVFaultError(
+                    "HV: HV went off during set_voltage (an HV fault, its cause cleared by the set, "
+                    "or a console reset); HV left off"
+                )
             self.send_checked(packet_type=OW_POWER, command=OW_POWER_HV_ON, timeout=10.0, op="reassert_hv_on")
         return True
 

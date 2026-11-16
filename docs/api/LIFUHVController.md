@@ -57,11 +57,19 @@ HV rail monitor (SR-025; wire contract in console-fw#43)
   `deselect_preset` (FDA) or `set_voltage` (RUO) clears it; `turn_hv_off`
   does not. The simulator's `inject_hv_fault(cause)` trips it.
 - A read that sees a fault clears the cached `is_hv_on` (the console
-  turned HV off). With HV on, RUO `set_voltage` reads the fault first and
-  refuses with `OW_HV_FAULT` if one is latched, leaving the latch. This
-  narrows but does not close the window: a trip between that read and the
-  `SET_HV` is cleared by the `SET_HV`, and HV on is re-sent. Closing it
-  needs the firmware (console-fw#43).
+  turned HV off). With HV on, RUO `set_voltage` reads the fault first
+  (`GET_HV`) and refuses if one is latched, leaving the latch. After the
+  `SET_HV` (which clears the latch) it reads HV (`GET_HVON`): the console
+  turns HV off by itself only at a trip, so HV found off is reported and
+  HV is left off. Only then is HV on re-sent; a later trip stays latched
+  and the console refuses that HV on (`OW_HV_FAULT`). Both host-found
+  cases raise `LIFUHVFaultError` (code `LIFU_ERR_HV_FAULT`, 4006; `fault`
+  is the cause, or None when the `SET_HV` cleared it), not a
+  `LIFUDeviceError`, so a host-found trip is told apart from a console
+  refusal.
+- Firmware without the monitor leaves `GET_HV`'s `reserved` at 0: every
+  console-fw tag from v1.0.5 to 1.3.0-rc.1 zeroes it in
+  `process_if_command` (`if_commands.c`), and no `GET_HV` case writes it.
 
 Cooling and LED
 - `set_fan_speed(fan_id=0, fan_speed=50) -> int` — set fan 0 or 1 speed (0–100).

@@ -23,6 +23,7 @@ from openlifu_sdk.io.LIFUConfig import (
 from openlifu_sdk.io.exceptions import (
     LIFUError,
     LIFUHardwareInUseError,
+    LIFUHVFaultError,
     LIFUNoTriggerStatusError,
     LIFUSolutionError,
 )
@@ -960,6 +961,9 @@ class LIFUInterface(DeviceInterface):
             LIFUSolutionError: If the solution fails safety checks (unless
                 *_allow_unsafe_solution* is True).
             LIFUError: On any device-communication failure.
+            LIFUHVFaultError: HV was on and the console's HV rail monitor
+                had tripped (see LIFUHVController.set_voltage); status is
+                STATUS_ERROR and HV is off.
             LIFUHVSettleError: If *wait_for_settle* is requested and the HV
                 rail does not settle in time.
         """
@@ -994,7 +998,12 @@ class LIFUInterface(DeviceInterface):
         self.set_status(LIFUInterfaceStatus.STATUS_READY)
 
         if self.hvcontroller is not None:
-            self.hvcontroller.set_voltage(voltage)
+            try:
+                self.hvcontroller.set_voltage(voltage)
+            except LIFUHVFaultError:
+                # HV is off and a trip was found (SR-025): not ready to sonicate.
+                self.set_status(LIFUInterfaceStatus.STATUS_ERROR)
+                raise
             logger.debug("Set HV to %.2f", self.hvcontroller.supply_voltage)
             if turn_hv_on:
                 logger.debug("Turn ON HV")

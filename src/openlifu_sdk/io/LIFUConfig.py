@@ -336,6 +336,7 @@ LIFU_ERR_MODULE_COUNT_MISMATCH = 4002 # detected modules != requested modules
 LIFU_ERR_SOLUTION_INVALID     = 4003  # solution failed safety check
 LIFU_ERR_SONICATION_FAILED    = 4004  # start/stop sonication did not complete cleanly
 LIFU_ERR_NO_TRIGGER_STATUS = 4005  # sonication trigger status could not be determined after sonication
+LIFU_ERR_HV_FAULT             = 4006  # host found an HV rail fault (SR-025): latched, or HV off under a set
 
 LIFU_ERROR_MESSAGES: dict[int, str] = {
     LIFU_ERR_NOT_CONNECTED:        "Device is not connected",
@@ -350,4 +351,5 @@ LIFU_ERROR_MESSAGES: dict[int, str] = {
     LIFU_ERR_MODULE_COUNT_MISMATCH:"Detected module count does not match requested",
     LIFU_ERR_SOLUTION_INVALID:     "Solution failed safety validation",
     LIFU_ERR_SONICATION_FAILED:    "Sonication start/stop did not complete successfully",
+    LIFU_ERR_HV_FAULT:             "The console's HV rail monitor tripped",
 }
