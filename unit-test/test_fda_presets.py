@@ -1078,6 +1078,42 @@ class TestInterfacePresetLoad(unittest.TestCase):
         self.assertEqual(iface.hvcontroller.supply_voltage, 44.75)   # the console's answer, for wait_for_settle
 
 
+    def test_a_real_two_module_load_with_one_uncalibrated_module_is_refused(self):
+        # SR-004 end to end: the real DeviceInterface over the real TxDevice and HVController,
+        # on a fake transport. Module 1's page has an invalid row before a valid one at 400 kHz.
+        for cls in (DeviceInterface, LIFUInterface):
+            with self.subTest(cls=cls.__name__):
+                iface = object.__new__(cls)
+                iface.txdevice, iface.hvcontroller = TxDevice(), HVController()
+                iface.status = LIFUInterfaceStatus.STATUS_SYS_OFF
+                iface._test_mode = False
+                tx_uart, hv_uart = _mock_uart(iface.txdevice, "TX"), _mock_uart(iface.hvcontroller, "HV")
+                pages = [LifuUserConfig(json_data={"module": {"sensitivity": rows}}).to_wire_bytes()
+                         for rows in ([[400000, 3220]], [[400000, -1], [400000, 3220]])]
+
+                def tx_reply(*, command, addr=0, **_):
+                    if command == OW_CMD_USR_CFG:
+                        return _packet(pages[addr])
+                    return _packet({OW_CTRL_GET_SWTRIG: b'{"TriggerStatus": "STOPPED"}',
+                                    OW_CTRL_GET_MODULE_COUNT: bytes([2])}.get(command, b""))
+                tx_uart.send_packet.side_effect = tx_reply
+                hv_uart.send_packet.return_value = _packet(b"")
+
+                with self.assertRaisesRegex(LIFUSolutionError, r"module\(s\) \[1\]"):
+                    iface.load_preset(0, 0xABCD, [0x1111, 0x2222], 400000.0, turn_hv_on=True)
+
+                tx_sent = [c.kwargs for c in tx_uart.send_packet.call_args_list]
+                self.assertEqual([s["addr"] for s in tx_sent if s["command"] == OW_CMD_USR_CFG], [0, 1])
+                # Both modules loaded, then both unloaded (a load with no payload).
+                self.assertEqual([(s["addr"], bool(s["data"])) for s in tx_sent if s["command"] == OW_PRESET_LOAD],
+                                 [(0, True), (1, True), (0, False), (1, False)])
+                hv_sent = [(c.kwargs["command"], bytes(c.kwargs["data"] or b""))
+                           for c in hv_uart.send_packet.call_args_list]
+                # The console is never asked to select (only the cleanup's empty deselect) or turn HV on.
+                self.assertEqual([d for c, d in hv_sent if c == OW_POWER_PRESET_SELECT], [b""])
+                self.assertNotIn(OW_POWER_HV_ON, [c for c, _ in hv_sent])
+                self.assertEqual(iface.status, LIFUInterfaceStatus.STATUS_ERROR)
+
 class TestInterfaceSurface(unittest.TestCase):
     """DeviceInterface is the FDA surface; LIFUInterface adds the RUO endpoints."""
 
