@@ -753,11 +753,31 @@ class TestSensitivityLookup(unittest.TestCase):
             with self.subTest(bad=bad):
                 self.assertIsNone(sensitivity_at_frequency([self._module((400000, bad))], 400000.0))
 
-    def test_malformed_rows_are_skipped_not_raised(self):
-        # The user config is RUO-writable: one bad row must not break the lookup of a good one.
-        module = {"module": {"sensitivity": [["x", 1], None, [1, 2, 3], [400000, None], [400000, 2720]]}}
+    def test_malformed_rows_are_no_calibration_not_errors(self):
+        # The user config is RUO-writable: a bad row must not raise. A row that is not a number
+        # pair could be this frequency's, so it leaves the module uncalibrated (SR-004 "invalid").
+        for bad in (["x", 1], None, [1, 2, 3], [400000, None], "12", {"400000": 1}):
+            with self.subTest(bad=bad):
+                module = {"module": {"sensitivity": [bad, [400000, 2720]]}}
+                self.assertIsNone(sensitivity_at_frequency([module], 400000.0))
+                self.assertEqual(uncalibrated_modules([module], 400000.0), [0])
+
+    def test_an_invalid_row_at_the_frequency_is_not_skipped_for_a_valid_one(self):
+        # SR-004 "invalid": a bad row at the preset's frequency makes the module uncalibrated,
+        # whichever side of a valid row it is on; so do two rows there (which would win?).
+        good = self._module((400000, 2720))
+        for name, rows in (("invalid row before a valid one", ((400000, 0.0), (400000, 2720))),
+                           ("invalid row after a valid one", ((400000, 2720), (400000, -1))),
+                           ("non-finite row before a valid one", ((400000, float("nan")), (400000, 2720))),
+                           ("two different valid rows", ((400000, 3000), (400000, 3600))),
+                           ("the same row twice", ((400000, 2720), (400000, 2720)))):
+            with self.subTest(case=name):
+                self.assertIsNone(sensitivity_at_frequency([good, self._module(*rows)], 400000.0))
+                self.assertEqual(uncalibrated_modules([good, self._module(*rows)], 400000.0), [1])
+
+    def test_well_formed_rows_at_other_frequencies_do_not_matter(self):
+        module = self._module((380000, -1), (390000, float("inf")), (400000, 2720))
         self.assertEqual(sensitivity_at_frequency([module], 400000.0), 2720.0)
-        self.assertIsNone(sensitivity_at_frequency([{"module": {"sensitivity": [["x", 1]]}}], 400000.0))
 
     def test_every_module_present_gives_their_mean(self):
         modules = [self._module((400000, 3000)), self._module((380000, 1), (400000, 3600))]

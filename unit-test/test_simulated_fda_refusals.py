@@ -194,10 +194,14 @@ def test_a_two_module_preset_loads_on_a_two_module_transmitter(interface_cls):
 
 
 @pytest.mark.parametrize("interface_cls", [SimulatedDeviceInterface, SimulatedLIFUInterface])
-@pytest.mark.parametrize("uncalibrated", [{}, {"module": {"sensitivity": [[380000, 3110]]}}],
-                         ids=["blank-config", "no-entry-at-frequency"])
+@pytest.mark.parametrize("uncalibrated", [{}, {"module": {"sensitivity": [[380000, 3110]]}},
+                                          {"module": {"sensitivity": [[400000, -1], [400000, 3110]]}},
+                                          [1, 2]],
+                         ids=["blank-config", "no-entry-at-frequency", "invalid-row-before-a-valid-one",
+                              "non-object-config"])
 def test_a_two_module_load_with_one_uncalibrated_module_is_refused(interface_cls, uncalibrated):
-    # SR-004: module 0's calibration alone must not scale the HV for both.
+    # SR-004: module 0's calibration alone must not scale the HV for both. A non-object
+    # config (the RUO page can hold any JSON) is refused like on hardware, not raised.
     mc, regs = two_module_flash_entry()
     interface = interface_cls(num_modules=2, preset_flash=[(mc, regs)])
     try:

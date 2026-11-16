@@ -20,6 +20,7 @@ sonicating and decays toward 25 deg C otherwise (Newton's law,
 
 from __future__ import annotations
 
+import copy
 import json
 import logging
 import math
@@ -306,7 +307,8 @@ class SimulatedTxDevice:
     def refresh_metadata(self, module_count: Optional[int] = None) -> None:
         """Same contract as :meth:`TxDevice.refresh_metadata`."""
         count = len(self._user_configs) if module_count is None else int(module_count)
-        self.module_user_configs = [dict(cfg) for cfg in self._user_configs[:count]]
+        self.module_user_configs = [self.read_config(module=m).module_config()
+                                    for m in range(min(count, len(self._user_configs)))]
         primary = self.module_user_configs[0] if self.module_user_configs else {}
         self.serial_number = primary.get("sn") if isinstance(primary.get("sn"), str) else None
         hwid = primary.get("hwid") if isinstance(primary.get("hwid"), str) else None
@@ -526,7 +528,7 @@ class SimulatedTxDevice:
 
     def read_config(self, module: int = 0):
         from openlifu_sdk.io.LIFUUserConfig import LifuUserConfig
-        return LifuUserConfig(json_data=dict(self._user_configs[module]))
+        return LifuUserConfig(json_data=copy.deepcopy(self._user_configs[module]))
 
     def apply_simulated_transducer(self, arr) -> None:
         """Reconfigure the simulator to mimic a transducer (array).
@@ -772,7 +774,7 @@ class SimulatedLIFUTxDevice(SimulatedTxDevice):
         except (TypeError, ValueError):
             logger.warning("SimulatedLIFUTxDevice.write_config_json: invalid json; ignored")
         self.refresh_metadata()
-        return LifuUserConfig(json_data=dict(self._user_configs[module]))
+        return LifuUserConfig(json_data=copy.deepcopy(self._user_configs[module]))
 
     def set_solution(self, pulse=None, delays=None, apodizations=None,
                      sequence=None, profile_index=1, profile_increment=True,
