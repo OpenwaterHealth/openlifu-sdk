@@ -6,6 +6,8 @@ import sys
 import time
 
 from openlifu_sdk.io.LIFUDFU import (
+    DFU_KIND_LEGACY,
+    DFU_KIND_NO_DFU,
     LIFUDFUManager,
     infer_console_bootloader_from_app_version,
 )
@@ -13,13 +15,18 @@ from openlifu_sdk.io.LIFUInterface import LIFUInterface
 
 # Migrate a beta console unit to the secure bootloader, over USB only.
 #
-# All cohorts converge on one path: the running app honours the hidden
-# force-STM32-ROM-DFU switch, the ROM loader can write the whole flash, and
-# migrate_console_rom_dfu() installs the new secure bootloader + signed app.
+# The no-bootloader and secure cohorts converge on one path: the running app
+# is forced into the STM32 ROM loader, which can write the whole flash, and
+# the new secure bootloader + signed app are installed from there.
 #
-#   no-bootloader (<1.2.0) | legacy BL (1.2.0-1.2.5) | secure BL (>=1.2.6)
+#   no-bootloader (1.1.0-1.2.2) | secure BL (>=1.2.6)
 #        --> STM32 ROM DFU --> [new secure bootloader @ 0x08000000]
 #                              [signed app @ 0x08010000] --> power cycle
+#
+# Legacy-bootloader consoles (1.2.3-1.2.5) are REFUSED (SR-021): their
+# bootloader intercepts the force request, and its ~5 s IWDG would reset the
+# unit mid-write. Recover those with BOOT0 (then --already-in-dfu) or SWD.
+# Apps below 1.1.0 have no DFU at all and are refused too.
 #
 # WARNING: only works on unlocked beta units. After RDP/FDA lockdown the
 # force switch is inert and the bootloader region cannot be erased.
@@ -41,10 +48,8 @@ parser.add_argument("--keys", help="Keys dir to fully validate the signed app")
 parser.add_argument("--already-in-dfu", action="store_true",
                     help="Unit is already in STM32 ROM DFU; skip app connection")
 parser.add_argument("--dwell", type=float, metavar="SECONDS",
-                    help="Safety pre-check only: force ROM DFU and confirm the "
-                         "unit stays there for SECONDS (no writes). Recommended "
-                         "on the first legacy-bootloader unit to rule out an "
-                         "IWDG reset mid-migration.")
+                    help="Diagnostic only: force ROM DFU and confirm the "
+                         "unit stays there for SECONDS (no writes).")
 args = parser.parse_args()
 if args.bootloader and not args.app:
     parser.error("--bootloader requires --app")
@@ -66,13 +71,22 @@ if not args.already_in_dfu:
         sys.exit(1)
     interface.hvcontroller.ping()
 
-    # Advisory: report the cohort inferred from the running app version.
+    # Gate on the cohort inferred from the running app version: a legacy
+    # console must not be forced into ROM DFU (SR-021, IWDG), and an unread
+    # version could be one.
     try:
         ver = interface.hvcontroller.get_version()  # app version string
         cohort = infer_console_bootloader_from_app_version(str(ver))
-        print(f"Running app version : {ver}  (inferred cohort: {cohort})")
-    except Exception as e:
-        print(f"(could not read app version: {e})")
+    except Exception as e:  # reason: any read/parse failure means "unknown"
+        print(f"Could not read the app version ({e}); refusing to force ROM "
+              "DFU on a unit of unknown cohort.")
+        sys.exit(1)
+    print(f"Running app version : {ver}  (inferred cohort: {cohort})")
+    if cohort in (DFU_KIND_LEGACY, DFU_KIND_NO_DFU):
+        print("REFUSED: this console is on the legacy bootloader or has no "
+              "DFU. Recover it with BOOT0 (then rerun with --already-in-dfu) "
+              "or SWD.")
+        sys.exit(1)
 
     enter_fn = interface.hvcontroller.enter_stm32_rom_dfu
 
@@ -82,11 +96,11 @@ if args.dwell:
     stable = mgr.dwell_rom_dfu_check(enter_stm32_rom_dfu_fn=enter_fn,
                                      seconds=args.dwell)
     if stable:
-        print("STABLE - the unit held ROM DFU. Safe to migrate (rerun without "
-              "--dwell).")
+        print("STABLE - the unit held ROM DFU (rerun without --dwell to "
+              "migrate).")
         sys.exit(0)
     print("UNSTABLE - the unit dropped out of ROM DFU (likely IWDG). Do NOT "
-          "migrate this cohort over USB; use SWD/bench.")
+          "migrate this unit over USB; use SWD/bench.")
     sys.exit(1)
 
 print("Migrating (this forces ROM DFU, writes the bootloader + app, and "

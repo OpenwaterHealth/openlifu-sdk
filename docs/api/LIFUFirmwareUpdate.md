@@ -17,7 +17,9 @@ production image, `OW DFU x.y.z` → signed app (`LIFU BL DFU x.y.z` → refused
 — so a console whose app is dead is still recoverable as long as it reaches
 one of the first two.
 
-Legacy-bootloader units are not updatable by this SDK. The paths that migrated them authorized an interim image with the legacy bootloader's shared HMAC trust key, and that key was removed (SR-021, #91). Recover such a unit with BOOT0 (STM32 ROM DFU, then re-run) or SWD.
+Legacy-bootloader consoles are not updatable by this SDK. The paths that migrated them authorized an interim image with the legacy bootloader's shared HMAC trust key, and that key was removed (SR-021, #91). The keyless alternative, forcing the running app into the STM32 ROM loader, is refused too: the legacy bootloader's ~5 s IWDG would reset a ROM-DFU write after the mass erase. Recover such a unit with BOOT0 (STM32 ROM DFU, then re-run) or SWD.
+
+The low-level `LIFUDFUManager` console migration methods do not know the unit's cohort and do not refuse it; only this class does. Do not call them on a 1.2.3 – 1.2.5 console.
 
 Defaults to the firmware images **bundled with the SDK** and needs **no
 signing keys**: the secure bootloader verifies the app at boot.
@@ -91,7 +93,9 @@ Same auto-detect pattern for the transmitter. Module 0 (the USB master):
 | Legacy bootloader, **dead app** | — (unit parked in `LIFU BL DFU x.y.z`) | **Refused** (BOOT0 / SWD only) |
 
 A master whose app is corrupt parks in its legacy bootloader's USB DFU, where
-the ROM-loader switch is out of reach; legacy-bootloader units are not updatable by this SDK. The paths that migrated them authorized an interim image with the legacy bootloader's shared HMAC trust key, and that key was removed (SR-021, #91). Recover such a unit with BOOT0 (STM32 ROM DFU, then re-run) or SWD.
+the ROM-loader switch is out of reach. The legacy DFU itself writes only the app slot, and the paths that migrated a unit from there authorized an interim image with the legacy bootloader's shared HMAC trust key, which was removed (SR-021, #91). Recover such a unit with BOOT0 (STM32 ROM DFU, then re-run) or SWD.
+
+A legacy master whose app **runs** still migrates, through the STM32 ROM loader (row above). That path needs no key. Option (b) of #91 keeps it in the SDK for service units and out of the FDA bundle (OpenwaterHealth/openlifu-diathermy-application#99).
 
 **Slave modules** (`--module N`, N ≥ 1) are updated over I2C through the
 master's passthrough with `update_slave(module, ...)`:

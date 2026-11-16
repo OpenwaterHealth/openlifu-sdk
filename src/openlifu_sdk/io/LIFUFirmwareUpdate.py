@@ -170,11 +170,14 @@ def _no_legacy_path_message(device: str, where: str) -> str:
     The paths that used to get round that wrote an interim image into the
     slot and authorized it with the legacy bootloader's HMAC trust tag, whose
     key is shared and public; SR-021 removed that key from the SDK, and with
-    it every legacy-bootloader update path.
+    it every update path that needed it. What remains is keyless: the
+    STM32 ROM loader, reached with the 0x77 switch from a RUNNING legacy
+    transmitter master (never a console; see
+    :meth:`LIFUFirmwareUpdate._force_production_update`) or with BOOT0.
     """
     return (
-        f"the {device} is on the LEGACY bootloader ({where}). This SDK has "
-        "no legacy-bootloader update path: its DFU can write only the app "
+        f"the {device} is on the LEGACY bootloader ({where}). This SDK "
+        "cannot update it from there: the legacy DFU can write only the app "
         "slot, and the interim updaters that replaced the bootloader from "
         "there needed its shared HMAC trust key, which was removed (SR-021). "
         "Recover the unit in hardware: hold BOOT0 while power-cycling it, so "
@@ -205,8 +208,9 @@ class LIFUFirmwareUpdate:
 
       - **app >= 1.2.6** (current bootloader) → its own DFU → signed app.
       - **app 1.2.3 - 1.2.5** (legacy bootloader) → REFUSED: the legacy DFU
-        can only write the app slot, and this SDK has no legacy migration
-        (SR-021). BOOT0 or SWD.
+        can only write the app slot, the key-based migration is gone
+        (SR-021), and the ROM-loader reflash is unsafe under the legacy
+        bootloader's IWDG. BOOT0 or SWD.
       - **app 1.1.0 - 1.2.2** (no bootloader) → a plain DFU request reboots
         straight into the STM32 ROM DFU → combined production image.
       - **app < 1.1.0** → REFUSED: the DFU request never reaches a DFU
@@ -342,8 +346,10 @@ class LIFUFirmwareUpdate:
                                  progress_callback: Callable | None
                                  ) -> UpdateResult:
         """Force a FULL production reflash (bootloader + signed app) via the
-        STM32 ROM DFU, regardless of the unit's cohort — the path for rolling
-        a NEW BOOTLOADER onto a unit that is already on the secure bootloader.
+        STM32 ROM DFU — the path for rolling a NEW BOOTLOADER onto a unit
+        that is already on the secure bootloader. Also taken by no-bootloader
+        units and by a console already in the STM32 ROM DFU. Refused for the
+        no-DFU and legacy-bootloader cohorts (below).
 
         The running application is forced into the ROM loader with the
         OW_CMD_DFU hidden switch (reserved=0x77). Beta/unlocked units only:
@@ -394,7 +400,8 @@ class LIFUFirmwareUpdate:
         combined production image; the current bootloader's DFU (app
         >= 1.2.6) takes the signed app alone. Apps below 1.1.0 are refused —
         they never reach a DFU environment — and so are legacy-bootloader
-        units (app 1.2.3 - 1.2.5): this SDK has no legacy migration (SR-021).
+        units (app 1.2.3 - 1.2.5): the key-based migration is gone (SR-021)
+        and the ROM-loader reflash is unsafe for them (IWDG).
 
         Args:
             production_image: Override the combined bootloader+app image
@@ -406,8 +413,9 @@ class LIFUFirmwareUpdate:
                 version is below the installed one (still subject to the
                 bootloader's anti-rollback floor at boot).
             force_production: Reflash the FULL production image (bootloader +
-                app) via STM32 ROM DFU regardless of cohort — see
-                :meth:`_force_production_update`. Beta/unlocked units only.
+                app) via STM32 ROM DFU. Refused for no-DFU and
+                legacy-bootloader units — see :meth:`_force_production_update`.
+                Beta/unlocked units only.
 
         Returns:
             :class:`UpdateResult`.
@@ -502,7 +510,8 @@ class LIFUTransmitterFirmwareUpdate:
     whose app is corrupt instead sits in its LEGACY bootloader's own USB DFU
     ("LIFU BL DFU x.y.z"); :meth:`detect` reports ``(COHORT_LEGACY, "dfu")``
     and :meth:`update` REFUSES it: the legacy DFU can write only the app
-    slot, and this SDK has no legacy-bootloader path (SR-021). BOOT0 or SWD.
+    slot, and the key-based path that got round that is gone (SR-021).
+    BOOT0 or SWD.
 
     Slave modules (index >= 1) are updated over I2C through the master with
     :meth:`update_slave` — the master puts the slave into its bootloader's
@@ -658,14 +667,18 @@ class LIFUTransmitterFirmwareUpdate:
                                  progress_callback: Callable | None
                                  ) -> UpdateResult:
         """Force a FULL production reflash (bootloader + signed app) via the
-        STM32 ROM DFU, regardless of the unit's cohort — the path for rolling
-        a NEW BOOTLOADER onto a unit that is already on the secure bootloader.
+        STM32 ROM DFU — the path for rolling a NEW BOOTLOADER onto a unit
+        that is already on the secure bootloader. Any master whose app runs
+        (2.0.2 and up), or one already in the STM32 ROM DFU, can take it.
 
         The running application is forced into the ROM loader with the
         OW_CMD_DFU hidden switch (reserved=0x77). Beta/unlocked units only:
         after RDP/FDA lockdown the bootloader flash is protected and the
         switch is inert, so the flow aborts at the ROM-DFU gate without
         touching flash.
+
+        Refused: a no-DFU unit (app < 2.0.2), and a master parked in any
+        bootloader's DFU (the ROM loader is entered from the running app).
         """
         state, source = self.detect()
         in_rom_dfu = source == "dfu" and state == COHORT_NONE
@@ -705,8 +718,9 @@ class LIFUTransmitterFirmwareUpdate:
         A legacy-bootloader unit whose app still runs takes the ROM-DFU
         production-image migration, which also clears the anti-rollback
         floor. One found parked in its LEGACY bootloader's USB DFU (dead app)
-        is refused: the ROM loader is out of reach without the app, and this
-        SDK has no legacy-bootloader path (SR-021) — BOOT0 or SWD.
+        is refused: the ROM loader is out of reach without the app, and the
+        key-based path through the legacy DFU is gone (SR-021) — BOOT0 or
+        SWD.
 
         Args:
             signed_app: Override the signed app image (secure path). Defaults
@@ -718,7 +732,8 @@ class LIFUTransmitterFirmwareUpdate:
                 the installed one (still subject to the bootloader's
                 anti-rollback floor at boot).
             force_production: Reflash the FULL production image (bootloader +
-                app) via STM32 ROM DFU regardless of cohort — see
+                app) via STM32 ROM DFU. Refused for no-DFU units and for a
+                master parked in a bootloader's DFU — see
                 :meth:`_force_production_update`. Beta/unlocked units only.
 
         Returns:
@@ -860,8 +875,8 @@ class LIFUTransmitterFirmwareUpdate:
         I2C.
 
         Raises RuntimeError for the cohorts that cannot be updated over the
-        master's I2C passthrough — apps 2.0.4 - 2.0.7 (legacy bootloader: no
-        legacy path, SR-021), 2.0.2 - 2.0.3 (no bootloader: DFU entry lands
+        master's I2C passthrough — apps 2.0.4 - 2.0.7 (legacy bootloader: the
+        key-based I2C migration is gone, SR-021), 2.0.2 - 2.0.3 (no bootloader: DFU entry lands
         in the STM32 ROM loader, which does not speak this protocol) and
         < 2.0.2 (no OW_CMD_DFU handler at all) — and when the version cannot
         be read.
@@ -1226,8 +1241,10 @@ def main(argv: list[str] | None = None) -> int:
                         help="Secure path only: flash even if not newer.")
     parser.add_argument("--force-production", action="store_true",
                         help="Force a FULL production reflash (bootloader + "
-                             "app) regardless of the unit's state — the path "
-                             "for installing a NEW bootloader. Module 0: the "
+                             "app) — the path for installing a NEW "
+                             "bootloader. Refused for units with no DFU, "
+                             "legacy-bootloader consoles, units parked in a "
+                             "bootloader DFU and non-secure slaves. Module 0: the "
                              "running app is forced into the STM32 ROM "
                              "loader (OW_CMD_DFU reserved=0x77). Transmitter "
                              "slave (--module >= 1): the SIGNED DFU stub is "

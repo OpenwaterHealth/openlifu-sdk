@@ -9,7 +9,9 @@ Provides:
   - :class:`LIFUDFUManager`      — high-level firmware update orchestration:
       * transmitter modules: :meth:`LIFUDFUManager.update_module` — module 0
         accepts both SBSFU signed images ('SFU1', secure bootloader) and legacy
-        PGK1 packages (auto-detected by magic); modules 1+ use I2C passthrough
+        PGK1 packages (auto-detected by magic; a PGK1 metadata page is built
+        and authorized offline, so the SDK holds no key for it); modules 1+
+        use I2C passthrough
       * transmitter (secure bootloader, USB): :meth:`LIFUDFUManager.update_transmitter`
         (SBSFU signed image, with pre-erase validation and anti-downgrade checks)
       * console: :meth:`LIFUDFUManager.update_console` (SBSFU signed images from
@@ -235,8 +237,8 @@ def split_transmitter_flash_image(image: bytes) -> tuple[bytes, bytes]:
 # product string tells them apart:
 #   STM32 ROM DFU        : "STM32 BOOTLOADER"        (built-in system loader)
 #   legacy bootloader    : "LIFU BL DFU 0.0.x"       (non-secure, app @ 0x08008000;
-#                          detected so it can be refused: this SDK has no
-#                          legacy-bootloader update path, SR-021)
+#                          detected so it can be refused: the key-based
+#                          paths through it were removed, SR-021)
 #   secure bootloader    : "OW DFU 1.x.x"            (SBSFU, app slot @ 0x08010000)
 #                          "STM32 DownLoad Firmware Update"  (pre-branding
 #                          secure builds; version via the DFU virtual address)
@@ -285,9 +287,10 @@ def infer_console_bootloader_from_app_version(app_version: str) -> str:
       1.2.3 <= app < 1.2.6   -> LEGACY bootloader (``DFU_KIND_LEGACY``): the
                                 first custom bootloader. A DFU request enters
                                 ITS DFU, which can only write the app slot;
-                                this SDK has no update path through it
-                                (SR-021). The ROM loader (0x77 switch from a
-                                running app, or BOOT0) or SWD remain.
+                                the key-based paths through it were removed
+                                (SR-021). BOOT0 (ROM loader) or SWD remain;
+                                the 0x77 switch is unsafe on these units
+                                (legacy-BL IWDG).
       1.1.0 <= app < 1.2.3   -> NO bootloader (``DFU_KIND_NONE``): the app
                                 boots bare-metal and a DFU request reboots
                                 straight into the STM32 ROM DFU, where the
@@ -1061,7 +1064,10 @@ class LIFUDFUManager:
           - ``SFU1`` — SBSFU signed image (secure bootloader): written whole to
             the active slot with pre-erase validation and anti-downgrade checks.
           - otherwise — legacy ``PGK1`` package (fw + metadata page), for units
-            still on the legacy non-secure bootloader.
+            still on the legacy non-secure bootloader. The metadata page is
+            built and authorized offline; this SDK holds no key for it. Kept
+            as-is for service use; moving it behind a service interface is
+            #46.
 
         The module must already be in DFU bootloader mode.
         """
@@ -1760,12 +1766,19 @@ class LIFUDFUManager:
                         progress_callback: Callable | None = None) -> None:
         """End-to-end console bootloader migration for a beta unit.
 
-        Because every application build honours the hidden force-STM32-ROM-DFU
-        switch, ALL cohorts converge on the same path - no interim app:
+        The no-bootloader and secure-bootloader cohorts converge on the same
+        path - no interim app:
 
-          no-bootloader (<1.2.0), legacy BL (1.2.0-1.2.5), secure BL (>=1.2.6)
+          no-bootloader (1.1.0-1.2.2), secure BL (>=1.2.6)
             --enter_stm32_rom_dfu_fn()-->  STM32 ROM DFU
             --migrate_console_rom_dfu()-->  new secure BL + signed app
+
+        NOT for a legacy-bootloader console (app 1.2.3 - 1.2.5): its
+        bootloader intercepts the force request, and its ~5 s IWDG would
+        reset the unit mid-write after the mass erase. This method does not
+        know the running app version and does not check it; the caller must.
+        :class:`~openlifu_sdk.io.LIFUFirmwareUpdate.LIFUFirmwareUpdate` does,
+        and refuses that cohort (SR-021).
 
         Args:
             bootloader_bin: Raw secure bootloader binary.
@@ -1842,6 +1855,13 @@ class LIFUDFUManager:
 
         NOTE: beta/unlocked units only. After RDP/FDA lockdown the force
         switch is inert and the flash cannot be mass-erased over DFU.
+
+        NOT for a legacy-bootloader console (app 1.2.3 - 1.2.5): its
+        bootloader intercepts the force request, and its ~5 s IWDG would
+        reset the unit mid-write after the mass erase. This method does not
+        know the running app version and does not check it; the caller must.
+        :class:`~openlifu_sdk.io.LIFUFirmwareUpdate.LIFUFirmwareUpdate` does,
+        and refuses that cohort (SR-021).
         """
         from openlifu_sdk.io import LIFUCrypto
 
@@ -1905,11 +1925,12 @@ class LIFUDFUManager:
         """Force STM32 ROM DFU (if *enter_stm32_rom_dfu_fn* is given) and then
         watch that the device stays enumerated in ROM DFU for *seconds*.
 
-        This is the pre-migration safety check for legacy-bootloader units:
-        the legacy bootloader arms a ~5 s IWDG before launching the app, and
-        if that watchdog keeps running after the app jumps to ROM DFU it would
-        reset the unit mid-write. A stable dwell (no disappearance, kind stays
-        ROM) means the migration window is safe.
+        A write-free diagnostic: it shows whether the unit reaches the ROM
+        loader and stays there (no wrong-DFU landing, no watchdog reset
+        loop). It was written for legacy-bootloader units, whose ~5 s IWDG
+        could reset a ROM-DFU write mid-way. A stable dwell does NOT make a
+        legacy console a supported migration target: the SDK refuses that
+        cohort (SR-021), whatever this check returns.
 
         Returns:
             True if the device stayed in ROM DFU for the whole window.
