@@ -893,8 +893,7 @@ class TestInterfacePresetLoad(unittest.TestCase):
         iface.hvcontroller.deselect_preset.assert_called_once_with()   # still tried
 
     def test_start_sonication_waits_up_to_10_s_for_hv_to_settle(self):
-        # turn_hv_on alone takes ~4.8 s on hardware (operator-interface#225).
-        self.assertEqual(SETTLE_TIME_HV_ON, 10)
+        self.assertEqual(SETTLE_TIME_HV_ON, 10)   # design decision, #121
         iface = self._mocked()
         iface.txdevice.get_trigger_json.return_value = {"TriggerStatus": "STOPPED"}
         iface.start_sonication()
@@ -914,23 +913,25 @@ class TestInterfacePresetLoad(unittest.TestCase):
         iface.hvcontroller.turn_hv_off.assert_called_once_with()
         self.assertNotEqual(iface.status, LIFUInterfaceStatus.STATUS_RUNNING)
 
-    def test_a_rail_that_never_settles_is_refused_at_the_ceiling_not_before(self):
-        # The real wait_for_settle loop, on a fake clock, with the ceiling start_sonication passes.
+    def test_a_rail_that_never_settles_is_refused_at_the_10_s_ceiling(self):
+        # The real wait_for_settle loop, on a fake clock that steps 1 ms per read,
+        # given the ceiling start_sonication passes. A 9.9 s ceiling would fail this.
         hv = HVController()
         hv.is_hv_on, hv.supply_voltage = True, 40.0
         hv.get_voltage = MagicMock(return_value=0.0)   # never reaches 40 V
-        clock = [1000.0]
+        reads = []
 
         def tick():
-            clock[0] += 0.1
-            return clock[0]
+            reads.append(1000.0 + 0.001 * len(reads))
+            return reads[-1]
 
         with patch("openlifu_sdk.io.LIFUHVController.time.time", side_effect=tick), \
              patch("openlifu_sdk.io.LIFUHVController.time.sleep"):
             with self.assertRaises(LIFUHVSettleError):
                 hv.wait_for_settle(timeout=SETTLE_TIME_HV_ON)
-        self.assertGreaterEqual(clock[0] - 1000.0, 10.0)
-        self.assertLess(clock[0] - 1000.0, 11.0)
+        elapsed = reads[-1] - reads[0]   # from the loop's start_time to the read that ended it
+        self.assertGreaterEqual(elapsed, 10.0)
+        self.assertLess(elapsed, 10.01)
 
     def test_load_preset_settle_uses_the_same_10_s(self):
         iface = self._mocked()
