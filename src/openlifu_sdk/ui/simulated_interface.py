@@ -1573,7 +1573,7 @@ class SimulatedDeviceInterface(QObject):
         try:
             if turn_hv_on:
                 self.hvcontroller.turn_hv_on()
-            if wait_for_settle:
+            if wait_for_settle and self.hvcontroller.get_hv_status():
                 self.hvcontroller.wait_for_settle(timeout=SETTLE_TIME_HV_ON)
             self._engine = _SimulatedRunEngine(
                 txdevice=self.txdevice,

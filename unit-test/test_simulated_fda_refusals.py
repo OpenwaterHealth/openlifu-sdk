@@ -179,6 +179,23 @@ def test_load_preset_settle_uses_the_same_10_s(iface, monkeypatch):
     assert timeouts == [10]
 
 
+@pytest.mark.parametrize("op", ["start_sonication", "load_preset"])
+def test_no_settle_wait_with_hv_off(iface, monkeypatch, op):
+    # As DeviceInterface: settle only with HV on.
+    if op == "start_sonication":
+        _load(iface)
+    timeouts = []
+    monkeypatch.setattr(iface.hvcontroller, "wait_for_settle",
+                        lambda timeout: timeouts.append(timeout) or True)
+    if op == "start_sonication":
+        iface.start_sonication(turn_hv_on=False, wait_for_settle=True)
+        iface.stop_sonication()
+    else:
+        settings_crc, regs = iface.preset
+        iface.load_preset(0, settings_crc, regs, 400_000.0, turn_hv_on=False, wait_for_settle=True)
+    assert timeouts == []
+
+
 def test_a_trigger_refusal_turns_hv_back_off(iface):
     _load(iface)
     iface.txdevice._modules[0].temp_c = 80.0

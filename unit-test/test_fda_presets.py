@@ -914,6 +914,24 @@ class TestInterfacePresetLoad(unittest.TestCase):
         iface.hvcontroller.turn_hv_off.assert_called_once_with()
         self.assertNotEqual(iface.status, LIFUInterfaceStatus.STATUS_RUNNING)
 
+    def test_a_rail_that_never_settles_is_refused_at_the_ceiling_not_before(self):
+        # The real wait_for_settle loop, on a fake clock, with the ceiling start_sonication passes.
+        hv = HVController()
+        hv.is_hv_on, hv.supply_voltage = True, 40.0
+        hv.get_voltage = MagicMock(return_value=0.0)   # never reaches 40 V
+        clock = [1000.0]
+
+        def tick():
+            clock[0] += 0.1
+            return clock[0]
+
+        with patch("openlifu_sdk.io.LIFUHVController.time.time", side_effect=tick), \
+             patch("openlifu_sdk.io.LIFUHVController.time.sleep"):
+            with self.assertRaises(LIFUHVSettleError):
+                hv.wait_for_settle(timeout=SETTLE_TIME_HV_ON)
+        self.assertGreaterEqual(clock[0] - 1000.0, 10.0)
+        self.assertLess(clock[0] - 1000.0, 11.0)
+
     def test_load_preset_settle_uses_the_same_10_s(self):
         iface = self._mocked()
         iface.hvcontroller.get_hv_status.return_value = True
