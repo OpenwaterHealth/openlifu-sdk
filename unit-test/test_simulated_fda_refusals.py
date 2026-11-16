@@ -144,6 +144,27 @@ def test_start_sonication_with_nothing_loaded_is_refused_with_hv_off(iface, turn
     assert iface.get_status() != LIFUInterfaceStatus.STATUS_RUNNING
 
 
+def test_start_sonication_waits_up_to_10_s_for_hv_to_settle(iface, monkeypatch):
+    # Same settle call and ceiling as DeviceInterface.start_sonication.
+    _load(iface)
+    timeouts = []
+    monkeypatch.setattr(iface.hvcontroller, "wait_for_settle",
+                        lambda timeout: timeouts.append(timeout) or True)
+    iface.start_sonication(turn_hv_on=True, wait_for_settle=True)
+    assert timeouts == [10]
+    assert iface.hvcontroller.get_hv_status() is True
+    iface.stop_sonication()
+
+
+def test_load_preset_settle_uses_the_same_10_s(iface, monkeypatch):
+    timeouts = []
+    monkeypatch.setattr(iface.hvcontroller, "wait_for_settle",
+                        lambda timeout: timeouts.append(timeout) or True)
+    settings_crc, regs = iface.preset
+    iface.load_preset(0, settings_crc, regs, 400_000.0, turn_hv_on=True, wait_for_settle=True)
+    assert timeouts == [10]
+
+
 def test_a_trigger_refusal_turns_hv_back_off(iface):
     _load(iface)
     iface.txdevice._modules[0].temp_c = 80.0

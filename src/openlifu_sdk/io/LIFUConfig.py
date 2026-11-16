@@ -271,7 +271,12 @@ USB_POLL_INTERVAL = 0.5     # seconds – USB presence polling in async mode
 MAX_DATA_LEN = 4096         # maximum payload bytes (sanity guard)
 HW_ID_DATA_LENGTH = 12      # hardware ID is 12 bytes
 
-SETTLE_TIME_HV_ON = 5
+# Ceiling, in seconds, on waiting for the HV rail to settle after it is
+# turned on (start_sonication, load_preset/set_solution with
+# wait_for_settle). wait_for_settle returns as soon as the rail settles, so
+# this only bounds a rail that does not. 10 s leaves margin over the ~4.8 s
+# turn_hv_on measured on hardware (openlifu-operator-interface#225).
+SETTLE_TIME_HV_ON = 10
 SETTLE_TIME_HV_OFF = 15
 
 TEMPERATURE_DATA_LENGTH = 4  # temperature responses are 4 bytes (float32)

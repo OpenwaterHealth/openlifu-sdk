@@ -78,6 +78,7 @@ from openlifu_sdk.io.LIFUConfig import (
     OW_NO_PRESET,
     OW_PRESET_BUSY,
     OW_TEMP_TOO_HIGH,
+    SETTLE_TIME_HV_ON,
 )
 from openlifu_sdk.io.LIFUTXDevice import PRESET_TEMP_SCALE
 from openlifu_sdk.io.LIFUTXPresets import (
@@ -911,6 +912,13 @@ class SimulatedHVController:
     def get_12v_status(self) -> bool:
         return self._v12_on
 
+    def wait_for_settle(self, range_volts: float = 2, settle_time: float = 0.2,
+                        timeout: float = 15.0, polling_interval: float = 0.1) -> bool:
+        """The simulated rail settles at once; take *settle_time* to do so,
+        as a real rail that settles immediately would."""
+        time.sleep(settle_time)
+        return True
+
     def get_version(self) -> str:
         return self._fw_version
 
@@ -1544,7 +1552,7 @@ class SimulatedDeviceInterface(QObject):
             if turn_hv_on:
                 self.hvcontroller.turn_hv_on()
             if wait_for_settle:
-                time.sleep(0.2)
+                self.hvcontroller.wait_for_settle(timeout=SETTLE_TIME_HV_ON)
         except Exception:  # reason: any failure must not leave half a preset loaded; re-raised
             self.unload_preset()
             self.set_status(LIFUInterfaceStatus.STATUS_ERROR)
@@ -1566,9 +1574,7 @@ class SimulatedDeviceInterface(QObject):
             if turn_hv_on:
                 self.hvcontroller.turn_hv_on()
             if wait_for_settle:
-                # Brief settle delay (real device is ~200 ms); not perceptible
-                # but matches the real code path's blocking nature.
-                time.sleep(0.2)
+                self.hvcontroller.wait_for_settle(timeout=SETTLE_TIME_HV_ON)
             self._engine = _SimulatedRunEngine(
                 txdevice=self.txdevice,
                 hvcontroller=self.hvcontroller,

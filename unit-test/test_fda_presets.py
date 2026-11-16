@@ -40,6 +40,7 @@ from openlifu_sdk.io.LIFUConfig import (
     OW_POWER_HV_ON,
     OW_POWER_PRESET_SELECT,
     OW_POWER_SET_HV,
+    SETTLE_TIME_HV_ON,
     OW_PRESET_LOAD,
     OW_RESP,
     OW_TX7332,
@@ -890,6 +891,23 @@ class TestInterfacePresetLoad(unittest.TestCase):
             iface.load_preset(0, 0xABCD, 0xDCBA, 400000.0)
         self.assertEqual(raised.exception.device_error_code, OW_BAD_CRC)
         iface.hvcontroller.deselect_preset.assert_called_once_with()   # still tried
+
+    def test_start_sonication_waits_up_to_10_s_for_hv_to_settle(self):
+        # turn_hv_on alone takes ~4.8 s on hardware (operator-interface#225).
+        self.assertEqual(SETTLE_TIME_HV_ON, 10)
+        iface = self._mocked()
+        iface.hvcontroller.reset_mock()
+        iface.txdevice.get_trigger.return_value = {"trigger_status": "STOPPED"}
+        iface.start_sonication()
+        iface.hvcontroller.turn_hv_on.assert_called_once_with()
+        iface.hvcontroller.wait_for_settle.assert_called_once_with(timeout=10)
+        iface.txdevice.start_trigger.assert_called_once_with()
+
+    def test_load_preset_settle_uses_the_same_10_s(self):
+        iface = self._mocked()
+        iface.hvcontroller.get_hv_status.return_value = True
+        iface.load_preset(0, 0xABCD, 0xDCBA, 400000.0, turn_hv_on=True, wait_for_settle=True)
+        iface.hvcontroller.wait_for_settle.assert_called_once_with(timeout=10)
 
     def test_no_trigger_no_hv(self):
         # A transmitter with nothing loaded refuses to start: HV must not stay on.
