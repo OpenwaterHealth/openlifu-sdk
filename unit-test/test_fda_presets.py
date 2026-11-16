@@ -24,7 +24,7 @@ _SRC = os.path.join(os.path.dirname(__file__), "..", "src")
 if _SRC not in sys.path:
     sys.path.insert(0, _SRC)
 
-from openlifu_sdk.io.exceptions import LIFUDeviceError, LIFUError, LIFUSolutionError
+from openlifu_sdk.io.exceptions import LIFUDeviceError, LIFUError, LIFUHVSettleError, LIFUSolutionError
 from openlifu_sdk.io.LIFUConfig import (
     LIFU_ERR_MODULE_COUNT_MISMATCH,
     OW_BAD_CRC,
@@ -40,12 +40,12 @@ from openlifu_sdk.io.LIFUConfig import (
     OW_POWER_HV_ON,
     OW_POWER_PRESET_SELECT,
     OW_POWER_SET_HV,
-    SETTLE_TIME_HV_ON,
     OW_PRESET_LOAD,
     OW_RESP,
     OW_TX7332,
     OW_TX7332_DEVICE_COUNT,
     OW_TX7332_WREG,
+    SETTLE_TIME_HV_ON,
 )
 from openlifu_sdk.io.LIFUHVController import HVController, LIFUHVController
 from openlifu_sdk.io.LIFUInterface import DeviceInterface, LIFUInterface, LIFUInterfaceStatus
@@ -896,12 +896,23 @@ class TestInterfacePresetLoad(unittest.TestCase):
         # turn_hv_on alone takes ~4.8 s on hardware (operator-interface#225).
         self.assertEqual(SETTLE_TIME_HV_ON, 10)
         iface = self._mocked()
-        iface.hvcontroller.reset_mock()
-        iface.txdevice.get_trigger.return_value = {"trigger_status": "STOPPED"}
+        iface.txdevice.get_trigger_json.return_value = {"TriggerStatus": "STOPPED"}
         iface.start_sonication()
         iface.hvcontroller.turn_hv_on.assert_called_once_with()
         iface.hvcontroller.wait_for_settle.assert_called_once_with(timeout=10)
         iface.txdevice.start_trigger.assert_called_once_with()
+        self.assertEqual(iface.status, LIFUInterfaceStatus.STATUS_RUNNING)
+
+    def test_a_rail_that_does_not_settle_refuses_start_with_hv_off(self):
+        # SR-007: past the settle ceiling, Start is refused and HV goes back off.
+        iface = self._mocked()
+        iface.txdevice.get_trigger_json.return_value = {"TriggerStatus": "STOPPED"}
+        iface.hvcontroller.wait_for_settle.side_effect = LIFUHVSettleError("did not settle")
+        with self.assertRaises(LIFUHVSettleError):
+            iface.start_sonication()
+        iface.txdevice.start_trigger.assert_not_called()
+        iface.hvcontroller.turn_hv_off.assert_called_once_with()
+        self.assertNotEqual(iface.status, LIFUInterfaceStatus.STATUS_RUNNING)
 
     def test_load_preset_settle_uses_the_same_10_s(self):
         iface = self._mocked()

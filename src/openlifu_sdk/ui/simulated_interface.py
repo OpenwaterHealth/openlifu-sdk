@@ -1551,7 +1551,7 @@ class SimulatedDeviceInterface(QObject):
             self._last_solution_voltage = applied
             if turn_hv_on:
                 self.hvcontroller.turn_hv_on()
-            if wait_for_settle:
+            if self.hvcontroller.get_hv_status() and wait_for_settle:
                 self.hvcontroller.wait_for_settle(timeout=SETTLE_TIME_HV_ON)
         except Exception:  # reason: any failure must not leave half a preset loaded; re-raised
             self.unload_preset()

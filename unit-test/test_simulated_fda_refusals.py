@@ -24,7 +24,7 @@ pytest.importorskip("openlifu_sdk.ui._qt")
 
 from sr003_presets import flash_entry, two_module_flash_entry  # noqa: E402 -- reason: after the Qt importorskip
 
-from openlifu_sdk.io.exceptions import LIFUDeviceError, LIFUError, LIFUSolutionError  # noqa: E402 -- reason: after the Qt importorskip
+from openlifu_sdk.io.exceptions import LIFUDeviceError, LIFUError, LIFUHVSettleError, LIFUSolutionError  # noqa: E402 -- reason: after the Qt importorskip
 from openlifu_sdk.io.LIFUConfig import (  # noqa: E402 -- reason: after the Qt importorskip
     LIFU_ERR_MODULE_COUNT_MISMATCH,
     OW_HV_FDA_REFUSED,
@@ -154,6 +154,20 @@ def test_start_sonication_waits_up_to_10_s_for_hv_to_settle(iface, monkeypatch):
     assert timeouts == [10]
     assert iface.hvcontroller.get_hv_status() is True
     iface.stop_sonication()
+
+
+def test_a_rail_that_does_not_settle_refuses_start_with_hv_off(iface, monkeypatch):
+    _load(iface)
+
+    def never_settles(timeout):
+        raise LIFUHVSettleError(f"did not settle within {timeout} S")
+
+    monkeypatch.setattr(iface.hvcontroller, "wait_for_settle", never_settles)
+    with pytest.raises(LIFUHVSettleError):
+        iface.start_sonication(turn_hv_on=True, wait_for_settle=True)
+    assert iface.hvcontroller.get_hv_status() is False
+    assert not iface.is_running()
+    assert iface.get_status() != LIFUInterfaceStatus.STATUS_RUNNING
 
 
 def test_load_preset_settle_uses_the_same_10_s(iface, monkeypatch):
