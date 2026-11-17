@@ -104,6 +104,11 @@ I2C_DFU_STATUS_BUSY     = 0x01
 I2C_DFU_STATUS_ERROR    = 0x02
 I2C_DFU_STATUS_BAD_ADDR = 0x03
 I2C_DFU_STATUS_FLASH_ERR= 0x04
+# The download was refused before anything was erased: its first block was
+# not a signed header that passed the bootloader's check (signature for this
+# board, version not below the installed one / anti-rollback floor, size).
+# open-lifu-transmitter-bl >= 1.1.0 (Core/Inc/dfu_guard.h).
+I2C_DFU_STATUS_REJECTED = 0x05
 I2C_DFU_STATE_DNBUSY    = 0x01
 I2C_DFU_STATE_ERROR     = 0x04
 # Maximum data bytes per write_block call.  The enclosing OW_I2C_PASSTHRU UART
@@ -113,6 +118,18 @@ I2C_DFU_STATE_ERROR     = 0x04
 # must be ≤ 2041.  Use 512 for a safe, standard I2C block size.
 I2C_DFU_MAX_XFER_SIZE   = 512
 I2C_DFU_VERSION_STR_MAX = 32
+
+
+class DFUWriteRefusedError(RuntimeError):
+    """The bootloader reported a failed DFU write (USB ``dfuERROR`` after a
+    data block, I2C status ``REJECTED``/error), as opposed to a transport
+    fault. Not retried: the same block would be refused again.
+
+    A bootloader that checks the signed header before erasing
+    (open-lifu-transmitter-bl >= 1.1.0) refuses a wrong-board, tampered,
+    downgraded or oversized image at the first block and keeps its
+    installed firmware.
+    """
 
 
 @dataclass
@@ -761,7 +778,18 @@ class STM32USBDFU:
         self._ctrl_out(
             self.DFU_DNLOAD, block_num, bytes(payload) if payload else b""
         )
-        return self._wait_while_busy()
+        st = self._wait_while_busy()
+        # A data block (wBlockNum >= 2) the device failed leaves it in
+        # dfuERROR. Report it: _prepare_dnload() would otherwise clear the
+        # error before the next block and the write would carry on with a
+        # hole (or, on a bootloader that checks the header before erasing,
+        # past a refused image). Block 0 commands (erase / set address)
+        # keep their previous, lenient handling.
+        if block_num >= 2 and st["state"] == self.STATE_DFU_ERROR:
+            raise DFUWriteRefusedError(
+                f"device refused DFU block {block_num} "
+                f"(bStatus 0x{st['status']:02X})")
+        return st
 
     def _set_address(self, address: int) -> None:
         payload = bytes([self.CMD_SET_ADDRESS_POINTER]) + struct.pack("<I", address)
@@ -895,6 +923,15 @@ class STM32USBDFU:
             try:
                 self._dnload(block, chunk)
                 return block + 1
+            except DFUWriteRefusedError as e:
+                # The device answered and failed the block: not a bus glitch.
+                hint = ("; the bootloader refused the image header (wrong key for "
+                        "this board, tampered, version below the installed one or "
+                        "the anti-rollback floor, or too large); a bootloader that "
+                        "checks before erasing keeps its installed firmware"
+                        if offset == 0 else "")
+                raise DFUWriteRefusedError(
+                    f"USB DFU write refused at offset 0x{offset:X}: {e}{hint}") from e
             except Exception as e:
                 if attempt == 2:
                     raise
@@ -1043,12 +1080,32 @@ class STM32I2CDFUviaMaster:
         return {"status": raw[0], "state": raw[1]}
 
     def _wait_while_busy(self, timeout_s: float = 10.0) -> dict:
+        """Poll GETSTATUS until the slave has finished the last command.
+
+        A failed poll is retried until the deadline. A bootloader that checks
+        the signed header before erasing (open-lifu-transmitter-bl >= 1.1.0)
+        leaves the I2C bus for its ~1.5 s Secure Engine signature check
+        (interrupts are masked meanwhile), so polls in that window are NACKed
+        and the master reports the exchange as failed.
+        """
         _ERROR_STATUSES = (I2C_DFU_STATUS_ERROR, I2C_DFU_STATUS_BAD_ADDR, I2C_DFU_STATUS_FLASH_ERR)
         deadline = time.monotonic() + timeout_s
+        last_error: Exception | None = None
         while time.monotonic() < deadline:
-            st = self.get_status()
+            try:
+                st = self.get_status()
+            except RuntimeError as e:
+                last_error = e
+                time.sleep(0.050)
+                continue
+            if st["status"] == I2C_DFU_STATUS_REJECTED:
+                raise DFUWriteRefusedError(
+                    f"I2C DFU: the slave at 0x{self._addr:02X} refused the image "
+                    "before erasing anything (wrong key for this board, tampered "
+                    "header, version below the installed one or the anti-rollback "
+                    "floor, or too large); its installed firmware is intact")
             if st["state"] == I2C_DFU_STATE_ERROR or st["status"] in _ERROR_STATUSES:
-                raise RuntimeError(
+                raise DFUWriteRefusedError(
                     f"I2C DFU error: status=0x{st['status']:02X}, "
                     f"state=0x{st['state']:02X}"
                 )
@@ -1056,7 +1113,8 @@ class STM32I2CDFUviaMaster:
                     and st["state"] != I2C_DFU_STATE_DNBUSY):
                 return st
             time.sleep(0.020)
-        raise TimeoutError(f"I2C DFU timed out after {timeout_s:.0f} s")
+        suffix = f" (last poll failed: {last_error})" if last_error else ""
+        raise TimeoutError(f"I2C DFU timed out after {timeout_s:.0f} s{suffix}")
 
     def erase_page(self, address: int) -> None:
         """Erase the flash page containing *address*."""
