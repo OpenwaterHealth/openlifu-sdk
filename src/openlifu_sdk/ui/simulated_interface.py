@@ -67,10 +67,18 @@ else:
         _QT_BACKEND = "PythonQt"
 
 from openlifu_sdk.io import LIFUInterfaceStatus
-from openlifu_sdk.io.exceptions import LIFUDeviceError, LIFUError, LIFUSolutionError
+from openlifu_sdk.io.exceptions import LIFUDeviceError, LIFUError, LIFUHVFaultError, LIFUSolutionError
 from openlifu_sdk.io.LIFUConfig import (
     LIFU_ERR_MODULE_COUNT_MISMATCH,
+    HV_FAULT_ADC_FAIL,
+    HV_FAULT_HVM_HIGH,
+    HV_FAULT_HVM_LOW,
+    HV_FAULT_HVP_HIGH,
+    HV_FAULT_HVP_LOW,
+    HV_FAULT_NONE,
+    HV_MONITOR_STATUS_VERSION,
     OW_BAD_CRC,
+    OW_HV_FAULT,
     OW_HV_FDA_REFUSED,
     OW_HV_NO_PRESET,
     OW_HV_PRESET_CRC,
@@ -81,6 +89,7 @@ from openlifu_sdk.io.LIFUConfig import (
     OW_TEMP_TOO_HIGH,
     SETTLE_TIME_HV_ON,
 )
+from openlifu_sdk.io.LIFUHVController import hv_fault_name
 from openlifu_sdk.io.LIFUTXDevice import PRESET_TEMP_SCALE
 from openlifu_sdk.io.LIFUTXPresets import (
     console_record_window,
@@ -116,6 +125,9 @@ TX_AMBIENT_C = 25.0
 TX_TEMP_NOISE_SIGMA = 0.2
 HV_TEMP_NOISE_SIGMA = 0.1
 HV_VMON_NOISE_SIGMA = 0.05
+# The console's HV rail monitor (hv_monitor.h, console-fw#48/#49).
+HV_MONITOR_TOL = 0.03          # HV_MONITOR_TOL: the window is V_set +/- 3 %
+HV_MONITOR_SETTLE_S = 1.0      # HV_MONITOR_SETTLE_MS: armed this long after HV on / a new V_set
 
 # Auto-connect delay after start_monitoring() (seconds). Set to 0 so
 # the simulator reports HV + TX as already connected when the QML
@@ -852,12 +864,26 @@ class SimulatedHVController:
         self.signal_error = OWSignal()
 
         self._connected = False
-        self._hv_on = False
+        self._hv_on = False             # the console's HV (getHVOnStatus)
+        self.is_hv_on = False           # the host's cached view, as HVController.is_hv_on
         self._v12_on = True
         self._voltage_setpoint = 0.0
         self.supply_voltage = 0.0
         self.last_device_sensitivity: Optional[float] = None
         self._selected_preset_index: Optional[int] = None
+        # SR-025 HV rail monitor, as hv_monitor.c's `mon` (console-fw#48/#49).
+        # The setpoint and window it holds the rails to change only where the
+        # firmware calls hv_monitor_set_point (_set_monitor_point); a trip
+        # leaves them. The latch is the cause, the rails at the trip and when
+        # it tripped: inject_hv_fault() sets it; a select or deselect that
+        # succeeds (FDA image) or a set_voltage (RUO) clears it.
+        self._mon_v_set = 0.0
+        self._mon_window = (0.0, 0.0)
+        self._mon_preset_range = False
+        self._mon_settle_from = 0.0     # time.monotonic() the settle period started
+        self._hv_fault = HV_FAULT_NONE
+        self._hv_fault_rails = (0.0, 0.0)
+        self._hv_fault_time: Optional[float] = None
         # Matches SimulatedTxDevice's default preset; its sensitivity equals the
         # default transmitter calibration at 400 kHz, so a select applies 40 V.
         self._presets = [{
@@ -897,19 +923,135 @@ class SimulatedHVController:
 
     # ---- methods --------------------------------------------------------
 
+    def _refuse_hv_on_while_faulted(self) -> None:
+        if self._hv_fault != HV_FAULT_NONE:
+            raise LIFUDeviceError(f"HV: HV fault latched ({hv_fault_name(self._hv_fault)})",
+                                  device_error_code=OW_HV_FAULT)
+
+    def _hv_enabled(self) -> None:
+        """HV on: the console's HV, the host's view, and the monitor's
+        settle period (hv_monitor_hv_enabled)."""
+        self._hv_on = True
+        self.is_hv_on = True
+        self._mon_settle_from = time.monotonic()
+
     def turn_hv_on(self):
-        """An FDA_MODE console refuses HV on until a preset is selected."""
+        """An FDA_MODE console refuses HV on while an HV fault is latched
+        (OW_HV_FAULT) and until a preset is selected (OW_HV_NO_PRESET), in
+        that order (hv_monitor_process runs before hv_presets_process)."""
+        self._refuse_hv_on_while_faulted()
         if self._selected_preset_index is None:
             raise LIFUDeviceError("HV: no preset selected", device_error_code=OW_HV_NO_PRESET)
-        self._hv_on = True
+        self._hv_enabled()
         return True
 
     def turn_hv_off(self):
         self._hv_on = False
+        self.is_hv_on = False
         return True
 
     def get_hv_status(self) -> bool:
         return self._hv_on
+
+    def _set_monitor_point(self, v_set: float, voltage_range: tuple[float, float] | None = None) -> None:
+        """hv_monitor_set_point (hv_monitor.c): the setpoint the monitor
+        holds the rails to, and its window, V_set +/- 3 % (HV_MONITOR_TOL)
+        in float32, clamped to the preset's range when there is one. A
+        V_set of 0 leaves the monitor idle. Restarts the settle period."""
+        self._mon_v_set = float(v_set)
+        self._mon_preset_range = voltage_range is not None
+        if v_set > 0:
+            low = _f32(_f32(1.0 - _f32(HV_MONITOR_TOL)) * _f32(v_set))
+            high = _f32(_f32(1.0 + _f32(HV_MONITOR_TOL)) * _f32(v_set))
+            if voltage_range is not None:
+                low, high = max(low, voltage_range[0]), min(high, voltage_range[1])
+            self._mon_window = (low, high)
+        else:
+            self._mon_window = (0.0, 0.0)
+        self._mon_settle_from = time.monotonic()
+
+    def _monitor_armed(self) -> bool:
+        """hv_monitor.c armed(): HV on at a setpoint, past the settle time."""
+        return (self._hv_on and self._mon_v_set > 0
+                and time.monotonic() - self._mon_settle_from >= HV_MONITOR_SETTLE_S)
+
+    def inject_hv_fault(self, cause: int) -> None:
+        """Simulate the console's HV rail monitor tripping (SR-025): turn HV
+        off and latch *cause* (HV_FAULT_HVP_HIGH..HV_FAULT_ADC_FAIL) with
+        the rails at the trip, as the firmware does. The monitor's setpoint
+        and window are left as they were. The host's :attr:`is_hv_on` is
+        not touched: the host learns of the trip only by reading it. Test /
+        debug-UI hook.
+
+        The firmware only trips with HV on, armed, at a setpoint. Injecting
+        with HV off, or within the settle time, stands for a trip the test
+        does not want to wait for, or one latched earlier (say, before a
+        host restart): the at-trip rails are still those of the setpoint.
+
+        Raises:
+            ValueError: *cause* is not a fault cause (HV_FAULT_NONE included:
+                only a select, deselect or set_voltage clears the latch); a
+                fault is already latched (HV cannot be on to trip again); or
+                the monitor has no setpoint, so it is idle and cannot trip.
+        """
+        if cause not in (HV_FAULT_HVP_HIGH, HV_FAULT_HVP_LOW, HV_FAULT_HVM_HIGH,
+                         HV_FAULT_HVM_LOW, HV_FAULT_ADC_FAIL):
+            raise ValueError(f"not an HV fault cause: {cause!r}")
+        if self._hv_fault != HV_FAULT_NONE:
+            raise ValueError(f"an HV fault is already latched: {hv_fault_name(self._hv_fault)}")
+        if self._mon_v_set <= 0:
+            raise ValueError("no HV setpoint applied: nothing for the monitor to trip on")
+        low, high = self._mon_window
+        v = float(self._voltage_setpoint)   # the supply's output, the in-window rail
+        hvp, hvm = v, v
+        if cause == HV_FAULT_HVP_HIGH:
+            hvp = high * 1.05
+        elif cause == HV_FAULT_HVP_LOW:
+            hvp = low * 0.9
+        elif cause == HV_FAULT_HVM_HIGH:
+            hvm = high * 1.05
+        elif cause == HV_FAULT_HVM_LOW:
+            hvm = low * 0.9
+        else:
+            hvp, hvm = 0.0, 0.0
+        self._hv_on = False
+        self._hv_fault = cause
+        self._hv_fault_rails = (hvp, hvm)
+        self._hv_fault_time = time.monotonic()
+        logger.info("Simulated HV fault %s injected", hv_fault_name(cause))
+
+    def _clear_hv_fault(self) -> None:
+        """hv_monitor_clear_fault (hv_monitor.c)."""
+        self._hv_fault = HV_FAULT_NONE
+        self._hv_fault_rails = (0.0, 0.0)
+        self._hv_fault_time = None
+
+    def get_hv_monitor(self) -> dict:
+        """Same shape and host-side effect as :meth:`HVController.get_hv_monitor`."""
+        if self._hv_fault != HV_FAULT_NONE:
+            self.is_hv_on = False
+        return {"voltage": round(self.get_voltage(), 2), "fault": self._hv_fault,
+                "fault_name": hv_fault_name(self._hv_fault)}
+
+    def get_hv_monitor_status(self) -> dict:
+        """Same shape and host-side effect as
+        :meth:`HVController.get_hv_monitor_status` (v1), with the values
+        status_reply (hv_monitor.c) gives: ``hvp`` / ``hvm`` are the last
+        sample, taken only while armed, so 0 with HV off or settling."""
+        faulted = self._hv_fault != HV_FAULT_NONE
+        if faulted:
+            self.is_hv_on = False
+        armed = self._monitor_armed()
+        rail = float(self._voltage_setpoint) if armed else 0.0
+        low, high = self._mon_window
+        hvp_trip, hvm_trip = self._hv_fault_rails
+        ms = int((time.monotonic() - self._hv_fault_time) * 1000) if faulted else 0
+        return {"version": HV_MONITOR_STATUS_VERSION, "fault": self._hv_fault,
+                "fault_name": hv_fault_name(self._hv_fault), "hv_on": self._hv_on,
+                "armed": armed, "preset_window": self._mon_preset_range,
+                "v_set": self._mon_v_set, "window_low": low, "window_high": high,
+                "hvp": rail, "hvm": rail, "hvp_at_trip": hvp_trip, "hvm_at_trip": hvm_trip,
+                "ms_since_trip": ms}
 
     def get_12v_status(self) -> bool:
         return self._v12_on
@@ -947,8 +1089,13 @@ class SimulatedHVController:
 
     def configure_presets(self, presets: List[dict]) -> None:
         """Replace the simulated console's preset table: ``id``,
-        ``settings_crc``, ``voltage`` and ``sensitivity``, as a console image
-        carries them.
+        ``settings_crc``, ``voltage``, ``sensitivity`` and ``voltage_range``,
+        as a console image's PRESET_HV_RECORD v2 carries them (a record
+        whose range the console would treat as absent is refused at read
+        and select, as on the console).
+
+        Like flashing a new image, it leaves the console as a reset does:
+        HV off, nothing selected, the monitor idle and no fault latched.
 
         Raises:
             ValueError: A preset without a positive ``voltage`` and
@@ -963,6 +1110,10 @@ class SimulatedHVController:
                         or not math.isfinite(value) or value <= 0:
                     raise ValueError(f"simulated console preset {index}: {key} must be a positive number, got {value!r}")
         self._presets = [dict(preset) for preset in presets]
+        self.turn_hv_off()
+        self._clear_selection()
+        self._set_monitor_point(0.0)
+        self._clear_hv_fault()
 
     def _select_window(self, preset: dict) -> tuple[float, float] | None:
         """The window a select's rescaled voltage must land in: the record's
@@ -981,7 +1132,7 @@ class SimulatedHVController:
         """Same shape as :meth:`HVController.get_preset`; ``min_voltage`` /
         ``max_voltage`` are the window this console enforces (None for none)."""
         if not 0 <= index < len(self._presets):
-            raise LIFUDeviceError(f"HV: no preset at index {index}")
+            raise LIFUDeviceError(f"HV: no preset at index {index}", device_error_code=OW_HV_DATA_ERROR)
         preset = dict(self._presets[index])
         preset.setdefault("count", len(self._presets))
         preset.setdefault("index", index)
@@ -997,8 +1148,11 @@ class SimulatedHVController:
         if self.fda_image and self._hv_on:
             raise LIFUDeviceError("HV: HV is on; turn it off to select a preset",
                                   device_error_code=OW_HV_FDA_REFUSED)
-        # Like the firmware, anything short of a select that succeeds leaves nothing selected.
+        # Like the firmware, anything short of a select that succeeds leaves
+        # nothing selected, and the monitor idle; only a success clears a fault.
         self._clear_selection()
+        if self.fda_image:
+            self._set_monitor_point(0.0)
         preset = self.get_preset(index)
         if int(preset["settings_crc"]) != int(settings_crc):
             raise LIFUDeviceError("HV: settings_crc is not this preset's",
@@ -1014,6 +1168,10 @@ class SimulatedHVController:
             raise LIFUDeviceError(f"HV: {volts:.2f} V for this transmitter is outside "
                                   f"{window[0]:g}-{window[1]:g} V", device_error_code=OW_HV_RANGE)
         self._selected_preset_index = index
+        if self.fda_image:
+            # preset_select: hv_monitor_set_point(volts, p.window), then clear the latch.
+            self._set_monitor_point(volts, window)
+            self._clear_hv_fault()
         self.last_device_sensitivity = float(device_sensitivity)
         self._voltage_setpoint = volts
         self.supply_voltage = volts
@@ -1030,6 +1188,9 @@ class SimulatedHVController:
             raise LIFUDeviceError("HV: HV is on; turn it off to select a preset",
                                   device_error_code=OW_HV_FDA_REFUSED)
         self._clear_selection()
+        if self.fda_image:
+            self._set_monitor_point(0.0)
+            self._clear_hv_fault()
         return True
 
     def get_voltage(self) -> float:
@@ -1084,6 +1245,12 @@ class SimulatedLIFUHVController(SimulatedHVController):
     the 45 V ceiling, and the selection may change with HV on. A select applies whatever it
     rescales to; the preset's own ``voltage_range`` is the host's to check
     (``load_preset(voltage_range=...)``), as on real consoles.
+
+    A real RUO console image has no preset table at all: it answers
+    OW_POWER_PRESET_GET / _SELECT with OW_UNKNOWN (hv_presets.c is
+    FDA_MODE only, console-fw feature/fda-hv-presets). The select here is
+    a simulator convenience, so it leaves the HV rail monitor alone: on an
+    RUO image only SET_HV moves the monitor's setpoint or clears its latch.
     """
 
     fda_image = False
@@ -1096,8 +1263,9 @@ class SimulatedLIFUHVController(SimulatedHVController):
 
     def turn_hv_on(self):
         """An RUO console turns HV on at whatever voltage was set; there is
-        no preset gate."""
-        self._hv_on = True
+        no preset gate. A latched HV fault still refuses it (OW_HV_FAULT)."""
+        self._refuse_hv_on_while_faulted()
+        self._hv_enabled()
         return True
 
     def turn_12v_on(self):
@@ -1109,8 +1277,28 @@ class SimulatedLIFUHVController(SimulatedHVController):
         return True
 
     def set_voltage(self, voltage: float) -> bool:
+        """Same contract as :meth:`LIFUHVController.set_voltage`, host and
+        console together: the host's range check (before anything is
+        sent), its fault read with :attr:`is_hv_on` set, the console's SET_HV
+        (setpoint, monitor window, latch cleared), the host's HV read, and
+        HV on re-sent."""
+        if not 5.0 <= voltage <= 100.0:   # also refuses a NaN
+            raise ValueError("HV voltage must be between 5 and 100 V")
+        hv_was_on = self.is_hv_on
+        if hv_was_on and self._hv_fault != HV_FAULT_NONE:
+            self.is_hv_on = False
+            raise LIFUHVFaultError(f"HV: HV fault {hv_fault_name(self._hv_fault)} latched; voltage not set",
+                                   fault=self._hv_fault)
+        # The console's SET_HV (if_commands.c): store it, move the monitor, clear the latch.
         self._voltage_setpoint = float(voltage)
         self.supply_voltage = self._voltage_setpoint
+        self._set_monitor_point(self._voltage_setpoint)
+        self._clear_hv_fault()
+        if hv_was_on:
+            if not self._hv_on:
+                self.is_hv_on = False
+                raise LIFUHVFaultError("HV: HV went off during set_voltage; HV left off")
+            self.turn_hv_on()   # ramps to the new voltage; the settle period restarts
         return True
 
     def set_rgb_led(self, state: int):
@@ -1724,7 +1912,11 @@ class SimulatedLIFUInterface(SimulatedDeviceInterface):
         # down to the HV controller as part of loading the solution.
         # Mirror that so QML's vmon plots / rail readouts track the
         # configured value.
-        self.hvcontroller.set_voltage(voltage)
+        try:
+            self.hvcontroller.set_voltage(voltage)
+        except LIFUHVFaultError:
+            self.set_status(LIFUInterfaceStatus.STATUS_ERROR)   # as LIFUInterface.set_solution
+            raise
         self.set_status(LIFUInterfaceStatus.STATUS_READY)
         if turn_hv_on:
             self.hvcontroller.turn_hv_on()

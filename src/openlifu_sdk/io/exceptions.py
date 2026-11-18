@@ -20,6 +20,7 @@ from .LIFUConfig import (
     LIFU_ERR_DEVICE_NAK,
     LIFU_ERR_EMPTY_RESPONSE,
     LIFU_ERR_HARDWARE_IN_USE,
+    LIFU_ERR_HV_FAULT,
     LIFU_ERR_HV_NOT_SETTLED,
     LIFU_ERR_MODULE_COUNT_MISMATCH,
     LIFU_ERR_NOT_CONNECTED,
@@ -120,6 +121,26 @@ class LIFUHVSettleError(LIFUError):
     default_code = LIFU_ERR_HV_NOT_SETTLED
 
 
+class LIFUHVFaultError(LIFUError):
+    """The host found the console's HV rail monitor tripped (SR-025).
+
+    Raised by the host from what it read, not from an ``OW_ERROR`` reply:
+    a console refusing HV on over a latched fault is instead a
+    :class:`LIFUDeviceError` with ``device_error_code`` OW_HV_FAULT.
+
+    Attributes:
+        fault: The latched cause (``LIFUConfig.HV_FAULT_*``), or None when
+            the console was found with HV off after a set_voltage whose
+            SET_HV had already cleared the cause.
+    """
+
+    default_code = LIFU_ERR_HV_FAULT
+
+    def __init__(self, message: str = "", *, fault: int | None = None, code: int | None = None):
+        self.fault = fault
+        super().__init__(message, code=code)
+
+
 class LIFUSolutionError(LIFUError):
     """Provided solution failed safety validation."""
 
@@ -145,6 +166,7 @@ __all__ = [
     "LIFUDeviceError",
     "LIFUProtocolError",
     "LIFUHVSettleError",
+    "LIFUHVFaultError",
     "LIFUSolutionError",
     "LIFUSonicationError",
     # Re-export commonly used codes for convenience
@@ -153,6 +175,7 @@ __all__ = [
     "LIFU_ERR_DEVICE_NAK",
     "LIFU_ERR_EMPTY_RESPONSE",
     "LIFU_ERR_HARDWARE_IN_USE",
+    "LIFU_ERR_HV_FAULT",
     "LIFU_ERR_HV_NOT_SETTLED",
     "LIFU_ERR_MODULE_COUNT_MISMATCH",
     "LIFU_ERR_NOT_CONNECTED",
