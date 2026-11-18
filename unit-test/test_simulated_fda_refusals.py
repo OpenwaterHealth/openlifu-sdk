@@ -24,7 +24,7 @@ pytest.importorskip("openlifu_sdk.ui._qt")
 
 from sr003_presets import flash_entry, two_module_flash_entry  # noqa: E402 -- reason: after the Qt importorskip
 
-from openlifu_sdk.io.exceptions import LIFUDeviceError, LIFUError, LIFUSolutionError  # noqa: E402 -- reason: after the Qt importorskip
+from openlifu_sdk.io.exceptions import LIFUDeviceError, LIFUError, LIFUHVSettleError, LIFUSolutionError  # noqa: E402 -- reason: after the Qt importorskip
 from openlifu_sdk.io.LIFUConfig import (  # noqa: E402 -- reason: after the Qt importorskip
     LIFU_ERR_MODULE_COUNT_MISMATCH,
     OW_HV_FDA_REFUSED,
@@ -144,6 +144,58 @@ def test_start_sonication_with_nothing_loaded_is_refused_with_hv_off(iface, turn
     assert iface.get_status() != LIFUInterfaceStatus.STATUS_RUNNING
 
 
+def test_start_sonication_waits_up_to_10_s_for_hv_to_settle(iface, monkeypatch):
+    # Same settle call and ceiling as DeviceInterface.start_sonication.
+    _load(iface)
+    timeouts = []
+    monkeypatch.setattr(iface.hvcontroller, "wait_for_settle",
+                        lambda timeout: timeouts.append(timeout) or True)
+    iface.start_sonication(turn_hv_on=True, wait_for_settle=True)
+    assert timeouts == [10]
+    assert iface.hvcontroller.get_hv_status() is True
+    iface.stop_sonication()
+
+
+def test_a_rail_that_does_not_settle_refuses_start_with_hv_off(iface, monkeypatch):
+    _load(iface)
+
+    def never_settles(timeout):
+        raise LIFUHVSettleError(f"did not settle within {timeout} S")
+
+    monkeypatch.setattr(iface.hvcontroller, "wait_for_settle", never_settles)
+    with pytest.raises(LIFUHVSettleError):
+        iface.start_sonication(turn_hv_on=True, wait_for_settle=True)
+    assert iface.hvcontroller.get_hv_status() is False
+    assert not iface.is_running()
+    assert iface.get_status() != LIFUInterfaceStatus.STATUS_RUNNING
+
+
+def test_load_preset_settle_uses_the_same_10_s(iface, monkeypatch):
+    timeouts = []
+    monkeypatch.setattr(iface.hvcontroller, "wait_for_settle",
+                        lambda timeout: timeouts.append(timeout) or True)
+    settings_crc, regs = iface.preset
+    iface.load_preset(0, settings_crc, regs, 400_000.0, turn_hv_on=True, wait_for_settle=True)
+    assert timeouts == [10]
+
+
+@pytest.mark.parametrize("op", ["start_sonication", "load_preset"])
+def test_no_settle_wait_with_hv_off(iface, monkeypatch, op):
+    # As DeviceInterface: settle only with HV on.
+    if op == "start_sonication":
+        _load(iface)
+    timeouts = []
+    monkeypatch.setattr(iface.hvcontroller, "wait_for_settle",
+                        lambda timeout: timeouts.append(timeout) or True)
+    if op == "start_sonication":
+        iface.start_sonication(turn_hv_on=False, wait_for_settle=True)
+        iface.stop_sonication()
+    else:
+        settings_crc, regs = iface.preset
+        iface.load_preset(0, settings_crc, regs, 400_000.0, turn_hv_on=False, wait_for_settle=True)
+    assert timeouts == []
+
+
 def test_a_trigger_refusal_turns_hv_back_off(iface):
     _load(iface)
     iface.txdevice._modules[0].temp_c = 80.0
@@ -189,6 +241,45 @@ def test_a_two_module_preset_loads_on_a_two_module_transmitter(interface_cls):
         assert interface.get_status() == LIFUInterfaceStatus.STATUS_READY
         interface.unload_preset()
         assert interface.txdevice._loaded_modules == set()
+    finally:
+        interface.close()
+
+
+@pytest.mark.parametrize("interface_cls", [SimulatedDeviceInterface, SimulatedLIFUInterface])
+@pytest.mark.parametrize("uncalibrated", [{}, {"module": {"sensitivity": [[380000, 3110]]}},
+                                          {"module": {"sensitivity": [[400000, -1], [400000, 3110]]}},
+                                          [1, 2]],
+                         ids=["blank-config", "no-entry-at-frequency", "invalid-row-before-a-valid-one",
+                              "non-object-config"])
+def test_a_two_module_load_with_one_uncalibrated_module_is_refused(interface_cls, uncalibrated):
+    # SR-004: module 0's calibration alone must not scale the HV for both. A non-object
+    # config (the RUO page can hold any JSON) is refused like on hardware, not raised.
+    mc, regs = two_module_flash_entry()
+    interface = interface_cls(num_modules=2, preset_flash=[(mc, regs)])
+    try:
+        interface.txdevice._user_configs[1] = uncalibrated
+        with pytest.raises(LIFUSolutionError, match=r"module\(s\) \[1\]"):
+            interface.load_preset(0, mc["settings_crc"], regs, 400_000.0, turn_hv_on=True)
+        assert interface.txdevice._loaded_modules == set()
+        assert interface.hvcontroller.get_preset(0)["selected"] is None
+        assert not interface.hvcontroller.get_hv_status()
+        assert interface.get_status() == LIFUInterfaceStatus.STATUS_ERROR
+    finally:
+        interface.close()
+
+
+@pytest.mark.parametrize("interface_cls", [SimulatedDeviceInterface, SimulatedLIFUInterface])
+def test_calibration_read_for_fewer_modules_than_loaded_is_refused(interface_cls):
+    mc, regs = two_module_flash_entry()
+    interface = interface_cls(num_modules=2, preset_flash=[(mc, regs)])
+    try:
+        del interface.txdevice._user_configs[1:]   # the store and the module count disagree
+        with pytest.raises(LIFUSolutionError, match="1 of the 2 transmitter module"):
+            interface.load_preset(0, mc["settings_crc"], regs, 400_000.0, turn_hv_on=True)
+        assert interface.txdevice._loaded_modules == set()
+        assert interface.hvcontroller.get_preset(0)["selected"] is None
+        assert not interface.hvcontroller.get_hv_status()
+        assert interface.get_status() == LIFUInterfaceStatus.STATUS_ERROR
     finally:
         interface.close()
 

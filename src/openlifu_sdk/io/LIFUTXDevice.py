@@ -325,8 +325,7 @@ class TxDevice(OWComponent):
             module_count = max(1, int(self.get_module_count()))
         configs: list[dict] = []
         for module_idx in range(module_count):
-            config = self.read_config(module=module_idx).to_dict()
-            configs.append(config)
+            configs.append(self.read_config(module=module_idx).module_config())
 
         self.module_user_configs = configs
         primary = configs[0] if configs else {}

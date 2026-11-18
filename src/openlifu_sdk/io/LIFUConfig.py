@@ -271,7 +271,17 @@ USB_POLL_INTERVAL = 0.5     # seconds – USB presence polling in async mode
 MAX_DATA_LEN = 4096         # maximum payload bytes (sanity guard)
 HW_ID_DATA_LENGTH = 12      # hardware ID is 12 bytes
 
-SETTLE_TIME_HV_ON = 5
+# Ceiling, in seconds, on waiting for the HV rail to settle once
+# turn_hv_on has returned. The timer starts after turn_hv_on, so the
+# console's ramp before it answers HV_ON (~4.8 s,
+# openlifu-operator-interface#225) does not count against it.
+# wait_for_settle returns as soon as the rail settles, so this only bounds
+# a rail that does not. Past it, LIFUHVSettleError is raised and:
+#   start_sonication - Start is refused, HV turned off (SR-007);
+#   load_preset      - the preset is unloaded, HV turned off;
+#   set_solution     - (RUO) HV is left on (#123).
+# 10 s is a design decision (#121).
+SETTLE_TIME_HV_ON = 10
 SETTLE_TIME_HV_OFF = 15
 
 TEMPERATURE_DATA_LENGTH = 4  # temperature responses are 4 bytes (float32)

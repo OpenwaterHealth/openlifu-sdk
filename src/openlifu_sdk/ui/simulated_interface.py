@@ -20,6 +20,7 @@ sonicating and decays toward 25 deg C otherwise (Newton's law,
 
 from __future__ import annotations
 
+import copy
 import json
 import logging
 import math
@@ -78,6 +79,7 @@ from openlifu_sdk.io.LIFUConfig import (
     OW_NO_PRESET,
     OW_PRESET_BUSY,
     OW_TEMP_TOO_HIGH,
+    SETTLE_TIME_HV_ON,
 )
 from openlifu_sdk.io.LIFUTXDevice import PRESET_TEMP_SCALE
 from openlifu_sdk.io.LIFUTXPresets import (
@@ -89,7 +91,7 @@ from openlifu_sdk.io.LIFUTXPresets import (
     thermal_limits,
     treatment_timeout,
 )
-from openlifu_sdk.io.LIFUUserConfig import sensitivity_at_frequency
+from openlifu_sdk.io.LIFUUserConfig import sensitivity_at_frequency, uncalibrated_modules
 from openlifu_sdk.io.signal import OWSignal
 from openlifu_sdk.ui.status_frame import format_status_frame as _format_status_frame
 from openlifu_sdk.util.hwid import encode_hwid
@@ -306,7 +308,8 @@ class SimulatedTxDevice:
     def refresh_metadata(self, module_count: Optional[int] = None) -> None:
         """Same contract as :meth:`TxDevice.refresh_metadata`."""
         count = len(self._user_configs) if module_count is None else int(module_count)
-        self.module_user_configs = [dict(cfg) for cfg in self._user_configs[:count]]
+        self.module_user_configs = [self.read_config(module=m).module_config()
+                                    for m in range(min(count, len(self._user_configs)))]
         primary = self.module_user_configs[0] if self.module_user_configs else {}
         self.serial_number = primary.get("sn") if isinstance(primary.get("sn"), str) else None
         hwid = primary.get("hwid") if isinstance(primary.get("hwid"), str) else None
@@ -526,7 +529,7 @@ class SimulatedTxDevice:
 
     def read_config(self, module: int = 0):
         from openlifu_sdk.io.LIFUUserConfig import LifuUserConfig
-        return LifuUserConfig(json_data=dict(self._user_configs[module]))
+        return LifuUserConfig(json_data=copy.deepcopy(self._user_configs[module]))
 
     def apply_simulated_transducer(self, arr) -> None:
         """Reconfigure the simulator to mimic a transducer (array).
@@ -772,7 +775,7 @@ class SimulatedLIFUTxDevice(SimulatedTxDevice):
         except (TypeError, ValueError):
             logger.warning("SimulatedLIFUTxDevice.write_config_json: invalid json; ignored")
         self.refresh_metadata()
-        return LifuUserConfig(json_data=dict(self._user_configs[module]))
+        return LifuUserConfig(json_data=copy.deepcopy(self._user_configs[module]))
 
     def set_solution(self, pulse=None, delays=None, apodizations=None,
                      sequence=None, profile_index=1, profile_increment=True,
@@ -910,6 +913,13 @@ class SimulatedHVController:
 
     def get_12v_status(self) -> bool:
         return self._v12_on
+
+    def wait_for_settle(self, range_volts: float = 2, settle_time: float = 0.2,
+                        timeout: float = 15.0, polling_interval: float = 0.1) -> bool:
+        """The simulated rail settles at once; take *settle_time* to do so,
+        as a real rail that settles immediately would."""
+        time.sleep(settle_time)
+        return True
 
     def get_version(self) -> str:
         return self._fw_version
@@ -1530,10 +1540,20 @@ class SimulatedDeviceInterface(QObject):
                 self.txdevice.load_preset(preset_index, crc, duration_index,
                                           settings_crc=settings_crc, module=module)
             self.txdevice.refresh_metadata(module_count=len(regs_crcs))
+            # Defensive: the strict lookup covers only the configs it is
+            # given. TxDevice.refresh_metadata reads exactly module_count or
+            # raises; a simulated store can come up short.
+            configs = self.txdevice.module_user_configs
+            if len(configs) != len(regs_crcs):
+                raise LIFUSolutionError(
+                    f"read the calibration of {len(configs)} of the {len(regs_crcs)} "
+                    "transmitter module(s); cannot select FDA preset on HV.")
             device_sensitivity = self.txdevice.get_sensitivity_for_frequency(frequency_hz)
             if device_sensitivity is None:
                 raise LIFUSolutionError(
-                    f"TX device sensitivity is unavailable at {frequency_hz:.3f} Hz; "
+                    f"TX device sensitivity is unavailable at {frequency_hz:.3f} Hz "
+                    f"(no calibration from module(s) "
+                    f"{uncalibrated_modules(configs, frequency_hz)}); "
                     "cannot select FDA preset on HV.")
             applied = self.hvcontroller.select_preset(preset_index, settings_crc, device_sensitivity)
             if voltage_range is not None and not voltage_range[0] <= applied <= voltage_range[1]:
@@ -1543,8 +1563,8 @@ class SimulatedDeviceInterface(QObject):
             self._last_solution_voltage = applied
             if turn_hv_on:
                 self.hvcontroller.turn_hv_on()
-            if wait_for_settle:
-                time.sleep(0.2)
+            if self.hvcontroller.get_hv_status() and wait_for_settle:
+                self.hvcontroller.wait_for_settle(timeout=SETTLE_TIME_HV_ON)
         except Exception:  # reason: any failure must not leave half a preset loaded; re-raised
             self.unload_preset()
             self.set_status(LIFUInterfaceStatus.STATUS_ERROR)
@@ -1565,10 +1585,8 @@ class SimulatedDeviceInterface(QObject):
         try:
             if turn_hv_on:
                 self.hvcontroller.turn_hv_on()
-            if wait_for_settle:
-                # Brief settle delay (real device is ~200 ms); not perceptible
-                # but matches the real code path's blocking nature.
-                time.sleep(0.2)
+            if wait_for_settle and self.hvcontroller.get_hv_status():
+                self.hvcontroller.wait_for_settle(timeout=SETTLE_TIME_HV_ON)
             self._engine = _SimulatedRunEngine(
                 txdevice=self.txdevice,
                 hvcontroller=self.hvcontroller,
