@@ -2,7 +2,7 @@
 import struct
 import json
 from dataclasses import dataclass
-from typing import Optional, Any, Dict, Iterable
+from typing import Optional, Any, Dict, Sequence
 import logging
 import math
 
@@ -170,6 +170,14 @@ class LifuUserConfig:
         """Update multiple configuration values"""
         self.json_data.update(updates)
 
+    def module_config(self) -> Dict[str, Any]:
+        """The body as a module config: a copy if it is a JSON object, else
+        ``{}`` (no config). The page is RUO-writable, so its body can be any
+        JSON value. ``refresh_metadata``, real and simulated, reads each
+        module's calibration through this, so both treat a non-object body
+        the same way: as a module with no calibration."""
+        return dict(self.json_data) if isinstance(self.json_data, dict) else {}
+
     def to_dict(self) -> Dict[str, Any]:
         """Get the configuration as a dictionary"""
         return self.json_data.copy()
@@ -183,7 +191,31 @@ class LifuUserConfig:
 SENSITIVITY_FREQ_TOLERANCE_HZ = 1e-3
 
 
-def sensitivity_at_frequency(module_configs: Iterable[Dict[str, Any]], freq_hz: float) -> Optional[float]:
+def _module_sensitivity(config: Any, freq_hz: float) -> Optional[float]:
+    """One module's calibrated sensitivity at *freq_hz*, or ``None`` if its
+    table has no single valid entry there (see :func:`sensitivity_at_frequency`).
+    The user config is RUO-writable, so a config, ``module`` section, table
+    or row of the wrong shape is no calibration, not an error."""
+    module = config.get("module") if isinstance(config, dict) else None
+    table = module.get("sensitivity") if isinstance(module, dict) else None
+    if not isinstance(table, list):
+        return None
+    matches = []
+    for row in table:
+        try:
+            if not isinstance(row, (list, tuple)):
+                raise TypeError(row)
+            f, v = (float(x) for x in row)
+        except (TypeError, ValueError):
+            return None   # a row that is not a number pair could be this frequency's
+        if abs(f - freq_hz) <= SENSITIVITY_FREQ_TOLERANCE_HZ:
+            matches.append(v)
+    if len(matches) != 1 or not math.isfinite(matches[0]) or matches[0] <= 0:
+        return None   # none, a duplicate, or an unusable value at this frequency
+    return matches[0]
+
+
+def sensitivity_at_frequency(module_configs: Sequence[Any], freq_hz: float) -> Optional[float]:
     """Return a transmitter's sensitivity at *freq_hz* from its module user configs.
 
     Each config's ``module.sensitivity`` is a ``[[freq_hz, sensitivity], ...]``
@@ -197,20 +229,34 @@ def sensitivity_at_frequency(module_configs: Iterable[Dict[str, Any]], freq_hz: 
     This is the match the FDA bench check (``examples/test_fda_mode.py``,
     via ``LIFUTXPresets.device_sensitivity``) already used.
 
+    Every module must have its own valid entry (SR-004): one whose config is
+    empty, has no table, or has no usable entry at *freq_hz* makes the whole
+    transmitter uncalibrated there, rather than being left out of the mean.
+    Invalid data counts as no entry, even when a valid row is also present:
+    a row at *freq_hz* whose value is not a finite positive number, more than
+    one row at *freq_hz*, or a row that is not a number pair (it cannot be
+    ruled out as *freq_hz*'s) leaves the module uncalibrated. Well-formed
+    rows at other frequencies are not this lookup's concern.
+    An empty config is what :meth:`LifuUserConfig.from_wire_bytes` gives for
+    a page whose header is valid but whose JSON body does not parse. A page
+    whose header is not (an erased page, a wrong magic or version) never
+    gets here: ``read_config`` raises ``LIFUProtocolError``, and
+    ``load_preset`` refuses on that.
+    :func:`uncalibrated_modules` names which.
+
     Returns:
-        The mean over the modules that have a matching entry, or ``None`` if
-        none has (the caller must refuse to scale HV from it).
+        The mean over the modules, or ``None`` if there are none or any of
+        them has no matching entry (the caller must refuse to scale HV from
+        it).
     """
-    values = []
-    for config in module_configs:
-        for row in ((config or {}).get("module") or {}).get("sensitivity") or []:
-            try:
-                f, v = (float(x) for x in row)
-            except (TypeError, ValueError):
-                continue   # a malformed row (user config is RUO-writable) is no calibration point
-            if abs(f - freq_hz) <= SENSITIVITY_FREQ_TOLERANCE_HZ and math.isfinite(v) and v > 0:
-                values.append(v)
-                break
-    if not values:
+    values = [_module_sensitivity(config, freq_hz) for config in module_configs]
+    if not values or None in values:
         return None
     return sum(values) / len(values)
+
+
+def uncalibrated_modules(module_configs: Sequence[Any], freq_hz: float) -> list[int]:
+    """The indexes of the modules in *module_configs* that have no calibrated
+    sensitivity at *freq_hz*: what a refusal from
+    :func:`sensitivity_at_frequency` names."""
+    return [m for m, config in enumerate(module_configs) if _module_sensitivity(config, freq_hz) is None]

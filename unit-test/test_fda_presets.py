@@ -24,7 +24,7 @@ _SRC = os.path.join(os.path.dirname(__file__), "..", "src")
 if _SRC not in sys.path:
     sys.path.insert(0, _SRC)
 
-from openlifu_sdk.io.exceptions import LIFUDeviceError, LIFUError, LIFUSolutionError
+from openlifu_sdk.io.exceptions import LIFUDeviceError, LIFUError, LIFUHVSettleError, LIFUProtocolError, LIFUSolutionError
 from openlifu_sdk.io.LIFUConfig import (
     LIFU_ERR_MODULE_COUNT_MISMATCH,
     OW_BAD_CRC,
@@ -45,6 +45,7 @@ from openlifu_sdk.io.LIFUConfig import (
     OW_TX7332,
     OW_TX7332_DEVICE_COUNT,
     OW_TX7332_WREG,
+    SETTLE_TIME_HV_ON,
 )
 from openlifu_sdk.io.LIFUHVController import HVController, LIFUHVController
 from openlifu_sdk.io.LIFUInterface import DeviceInterface, LIFUInterface, LIFUInterfaceStatus
@@ -72,7 +73,7 @@ from openlifu_sdk.io.LIFUTXPresets import (
     treatment_timeout,
     verify_console_preset,
 )
-from openlifu_sdk.io.LIFUUserConfig import LifuUserConfig, sensitivity_at_frequency
+from openlifu_sdk.io.LIFUUserConfig import LifuUserConfig, sensitivity_at_frequency, uncalibrated_modules
 from openlifu_sdk.io.uart import OWUart
 
 
@@ -422,9 +423,15 @@ class TestPresetVoltage(unittest.TestCase):
         got = adjusted_voltage(doc, [self._module((400000, 3000)), self._module((400000, 3600))])
         self.assertEqual(got["device_sensitivity"], 3300.0)
         self.assertAlmostEqual(got["voltage"], 36.0)
-        # A module with no entry at the frequency is left out of the mean.
+
+    def test_a_module_without_an_entry_is_not_left_out_of_the_mean(self):
+        # SR-004: the transmitter has no sensitivity, and the reason names the modules.
+        doc = _preset(voltage=33.0, sensitivity=3600)
         modules = [self._module((400000, 3000)), self._module((380000, 3600)), {}]
-        self.assertEqual(device_sensitivity(doc, modules), 3000.0)
+        self.assertIsNone(device_sensitivity(doc, modules))
+        got = adjusted_voltage(doc, modules)
+        self.assertFalse(got["adjusted"])
+        self.assertIn("module(s) [1, 2]", got["reason"])
         # None at all is no sensitivity, not a guess: an FDA console cannot be selected without one.
         self.assertIsNone(device_sensitivity(doc, [self._module((380000, 3600)), {}]))
 
@@ -667,6 +674,45 @@ class TestTxMetadata(unittest.TestCase):
         # Between calibrated frequencies there is no value: no interpolation.
         self.assertIsNone(tx.get_sensitivity_for_frequency(425000.0))
 
+    def test_the_wire_pages_a_module_can_return(self):
+        # End to end through read_config: a valid page, a valid header with a JSON body that
+        # does not parse (-> {} -> uncalibrated), a non-object body, and an erased page (raises).
+        def page(body: bytes) -> bytes:
+            header = LifuUserConfig().header
+            header.json_len = len(body)
+            return header.to_bytes() + body
+
+        good = LifuUserConfig(json_data={"module": {"sensitivity": [[400000.0, 4.0]]}}).to_wire_bytes()
+        for second, uncalibrated in ((good, []), (page(b'{"module": {"sens'), [1]), (page(b"[1, 2]"), [1])):
+            with self.subTest(second=second[16:]):
+                tx = TxDevice()
+                tx.send_checked = MagicMock(side_effect=[MagicMock(data=good), MagicMock(data=second)])
+                tx.get_hardware_id = MagicMock(return_value="HWID")
+                tx.refresh_metadata(module_count=2)
+                self.assertEqual(uncalibrated_modules(tx.module_user_configs, 400000.0), uncalibrated)
+                self.assertEqual(tx.get_sensitivity_for_frequency(400000.0), None if uncalibrated else 4.0)
+
+        tx = TxDevice()
+        tx.send_checked = MagicMock(side_effect=[MagicMock(data=good), MagicMock(data=b"\xff" * 64)])
+        with self.assertRaises(LIFUProtocolError):
+            tx.refresh_metadata(module_count=2)
+
+    def test_a_module_that_reads_back_empty_leaves_the_transmitter_uncalibrated(self):
+        # SR-004 through the real read: module 1's page comes back with no calibration.
+        tx = TxDevice()
+        tx.get_module_count = MagicMock(return_value=2)
+        tx.read_config = MagicMock(side_effect=[
+            LifuUserConfig(json_data={"module": {"sensitivity": [[400000.0, 4.0]]}}),
+            LifuUserConfig(json_data={}),
+        ])
+        tx.get_hardware_id = MagicMock(return_value="FALLBACK-HWID")
+
+        tx.refresh_metadata(module_count=2)
+
+        self.assertEqual([c.kwargs for c in tx.read_config.call_args_list], [{"module": 0}, {"module": 1}])
+        self.assertIsNone(tx.get_sensitivity_for_frequency(400000.0))
+        self.assertEqual(uncalibrated_modules(tx.module_user_configs, 400000.0), [1])
+
 
 class TestPresetVoltageRange(unittest.TestCase):
     """voltage_range is preset data, carried through compile_preset, not baked."""
@@ -708,11 +754,59 @@ class TestSensitivityLookup(unittest.TestCase):
             with self.subTest(bad=bad):
                 self.assertIsNone(sensitivity_at_frequency([self._module((400000, bad))], 400000.0))
 
-    def test_malformed_rows_are_skipped_not_raised(self):
-        # The user config is RUO-writable: one bad row must not break the lookup of a good one.
-        module = {"module": {"sensitivity": [["x", 1], None, [1, 2, 3], [400000, None], [400000, 2720]]}}
+    def test_malformed_rows_are_no_calibration_not_errors(self):
+        # The user config is RUO-writable: a bad row must not raise. A row that is not a number
+        # pair could be this frequency's, so it leaves the module uncalibrated (SR-004 "invalid").
+        for bad in (["x", 1], None, [1, 2, 3], [400000, None], "12", {"400000": 1}):
+            with self.subTest(bad=bad):
+                module = {"module": {"sensitivity": [bad, [400000, 2720]]}}
+                self.assertIsNone(sensitivity_at_frequency([module], 400000.0))
+                self.assertEqual(uncalibrated_modules([module], 400000.0), [0])
+
+    def test_an_invalid_row_at_the_frequency_is_not_skipped_for_a_valid_one(self):
+        # SR-004 "invalid": a bad row at the preset's frequency makes the module uncalibrated,
+        # whichever side of a valid row it is on; so do two rows there (which would win?).
+        good = self._module((400000, 2720))
+        for name, rows in (("invalid row before a valid one", ((400000, 0.0), (400000, 2720))),
+                           ("invalid row after a valid one", ((400000, 2720), (400000, -1))),
+                           ("non-finite row before a valid one", ((400000, float("nan")), (400000, 2720))),
+                           ("two different valid rows", ((400000, 3000), (400000, 3600))),
+                           ("the same row twice", ((400000, 2720), (400000, 2720)))):
+            with self.subTest(case=name):
+                self.assertIsNone(sensitivity_at_frequency([good, self._module(*rows)], 400000.0))
+                self.assertEqual(uncalibrated_modules([good, self._module(*rows)], 400000.0), [1])
+
+    def test_well_formed_rows_at_other_frequencies_do_not_matter(self):
+        module = self._module((380000, -1), (390000, float("inf")), (400000, 2720))
         self.assertEqual(sensitivity_at_frequency([module], 400000.0), 2720.0)
-        self.assertIsNone(sensitivity_at_frequency([{"module": {"sensitivity": [["x", 1]]}}], 400000.0))
+
+    def test_every_module_present_gives_their_mean(self):
+        modules = [self._module((400000, 3000)), self._module((380000, 1), (400000, 3600))]
+        self.assertEqual(sensitivity_at_frequency(modules, 400000.0), 3300.0)
+        self.assertEqual(uncalibrated_modules(modules, 400000.0), [])
+
+    def test_one_uncalibrated_module_makes_the_transmitter_uncalibrated(self):
+        # SR-004: a module with no entry is not left out of the mean; the lookup refuses.
+        good = self._module((400000, 2720))
+        for name, bad in (("empty config (JSON body did not parse)", {}),
+                          ("no table", {"module": {}}),
+                          ("no entry at the frequency", self._module((380000, 3110))),
+                          ("unusable entry", self._module((400000, 0.0)))):
+            for modules, missing in (([good, bad], [1]), ([bad, good], [0]), ([bad, bad], [0, 1])):
+                with self.subTest(case=name, missing=missing):
+                    self.assertIsNone(sensitivity_at_frequency(modules, 400000.0))
+                    self.assertEqual(uncalibrated_modules(modules, 400000.0), missing)
+
+    def test_malformed_config_shapes_are_no_calibration_not_errors(self):
+        good = self._module((400000, 2720))
+        for bad in ([1], "x", None, {"module": []}, {"module": {"sensitivity": 5}},
+                    {"module": {"sensitivity": "ab"}}, {"module": {"sensitivity": ["12"]}}):
+            with self.subTest(bad=bad):
+                self.assertIsNone(sensitivity_at_frequency([good, bad], 400000.0))
+                self.assertEqual(uncalibrated_modules([good, bad], 400000.0), [1])
+
+    def test_no_modules_is_no_calibration(self):
+        self.assertIsNone(sensitivity_at_frequency([], 400000.0))
 
     def test_device_sensitivity_is_the_same_lookup(self):
         modules = [self._module((400000, 3000)), self._module((400000, 3600))]
@@ -728,7 +822,7 @@ class TestInterfacePresetLoad(unittest.TestCase):
         iface = object.__new__(cls)
         iface.txdevice = MagicMock()
         iface.txdevice.get_module_count.return_value = modules
-        iface.txdevice.module_user_configs = [{"module": {"sensitivity": []}}]
+        iface.txdevice.module_user_configs = [{"module": {"sensitivity": [[400000, 2720]]}}] * max(modules, 1)
         iface.txdevice.get_sensitivity_for_frequency.return_value = 2720.0
         iface.hvcontroller = MagicMock()
         iface.status = LIFUInterfaceStatus.STATUS_SYS_OFF
@@ -778,6 +872,34 @@ class TestInterfacePresetLoad(unittest.TestCase):
                 iface.txdevice.refresh_metadata.assert_called_once_with(module_count=2)
                 iface.hvcontroller.select_preset.assert_called_once_with(0, 0xABCD, 2720.0)
                 self.assertEqual(iface.status, LIFUInterfaceStatus.STATUS_READY)
+
+    def test_a_two_module_load_with_one_uncalibrated_module_is_refused(self):
+        # SR-004: the real lookup over the configs read at load; module 1 has no entry at 400 kHz.
+        for cls in (DeviceInterface, LIFUInterface):
+            for configs, named in (([{"module": {"sensitivity": [[400000, 2720]]}}, {}], r"module\(s\) \[1\]"),
+                                   ([{}, {"module": {"sensitivity": [[400000, 2720]]}}], r"module\(s\) \[0\]")):
+                with self.subTest(cls=cls.__name__, named=named):
+                    iface = self._mocked(cls, modules=2)
+                    iface.txdevice.module_user_configs = configs
+                    iface.txdevice.get_sensitivity_for_frequency.side_effect = (
+                        lambda hz, tx=iface.txdevice: sensitivity_at_frequency(tx.module_user_configs, hz))
+                    with self.assertRaisesRegex(LIFUSolutionError, named):
+                        iface.load_preset(0, 0xABCD, [0x1111, 0x2222], 400000.0, turn_hv_on=True)
+                    iface.hvcontroller.select_preset.assert_not_called()
+                    iface.hvcontroller.turn_hv_on.assert_not_called()
+                    self._cleared(iface, modules=2)
+
+    def test_calibration_read_for_fewer_modules_than_loaded_is_refused(self):
+        # The strict lookup covers the modules it is given: the load checks it was given all of them.
+        for cls in (DeviceInterface, LIFUInterface):
+            with self.subTest(cls=cls.__name__):
+                iface = self._mocked(cls, modules=2)
+                iface.txdevice.module_user_configs = iface.txdevice.module_user_configs[:1]
+                with self.assertRaisesRegex(LIFUSolutionError, "1 of the 2 transmitter module"):
+                    iface.load_preset(0, 0xABCD, [0x1111, 0x2222], 400000.0, turn_hv_on=True)
+                iface.hvcontroller.select_preset.assert_not_called()
+                iface.hvcontroller.turn_hv_on.assert_not_called()
+                self._cleared(iface, modules=2)
 
     def test_a_refused_two_module_load_unloads_every_module(self):
         iface = self._mocked(modules=2)
@@ -891,6 +1013,53 @@ class TestInterfacePresetLoad(unittest.TestCase):
         self.assertEqual(raised.exception.device_error_code, OW_BAD_CRC)
         iface.hvcontroller.deselect_preset.assert_called_once_with()   # still tried
 
+    def test_start_sonication_waits_up_to_10_s_for_hv_to_settle(self):
+        self.assertEqual(SETTLE_TIME_HV_ON, 10)   # design decision, #121
+        iface = self._mocked()
+        iface.txdevice.get_trigger_json.return_value = {"TriggerStatus": "STOPPED"}
+        iface.start_sonication()
+        iface.hvcontroller.turn_hv_on.assert_called_once_with()
+        iface.hvcontroller.wait_for_settle.assert_called_once_with(timeout=10)
+        iface.txdevice.start_trigger.assert_called_once_with()
+        self.assertEqual(iface.status, LIFUInterfaceStatus.STATUS_RUNNING)
+
+    def test_a_rail_that_does_not_settle_refuses_start_with_hv_off(self):
+        # SR-007: past the settle ceiling, Start is refused and HV goes back off.
+        iface = self._mocked()
+        iface.txdevice.get_trigger_json.return_value = {"TriggerStatus": "STOPPED"}
+        iface.hvcontroller.wait_for_settle.side_effect = LIFUHVSettleError("did not settle")
+        with self.assertRaises(LIFUHVSettleError):
+            iface.start_sonication()
+        iface.txdevice.start_trigger.assert_not_called()
+        iface.hvcontroller.turn_hv_off.assert_called_once_with()
+        self.assertNotEqual(iface.status, LIFUInterfaceStatus.STATUS_RUNNING)
+
+    def test_a_rail_that_never_settles_is_refused_at_the_10_s_ceiling(self):
+        # The real wait_for_settle loop, on a fake clock that steps 1 ms per read,
+        # given the ceiling start_sonication passes. A 9.9 s ceiling would fail this.
+        hv = HVController()
+        hv.is_hv_on, hv.supply_voltage = True, 40.0
+        hv.get_voltage = MagicMock(return_value=0.0)   # never reaches 40 V
+        reads = []
+
+        def tick():
+            reads.append(1000.0 + 0.001 * len(reads))
+            return reads[-1]
+
+        with patch("openlifu_sdk.io.LIFUHVController.time.time", side_effect=tick), \
+             patch("openlifu_sdk.io.LIFUHVController.time.sleep"):
+            with self.assertRaises(LIFUHVSettleError):
+                hv.wait_for_settle(timeout=SETTLE_TIME_HV_ON)
+        elapsed = reads[-1] - reads[0]   # from the loop's start_time to the read that ended it
+        self.assertGreaterEqual(elapsed, 10.0)
+        self.assertLess(elapsed, 10.01)
+
+    def test_load_preset_settle_uses_the_same_10_s(self):
+        iface = self._mocked()
+        iface.hvcontroller.get_hv_status.return_value = True
+        iface.load_preset(0, 0xABCD, 0xDCBA, 400000.0, turn_hv_on=True, wait_for_settle=True)
+        iface.hvcontroller.wait_for_settle.assert_called_once_with(timeout=10)
+
     def test_no_trigger_no_hv(self):
         # A transmitter with nothing loaded refuses to start: HV must not stay on.
         iface = self._mocked()
@@ -956,6 +1125,42 @@ class TestInterfacePresetLoad(unittest.TestCase):
                          (OW_POWER_PRESET_SELECT, 0, struct.pack("<If", 0xAABBCCDD, 3220.0)))
         self.assertEqual(iface.hvcontroller.supply_voltage, 44.75)   # the console's answer, for wait_for_settle
 
+
+    def test_a_real_two_module_load_with_one_uncalibrated_module_is_refused(self):
+        # SR-004 end to end: the real DeviceInterface over the real TxDevice and HVController,
+        # on a fake transport. Module 1's page has an invalid row before a valid one at 400 kHz.
+        for cls in (DeviceInterface, LIFUInterface):
+            with self.subTest(cls=cls.__name__):
+                iface = object.__new__(cls)
+                iface.txdevice, iface.hvcontroller = TxDevice(), HVController()
+                iface.status = LIFUInterfaceStatus.STATUS_SYS_OFF
+                iface._test_mode = False
+                tx_uart, hv_uart = _mock_uart(iface.txdevice, "TX"), _mock_uart(iface.hvcontroller, "HV")
+                pages = [LifuUserConfig(json_data={"module": {"sensitivity": rows}}).to_wire_bytes()
+                         for rows in ([[400000, 3220]], [[400000, -1], [400000, 3220]])]
+
+                def tx_reply(*, command, addr=0, **_):
+                    if command == OW_CMD_USR_CFG:
+                        return _packet(pages[addr])
+                    return _packet({OW_CTRL_GET_SWTRIG: b'{"TriggerStatus": "STOPPED"}',
+                                    OW_CTRL_GET_MODULE_COUNT: bytes([2])}.get(command, b""))
+                tx_uart.send_packet.side_effect = tx_reply
+                hv_uart.send_packet.return_value = _packet(b"")
+
+                with self.assertRaisesRegex(LIFUSolutionError, r"module\(s\) \[1\]"):
+                    iface.load_preset(0, 0xABCD, [0x1111, 0x2222], 400000.0, turn_hv_on=True)
+
+                tx_sent = [c.kwargs for c in tx_uart.send_packet.call_args_list]
+                self.assertEqual([s["addr"] for s in tx_sent if s["command"] == OW_CMD_USR_CFG], [0, 1])
+                # Both modules loaded, then both unloaded (a load with no payload).
+                self.assertEqual([(s["addr"], bool(s["data"])) for s in tx_sent if s["command"] == OW_PRESET_LOAD],
+                                 [(0, True), (1, True), (0, False), (1, False)])
+                hv_sent = [(c.kwargs["command"], bytes(c.kwargs["data"] or b""))
+                           for c in hv_uart.send_packet.call_args_list]
+                # The console is never asked to select (only the cleanup's empty deselect) or turn HV on.
+                self.assertEqual([d for c, d in hv_sent if c == OW_POWER_PRESET_SELECT], [b""])
+                self.assertNotIn(OW_POWER_HV_ON, [c for c, _ in hv_sent])
+                self.assertEqual(iface.status, LIFUInterfaceStatus.STATUS_ERROR)
 
 class TestInterfaceSurface(unittest.TestCase):
     """DeviceInterface is the FDA surface; LIFUInterface adds the RUO endpoints."""
