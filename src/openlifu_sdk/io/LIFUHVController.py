@@ -31,8 +31,14 @@ from openlifu_sdk.io.LIFUConfig import (
     OW_POWER_HV_ENABLE,
     OW_POWER_HV_OFF,
     OW_POWER_HV_ON,
+    OW_POWER_PRESET_COMMIT,
     OW_POWER_PRESET_GET,
+    OW_POWER_PRESET_INFO,
     OW_POWER_PRESET_SELECT,
+    OW_POWER_PRESET_WRITE,
+    PRESET_INFO_EMPTY,
+    PRESET_INFO_NO_PAGE,
+    PRESET_INFO_OK,
     OW_POWER_RAW_DAC,
     OW_POWER_SET_DACS,
     OW_POWER_SET_FAN,
@@ -318,6 +324,42 @@ class HVController(OWComponent):
         self.supply_voltage = None
         return True
 
+    def get_preset_info(self):
+        """Which preset set the console's preset page holds
+        (OW_POWER_PRESET_INFO): the header of its signed package.
+
+        Returns:
+            A :class:`openlifu_sdk.io.LIFUPresetPackage.PresetHeader` (body
+            size and SHA-256, diathermy commit, context; ``signed_by(key)``
+            checks its signature), or None when the page holds no valid
+            package.
+
+        Raises:
+            LIFUDeviceError: The console has no preset page (its bootloader
+                predates open-lifu-console-bl 1.1.0-rc.2), or firmware from
+                before the preset page.
+            LIFUProtocolError: The reply is not a PRS1 header.
+        """
+        from openlifu_sdk.io import LIFUPresetPackage as pp
+        from openlifu_sdk.io.exceptions import LIFUDeviceError
+        from openlifu_sdk.io.LIFUCrypto import LIFUCryptoError
+
+        r = self.send_checked(packet_type=OW_POWER, command=OW_POWER_PRESET_INFO,
+                              op="get_preset_info")
+        if r.reserved == PRESET_INFO_EMPTY:
+            return None
+        if r.reserved == PRESET_INFO_NO_PAGE:
+            raise LIFUDeviceError("HV: no preset page; the console bootloader "
+                                  "predates 1.1.0-rc.2", packet=r)
+        if r.reserved != PRESET_INFO_OK:
+            raise LIFUProtocolError(f"HV: get_preset_info status 0x{r.reserved:02X}",
+                                    code=LIFU_ERR_BAD_PAYLOAD_LENGTH)
+        try:
+            return pp.parse_preset_header(bytes(r.data[:r.data_len]))
+        except LIFUCryptoError as e:
+            raise LIFUProtocolError(f"HV: get_preset_info: {e}",
+                                    code=LIFU_ERR_BAD_PAYLOAD_LENGTH) from e
+
     def get_voltage(self) -> float:
         """Read the measured HV output voltage.
 
@@ -477,6 +519,64 @@ class LIFUHVController(LIFUComponentMixin, HVController):
     SUPPORTED_COMMANDS = GLOBAL_COMMANDS | CONTROLLER_COMMANDS | POWER_COMMANDS
     ALLOWED_PACKETS = None
     READ_ONLY_COMMANDS = frozenset()
+
+    #: Bytes per OW_POWER_PRESET_WRITE: a multiple of 4 (the firmware programs
+    #: whole flash words), well under the packet limit.
+    PRESET_WRITE_CHUNK = 256
+
+    def write_presets(self, package: bytes):
+        """Write a preset package into the console's preset page
+        (OW_POWER_PRESET_WRITE, then OW_POWER_PRESET_COMMIT). Research and
+        bare-metal firmware only: the FDA (clinical) build refuses it, and
+        takes presets only through its bootloader
+        (LIFUDFUManager.program_console_presets).
+
+        The body goes first and the header last, so a write that stops half
+        way leaves no valid package; the commit has the console check the
+        page's CRC-32 and records, or erase it. The page is erased by the
+        first chunk: the stored set is gone until the commit succeeds.
+
+        Args:
+            package: A PRS1 package (LIFUPresetPackage.build_preset_package).
+                The firmware does not check its signature; the bootloader's
+                DFU write does.
+
+        Returns:
+            The :class:`PresetHeader` the console reports afterwards.
+
+        Raises:
+            ValueError: Not a well-formed package (checked before anything is
+                sent).
+            LIFUDeviceError: The console refused a chunk or the commit (HV on,
+                no preset page, FDA build, or the page did not verify).
+        """
+        import zlib
+
+        from openlifu_sdk.io import LIFUPresetPackage as pp
+        from openlifu_sdk.io.LIFUCrypto import LIFUCryptoError
+
+        try:
+            pkg = pp.parse_preset_package(package)
+        except LIFUCryptoError as e:
+            raise ValueError(str(e)) from e
+        if not pkg.body_ok:
+            raise ValueError("Preset package body does not match its signed hash")
+        data = pkg.header + pkg.body
+        if len(data) > pp.CONSOLE_PRESET_SIZE:
+            raise ValueError(f"Preset package is {len(data)} bytes; the page holds "
+                             f"{pp.CONSOLE_PRESET_SIZE}")
+        n = self.PRESET_WRITE_CHUNK
+        body = range(pp.PRESET_BODY_OFFSET, len(data), n)
+        header = range(0, pp.PRESET_BODY_OFFSET, n)
+        for off in [*body, *header]:
+            end = min(off + n, len(data) if off >= pp.PRESET_BODY_OFFSET else pp.PRESET_BODY_OFFSET)
+            self.send_checked(packet_type=OW_POWER, command=OW_POWER_PRESET_WRITE,
+                              data=bytearray(struct.pack("<H", off) + data[off:end]), op="write_presets")
+        self.send_checked(packet_type=OW_POWER, command=OW_POWER_PRESET_COMMIT,
+                          data=bytearray(struct.pack("<II", len(data), zlib.crc32(data))),
+                          op="write_presets")
+        self.supply_voltage = None          # writing deselected
+        return self.get_preset_info()
 
     def turn_12v_off(self) -> bool:
         """Turn off the 12V rail.

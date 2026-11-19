@@ -53,6 +53,26 @@ _SHA_LEN = 20                                 # git commit SHA-1, as bytes
 
 
 @dataclass(frozen=True)
+class PresetHeader:
+    """A parsed PRS1 header: what a device's preset page reports
+    (HVController.get_preset_info) without its body."""
+
+    header: bytes          # the 320-byte PRS1 header
+    body_size: int
+    body_sha256: bytes     # FwTag
+    diathermy_sha: str     # 40 hex characters
+    context: str           # "fda" / "test", or "unknown(<n>)"
+
+    def signed_by(self, public_key) -> bool:
+        """True if the header's signature verifies with *public_key*
+        (anything LIFUCrypto.load_public_key takes). The signature covers the
+        body's hash, so this says who signed the whole preset set."""
+        key = LIFUCrypto.load_public_key(public_key)
+        return LIFUCrypto.verify_header_signature(
+            self.header[:HEADER_AUTH_LEN + HEADER_SIGN_LEN], key)
+
+
+@dataclass(frozen=True)
 class PresetPackage:
     """A parsed preset package. Parsing does not check the signature."""
 
@@ -119,12 +139,12 @@ def build_preset_package(body: bytes, *, diathermy_sha: str, context: str,
     return header + body
 
 
-def parse_preset_package(data: bytes) -> PresetPackage:
-    """Split a preset package (or a dump of the preset page) into its parts.
-    Bytes past the body (erased flash in a page dump) are ignored.
+def parse_preset_header(data: bytes) -> PresetHeader:
+    """Parse the PRS1 header at the start of *data* (a header, a package or
+    a page dump). Does not check the signature.
 
     Raises:
-        LIFUCryptoError: Not a preset package, or truncated.
+        LIFUCryptoError: Not a PRS1 header, or malformed.
     """
     if len(data) < PRESET_BODY_OFFSET:
         raise LIFUCryptoError(f"Preset package shorter than its header ({len(data)} bytes)")
@@ -134,16 +154,29 @@ def parse_preset_package(data: bytes) -> PresetPackage:
         raise LIFUCryptoError(f"Not a preset package (magic {magic!r})")
     if protocol != PRESET_PROTOCOL or psize != size or ptag != tag or size == 0:
         raise LIFUCryptoError("Malformed preset package header")
-    if len(data) < PRESET_BODY_OFFSET + size:
-        raise LIFUCryptoError(f"Preset package truncated: body is {size} bytes, "
-                              f"{len(data) - PRESET_BODY_OFFSET} present")
     ctx = reserved[_SHA_LEN]
+    return PresetHeader(header=bytes(data[:PRESET_BODY_OFFSET]), body_size=size,
+                        body_sha256=tag, diathermy_sha=reserved[:_SHA_LEN].hex(),
+                        context=_CONTEXT_NAMES.get(ctx, f"unknown({ctx})"))
+
+
+def parse_preset_package(data: bytes) -> PresetPackage:
+    """Split a preset package (or a dump of the preset page) into its parts.
+    Bytes past the body (erased flash in a page dump) are ignored.
+
+    Raises:
+        LIFUCryptoError: Not a preset package, or truncated.
+    """
+    hdr = parse_preset_header(data)
+    if len(data) < PRESET_BODY_OFFSET + hdr.body_size:
+        raise LIFUCryptoError(f"Preset package truncated: body is {hdr.body_size} bytes, "
+                              f"{len(data) - PRESET_BODY_OFFSET} present")
     return PresetPackage(
-        header=bytes(data[:PRESET_BODY_OFFSET]),
-        body=bytes(data[PRESET_BODY_OFFSET:PRESET_BODY_OFFSET + size]),
-        diathermy_sha=reserved[:_SHA_LEN].hex(),
-        context=_CONTEXT_NAMES.get(ctx, f"unknown({ctx})"),
-        body_sha256=tag,
+        header=hdr.header,
+        body=bytes(data[PRESET_BODY_OFFSET:PRESET_BODY_OFFSET + hdr.body_size]),
+        diathermy_sha=hdr.diathermy_sha,
+        context=hdr.context,
+        body_sha256=hdr.body_sha256,
     )
 
 
