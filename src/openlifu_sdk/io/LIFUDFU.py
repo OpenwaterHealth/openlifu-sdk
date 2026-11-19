@@ -18,6 +18,7 @@ Provides:
 
 from __future__ import annotations
 
+import errno
 import logging
 import struct
 import sys
@@ -156,6 +157,16 @@ class DFUHeaderRefusedError(DFUWriteRefusedError, ValueError):
     was touched, so this is also a ``ValueError``: callers that treat
     ``ValueError`` as a pre-flight refusal (``update_console``) boot the
     installed application back up instead of leaving the unit in DFU.
+    """
+
+
+class DFUHeaderTimeoutError(TimeoutError, ValueError):
+    """The bootloader did not finish checking the header staged before the
+    erase. Nothing in the slot was touched, so, like
+    :class:`DFUHeaderRefusedError`, this is also a ``ValueError`` and
+    ``update_console`` boots the installed application back up. Raised by
+    :meth:`STM32USBDFU.prepare_slot_write` only: a re-stage after the erase
+    (``_resync_session``) raises ``RuntimeError`` instead.
     """
 
 
@@ -619,6 +630,10 @@ class STM32USBDFU:
     STATE_DFU_MANIFEST            = 7
     STATE_DFU_MANIFEST_WAIT_RESET = 8
     STATE_DFU_ERROR               = 10
+    # Not a DFU 1.1 state: ST's USB device library (v2.11.6, console
+    # bootloader >= 1.1.0) stores the status code DFU_ERROR_STALLEDPKT (0x0F)
+    # in bState after STALLing an UPLOAD it cannot serve.
+    STATE_ST_STALLED_PKT          = 0x0F
 
     def __init__(self, vid: int = 0x0483, pid: int = 0xDF11,
                  transfer_size: int = 1024, timeout_ms: int = 4000,
@@ -769,7 +784,10 @@ class STM32USBDFU:
                 self.STATE_DFU_MANIFEST_WAIT_RESET,
             ):
                 self.abort()
-            elif st["state"] == self.STATE_DFU_ERROR:
+            elif st["state"] in (self.STATE_DFU_ERROR,
+                                 self.STATE_ST_STALLED_PKT):
+                # From the STALLed-packet state, CLRSTATUS moves to dfuERROR
+                # and the next one to dfuIDLE (ABORT is ignored there).
                 self.clear_status()
             else:
                 break
@@ -861,29 +879,44 @@ class STM32USBDFU:
         """Return the bootloader's capability word, or 0 when it has none.
 
         Only probed when the device profile names a capability address.
-        Bootloaders that predate the word STALL the read or return flash
-        bytes, so the bits are trusted only behind ``USB_DFU_CAPS_MAGIC``; a
-        failed read is cleared back to dfuIDLE and reported as 0, so the
-        caller falls back to the plain erase-then-write flow.
+        Bootloaders that predate the word return flash bytes (1.0.x) or STALL
+        the read, so the bits are trusted only behind ``USB_DFU_CAPS_MAGIC``,
+        and a STALL is cleared back to dfuIDLE and reported as 0: the caller
+        keeps the plain erase-then-write flow.
+
+        Raises:
+            RuntimeError: Any other transfer error, after retries. Taking it
+                for "no capabilities" would skip the header staging a
+                verify-before-erase bootloader needs. Nothing was erased.
         """
         if self.caps_virt_addr is None:
             return 0
-        try:
-            self._recover_idle()
-            self._set_address(self.caps_virt_addr)
-            self.abort()   # UPLOAD is served from dfuIDLE only
-            raw = self._ctrl_in(self.DFU_UPLOAD, 2, 8)
-            self.abort()
-        except Exception as e:
-            logger.debug("DFU capability read failed (%s): no capabilities", e)
+        last_error: Exception | None = None
+        for _attempt in range(3):
             try:
                 self._recover_idle()
-            except Exception:
-                pass
-            return 0
-        if len(raw) < 8 or raw[:4] != USB_DFU_CAPS_MAGIC:
-            return 0
-        return struct.unpack("<I", raw[4:8])[0]
+                self._set_address(self.caps_virt_addr)
+                self.abort()   # UPLOAD is served from dfuIDLE only
+                raw = self._ctrl_in(self.DFU_UPLOAD, 2, 8)
+                self.abort()
+            except Exception as e:
+                try:
+                    self._recover_idle()
+                except Exception:
+                    pass
+                if getattr(e, "errno", None) == errno.EPIPE:   # STALL
+                    logger.debug("DFU capability read STALLed: no capabilities")
+                    return 0
+                last_error = e
+                logger.warning("DFU capability read failed (%s), retrying", e)
+                time.sleep(0.2)
+                continue
+            if len(raw) < 8 or raw[:4] != USB_DFU_CAPS_MAGIC:
+                return 0
+            return struct.unpack("<I", raw[4:8])[0]
+        raise RuntimeError(
+            f"DFU: could not read the bootloader's capabilities "
+            f"({last_error}). Nothing was erased; retry the update.") from last_error
 
     def requires_header_staging(self) -> bool:
         """True if the bootloader refuses slot erase/write until
@@ -955,10 +988,22 @@ class STM32USBDFU:
 
     def prepare_slot_write(self, image: bytes) -> bool:
         """Stage *image*'s header if the bootloader requires it. Returns True
-        if it was staged, False if this bootloader takes the plain flow."""
+        if it was staged, False if this bootloader takes the plain flow.
+        Call it before the slot erase.
+
+        Raises:
+            DFUHeaderRefusedError: The bootloader refused the header.
+            DFUHeaderTimeoutError: The bootloader did not finish the check.
+                Like a refusal, this happens before any erase.
+        """
         if not self.requires_header_staging():
             return False
-        self.stage_header(image)
+        try:
+            self.stage_header(image)
+        except TimeoutError as e:
+            raise DFUHeaderTimeoutError(
+                f"{e}. Nothing was erased: the installed firmware is "
+                f"intact.") from e
         return True
 
     def erase_pages(self, start_addr: int, end_addr: int,
@@ -1548,6 +1593,33 @@ class LIFUDFUManager:
             return None
         return header.fw_version
 
+    @staticmethod
+    def _check_slot_fit(image: bytes, report, profile: "DeviceProfile",
+                        label: str) -> None:
+        """Refuse, before any erase, an image the slot cannot hold as-is.
+
+        Raises:
+            ValueError: Larger than the slot, or data past the image end.
+        """
+        # validate_signed_image() has no slot limit, so bound the size here.
+        # The device would refuse the out-of-slot writes anyway, but only after
+        # the erase phase had already wiped the slot — this keeps the
+        # "nothing is erased until the image is accepted" contract above.
+        if profile.slot_size is not None and len(image) > profile.slot_size:
+            raise ValueError(
+                f"{label} image rejected before erase: {len(image)} bytes "
+                f"exceeds the {profile.slot_size}-byte slot capacity")
+        # Bytes past FwSize must be erased flash: secure boot invalidates a
+        # slot holding anything else, and a verify-before-erase bootloader
+        # refuses them mid-write, after the erase. The local check does not
+        # cover them, so refuse here, before anything is erased.
+        tail = image[len(image) - report.trailing_bytes:] if report.trailing_bytes else b""
+        if tail.strip(b"\xFF"):
+            raise ValueError(
+                f"{label} image rejected before erase: {len(tail)} bytes past "
+                f"the image end (FwSize {report.header.fw_size}) are not "
+                f"0xFF. The file has data appended to the signed image.")
+
     def _program_slot_image(self, signed_image: str,
                             profile: "DeviceProfile", slot_base: int,
                             label: str,
@@ -1564,18 +1636,23 @@ class LIFUDFUManager:
         flashers, which strand the board with an empty slot when the
         bootloader's anti-rollback refuses the new image at boot):
 
-          1. The image is validated locally (structure, sizes, SHA-256 tag;
-             plus the ECDSA signature when *keys_dir* is given).
-          2. The installed slot header is read back over DFU and a version
-             DOWNGRADE is refused unless *force* is set. Note this compares
-             against the installed image only - the bootloader's persistent
-             anti-rollback floor is not DFU-readable and remains the final
-             authority at boot.
+          1. The image is validated locally (structure, sizes, SHA-256 tag,
+             the ECDSA signature when *keys_dir* is given, slot fit).
+          2. A version DOWNGRADE against the installed slot header is
+             refused unless *force* is set.
+          3. A verify-before-erase bootloader (console >= 1.1.0) checks the
+             staged header: signature, size and anti-rollback.
+
+        *force* skips only (2). The bootloader's anti-rollback still applies:
+        (3) refuses a downgrade with the firmware intact; older bootloaders'
+        floor (not DFU-readable) may reject it at boot.
 
         The unit must already be in USB DFU mode.
 
         Raises:
-            ValueError: Image invalid, or downgrade without *force*.
+            ValueError: Image invalid, downgrade without *force*, or the
+                bootloader refused (or did not answer) the header check.
+                Nothing was erased.
             RuntimeError: DFU device/communication problems.
         """
         from openlifu_sdk.io import LIFUCrypto
@@ -1588,14 +1665,7 @@ class LIFUDFUManager:
                 f"Refusing to flash invalid image {signed_image}:\n"
                 + report.describe()
             )
-        # validate_signed_image() has no slot limit, so bound the size here.
-        # The device would refuse the out-of-slot writes anyway, but only after
-        # the erase phase had already wiped the slot — this keeps the
-        # "nothing is erased until the image is accepted" contract above.
-        if profile.slot_size is not None and len(image) > profile.slot_size:
-            raise ValueError(
-                f"{label} image rejected before erase: {len(image)} bytes "
-                f"exceeds the {profile.slot_size}-byte slot capacity")
+        self._check_slot_fit(image, report, profile, label)
 
         new_version = report.header.fw_version
         logger.info("%s image: version %d (%s), %d bytes", label,
@@ -1612,9 +1682,10 @@ class LIFUDFUManager:
                     f"({report.header.fw_version_str}) is below the installed "
                     f"version {installed} "
                     f"({LIFUCrypto.decode_fw_version(installed)}). "
-                    "Pass force=True to flash anyway (the bootloader's "
-                    "anti-rollback floor may still reject it at boot, leaving "
-                    "the slot empty)."
+                    "force=True skips this check only: the bootloader's own "
+                    "anti-rollback still applies (a console bootloader >= "
+                    "1.1.0 refuses the downgrade before erasing; elsewhere "
+                    "the floor may reject it at boot, leaving the slot empty)."
                 )
 
         with STM32USBDFU(vid=vid, pid=pid, libusb_dll=libusb_dll,
