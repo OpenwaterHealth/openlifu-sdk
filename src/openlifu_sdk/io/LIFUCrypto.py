@@ -47,11 +47,13 @@ hash checks work without it.
 
 from __future__ import annotations
 
+import functools
 import hashlib
 import os
 import re
 import struct
 from dataclasses import dataclass
+from importlib import resources
 from pathlib import Path
 
 # Base class for LIFUCryptoError. Guarded so this module stays usable as a
@@ -544,6 +546,27 @@ def verify_header_signature(header: bytes,
     except InvalidSignature:
         return False
     return True
+
+
+# The keys each board's bootloaders trust, shipped in openlifu_sdk/keys (see
+# its PROVENANCE.txt): research = the firmware repos' FW_SIGNING_KEY (GitHub
+# releases), clinical = the Cloud KMS HSM key.
+FIRMWARE_BOARDS  = ("console", "transmitter")
+FIRMWARE_DOMAINS = ("research", "clinical")
+
+
+@functools.cache
+def trusted_public_key(board: str, domain: str) -> "ec.EllipticCurvePublicKey":
+    """The public key *board*'s *domain* bootloader trusts.
+
+    Raises:
+        ValueError: Unknown board or domain.
+        LIFUCryptoError: The shipped key cannot be loaded.
+    """
+    if board not in FIRMWARE_BOARDS or domain not in FIRMWARE_DOMAINS:
+        raise ValueError(f"No trusted key for board {board!r}, domain {domain!r}")
+    pem = resources.files("openlifu_sdk").joinpath("keys", board, f"{domain}.pem").read_bytes()
+    return load_public_key(pem)
 
 
 def validate_signed_image(image: str | Path | bytes,
