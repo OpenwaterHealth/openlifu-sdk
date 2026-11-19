@@ -91,6 +91,24 @@ def _find_bundled_libusb_dll() -> str | None:
 USB_DFU_VERSION_VIRT_ADDR = 0xFFFFFF00
 USB_DFU_VERSION_READ_LEN  = 64
 
+# Verify before erase (open-lifu-console-bl >= 1.1.0, usbd_dfu_if.c). The
+# bootloader refuses every slot erase and write until the host has DNLOADed
+# the image's signed SFU header to USB_DFU_HDR_STAGE_VIRT_ADDR and it has
+# verified (size fits, version not below the installed one, ECDSA signature).
+# It advertises this at USB_DFU_CAPS_VIRT_ADDR: an UPLOAD there returns
+# b"OWC1" + a little-endian u32 capability word. Older bootloaders STALL that
+# read or return flash bytes (1.0.3-rc.1 does), so the bits are trusted only
+# behind the magic.
+USB_DFU_HDR_STAGE_VIRT_ADDR     = 0xFFFFFF10
+USB_DFU_CAPS_VIRT_ADDR          = 0xFFFFFF18
+USB_DFU_CAPS_MAGIC              = b"OWC1"
+USB_DFU_CAP_VERIFY_BEFORE_ERASE = 0x00000001
+# sizeof(SE_FwRawHeaderTypeDef): the signed part of the image header.
+USB_DFU_SFU_HEADER_LEN          = 320
+# The check is a software ECDSA verify on the console's Cortex-M0; the
+# bootloader's own flasher (py-tools/stm32dfu.py) allows 15 s.
+USB_DFU_HDR_VERIFY_TIMEOUT_S    = 15.0
+
 # I2C DFU command bytes (must match i2c_dfu_if.h)
 I2C_DFU_SLAVE_ADDR      = 0x72
 I2C_DFU_CMD_DNLOAD      = 0x01
@@ -132,6 +150,15 @@ class DFUWriteRefusedError(RuntimeError):
     """
 
 
+class DFUHeaderRefusedError(DFUWriteRefusedError, ValueError):
+    """The bootloader refused the signed header staged before the erase
+    (open-lifu-console-bl >= 1.1.0, verify before erase). Nothing in the slot
+    was touched, so this is also a ``ValueError``: callers that treat
+    ``ValueError`` as a pre-flight refusal (``update_console``) boot the
+    installed application back up instead of leaving the unit in DFU.
+    """
+
+
 @dataclass
 class DeviceProfile:
     name: str
@@ -141,6 +168,11 @@ class DeviceProfile:
     app_default_address: int | None = None
     reset_virt_addr: int | None = 0xFFFFFF08
     slot_size: int | None = None
+    # Verify-before-erase virtual addresses (see USB_DFU_CAPS_VIRT_ADDR).
+    # None = never probed: the transmitter bootloader checks the header
+    # in-band on the first slot block and needs no staging step.
+    caps_virt_addr: int | None = None
+    hdr_stage_virt_addr: int | None = None
 
 # Built-in profiles
 TRANSMITTER_PROFILE = DeviceProfile(
@@ -168,6 +200,10 @@ CONSOLE_PROFILE = DeviceProfile(
     # short of the app config block (0x0801F000, exposed over OW_CMD_USR_CFG
     # since app 1.2.7) and the anti-rollback floor (0x0801F800).
     slot_size=0xF000,
+    # Probed on every slot write; staged only when the bootloader advertises
+    # verify before erase (>= 1.1.0), so older bootloaders keep the old flow.
+    caps_virt_addr=USB_DFU_CAPS_VIRT_ADDR,
+    hdr_stage_virt_addr=USB_DFU_HDR_STAGE_VIRT_ADDR,
 )
 
 # Console SBSFU active slot: the signed image (320 B header + app @ +0x400)
@@ -600,11 +636,19 @@ class STM32USBDFU:
         self.dev = None
         self.intf = None
         self._backend = None
+        # Verify before erase: addresses from the profile (None = not probed),
+        # and the header this session staged, re-staged if the device has to
+        # be re-opened mid-write (_resync_session).
+        self.caps_virt_addr: int | None = None
+        self.hdr_stage_virt_addr: int | None = None
+        self._staged_header: bytes | None = None
         # device_profile may override transfer_size and provide read_len/alignment
         if device_profile is not None:
             self.transfer_size = int(device_profile.transfer_size)
             self.version_read_len = int(device_profile.version_read_len)
             self.program_alignment = int(device_profile.program_alignment_bytes)
+            self.caps_virt_addr = device_profile.caps_virt_addr
+            self.hdr_stage_virt_addr = device_profile.hdr_stage_virt_addr
         else:
             self.version_read_len = USB_DFU_VERSION_READ_LEN
             # default alignment (safe): 8 (transmitter L4 uses 8-byte doubleword)
@@ -811,6 +855,112 @@ class STM32USBDFU:
         self.abort()
         return raw.rstrip(b"\x00").decode("ascii", errors="replace")
 
+    # --- verify before erase (open-lifu-console-bl >= 1.1.0) ---
+
+    def read_capabilities(self) -> int:
+        """Return the bootloader's capability word, or 0 when it has none.
+
+        Only probed when the device profile names a capability address.
+        Bootloaders that predate the word STALL the read or return flash
+        bytes, so the bits are trusted only behind ``USB_DFU_CAPS_MAGIC``; a
+        failed read is cleared back to dfuIDLE and reported as 0, so the
+        caller falls back to the plain erase-then-write flow.
+        """
+        if self.caps_virt_addr is None:
+            return 0
+        try:
+            self._recover_idle()
+            self._set_address(self.caps_virt_addr)
+            self.abort()   # UPLOAD is served from dfuIDLE only
+            raw = self._ctrl_in(self.DFU_UPLOAD, 2, 8)
+            self.abort()
+        except Exception as e:
+            logger.debug("DFU capability read failed (%s): no capabilities", e)
+            try:
+                self._recover_idle()
+            except Exception:
+                pass
+            return 0
+        if len(raw) < 8 or raw[:4] != USB_DFU_CAPS_MAGIC:
+            return 0
+        return struct.unpack("<I", raw[4:8])[0]
+
+    def requires_header_staging(self) -> bool:
+        """True if the bootloader refuses slot erase/write until
+        :meth:`stage_header` has run."""
+        if self.hdr_stage_virt_addr is None:
+            return False
+        return bool(self.read_capabilities() & USB_DFU_CAP_VERIFY_BEFORE_ERASE)
+
+    def stage_header(self, image: bytes) -> None:
+        """DNLOAD the image's signed header to the staging address and wait
+        for the bootloader to verify it. Must precede any erase or write of
+        the slot on a verify-before-erase bootloader.
+
+        Raises:
+            ValueError: *image* does not start with a signed SFU header.
+            DFUHeaderRefusedError: The bootloader refused the header; nothing
+                in the slot was erased.
+            TimeoutError: The bootloader did not finish the check in time.
+        """
+        if self.hdr_stage_virt_addr is None:
+            raise RuntimeError("stage_header: this device profile has no "
+                               "header staging address")
+        header = bytes(image[:USB_DFU_SFU_HEADER_LEN])
+        if len(header) < USB_DFU_SFU_HEADER_LEN or header[:4] != b"SFU1":
+            raise ValueError("stage_header: not a signed image (no SFU1 "
+                             f"header in the first {USB_DFU_SFU_HEADER_LEN} bytes)")
+        self._recover_idle()
+        self._set_address(self.hdr_stage_virt_addr)
+        self._prepare_dnload()
+        self._ctrl_out(self.DFU_DNLOAD, 2, header)
+        st = self._wait_header_check(USB_DFU_HDR_VERIFY_TIMEOUT_S)
+        if st["state"] == self.STATE_DFU_ERROR:
+            self._staged_header = None
+            try:
+                self._recover_idle()
+            except Exception:
+                pass
+            raise DFUHeaderRefusedError(
+                f"the bootloader refused the image before erasing anything "
+                f"(bStatus 0x{st['status']:02X}): signed with a key this board "
+                f"does not trust (wrong board, or research vs clinical build), "
+                f"modified, too large for the slot, or older than the "
+                f"installed firmware. The installed firmware is intact.")
+        self._staged_header = header
+        logger.info("DFU: bootloader verified the image header before erase")
+
+    def _wait_header_check(self, timeout_s: float) -> dict:
+        """Poll GETSTATUS until the header check finishes. Unlike
+        :meth:`_wait_while_busy` this has a deadline and rides out failed
+        polls: the device may not answer while it runs the ECDSA verify."""
+        busy = {self.STATE_DFU_DNLOAD_SYNC, self.STATE_DFU_DNLOAD_BUSY}
+        deadline = time.monotonic() + timeout_s
+        last_error: Exception | None = None
+        while True:
+            try:
+                st = self.get_status()
+            except Exception as e:
+                last_error = e
+                st = None
+            if st is not None and st["state"] not in busy:
+                return st
+            if time.monotonic() >= deadline:
+                suffix = f" (last poll failed: {last_error})" if last_error else ""
+                raise TimeoutError(
+                    f"DFU: the bootloader did not finish checking the image "
+                    f"header within {timeout_s:.0f} s{suffix}")
+            wait = 0.2 if st is None else max(st["poll_timeout_ms"] / 1000.0, 0.010)
+            time.sleep(min(wait, max(deadline - time.monotonic(), 0.0)))
+
+    def prepare_slot_write(self, image: bytes) -> bool:
+        """Stage *image*'s header if the bootloader requires it. Returns True
+        if it was staged, False if this bootloader takes the plain flow."""
+        if not self.requires_header_staging():
+            return False
+        self.stage_header(image)
+        return True
+
     def erase_pages(self, start_addr: int, end_addr: int,
                     page_size: int = 2048) -> None:
         """Explicitly page-erase every flash page in [start_addr, end_addr).
@@ -952,6 +1102,12 @@ class STM32USBDFU:
         10 s for it to come back). Finally the DfuSe address pointer is set
         to the interrupted flash offset so the caller can resume with
         block 2 exactly where the failed block was.
+
+        Raises:
+            RuntimeError: The re-opened device would not take the staged
+                header again. The slot is already erased, so this is never
+                the pre-flight ``ValueError`` that :meth:`stage_header`
+                raises before an erase.
         """
         try:
             self._recover_idle()
@@ -968,6 +1124,27 @@ class STM32USBDFU:
                 except Exception:
                     if time.monotonic() > deadline:
                         raise
+            # A verify-before-erase bootloader that rebooted has forgotten
+            # the verified header and refuses every write until it is staged
+            # again. Re-staging is harmless if it had not rebooted.
+            if self._staged_header is not None:
+                logger.warning("DFU: re-staging the image header after "
+                               "re-opening the device")
+                try:
+                    self.stage_header(self._staged_header)
+                except Exception as e:
+                    # Not stage_header's own exception: a refusal is a
+                    # ValueError, which update_console answers by resetting
+                    # the unit as if nothing were erased, and a TimeoutError
+                    # during read-back repair would pass _program_slot_image's
+                    # legacy-reboot fallback as success.
+                    cause = ("the bootloader refused it"
+                             if isinstance(e, DFUHeaderRefusedError) else str(e))
+                    raise RuntimeError(
+                        f"DFU: the image header could not be staged again after "
+                        f"re-opening the device mid-write ({cause}). The slot is "
+                        f"already erased and may be partly written: leave the "
+                        f"unit in DFU and retry the update.") from e
         self._set_address(address + offset)
 
     def manifest(self) -> None:
@@ -1442,6 +1619,7 @@ class LIFUDFUManager:
 
         with STM32USBDFU(vid=vid, pid=pid, libusb_dll=libusb_dll,
                          device_profile=profile) as dfu:
+            dfu.prepare_slot_write(image)   # verify before erase (BL >= 1.1.0)
             # Erase the whole slot, not just this image's pages: a smaller
             # image would leave the old tail behind, and the bootloader rejects
             # it at boot and 0x00-fills the slot, stranding the unit.
