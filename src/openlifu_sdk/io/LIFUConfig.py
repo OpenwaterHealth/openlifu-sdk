@@ -59,6 +59,7 @@ OW_CMD_TOGGLE_LED = 0x04
 OW_CMD_HWID = 0x05
 OW_CMD_GET_TEMP = 0x06
 OW_CMD_GET_AMBIENT = 0x07
+OW_CMD_SIGCHK = 0x08  # signature check: the signed header, or bare metal
 OW_CMD_ASYNC = 0x09
 OW_CMD_USR_CFG = 0x0A
 OW_CMD_CLEAR_CONFIG = 0x0B  # Phase 2: chain broadcast to drop stale I2C addresses
@@ -191,8 +192,13 @@ GLOBAL_COMMANDS = {
     OW_CMD_PING, OW_CMD_PONG, OW_CMD_VERSION, OW_CMD_ECHO,
     OW_CMD_TOGGLE_LED, OW_CMD_HWID, OW_CMD_GET_TEMP, OW_CMD_GET_AMBIENT,
     OW_CMD_ASYNC, OW_CMD_USR_CFG, OW_CMD_DISCOVERY, OW_CMD_DFU,
-    OW_CMD_NOP, OW_CMD_RESET,
+    OW_CMD_NOP, OW_CMD_RESET, OW_CMD_SIGCHK,
 }
+
+# OW_CMD_SIGCHK reply payload (both firmwares, Core/Inc/common.h): a status
+# byte, then for a slot build the signed SBSFU header from the slot start.
+SIGCHK_SLOT_IMAGE = 0x00   # data[1:321] is the signed header
+SIGCHK_BARE_METAL = 0x01   # no bootloader, so no signed header
 
 TX7332_COMMANDS = {
     OW_TX7332_STATUS, OW_TX7332_ENUM, OW_TX7332_WREG, OW_TX7332_RREG,
@@ -226,9 +232,10 @@ POWER_COMMANDS = {
 # FDA subsets: the only commands the FDA components (TxDevice / HVController)
 # will put on the wire. LIFUTxDevice / LIFUHVController use the full sets
 # above. OW_CMD_USR_CFG carries both read (reserved=0) and write (reserved=1);
-# the FDA classes only expose the read.
+# the FDA classes only expose the read. OW_CMD_SIGCHK is a read: the clinical
+# app checks the firmware's signing key with it.
 GLOBAL_FDA_COMMANDS = {
-    OW_CMD_PING, OW_CMD_VERSION, OW_CMD_HWID, OW_CMD_USR_CFG,
+    OW_CMD_PING, OW_CMD_VERSION, OW_CMD_HWID, OW_CMD_USR_CFG, OW_CMD_SIGCHK,
 }
 
 # What the FDA components may send, as packet type -> opcodes. The firmware

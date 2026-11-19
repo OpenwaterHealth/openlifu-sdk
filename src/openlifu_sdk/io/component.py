@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 from __future__ import annotations
 
+import enum
 import json
 import logging
 import struct
@@ -11,6 +12,7 @@ from .LIFUConfig import (
     DEFAULT_TIMEOUT, HW_ID_DATA_LENGTH,
     OW_CMD_PING, OW_CMD_VERSION, OW_CMD_ECHO, OW_CMD_HWID,
     OW_CMD_TOGGLE_LED, OW_CMD_DFU, OW_CMD_RESET, OW_CMD_USR_CFG,
+    OW_CMD_SIGCHK, SIGCHK_SLOT_IMAGE, SIGCHK_BARE_METAL,
     LIFU_ERR_BAD_PAYLOAD_FORMAT,
     LIFU_ERR_BAD_PAYLOAD_LENGTH,
 )
@@ -28,6 +30,15 @@ from ..util.hwid import encode_hwid
 
 
 log = logging.getLogger(__name__)
+
+
+class SignatureCheck(enum.Enum):
+    """Result of :meth:`OWComponent.check_signature`."""
+
+    SIGNED = "signed"            # the running image is signed by the key's private key
+    NOT_SIGNED = "not-signed"    # it is not (another key, or no valid header)
+    BARE_METAL = "bare-metal"    # a bare-metal build: no bootloader, no signature
+    ERROR = "error"              # the device refused or answered malformed
 
 # Build a command -> packet-type lookup so callers only need to specify the
 # command byte; the correct packet type is inferred automatically.
@@ -331,6 +342,51 @@ class OWComponent:
             )
         return encode_hwid(bytes(r.data[:HW_ID_DATA_LENGTH]), raw_hex, base58,
                            legacy_6byte)
+
+    def check_signature(self, public_key, module: int = 0) -> SignatureCheck:
+        """Check whether the running firmware is signed by the private key
+        matching *public_key* (OW_CMD_SIGCHK).
+
+        The device returns the signed header the bootloader verified at boot
+        (or says it is a bare-metal build); the ECDSA check runs here. Like the
+        firmware's other answers about itself, it reports what the image
+        says: the bootloader's boot-time check is what enforces it.
+
+        Args:
+            public_key: An ECDSA P-256 public key: a key object, PEM bytes, a
+                PEM file, or a keys directory holding ``ecdsa_public.pem``
+                (see :func:`openlifu_sdk.io.LIFUCrypto.load_public_key`).
+            module: Target module address (default 0).
+
+        Returns:
+            :class:`SignatureCheck`. ``ERROR`` when the device refuses the
+            command (e.g. firmware without it) or the reply is malformed.
+
+        Raises:
+            LIFUCryptoError: *public_key* cannot be loaded.
+            LIFUNotConnectedError, LIFUCommunicationError.
+        """
+        from openlifu_sdk.io import LIFUCrypto
+
+        key = LIFUCrypto.load_public_key(public_key)
+        try:
+            r = self.send_checked(OW_CMD_SIGCHK, addr=module, op="check_signature")
+        except LIFUDeviceError as e:
+            log.warning("%s: signature check refused: %s", self._uart.desc, e)
+            return SignatureCheck.ERROR
+        data = bytes(r.data[:r.data_len]) if r.data_len and r.data else b""
+        if data[:1] == bytes([SIGCHK_BARE_METAL]):
+            return SignatureCheck.BARE_METAL
+        if data[:1] != bytes([SIGCHK_SLOT_IMAGE]) or len(data) < 1 + LIFUCrypto.HEADER_TOTAL_LEN:
+            log.warning("%s: malformed signature check reply (%d bytes)",
+                        self._uart.desc, len(data))
+            return SignatureCheck.ERROR
+        header = data[1:1 + LIFUCrypto.HEADER_TOTAL_LEN]
+        if header[:4] != LIFUCrypto.SFU_MAGIC:
+            return SignatureCheck.NOT_SIGNED
+        if LIFUCrypto.verify_header_signature(header, key):
+            return SignatureCheck.SIGNED
+        return SignatureCheck.NOT_SIGNED
 
     # ------------------------------------------------------------------
     # User configuration helpers
