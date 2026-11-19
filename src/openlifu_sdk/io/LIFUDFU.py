@@ -104,6 +104,12 @@ USB_DFU_HDR_STAGE_VIRT_ADDR     = 0xFFFFFF10
 USB_DFU_CAPS_VIRT_ADDR          = 0xFFFFFF18
 USB_DFU_CAPS_MAGIC              = b"OWC1"
 USB_DFU_CAP_VERIFY_BEFORE_ERASE = 0x00000001
+# Signed preset write (open-lifu-console-bl >= 1.1.0-rc.2): the slot stops at
+# page 60 and page 61 holds a signed preset package (LIFUPresetPackage), which
+# the bootloader takes only after its PRS1 header, DNLOADed to
+# USB_DFU_PRESET_STAGE_VIRT_ADDR, verifies.
+USB_DFU_CAP_SIGNED_PRESET_WRITE = 0x00000002
+USB_DFU_PRESET_STAGE_VIRT_ADDR  = 0xFFFFFF20
 # sizeof(SE_FwRawHeaderTypeDef): the signed part of the image header.
 USB_DFU_SFU_HEADER_LEN          = 320
 # The check is a software ECDSA verify on the console's Cortex-M0; the
@@ -184,6 +190,11 @@ class DeviceProfile:
     # in-band on the first slot block and needs no staging step.
     caps_virt_addr: int | None = None
     hdr_stage_virt_addr: int | None = None
+    # Preset page above the slot, on a bootloader advertising
+    # USB_DFU_CAP_SIGNED_PRESET_WRITE (console >= 1.1.0-rc.2). On such a
+    # bootloader the slot ends at preset_base, so the slot erase stops there.
+    preset_base: int | None = None
+    preset_size: int | None = None
 
 # Built-in profiles
 TRANSMITTER_PROFILE = DeviceProfile(
@@ -207,14 +218,18 @@ CONSOLE_PROFILE = DeviceProfile(
     program_alignment_bytes=4,
     app_default_address=0x08010000,  # SBSFU active slot (console memory_map.h)
     reset_virt_addr=0xFFFFFF08,
-    # Pages 32-61 = the DFU-writable window. The erase stops at 0x0801EFFF,
-    # short of the app config block (0x0801F000, exposed over OW_CMD_USR_CFG
-    # since app 1.2.7) and the anti-rollback floor (0x0801F800).
+    # Pages 32-61: the slot on bootloaders before 1.1.0-rc.2. The erase stops
+    # at 0x0801EFFF, short of the app config block (0x0801F000, exposed over
+    # OW_CMD_USR_CFG since app 1.2.7) and the anti-rollback floor (0x0801F800).
+    # A bootloader with the preset page has a 58 KB slot (pages 32-60): see
+    # STM32USBDFU.slot_erase_bytes().
     slot_size=0xF000,
     # Probed on every slot write; staged only when the bootloader advertises
     # verify before erase (>= 1.1.0), so older bootloaders keep the old flow.
     caps_virt_addr=USB_DFU_CAPS_VIRT_ADDR,
     hdr_stage_virt_addr=USB_DFU_HDR_STAGE_VIRT_ADDR,
+    preset_base=0x0801E800,         # page 61 (LIFUPresetPackage.CONSOLE_PRESET_BASE)
+    preset_size=0x800,
 )
 
 # Console SBSFU active slot: the signed image (320 B header + app @ +0x400)
@@ -657,6 +672,8 @@ class STM32USBDFU:
         self.caps_virt_addr: int | None = None
         self.hdr_stage_virt_addr: int | None = None
         self._staged_header: bytes | None = None
+        self._profile = device_profile
+        self._caps: int | None = None       # read_capabilities() result, cached
         # device_profile may override transfer_size and provide read_len/alignment
         if device_profile is not None:
             self.transfer_size = int(device_profile.transfer_size)
@@ -912,8 +929,10 @@ class STM32USBDFU:
                 time.sleep(0.2)
                 continue
             if len(raw) < 8 or raw[:4] != USB_DFU_CAPS_MAGIC:
-                return 0
-            return struct.unpack("<I", raw[4:8])[0]
+                self._caps = 0
+            else:
+                self._caps = struct.unpack("<I", raw[4:8])[0]
+            return self._caps
         raise RuntimeError(
             f"DFU: could not read the bootloader's capabilities "
             f"({last_error}). Nothing was erased; retry the update.") from last_error
@@ -943,25 +962,74 @@ class STM32USBDFU:
         if len(header) < USB_DFU_SFU_HEADER_LEN or header[:4] != b"SFU1":
             raise ValueError("stage_header: not a signed image (no SFU1 "
                              f"header in the first {USB_DFU_SFU_HEADER_LEN} bytes)")
+        self._staged_header = None
+        self._stage(header, self.hdr_stage_virt_addr,
+                    "the bootloader refused the image before erasing anything "
+                    "(bStatus 0x{status:02X}): signed with a key this board "
+                    "does not trust (wrong board, or research vs clinical build), "
+                    "modified, too large for the slot, or older than the "
+                    "installed firmware. The installed firmware is intact.")
+        self._staged_header = header
+        logger.info("DFU: bootloader verified the image header before erase")
+
+    def stage_preset(self, package: bytes) -> None:
+        """DNLOAD a preset package's signed PRS1 header to the preset staging
+        address and wait for the bootloader to verify it. Must precede any
+        erase or write of the preset page.
+
+        Raises:
+            ValueError: *package* does not start with a PRS1 header.
+            DFUHeaderRefusedError: The bootloader refused it; the preset page
+                was not touched.
+            TimeoutError: The bootloader did not finish the check in time.
+        """
+        header = bytes(package[:USB_DFU_SFU_HEADER_LEN])
+        if len(header) < USB_DFU_SFU_HEADER_LEN or header[:4] != b"PRS1":
+            raise ValueError("stage_preset: not a preset package (no PRS1 "
+                             f"header in the first {USB_DFU_SFU_HEADER_LEN} bytes)")
+        self._stage(header, USB_DFU_PRESET_STAGE_VIRT_ADDR,
+                    "the bootloader refused the preset package before touching "
+                    "the preset page (bStatus 0x{status:02X}): signed with a key "
+                    "this board does not trust (wrong board, or research vs "
+                    "clinical), modified, or too large for the page. The "
+                    "installed presets are intact.")
+        logger.info("DFU: bootloader verified the preset package header")
+
+    def _stage(self, header: bytes, virt_addr: int, refused: str) -> None:
+        """DNLOAD *header* to the staging address *virt_addr* and wait for
+        the bootloader's verdict; *refused* (formatted with ``status``) is the
+        DFUHeaderRefusedError message."""
         self._recover_idle()
-        self._set_address(self.hdr_stage_virt_addr)
+        self._set_address(virt_addr)
         self._prepare_dnload()
         self._ctrl_out(self.DFU_DNLOAD, 2, header)
         st = self._wait_header_check(USB_DFU_HDR_VERIFY_TIMEOUT_S)
         if st["state"] == self.STATE_DFU_ERROR:
-            self._staged_header = None
             try:
                 self._recover_idle()
             except Exception:
                 pass
-            raise DFUHeaderRefusedError(
-                f"the bootloader refused the image before erasing anything "
-                f"(bStatus 0x{st['status']:02X}): signed with a key this board "
-                f"does not trust (wrong board, or research vs clinical build), "
-                f"modified, too large for the slot, or older than the "
-                f"installed firmware. The installed firmware is intact.")
-        self._staged_header = header
-        logger.info("DFU: bootloader verified the image header before erase")
+            raise DFUHeaderRefusedError(refused.format(status=st["status"]))
+
+    def has_preset_page(self) -> bool:
+        """True if the bootloader keeps presets in their own page above the
+        slot (capability USB_DFU_CAP_SIGNED_PRESET_WRITE)."""
+        if self._profile is None or self._profile.preset_base is None:
+            return False
+        caps = self._caps if self._caps is not None else self.read_capabilities()
+        return bool(caps & USB_DFU_CAP_SIGNED_PRESET_WRITE)
+
+    def slot_erase_bytes(self) -> int | None:
+        """How many bytes from the slot base a slot write erases: up to the
+        preset page on a bootloader that has one (it must survive an
+        application update), else the profile's whole slot (on older
+        bootloaders that page is part of the slot and must be blank)."""
+        p = self._profile
+        if p is None:
+            return None
+        if self.has_preset_page() and p.app_default_address is not None:
+            return p.preset_base - p.app_default_address
+        return p.slot_size
 
     def _wait_header_check(self, timeout_s: float) -> dict:
         """Poll GETSTATUS until the header check finishes. Unlike
@@ -1695,7 +1763,7 @@ class LIFUDFUManager:
             # image would leave the old tail behind, and the bootloader rejects
             # it at boot and 0x00-fills the slot, stranding the unit.
             dfu.write_memory(slot_base, image, page_erase=True,
-                             erase_bytes=profile.slot_size,
+                             erase_bytes=dfu.slot_erase_bytes(),
                              progress_callback=progress_callback)
             # Read-back verify + targeted page repair, then manifest. On
             # bootloaders <= 1.0.1-rc.1 the verify read's initial ABORT
@@ -1778,6 +1846,61 @@ class LIFUDFUManager:
             signed_image, CONSOLE_PROFILE, CONSOLE_SLOT_BASE, "Console",
             keys_dir=keys_dir, force=force, vid=vid, pid=pid,
             libusb_dll=libusb_dll, progress_callback=progress_callback)
+
+    def program_console_presets(self, package: str | bytes,
+                                public_key=None,
+                                vid: int = 0x0483, pid: int = 0xDF11,
+                                libusb_dll: str | None = None,
+                                progress_callback: Callable | None = None) -> None:
+        """Write a signed preset package to the console's preset page via the
+        bootloader's USB DFU (console bootloader >= 1.1.0-rc.2). The console
+        must already be in USB DFU mode.
+
+        Pre-flight, before the device is touched: the package must parse, its
+        body must match its signed hash, it must fit the page, and with
+        *public_key* its signature must verify. The bootloader then checks the
+        signature itself before it lets the page be erased, and the body's
+        hash when the download completes.
+
+        Raises:
+            ValueError: The package is invalid, too large, or not signed by
+                *public_key*. Nothing was written.
+            RuntimeError: The bootloader has no preset page (older than
+                1.1.0-rc.2), or DFU communication failed.
+            DFUHeaderRefusedError: The bootloader refused the package; the
+                installed presets are intact.
+        """
+        from openlifu_sdk.io import LIFUPresetPackage as pp
+
+        data = Path(package).read_bytes() if isinstance(package, (str, Path)) else bytes(package)
+        pkg = pp.parse_preset_package(data)
+        if not pkg.body_ok:
+            raise ValueError("Preset package body does not match its signed hash")
+        data = pkg.header + pkg.body
+        if len(data) > CONSOLE_PROFILE.preset_size:
+            raise ValueError(f"Preset package is {len(data)} bytes; the page "
+                             f"holds {CONSOLE_PROFILE.preset_size}")
+        if public_key is not None and not pp.verify_preset_package(data, public_key):
+            raise ValueError("Preset package is not signed by the given key")
+        logger.info("Console presets: %d bytes, context %s, diathermy %s",
+                    len(pkg.body), pkg.context, pkg.diathermy_sha)
+
+        with STM32USBDFU(vid=vid, pid=pid, libusb_dll=libusb_dll,
+                         device_profile=CONSOLE_PROFILE) as dfu:
+            if not dfu.has_preset_page():
+                raise RuntimeError(
+                    "This console bootloader has no preset page (it predates "
+                    "open-lifu-console-bl 1.1.0-rc.2); update the bootloader first.")
+            dfu.stage_preset(data)
+            dfu.write_memory(CONSOLE_PROFILE.preset_base, data, page_erase=True,
+                             progress_callback=progress_callback)
+            readback = dfu.read_memory(CONSOLE_PROFILE.preset_base, len(data))
+            if readback != data:
+                raise RuntimeError("Console presets: read-back does not match "
+                                   "the package; the unit stays in DFU, retry")
+            logger.info("Console presets written and read back; sending manifest "
+                        "(the bootloader checks the body hash, then resets)")
+            dfu.manifest()
 
     def update_console(self, signed_image: str,
                        enter_dfu_fn: Callable | None = None,

@@ -92,6 +92,8 @@ class FakeConsoleBootloader(STM32USBDFU):
         self.caps_virt_addr = profile.caps_virt_addr
         self.hdr_stage_virt_addr = profile.hdr_stage_virt_addr
         self._staged_header = None
+        self._profile = profile
+        self._caps = None
         self.caps = caps
         self.accept_header = accept_header
         self.scripted_polls = list(header_polls)
