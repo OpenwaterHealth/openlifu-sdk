@@ -12,6 +12,7 @@ update path with a fake transport modelling both kinds of bootloader.
 
 from __future__ import annotations
 
+import errno
 import struct
 from types import SimpleNamespace
 
@@ -26,6 +27,7 @@ from openlifu_sdk.io.LIFUDFU import (
     USB_DFU_HDR_STAGE_VIRT_ADDR,
     USB_DFU_SFU_HEADER_LEN,
     DFUHeaderRefusedError,
+    DFUHeaderTimeoutError,
     DFUWriteRefusedError,
     LIFUDFUManager,
     STM32USBDFU,
@@ -48,7 +50,15 @@ def _no_sleep(monkeypatch):
 
 
 class UsbStall(Exception):
-    """Stands in for usb.core.USBError (pipe error / STALL)."""
+    """Stands in for usb.core.USBError. A STALL is a pipe error (EPIPE);
+    other failures (no answer, device gone) carry another errno."""
+
+    def __init__(self, msg, err=errno.EIO):
+        super().__init__(msg)
+        self.errno = err
+
+
+STALLED_PKT = STM32USBDFU.STATE_ST_STALLED_PKT
 
 
 class FakeConsoleBootloader(STM32USBDFU):
@@ -58,6 +68,8 @@ class FakeConsoleBootloader(STM32USBDFU):
     caps: what an UPLOAD at 0xFFFFFF18 does - CAPS_OK (>= 1.1.0), "stall"
           (a bootloader that does not serve the address), or other bytes
           (1.0.3-rc.1 returns flash bytes).
+    caps_glitches: how many capability reads fail with a non-STALL error
+          before one gets through.
     accept_header: whether a staged header verifies.
     header_polls: GETSTATUS replies scripted after the staging DNLOAD -
           "busy" (still checking) or "fail" (no answer); the real result
@@ -73,7 +85,7 @@ class FakeConsoleBootloader(STM32USBDFU):
 
     def __init__(self, caps=CAPS_OK, accept_header=True, header_polls=(),
                  profile=CONSOLE_PROFILE, reboot_at_write=None,
-                 lost_write_at=None, restage="accept"):
+                 lost_write_at=None, restage="accept", caps_glitches=0):
         self.transfer_size = 1024
         self.program_alignment = 4
         self.timeout_ms = 4000
@@ -96,6 +108,7 @@ class FakeConsoleBootloader(STM32USBDFU):
         self.restage = restage
         self.writes = 0
         self.dead = False
+        self.caps_glitches = caps_glitches
 
     # -- transport model --------------------------------------------------
     def open(self):
@@ -126,8 +139,15 @@ class FakeConsoleBootloader(STM32USBDFU):
     def _ctrl_out(self, req, value, data=b""):
         if self.dead:
             raise UsbStall("device gone")
-        if req in (self.DFU_CLRSTATUS, self.DFU_ABORT):
-            self.state = DFU_IDLE
+        # ST USB device library v2.11.6: CLRSTATUS clears dfuERROR to dfuIDLE
+        # and sets dfuERROR from any other state (so the STALLed-packet
+        # state takes two); ABORT is ignored in either error state.
+        if req == self.DFU_CLRSTATUS:
+            self.state = DFU_IDLE if self.state == self.STATE_DFU_ERROR else self.STATE_DFU_ERROR
+            return 0
+        if req == self.DFU_ABORT:
+            if self.state not in (self.STATE_DFU_ERROR, STALLED_PKT):
+                self.state = DFU_IDLE
             return 0
         assert req == self.DFU_DNLOAD
         if value == 0:                                    # DfuSe command
@@ -180,9 +200,12 @@ class FakeConsoleBootloader(STM32USBDFU):
         addr = self.pointer + (value - 2) * self.transfer_size
         if addr == USB_DFU_CAPS_VIRT_ADDR:
             self.ops.append(("caps", None))
+            if self.caps_glitches:
+                self.caps_glitches -= 1
+                raise UsbStall("transfer timed out", errno.ETIMEDOUT)
             if self.caps == "stall":
-                self.state = self.STATE_DFU_ERROR
-                raise UsbStall("pipe error")
+                self.state = STALLED_PKT
+                raise UsbStall("pipe error", errno.EPIPE)
             return bytes(self.caps)[:length]
         off = addr - SLOT
         return bytes(self.flash[off:off + length])
@@ -211,7 +234,31 @@ def test_capability_bytes_without_the_magic_mean_none(caps):
 def test_stalled_capability_read_is_cleared_and_means_none():
     dfu = FakeConsoleBootloader(caps="stall")
     assert dfu.read_capabilities() == 0
-    assert dfu.state == DFU_IDLE                  # left usable, not in dfuERROR
+    assert dfu.state == DFU_IDLE                  # left usable, not STALLed
+
+
+def test_recover_idle_clears_the_stalled_packet_state():
+    # ST's library leaves bState = 0x0F after a STALLed UPLOAD; ABORT is
+    # ignored there and it takes two CLRSTATUS to reach dfuIDLE.
+    dfu = FakeConsoleBootloader()
+    dfu.state = STALLED_PKT
+    dfu._recover_idle()
+    assert dfu.state == DFU_IDLE
+
+
+def test_transient_capability_read_failure_is_retried():
+    dfu = FakeConsoleBootloader(caps_glitches=2)
+    assert dfu.read_capabilities() == 1
+    assert dfu.kinds().count("caps") == 3
+
+
+def test_persistent_capability_read_failure_raises_before_any_erase():
+    # Not taken for "no capabilities": that would skip the staging a 1.1.0
+    # bootloader needs and end in a misleading refused-block error.
+    dfu = FakeConsoleBootloader(caps_glitches=99)
+    with pytest.raises(RuntimeError, match="Nothing was erased"):
+        dfu.prepare_slot_write(signed_image())
+    assert "erase" not in dfu.kinds() and "stage" not in dfu.kinds()
 
 
 def test_magic_without_the_staging_bit_needs_no_staging():
@@ -289,6 +336,16 @@ def test_header_check_that_never_finishes_times_out(monkeypatch):
         dfu.stage_header(signed_image())
 
 
+def test_first_staging_timeout_is_a_pre_flight_refusal(monkeypatch):
+    monkeypatch.setattr(LIFUDFU, "USB_DFU_HDR_VERIFY_TIMEOUT_S", 0)
+    dfu = FakeConsoleBootloader(header_polls=["fail"])
+    with pytest.raises(DFUHeaderTimeoutError, match="Nothing was erased") as exc:
+        dfu.prepare_slot_write(signed_image())
+    assert isinstance(exc.value, ValueError)      # update_console boots the app back
+    assert isinstance(exc.value, TimeoutError)    # existing TimeoutError handlers
+    assert "erase" not in dfu.kinds()
+
+
 def test_unsigned_image_is_refused_locally():
     dfu = FakeConsoleBootloader()
     with pytest.raises(ValueError, match="not a signed image"):
@@ -330,13 +387,14 @@ def console_path(monkeypatch, tmp_path):
     image = signed_image(8000)
     path = tmp_path / "console-signed.bin"
     path.write_bytes(image)
-    report = SimpleNamespace(ok=True, structural_ok=True,
-                             header=SimpleNamespace(fw_version=2144, fw_version_str="1.3.0"),
+    report = SimpleNamespace(ok=True, structural_ok=True, trailing_bytes=0,
+                             header=SimpleNamespace(fw_version=2144, fw_version_str="1.3.0",
+                                                    fw_size=len(image) - 0x400),
                              describe=lambda: "")
     monkeypatch.setattr(LIFUCrypto, "validate_signed_image", lambda *_a, **_k: report)
     monkeypatch.setattr(LIFUDFUManager, "_get_installed_slot_version",
                         lambda *_a, **_k: 2144)
-    holder = {}
+    holder = {"report": report}
 
     def make(**kwargs):
         dev = FakeConsoleBootloader(**holder.get("kwargs", {}))
@@ -413,3 +471,36 @@ def test_a_restage_timeout_during_repair_is_not_reported_as_success(console_path
     dev = holder["dev"]
     assert dev.kinds().count("stage") == 2
     assert dev.writes == 9                        # the repair started, then dropped
+
+
+def test_staging_timeout_boots_the_app_back(console_path, monkeypatch):
+    path, _image, holder = console_path
+    holder["kwargs"] = {"header_polls": ["fail"]}
+    monkeypatch.setattr(LIFUDFU, "USB_DFU_HDR_VERIFY_TIMEOUT_S", 0)
+    mgr = LIFUDFUManager()
+    monkeypatch.setattr(mgr, "get_console_bootloader_version",
+                        lambda **_k: "1.1.0-rc.0+research")
+    aborted = []
+    monkeypatch.setattr(mgr, "abort_dfu", lambda **k: aborted.append(k))
+    with pytest.raises(DFUHeaderTimeoutError):
+        mgr.update_console(str(path), enter_dfu_fn=lambda: None, dfu_wait_s=0)
+    assert aborted and aborted[0]["profile"] is CONSOLE_PROFILE
+    assert "erase" not in holder["dev"].kinds()
+
+
+@pytest.mark.parametrize("tail", [b"\x00", b"\xFF" * 3 + b"\x01", b"junk" * 64])
+def test_data_appended_to_the_image_is_refused_before_anything_is_sent(console_path, tail):
+    path, image, holder = console_path
+    path.write_bytes(image + tail)
+    holder["report"].trailing_bytes = len(tail)
+    with pytest.raises(ValueError, match="not 0xFF"):
+        LIFUDFUManager().program_console(str(path))
+    assert "dev" not in holder                    # no DFU session was opened
+
+
+def test_erased_padding_after_the_image_is_accepted(console_path):
+    path, image, holder = console_path
+    path.write_bytes(image + b"\xFF" * 100)
+    holder["report"].trailing_bytes = 100
+    LIFUDFUManager().program_console(str(path))
+    assert holder["dev"].refused == []

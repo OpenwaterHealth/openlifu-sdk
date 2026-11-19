@@ -396,9 +396,11 @@ class LIFUFirmwareUpdate:
                 Defaults to the bundled signed app.
             updater_bin: Override the legacy RAM updater. Defaults to the
                 bundled updater.
-            force: For the secure app-update path, flash even if the image
-                version is below the installed one (still subject to the
-                bootloader's anti-rollback floor at boot).
+            force: For the secure app-update path, skip the SDK's check that
+                the image version is not below the installed one. The
+                bootloader's anti-rollback still applies: a console
+                bootloader >= 1.1.0 refuses the downgrade before erasing;
+                elsewhere the floor may reject it at boot.
             force_production: Reflash the FULL production image (bootloader +
                 app) via STM32 ROM DFU regardless of cohort — see
                 :meth:`_force_production_update`. Beta/unlocked units only.
