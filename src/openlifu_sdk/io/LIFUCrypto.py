@@ -47,11 +47,13 @@ hash checks work without it.
 
 from __future__ import annotations
 
+import functools
 import hashlib
 import os
 import re
 import struct
 from dataclasses import dataclass
+from importlib import resources
 from pathlib import Path
 
 # Base class for LIFUCryptoError. Guarded so this module stays usable as a
@@ -493,6 +495,80 @@ class ValidationReport:
         return "\n".join(lines)
 
 
+def load_public_key(key: "str | Path | bytes | ec.EllipticCurvePublicKey"
+                    ) -> "ec.EllipticCurvePublicKey":
+    """Load an ECDSA P-256 public key.
+
+    Args:
+        key: A public key object, PEM bytes, a PEM file, or a keys directory
+            holding ``ecdsa_public.pem``.
+
+    Raises:
+        LIFUCryptoError: Unreadable, or not a P-256 public key.
+    """
+    _require_cryptography()
+    if isinstance(key, ec.EllipticCurvePublicKey):
+        loaded = key
+    else:
+        if isinstance(key, bytes):
+            pem = key
+        else:
+            path = Path(key)
+            pem = (path / PUBLIC_KEY_FILE if path.is_dir() else path).read_bytes()
+        try:
+            loaded = serialization.load_pem_public_key(pem)
+        except ValueError as e:
+            raise LIFUCryptoError(f"Cannot load the public key: {e}") from e
+    if not (isinstance(loaded, ec.EllipticCurvePublicKey)
+            and isinstance(loaded.curve, ec.SECP256R1)):
+        raise LIFUCryptoError("Not an ECDSA P-256 public key")
+    return loaded
+
+
+def verify_header_signature(header: bytes,
+                            public_key: "ec.EllipticCurvePublicKey") -> bool:
+    """True if *header*'s ECDSA signature (over its first 128 bytes, the
+    signed part the bootloader checks) verifies with *public_key*.
+
+    Raises:
+        LIFUCryptoError: *header* is shorter than the signed part.
+    """
+    _require_cryptography()
+    if len(header) < HEADER_AUTH_LEN + HEADER_SIGN_LEN:
+        raise LIFUCryptoError(
+            f"Header too short to verify ({len(header)} bytes)")
+    sig = header[HEADER_AUTH_LEN:HEADER_AUTH_LEN + HEADER_SIGN_LEN]
+    r = int.from_bytes(sig[:32], "big")
+    s = int.from_bytes(sig[32:], "big")
+    try:
+        public_key.verify(encode_dss_signature(r, s), header[:HEADER_AUTH_LEN],
+                          ec.ECDSA(hashes.SHA256()))
+    except InvalidSignature:
+        return False
+    return True
+
+
+# The keys each board's bootloaders trust, shipped in openlifu_sdk/keys (see
+# its PROVENANCE.txt): research = the firmware repos' FW_SIGNING_KEY (GitHub
+# releases), clinical = the Cloud KMS HSM key.
+FIRMWARE_BOARDS  = ("console", "transmitter")
+FIRMWARE_DOMAINS = ("research", "clinical")
+
+
+@functools.cache
+def trusted_public_key(board: str, domain: str) -> "ec.EllipticCurvePublicKey":
+    """The public key *board*'s *domain* bootloader trusts.
+
+    Raises:
+        ValueError: Unknown board or domain.
+        LIFUCryptoError: The shipped key cannot be loaded.
+    """
+    if board not in FIRMWARE_BOARDS or domain not in FIRMWARE_DOMAINS:
+        raise ValueError(f"No trusted key for board {board!r}, domain {domain!r}")
+    pem = resources.files("openlifu_sdk").joinpath("keys", board, f"{domain}.pem").read_bytes()
+    return load_public_key(pem)
+
+
 def validate_signed_image(image: str | Path | bytes,
                           keys_dir: str | Path | None = None) -> ValidationReport:
     """Validate a signed image (or a dump of the active slot).
@@ -525,15 +601,7 @@ def validate_signed_image(image: str | Path | bytes,
             raise LIFUCryptoError(
                 f"No {PUBLIC_KEY_FILE} or {PRIVATE_KEY_FILE} in {keys_dir} "
                 "to verify the signature with")
-        r = int.from_bytes(header.signature[:32], "big")
-        s = int.from_bytes(header.signature[32:], "big")
-        try:
-            keys.public_key.verify(encode_dss_signature(r, s),
-                                   data[:HEADER_AUTH_LEN],
-                                   ec.ECDSA(hashes.SHA256()))
-            signature_ok = True
-        except InvalidSignature:
-            signature_ok = False
+        signature_ok = verify_header_signature(data, keys.public_key)
 
     return ValidationReport(
         header=header,

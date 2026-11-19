@@ -281,6 +281,7 @@ class TxDevice(OWComponent):
     SUPPORTED_COMMANDS = TX_FDA_COMMANDS
     ALLOWED_PACKETS = TX_FDA_PACKETS
     READ_ONLY_COMMANDS = FDA_READ_ONLY_COMMANDS
+    FIRMWARE_BOARD = "transmitter"
 
     def __init__(self, vid: int = OW_VID, pid: int = OW_TRANSMITTER_PID,
                  baudrate: int = 921600, timeout: float = DEFAULT_TIMEOUT, test_mode: bool = False):

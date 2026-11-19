@@ -1,0 +1,41 @@
+Trusted firmware signing keys (ECDSA P-256 public keys, PEM)
+=============================================================
+
+Used by OWComponent.firmware_domain() to tell which key signed the firmware
+a device is running (OW_CMD_SIGCHK), and so whether it is a research or a
+clinical build. Public keys only: nothing here can sign. Fingerprints are
+SHA-256 over the DER SubjectPublicKeyInfo; unit-test/test_firmware_domain.py
+pins them, so replacing a file fails CI until that test is updated too.
+
+Each board's bootloader trusts exactly one of these keys: the research
+bootloader the research key, the clinical bootloader the clinical key.
+
+console/research.pem
+    4606fc385177cc91f9f7f2d123b6a0f33839084f43a6d4df4de5f58beb4e9775
+    Research key: the FW_SIGNING_KEY secret of openlifu-console-fw (GitHub
+    release builds). Copied from open-lifu-console-bl
+    py-tools/keys/research/ecdsa_public.pem at 0640116 (next).
+
+console/clinical.pem
+    5cffd2326732f1b2f89f9eed3bdfdf2384bf1e5649a11ef95ff0b6769145dade
+    Clinical key: Cloud KMS HSM key projects/openwater-cloud/locations/
+    us-central1/keyRings/openlifu-firmware/cryptoKeys/lifu-console-fw-signing/
+    cryptoKeyVersions/1 (key ceremony 2026-11-09). Copied from OpenWater-KMS
+    public-keys/lifu-console-fw-signing.pem at 267dabf; identical to
+    open-lifu-console-bl py-tools/keys/clinical/ecdsa_public.pem.
+
+transmitter/research.pem
+    f0a67190fc72379a29f4a3e88d173689a761d4edd9565880f250dfcb6ce3ce76
+    Research key: the FW_SIGNING_KEY secret of openlifu-transmitter-fw.
+    Copied from open-lifu-transmitter-bl py-tools/keys/research/
+    ecdsa_public.pem at 46ab59e (next).
+
+transmitter/clinical.pem
+    d0538bd89e77eb16f8a52cef0188f2ce6fac09d5b5a40f3b2416b572c2b94978
+    Clinical key: Cloud KMS HSM key .../keyRings/openlifu-firmware/
+    cryptoKeys/lifu-transmitter-fw-signing/cryptoKeyVersions/1 (key ceremony
+    2026-11-09). Copied from OpenWater-KMS
+    public-keys/lifu-transmitter-fw-signing.pem at 267dabf; identical to
+    open-lifu-transmitter-bl py-tools/keys/clinical/ecdsa_public.pem.
+
+Fingerprints match OpenWater-KMS docs/KEY-CEREMONY-RECORD (Open-LIFU).
