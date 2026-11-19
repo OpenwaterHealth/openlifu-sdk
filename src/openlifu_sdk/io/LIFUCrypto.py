@@ -363,6 +363,25 @@ def parse_signed_image(image: str | Path | bytes) -> FirmwareHeader:
 # Signing
 # ---------------------------------------------------------------------------
 
+def sign_auth_header(auth_header: bytes, keys: SigningKeys) -> bytes:
+    """ECDSA P-256 / SHA-256 signature of a 128-byte authenticated header, as
+    the bootloader stores it: raw R||S, 64 bytes. Firmware images and preset
+    packages are signed the same way.
+
+    Raises:
+        LIFUCryptoError: No private key, or not a 128-byte header.
+    """
+    _require_cryptography()
+    if keys.private_key is None:
+        raise LIFUCryptoError("Signing requires the private ECDSA key")
+    if len(auth_header) != HEADER_AUTH_LEN:
+        raise LIFUCryptoError(f"The signed header is {HEADER_AUTH_LEN} bytes, "
+                              f"not {len(auth_header)}")
+    der_sig = keys.private_key.sign(auth_header, ec.ECDSA(hashes.SHA256()))
+    r, s = decode_dss_signature(der_sig)
+    return r.to_bytes(32, "big") + s.to_bytes(32, "big")
+
+
 def sign_firmware_bytes(firmware: bytes, keys: SigningKeys,
                         version: int | str) -> bytes:
     """Sign a raw firmware binary; returns the complete signed image.
@@ -402,9 +421,7 @@ def sign_firmware_bytes(firmware: bytes, keys: SigningKeys,
         b"\x00" * 28,           # Reserved
     )
 
-    der_sig = keys.private_key.sign(auth_header, ec.ECDSA(hashes.SHA256()))
-    r, s = decode_dss_signature(der_sig)
-    signature = r.to_bytes(32, "big") + s.to_bytes(32, "big")
+    signature = sign_auth_header(auth_header, keys)
 
     header = (auth_header + signature
               + b"\xFF" * HEADER_STATE_LEN      # FwImageState: VALID

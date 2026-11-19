@@ -149,9 +149,19 @@ OW_POWER_VMON = 0x40
 OW_POWER_RAW_DAC = 0x41
 OW_POWER_HV_ENABLE = 0x42
 OW_POWER_SET_RGB_FX = 0x43
-# FDA mode only: the console's per-preset HV table, indexed like the TX's.
+# The console's presets, indexed like the TX's, read from its preset page
+# (page 61, a signed PRS1 package: LIFUPresetPackage). Every build reads them;
+# research and bare-metal builds can also write the page (WRITE/COMMIT); the
+# FDA (clinical) build refuses that with OW_HV_FDA_REFUSED.
 OW_POWER_PRESET_GET = 0x44     # reserved=index
 OW_POWER_PRESET_SELECT = 0x45  # reserved=index, data=settings_crc u32 + transmitter sensitivity f32 (LE)
+OW_POWER_PRESET_INFO = 0x46    # -> reserved=PRESET_INFO_*, data=the package header (320 B)
+OW_POWER_PRESET_WRITE = 0x47   # data=offset u16 + bytes; the first chunk erases the page
+OW_POWER_PRESET_COMMIT = 0x48  # data=package length u32 + CRC-32 u32 (LE)
+# OW_POWER_PRESET_INFO reply reserved byte
+PRESET_INFO_OK = 0x00          # a package whose records all parse
+PRESET_INFO_EMPTY = 0x01       # no valid package in the page
+PRESET_INFO_NO_PAGE = 0x02     # no preset page: console bootloader before 1.1.0-rc.2
 
 # HV rail monitor (SR-025, console-fw#43 "Host contract"). The latched fault
 # cause rides in OW_POWER_GET_HV's reply reserved byte and in byte 1 of the
@@ -226,7 +236,8 @@ POWER_COMMANDS = {
     OW_POWER_GET_TEMP2, OW_POWER_SET_FAN, OW_POWER_GET_FAN, OW_POWER_SET_RGB,
     OW_POWER_GET_RGB, OW_POWER_GET_HVON, OW_POWER_GET_12VON, OW_POWER_SET_DACS,
     OW_POWER_VMON, OW_POWER_RAW_DAC, OW_POWER_HV_ENABLE, OW_POWER_SET_RGB_FX,
-    OW_POWER_PRESET_GET, OW_POWER_PRESET_SELECT,
+    OW_POWER_PRESET_GET, OW_POWER_PRESET_SELECT, OW_POWER_PRESET_INFO,
+    OW_POWER_PRESET_WRITE, OW_POWER_PRESET_COMMIT,
 }
 
 # FDA subsets: the only commands the FDA components (TxDevice / HVController)
@@ -262,7 +273,7 @@ HV_FDA_PACKETS = {
         OW_POWER_GET_HV, OW_POWER_HV_ON, OW_POWER_HV_OFF, OW_POWER_GET_HVON,
         OW_POWER_GET_12VON, OW_POWER_GET_TEMP1, OW_POWER_GET_TEMP2,
         OW_POWER_GET_FAN, OW_POWER_VMON, OW_POWER_STATUS,
-        OW_POWER_PRESET_GET, OW_POWER_PRESET_SELECT,
+        OW_POWER_PRESET_GET, OW_POWER_PRESET_SELECT, OW_POWER_PRESET_INFO,
     }),
 }
 
