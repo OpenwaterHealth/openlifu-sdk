@@ -62,10 +62,18 @@ class FakeConsoleBootloader(STM32USBDFU):
     header_polls: GETSTATUS replies scripted after the staging DNLOAD -
           "busy" (still checking) or "fail" (no answer); the real result
           follows once they run out.
+    reboot_at_write: the n-th accepted slot data write (1-based) reboots
+          the bootloader: the block is lost, the handle is dead until
+          open(), and the verified header is forgotten.
+    lost_write_at: slot offset whose first write does not land, so the
+          read-back verify finds that page wrong and repairs it.
+    restage: what a header staged after the first one gets - "accept",
+          "refuse", or "no answer" (its GETSTATUS poll goes unanswered).
     """
 
     def __init__(self, caps=CAPS_OK, accept_header=True, header_polls=(),
-                 profile=CONSOLE_PROFILE):
+                 profile=CONSOLE_PROFILE, reboot_at_write=None,
+                 lost_write_at=None, restage="accept"):
         self.transfer_size = 1024
         self.program_alignment = 4
         self.timeout_ms = 4000
@@ -83,15 +91,24 @@ class FakeConsoleBootloader(STM32USBDFU):
         self.flash = bytearray(b"\xFF" * CONSOLE_PROFILE.slot_size)
         self.ops = []                 # ("stage"|"erase"|"write"|"caps", detail)
         self.refused = []             # ops the bootloader refused
+        self.reboot_at_write = reboot_at_write
+        self.lost_write_at = lost_write_at
+        self.restage = restage
+        self.writes = 0
+        self.dead = False
 
     # -- transport model --------------------------------------------------
     def open(self):
+        self.dead = False
+        self.state = DFU_IDLE
         return self
 
     def close(self):
         pass
 
     def get_status(self):
+        if self.dead:
+            raise UsbStall("device gone")
         if self.header_polls:
             reply = self.header_polls.pop(0)
             if reply == "fail":
@@ -107,6 +124,8 @@ class FakeConsoleBootloader(STM32USBDFU):
         self.state = self.STATE_DFU_ERROR
 
     def _ctrl_out(self, req, value, data=b""):
+        if self.dead:
+            raise UsbStall("device gone")
         if req in (self.DFU_CLRSTATUS, self.DFU_ABORT):
             self.state = DFU_IDLE
             return 0
@@ -127,9 +146,14 @@ class FakeConsoleBootloader(STM32USBDFU):
             return len(data)
         addr = self.pointer + (value - 2) * self.transfer_size
         if addr == USB_DFU_HDR_STAGE_VIRT_ADDR and self.verify_before_erase:
+            restaged = "stage" in self.kinds()
             self.ops.append(("stage", bytes(data)))
-            self.header_polls = list(self.scripted_polls)
-            self.verified = self.accept_header and len(data) == USB_DFU_SFU_HEADER_LEN
+            if restaged and self.restage == "no answer":
+                self.header_polls = ["fail"]
+            else:
+                self.header_polls = list(self.scripted_polls)
+            accept = self.restage == "accept" if restaged else self.accept_header
+            self.verified = accept and len(data) == USB_DFU_SFU_HEADER_LEN
             if not self.verified:
                 self._fail(("stage", len(data)))
             else:
@@ -138,10 +162,17 @@ class FakeConsoleBootloader(STM32USBDFU):
         self.ops.append(("write", addr))
         if self.verify_before_erase and not self.verified:
             self._fail(("write", addr))
+            return len(data)
+        self.writes += 1
+        if self.writes == self.reboot_at_write:
+            self.dead, self.verified = True, False
+            raise UsbStall("device dropped mid-write")
+        off = addr - SLOT
+        if off == self.lost_write_at:
+            self.lost_write_at = None             # the repair's rewrite lands
         else:
-            off = addr - SLOT
             self.flash[off:off + len(data)] = data
-            self.state = self.STATE_DFU_DNLOAD_IDLE
+        self.state = self.STATE_DFU_DNLOAD_IDLE
         return len(data)
 
     def _ctrl_in(self, req, value, length):
@@ -346,3 +377,39 @@ def test_refused_header_boots_the_app_back(console_path, monkeypatch):
         mgr.update_console(str(path), enter_dfu_fn=lambda: None, dfu_wait_s=0)
     assert aborted and aborted[0]["profile"] is CONSOLE_PROFILE
     assert "erase" not in holder["dev"].kinds()
+
+
+def test_a_restage_refused_mid_write_leaves_the_unit_in_dfu(console_path, monkeypatch):
+    # The bootloader reboots on the third block, after the whole slot was
+    # erased, and refuses the header staged again on the re-opened device.
+    path, _image, holder = console_path
+    holder["kwargs"] = {"reboot_at_write": 3, "restage": "refuse"}
+    mgr = LIFUDFUManager()
+    monkeypatch.setattr(mgr, "get_console_bootloader_version",
+                        lambda **_k: "1.1.0-rc.0+research")
+    aborted = []
+    monkeypatch.setattr(mgr, "abort_dfu", lambda **k: aborted.append(k))
+    with pytest.raises(RuntimeError, match="already erased") as exc:
+        mgr.update_console(str(path), enter_dfu_fn=lambda: None, dfu_wait_s=0)
+    assert not isinstance(exc.value, ValueError)  # not a pre-flight refusal
+    assert isinstance(exc.value.__cause__, DFUHeaderRefusedError)
+    assert "intact" not in str(exc.value)
+    assert aborted == []                          # no reset into an erased slot
+    dev = holder["dev"]
+    assert dev.kinds().count("stage") == 2 and "erase" in dev.kinds()
+
+
+def test_a_restage_timeout_during_repair_is_not_reported_as_success(console_path, monkeypatch):
+    # The block at 0x800 is lost, so the read-back repairs its page; the
+    # bootloader reboots on that rewrite (write 9 of 8 + 2) and never
+    # answers the header staged again.
+    path, _image, holder = console_path
+    holder["kwargs"] = {"lost_write_at": 0x800, "reboot_at_write": 9,
+                        "restage": "no answer"}
+    monkeypatch.setattr(LIFUDFU, "USB_DFU_HDR_VERIFY_TIMEOUT_S", 0)
+    with pytest.raises(RuntimeError, match="already erased") as exc:
+        LIFUDFUManager().program_console(str(path))
+    assert isinstance(exc.value.__cause__, TimeoutError)
+    dev = holder["dev"]
+    assert dev.kinds().count("stage") == 2
+    assert dev.writes == 9                        # the repair started, then dropped

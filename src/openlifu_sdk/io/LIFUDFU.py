@@ -1102,6 +1102,12 @@ class STM32USBDFU:
         10 s for it to come back). Finally the DfuSe address pointer is set
         to the interrupted flash offset so the caller can resume with
         block 2 exactly where the failed block was.
+
+        Raises:
+            RuntimeError: The re-opened device would not take the staged
+                header again. The slot is already erased, so this is never
+                the pre-flight ``ValueError`` that :meth:`stage_header`
+                raises before an erase.
         """
         try:
             self._recover_idle()
@@ -1124,7 +1130,21 @@ class STM32USBDFU:
             if self._staged_header is not None:
                 logger.warning("DFU: re-staging the image header after "
                                "re-opening the device")
-                self.stage_header(self._staged_header)
+                try:
+                    self.stage_header(self._staged_header)
+                except Exception as e:
+                    # Not stage_header's own exception: a refusal is a
+                    # ValueError, which update_console answers by resetting
+                    # the unit as if nothing were erased, and a TimeoutError
+                    # during read-back repair would pass _program_slot_image's
+                    # legacy-reboot fallback as success.
+                    cause = ("the bootloader refused it"
+                             if isinstance(e, DFUHeaderRefusedError) else str(e))
+                    raise RuntimeError(
+                        f"DFU: the image header could not be staged again after "
+                        f"re-opening the device mid-write ({cause}). The slot is "
+                        f"already erased and may be partly written: leave the "
+                        f"unit in DFU and retry the update.") from e
         self._set_address(address + offset)
 
     def manifest(self) -> None:
