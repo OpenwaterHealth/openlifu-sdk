@@ -75,7 +75,6 @@ where = ["src"]
 [tool.setuptools.package-data]
 openlifu_sdk = [
   "py.typed",
-  "firmware/*.bin",
   "keys/PROVENANCE.txt",
   "keys/*/*.pem",
   "libusb/win64/*.dll",

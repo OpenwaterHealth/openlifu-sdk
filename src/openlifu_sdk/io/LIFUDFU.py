@@ -282,18 +282,6 @@ TRANSMITTER_FLASH_SIZE = 0x40000          # 256 KB
 TRANSMITTER_DFU_STUB_PREFIX = "dfu-stub"
 
 
-def bundled_updater_path() -> Path:
-    """Path to the RAM-resident legacy-migration updater shipped with the SDK
-    (``firmware/openlifu-console-legacy-updater.bin`` — the interim image for
-    the console legacy-bootloader migration; see console-legacy-updater).
-
-    This is the one-time, keyless self-updater used by
-    :meth:`LIFUDFUManager.migrate_console_legacy`. It needs no signing key: the
-    legacy bootloader authenticates it with an HMAC "trust tag" that the SDK
-    computes from the updater bytes at run time (``build_legacy_metadata``)."""
-    return (Path(__file__).parent.parent / "firmware"
-            / "openlifu-console-legacy-updater.bin")
-
 
 def _split_flash_image(image: bytes, slot_off: int) -> tuple[bytes, bytes]:
     """Split a combined full-flash image (bootloader + signed app, starting
@@ -2639,9 +2627,8 @@ class LIFUDFUManager:
         Args:
             signed_app: SBSFU signed application image.
             updater_bin: The console-legacy-updater binary (embeds the new
-                secure bootloader; links at 0x08008000). Defaults to the
-                updater bundled with the SDK (``bundled_updater_path()``) - the
-                one-time, keyless self-updater; pass a path only to override it.
+                secure bootloader; links at 0x08008000): the one-time, keyless
+                self-updater. Required: the SDK carries no firmware.
             enter_dfu_fn: Callable that reboots the running app into DFU, e.g.
                 ``interface.hvcontroller.enter_dfu``.
             keys_dir: Optional keys dir to validate the signed app's ECDSA
@@ -2658,7 +2645,10 @@ class LIFUDFUManager:
         """
         from openlifu_sdk.io import LIFUCrypto
 
-        updater_path = Path(updater_bin) if updater_bin else bundled_updater_path()
+        if not updater_bin:
+            raise ValueError("No legacy updater image given (updater_bin): the SDK "
+                             "carries no firmware. Nothing was written.")
+        updater_path = Path(updater_bin)
         if not updater_path.is_file():
             raise ValueError(f"Updater not found: {updater_path}")
         updater = updater_path.read_bytes()

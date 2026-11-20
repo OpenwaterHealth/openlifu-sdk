@@ -9,6 +9,7 @@ client are faked: what is checked is the sequence of operations.
 
 from __future__ import annotations
 
+import sys
 from unittest.mock import MagicMock
 
 import pytest
@@ -17,7 +18,6 @@ from openlifu_sdk.io import LIFUFirmwareUpdate as fu
 from openlifu_sdk.io.LIFUConfig import NODE_MODE_APP, NODE_MODE_BOOTLOADER
 
 SHIM = "shim-signed.bin"
-APP = "app-signed.bin"
 
 
 @pytest.fixture(autouse=True)
@@ -38,6 +38,18 @@ def shim(tmp_path):
     return str(p)
 
 
+@pytest.fixture(autouse=True)
+def app_image(tmp_path, monkeypatch):
+    """The images come from the caller (the SDK carries none): a real file."""
+    p = tmp_path / "app-signed.bin"
+    p.write_bytes(b"app")
+    monkeypatch.setattr(sys.modules[__name__], "APP", str(p))
+    return str(p)
+
+
+APP = None   # set per test by app_image
+
+
 @pytest.mark.parametrize("version, needs", [
     ("1.0.3-rc.1", True), ("1.0.1", True), ("1.0.0", True), ("v1.0.2-dirty", True),
     ("1.1.0-rc.1", False), ("1.1.0", False), ("1.2.0", False), ("2.0.0", False),
@@ -49,12 +61,16 @@ def test_bootloader_needs_migration(version, needs):
 
 # ---------------------------------------------------------------- console (USB)
 
-def console(bl_versions, app_version="1.2.6"):
+def console(bl_versions, app_version="1.2.6", slot_empty=True):
     hv = MagicMock()
     hv.get_version.return_value = app_version
     upd = fu.LIFUFirmwareUpdate(hv=hv)
     mgr = MagicMock()
     mgr.get_console_bootloader_version.side_effect = list(bl_versions)
+    if isinstance(slot_empty, list):    # installed version per poll: None = empty
+        mgr.get_console_installed_version.side_effect = slot_empty
+    else:
+        mgr.get_console_installed_version.return_value = None if slot_empty else 2143
     upd._mgr = mgr
     return upd, hv, mgr
 
@@ -80,12 +96,35 @@ def test_console_current_bootloader_gets_the_app_only(shim):
     assert r.action == "app-update"
 
 
-def test_console_no_updater_image_writes_nothing(tmp_path, monkeypatch):
-    monkeypatch.setattr(fu, "bundled_console_bl_updater", lambda: tmp_path / "missing.bin")
+def test_console_no_updater_image_writes_nothing():
     upd, _, mgr = console(["1.0.3-rc.1"])
-    with pytest.raises(RuntimeError, match="bootloader updater image"):
+    with pytest.raises(RuntimeError, match="no bootloader updater image was given"):
         upd.update(signed_app=APP)
     mgr.program_console.assert_not_called()
+
+
+def test_no_app_image_is_refused_before_dfu(shim):
+    upd, hv, mgr = console(["1.1.0-rc.3"], app_version="1.3.0")
+    with pytest.raises(ValueError, match="no signed application image given"):
+        upd.update(bl_updater=shim)
+    hv.enter_dfu.assert_not_called()
+    mgr.program_console.assert_not_called()
+
+
+def test_console_replace_bootloader_on_a_current_bootloader(shim):
+    # research 1.1.0-rc.3 -> the updater -> (old BL still holds the updater) -> new BL, empty slot
+    upd, _, mgr = console(["1.1.0-rc.3", "1.1.0-rc.3", "1.1.0-rc.3"], app_version="1.3.0",
+                          slot_empty=[2143, None])
+    r = upd.update(signed_app=APP, bl_updater=shim, replace_bootloader=True)
+    assert programmed(mgr, "program_console") == [shim, APP]
+    assert r.action == "bl-migrate"
+    assert mgr.get_console_installed_version.call_count == 2
+
+
+def test_console_current_bootloader_is_kept_without_replace(shim):
+    upd, _, mgr = console(["1.1.0-rc.3"], app_version="1.3.0")
+    upd.update(signed_app=APP, bl_updater=shim)
+    assert programmed(mgr, "program_console") == [APP]
 
 
 def test_console_shim_refused_before_erase_boots_the_app_again(shim):
@@ -122,6 +161,7 @@ def master(bl_versions, app_version="2.0.8"):
     upd = fu.LIFUTransmitterFirmwareUpdate(tx=tx)
     mgr = MagicMock()
     mgr._wait_for_dfu_kind.side_effect = list(bl_versions)
+    mgr.get_transmitter_installed_version.return_value = None
     upd._mgr = mgr
     return upd, tx, mgr
 
@@ -185,6 +225,10 @@ def slave_env(monkeypatch):
 
         def get_version(self):
             return next(versions)
+
+        def read_memory(self, address, length):
+            assert address == fu.SLAVE_SLOT_BASE
+            return bytes([0xFF]) * length        # the updater erased the slot
 
     mgr = MagicMock()
     mgr.program_transmitter_slave_i2c.return_value = "1.1.0-rc.1"
