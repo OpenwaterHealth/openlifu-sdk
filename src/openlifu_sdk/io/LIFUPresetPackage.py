@@ -45,6 +45,19 @@ PRESET_BODY_OFFSET = HEADER_TOTAL_LEN        # 0x140
 CONSOLE_PRESET_BASE = 0x0801E800
 CONSOLE_PRESET_SIZE = 0x800
 
+#: Transmitter preset slots (open-lifu-transmitter-bl / openlifu-transmitter-fw
+#: memory_map.h): 10 slots of 4 KB, each one PRS1 header + one preset blob.
+TX_PRESET_BASE = 0x08035000
+TX_PRESET_SLOT_SIZE = 0x1000
+TX_PRESET_SLOTS = 10
+
+
+def tx_preset_slot_address(slot: int) -> int:
+    """Flash address of transmitter preset slot *slot* (0-based)."""
+    if not 0 <= slot < TX_PRESET_SLOTS:
+        raise ValueError(f"Transmitter preset slot must be 0..{TX_PRESET_SLOTS - 1}, got {slot}")
+    return TX_PRESET_BASE + slot * TX_PRESET_SLOT_SIZE
+
 #: The context byte: which released preset set the body is.
 PRESET_CONTEXTS = {"fda": 1, "test": 2}
 _CONTEXT_NAMES = {v: k for k, v in PRESET_CONTEXTS.items()}
@@ -137,6 +150,19 @@ def build_preset_package(body: bytes, *, diathermy_sha: str, context: str,
     signature = LIFUCrypto.sign_auth_header(auth, keys)
     header = auth + signature + b"\xFF" * HEADER_STATE_LEN + b"\x00" * HEADER_FP_LEN
     return header + body
+
+
+def build_tx_preset(blob: bytes, *, diathermy_sha: str, context: str,
+                    keys: SigningKeys) -> bytes:
+    """Sign one transmitter preset blob (``LIFUTXPresets.preset_blob``) into
+    the image of one 4 KB preset slot: the PRS1 header, then the blob.
+
+    Raises:
+        ValueError: The blob does not fit a slot, or a bad SHA or context.
+        LIFUCryptoError: No private key.
+    """
+    return build_preset_package(blob, diathermy_sha=diathermy_sha, context=context,
+                                keys=keys, page_size=TX_PRESET_SLOT_SIZE)
 
 
 def parse_preset_header(data: bytes) -> PresetHeader:
