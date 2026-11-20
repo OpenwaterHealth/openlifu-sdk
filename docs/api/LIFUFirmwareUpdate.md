@@ -17,19 +17,27 @@ production image, `LIFU BL DFU x.y.z` → updater + signed app, `OW DFU x.y.z` �
 signed app — so a console whose app is dead is still recoverable as long as it
 reaches one of those.
 
-Defaults to the firmware images **bundled with the SDK** and needs **no
-signing keys**: the legacy updater is authenticated by an HMAC trust tag
+**The SDK carries no firmware.** The caller passes each image, taken from the
+firmware releases:
+- research: the GitHub releases of `openlifu-console-fw` /
+  `openlifu-transmitter-fw` and `open-lifu-*-bl-updater` (the test app);
+- clinical: the private artifact bucket, packaged by `openlifu-fw-updater`.
+
+A path that needs an image it was not given refuses before anything is
+written. No **signing keys** are needed: the legacy updater is authenticated by an HMAC trust tag
 computed on the fly, and the secure bootloader verifies the app at boot.
 An optional `keys_dir` only adds an ECDSA app-signature pre-check.
 
-Bundled image helpers
-- `bundled_production_image() -> Path` — combined bootloader+app image
-  (`firmware/openlifu-console-fw-production.bin`), source for the
-  no-bootloader migration.
-- `bundled_signed_app() -> Path` — signed console app
-  (`firmware/openlifu-console-fw-signed.bin`), source for the legacy migration
-  and secure app update.
-- (The legacy RAM updater is `LIFUDFU.bundled_updater_path()`.)
+Images per path
+- secure bootloader: `signed_app` (`--app`); a 1.0.x bootloader, or
+  `replace_bootloader=True` (`--replace-bootloader`), also needs `bl_updater`
+  (`--bl-updater`);
+- no bootloader (ROM loader) and `force_production`: `production_image`
+  (`--production`, bootloader + signed app);
+- legacy bootloader: `signed_app` and `updater_bin` (`--updater`).
+
+`openlifu_sdk.util.firmware.firmware_image_version(path)` reads the version an
+image carries.
 
 Class
 - `LIFUFirmwareUpdate(hv=None, keys_dir=None, libusb_dll=None, vid=0x0483, pid=0xDF11)`
@@ -40,10 +48,13 @@ Class
 - `detect_cohort() -> (cohort, source)` — `cohort` is `"no-bootloader"` /
   `"legacy-bl"` / `"secure-bl"`; `source` is `"app"` (from the running app
   version) or `"dfu"` (the unit was already in a bootloader DFU).
-- `update(*, production_image=None, signed_app=None, updater_bin=None, force=False, progress_callback=None) -> UpdateResult`
-  - Detects the state and runs the right path. All image args default to the
-    bundled files. `force` (secure path only) flashes even if not newer (the
-    bootloader's anti-rollback floor still applies at boot).
+- `update(*, production_image=None, signed_app=None, updater_bin=None, force=False, bl_updater=None, replace_bootloader=False, progress_callback=None) -> UpdateResult`
+  - Detects the state and runs the right path with the images it is given
+    (see "Images per path"). `force` (secure path only) flashes even if not
+    newer (the bootloader's anti-rollback floor still applies at boot).
+    `replace_bootloader` installs `bl_updater` even on a current bootloader:
+    the bootloader it carries replaces the installed one (a research unit
+    converted to clinical by openlifu-fw-updater).
 
 `UpdateResult` fields: `cohort`, `action` (`"migrate-rom"` / `"migrate-legacy"`
 / `"app-update"`), `summary`, `reboot_required`.
@@ -57,7 +68,7 @@ Behaviour notes
 - The no-bootloader/ROM path needs **no external tools**: the ROM-loader write
   (mass erase → program → read-back verify → leave DFU) is done by the SDK's
   own DfuSe driver, `openlifu_sdk.io.STM32DFU`.
-- **Version encoding**: bundled images use the SDK's bitfield `FwVersion`
+- **Version encoding**: release images use the SDK's bitfield `FwVersion`
   (1.2.6 = 2118). A unit whose anti-rollback floor was latched under the old
   decimal scheme (1.2.6 = 10206) rejects bitfield images until the floor is
   reset — which the full-erase migration does; see `LIFUCrypto`.
@@ -78,7 +89,7 @@ if result.reboot_required:
 
 Runnable script: `examples/update_console_firmware.py`.
 
-Rebuilding the bundled `openlifu-console-legacy-updater.bin` (for an updated
+Rebuilding the console legacy updater image (for an updated
 secure bootloader) is documented in `console-legacy-updater/README.md` — the
 updater embeds a specific bootloader blob and is keyless.
 
@@ -101,14 +112,14 @@ so that switch is gone — `detect()` reports `("legacy-bl", "dfu")` and
 `update()` takes a USB-only path instead:
 
 1. The RAM-resident **legacy updater**
-   (`firmware/openlifu-transmitter-legacy-updater.bin`), which *embeds* the
+   (`--updater`, the transmitter legacy updater image), which *embeds* the
    secure bootloader, is written to the legacy app slot (0x08010000) with an
    HMAC-trust-tagged WFM1 block at 0x0800F800 (computed on the fly — no keys),
    then read back and verified.
 2. Reset: the legacy bootloader validates the trust tag, boots the updater,
    and the updater rewrites the bootloader region from the inside and resets.
 3. The secure bootloader finds no SFU1 image in the slot (the updater is
-   sitting there), parks in its own DFU, and the bundled signed app is flashed
+   sitting there), parks in its own DFU, and the signed app is flashed
    over it.
 
 The I2C DFU stub cannot be used here — it has no USB stack and needs a healthy
@@ -131,7 +142,7 @@ master's passthrough with `update_slave(module, ...)`:
   not help. BOOT0 (ROM loader over USB) or SWD only.
 - **legacy** (app 2.0.4 – 2.0.7): **one-shot migration** of bootloader + app.
   1. The small RAM-resident **DFU stub**
-     (`firmware/openlifu-transmitter-dfu-stub.bin`, built from
+     (`stub_bin=`, built from
      `stub-code/transmitter/`) is written through the legacy I2C DFU with an
      HMAC-trust-tagged WFM1 metadata block (computed on the fly — no keys).
   2. The legacy bootloader validates and boots the stub, which copies itself
@@ -139,7 +150,7 @@ master's passthrough with `update_slave(module, ...)`:
      0x72 — with the writable window opened to the whole 256 KB flash.
   3. The SDK full-chip-erases (this also resets any stale anti-rollback
      floor) and streams the whole production image
-     (`firmware/openlifu-transmitter-fw-production.bin`) to 0x08000000.
+     (`--production`) to 0x08000000.
   4. On reset the freshly written secure bootloader verifies the signed app
      in its slot and launches it.
 
@@ -154,11 +165,11 @@ master's passthrough with `update_slave(module, ...)`:
 - **Module 0** (≥ 2.0.4): the running app is forced into the STM32 ROM DFU
   (`OW_CMD_DFU` reserved=0x77) and the full production image is reflashed.
 - **Slave, secure BL** (≥ 2.0.8): the **signed** DFU stub
-  (`firmware/openlifu-transmitter-dfu-stub-signed.bin`) is installed through
+  (`stub_bin=`) is installed through
   the secure I2C DFU like a normal app — the bootloader verifies its SFU1
   signature at boot — then the production image is streamed through the
   stub's full-flash DFU, same as the legacy migration. The signed stub
-  carries the same FwVersion as the bundled production app, so the
+  must carry the production app's FwVersion, so the
   anti-rollback floor (boot check: version ≥ floor) is untouched.
 - A legacy slave with `--force-production` simply takes the normal legacy
   path, which already reflashes the bootloader.
@@ -202,8 +213,13 @@ writing anything and comes back in the old bootloader's DFU; the SDK then
 reports that no newer bootloader came up. A power loss while the bootloader
 pages are rewritten (a few seconds) needs SWD recovery.
 
-The updaters are bundled as `firmware/openlifu-{console,transmitter}-bl-updater-signed.bin`;
-`bl_updater=` / `--bl-updater` overrides them.
+The updaters are the `open-lifu-{console,transmitter}-bl-updater` release
+assets, passed as `bl_updater=` / `--bl-updater`. With `replace_bootloader=True`
+(`--replace-bootloader`) the updater is installed even on a 1.1.x bootloader:
+openlifu-fw-updater converts a research unit to clinical this way, with an
+updater that carries the clinical bootloader. The SDK knows the new bootloader
+is up when its DFU reports at least 1.1.0 **and** the slot is empty (the
+updater erases it; the old bootloader still holds it).
 
 **Whole transmitter chain:** `update_chain()` / `--all` updates every slave
 over I2C first, while the master still runs the firmware that brokers it, then

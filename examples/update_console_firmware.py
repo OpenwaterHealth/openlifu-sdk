@@ -14,15 +14,18 @@ from openlifu_sdk.io.LIFUInterface import LIFUInterface
 #   legacy bootloader (1.2.x)  -> migrate via the RAM self-updater
 #   secure bootloader (>=1.2.6) -> normal app update
 #
-# Uses the firmware images bundled with the SDK and needs NO signing keys.
+# The SDK carries no firmware: pass the images from the firmware releases.
+# Needs NO signing keys.
 #
 # set PYTHONPATH=%cd%\src;%PYTHONPATH%
-# python examples\update_console_firmware.py            # bundled images, auto-detect
-# python examples\update_console_firmware.py --force    # allow same/downgrade on secure
+# python examples\update_console_firmware.py --app openlifu-console-fw-signed.bin ^
+#     --bl-updater open-lifu-console-bl-updater-signed.bin
+# python examples\update_console_firmware.py --app ... --force   # allow same/downgrade on secure
 
 parser = argparse.ArgumentParser(description="Update console firmware (auto-detect)")
-parser.add_argument("--production", help="Override the combined bootloader+app image")
-parser.add_argument("--app", help="Override the signed app image")
+parser.add_argument("--production", help="Combined bootloader+app image (no-bootloader units)")
+parser.add_argument("--app", help="Signed app image (from the openlifu-console-fw release)")
+parser.add_argument("--bl-updater", help="Bootloader updater image (units on bootloader 1.0.x)")
 parser.add_argument("--keys", help="Optional keys dir to pre-validate the app signature")
 parser.add_argument("--force", action="store_true",
                     help="Secure path only: flash even if not newer (bootloader "
@@ -48,6 +51,7 @@ print(f"Console state: {cohort} (from {source})")
 try:
     result = fw.update(
         production_image=args.production,
+        bl_updater=args.bl_updater,
         signed_app=args.app,
         force=args.force,
         progress_callback=progress,
