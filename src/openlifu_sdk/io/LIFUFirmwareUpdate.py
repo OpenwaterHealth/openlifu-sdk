@@ -93,8 +93,25 @@ from openlifu_sdk.io.LIFUDFU import (
     infer_console_bootloader_from_app_version,
     infer_transmitter_bootloader_from_app_version,
 )
+from openlifu_sdk.io.exceptions import LIFUCommunicationError
 
 logger = logging.getLogger(__name__)
+
+
+def _request_dfu(enter: Callable[[], Any], what: str) -> None:
+    """Ask the running application to reboot into DFU.
+
+    The application resets into its bootloader as soon as it takes the
+    command, usually before its reply reaches the host, so no reply is the
+    normal case, not a failure: the caller goes on to wait for the DFU device
+    to enumerate, and that wait reports a unit that never got there. A device
+    error reply (e.g. a refusal) is still raised.
+    """
+    try:
+        enter()
+    except LIFUCommunicationError:
+        logger.info("%s: no reply to the DFU request; the application is "
+                    "rebooting into DFU, waiting for it to enumerate", what)
 
 _FW_DIR = Path(__file__).parent.parent / "firmware"
 
@@ -473,10 +490,10 @@ class LIFUFirmwareUpdate:
         return self.hv
 
     def _enter_dfu(self) -> None:
-        self._require_hv().enter_dfu()
+        _request_dfu(self._require_hv().enter_dfu, "Console")
 
     def _enter_rom(self) -> None:
-        self._require_hv().enter_stm32_rom_dfu()
+        _request_dfu(self._require_hv().enter_stm32_rom_dfu, "Console")
 
 
 class LIFUTransmitterFirmwareUpdate:
@@ -1169,10 +1186,10 @@ class LIFUTransmitterFirmwareUpdate:
         return self.tx
 
     def _enter_dfu(self) -> None:
-        self._require_tx().enter_dfu(module=0)
+        _request_dfu(lambda: self._require_tx().enter_dfu(module=0), "Transmitter")
 
     def _enter_rom(self) -> None:
-        self._require_tx().enter_stm32_rom_dfu(module=0)
+        _request_dfu(lambda: self._require_tx().enter_stm32_rom_dfu(module=0), "Transmitter")
 
 
 # ---------------------------------------------------------------------------
