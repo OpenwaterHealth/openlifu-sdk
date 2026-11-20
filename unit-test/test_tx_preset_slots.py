@@ -279,3 +279,102 @@ def test_i2c_stage_sends_the_header_to_the_staging_address(monkeypatch, tmp_path
     assert blocks == [(USB_DFU_PRESET_STAGE_VIRT_ADDR, data[:320])]
     with pytest.raises(ValueError, match="PRS1"):
         dfu.stage_preset(signed_image())
+
+
+# --------------------------------------------------------------------------
+# Through the application (standard images; FDA images only read)
+# --------------------------------------------------------------------------
+
+from unittest.mock import MagicMock  # noqa: E402
+
+from openlifu_sdk.io.exceptions import LIFUDeviceError  # noqa: E402
+from openlifu_sdk.io.LIFUConfig import (  # noqa: E402
+    OW_CONTROLLER, OW_ERROR, OW_PRESET_COMMIT, OW_PRESET_EMPTY, OW_PRESET_INFO,
+    OW_PRESET_NO_ROOM, OW_PRESET_WRITE, OW_RESP,
+)
+from openlifu_sdk.io.LIFUTXDevice import LIFUTxDevice, TxDevice  # noqa: E402
+from openlifu_sdk.io.uart import OWUart  # noqa: E402
+
+
+def _reply(packet_type=OW_RESP, reserved=0, data=b""):
+    r = MagicMock()
+    r.packet_type, r.reserved = packet_type, reserved
+    r.data, r.data_len = bytearray(data), len(data)
+    return r
+
+
+def _tx(make, replies):
+    dev = make()
+    uart = MagicMock(spec=OWUart)
+    uart.desc = "TX"
+    uart.demo_mode = False
+    uart.asyncMode = False
+    uart.is_connected = True
+    uart.send_packet.side_effect = list(replies)
+    dev._uart = uart
+    return dev
+
+
+def test_an_unsigned_slot_image_carries_the_blob_size_and_hash():
+    blob = b"OWPR" + bytes(500)
+    image = pp.tx_slot_image(blob)
+    hdr = pp.parse_preset_header(image)
+    assert image[:4] == b"PRS1" and image[0x140:] == blob
+    assert hdr.body_size == len(blob)
+    pkg = pp.parse_preset_package(image)
+    assert pkg.body_ok
+    with pytest.raises(ValueError, match="slot holds"):
+        pp.tx_slot_image(b"\x01" * (pp.TX_PRESET_SLOT_SIZE - 0x140 + 1))
+
+
+def test_write_preset_sends_the_slot_image_and_commits_it(tmp_path):
+    import zlib
+    data, _key = _preset(tmp_path)
+    chunks = len(range(0, len(data), 512))
+    dev = _tx(LIFUTxDevice, [_reply()] * (chunks + 1))
+    assert dev.write_preset(4, data, module=1)
+    sent = [c.kwargs for c in dev._uart.send_packet.call_args_list]
+    writes = [s for s in sent if s["command"] == OW_PRESET_WRITE]
+    assert all((s["reserved"], s["addr"]) == (4, 1) for s in sent)
+    assert b"".join(bytes(w["data"])[2:] for w in writes) == data
+    assert sent[-1]["command"] == OW_PRESET_COMMIT
+    assert bytes(sent[-1]["data"]) == struct.pack("<II", len(data), zlib.crc32(data))
+
+
+def test_write_preset_wraps_a_bare_blob_in_an_unsigned_header():
+    blob = b"OWPR" + bytes(200)
+    dev = _tx(LIFUTxDevice, [_reply()] * 3)       # two parts (320 + 204 bytes), commit
+    dev.write_preset(0, blob)
+    first = bytes(dev._uart.send_packet.call_args_list[0].kwargs["data"])
+    assert first[2:6] == b"PRS1"
+    commit = bytes(dev._uart.send_packet.call_args_list[-1].kwargs["data"])
+    assert struct.unpack("<I", commit[:4])[0] == 0x140 + len(blob)
+
+
+@pytest.mark.parametrize("make", [TxDevice, LIFUTxDevice])
+def test_preset_info_reads_a_slot_header(make, tmp_path):
+    data, key = _preset(tmp_path)
+    dev = _tx(make, [_reply(data=data[:320])])
+    info = dev.get_preset_info(2, module=1)
+    assert (info.diathermy_sha, info.context) == ("ab" * 20, "test")
+    assert info.signed_by(key)
+    sent = dev._uart.send_packet.call_args.kwargs
+    assert (sent["packet_type"], sent["command"], sent["reserved"], sent["addr"]) == (
+        OW_CONTROLLER, OW_PRESET_INFO, 2, 1)
+
+
+def test_preset_info_of_an_empty_slot_is_none():
+    dev = _tx(TxDevice, [_reply(OW_ERROR, OW_PRESET_EMPTY)])
+    assert dev.get_preset_info(0) is None
+
+
+def test_preset_info_without_preset_slots_raises():
+    dev = _tx(TxDevice, [_reply(OW_ERROR, OW_PRESET_NO_ROOM)])
+    with pytest.raises(LIFUDeviceError):
+        dev.get_preset_info(0)
+
+
+def test_the_fda_component_reads_preset_info_but_cannot_write():
+    from openlifu_sdk.io.LIFUConfig import TX_FDA_PACKETS
+    assert OW_PRESET_INFO in TX_FDA_PACKETS[OW_CONTROLLER]
+    assert OW_PRESET_WRITE not in TX_FDA_PACKETS[OW_CONTROLLER]

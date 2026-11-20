@@ -45,6 +45,7 @@ from openlifu_sdk.io.LIFUConfig import (
     OW_PRESET_EMPTY,
     OW_PRESET_GET,
     OW_PRESET_LOAD,
+    OW_PRESET_INFO,
     OW_PRESET_LOADED,
     OW_PRESET_SLOT_TAIL,
     OW_PRESET_CAPACITY,
@@ -204,13 +205,15 @@ PRESET_BLOB_MAGIC = b"OWPR"
 # 2 added treatment_timeout_s; the firmware refuses a version 1 blob.
 PRESET_BLOB_VERSION = 2
 PRESET_ID_MAX = 64
-# A PRESET_MODE image keeps blobs in fixed 4 KB flash slots, pages 106-125
-# (memory_map.h / presets.h in the firmware); a blob fits one slot.
-# The device reports its own figures (get_preset_capacity); these are what
-# today's firmware has, for code that runs with no device.
+# Presets live in fixed 4 KB flash slots, pages 106-125 (memory_map.h /
+# presets.h in the firmware): each a PRS1 header (LIFUPresetPackage, 320
+# bytes), then one blob. The device reports its own figures
+# (get_preset_capacity); these are what today's firmware has, for code that
+# runs with no device.
 PRESET_SLOT_SIZE = 4096
 PRESET_SLOTS = 10
-PRESET_BLOB_MAX = PRESET_SLOT_SIZE
+PRESET_HEADER_LEN = 0x140
+PRESET_BLOB_MAX = PRESET_SLOT_SIZE - PRESET_HEADER_LEN
 # Blob bytes per OW_PRESET_WRITE: well inside every hop's packet buffer.
 PRESET_WRITE_CHUNK = 512
 # Uploads tried before a missing reply is reported. On the bench about one
@@ -565,6 +568,35 @@ class TxDevice(OWComponent):
         self.send_checked(packet_type=OW_CONTROLLER, command=OW_PRESET_LOAD, addr=module,
                           op="unload_preset")
         return True
+
+    def get_preset_info(self, slot: int, module: int = 0):
+        """The PRS1 header of the preset in a slot (OW_PRESET_INFO), as a
+        :class:`LIFUPresetPackage.PresetHeader`: the blob's size and hash, the
+        diathermy commit and context it came from, and its signature, which
+        ``header.signed_by(public_key)`` checks. None if the slot is empty.
+
+        Every module keeps its own slots; *module* picks whose.
+
+        Raises:
+            LIFUDeviceError: Bad slot, or no preset slots (OW_PRESET_NO_ROOM:
+                a transmitter bootloader before 1.1.0-rc.1), or firmware that
+                predates the command.
+            LIFUProtocolError: The reply is not a PRS1 header.
+        """
+        from openlifu_sdk.io import LIFUPresetPackage as pp
+
+        try:
+            r = self.send_checked(packet_type=OW_CONTROLLER, command=OW_PRESET_INFO, addr=module,
+                                  reserved=slot, op="get_preset_info")
+        except LIFUDeviceError as e:
+            if e.device_error_code == OW_PRESET_EMPTY:
+                return None
+            raise
+        try:
+            return pp.parse_preset_header(bytes(r.data[:r.data_len]))
+        except Exception as e:
+            raise LIFUProtocolError(f"TX: get_preset_info: not a preset header ({e})",
+                                    code=LIFU_ERR_BAD_PAYLOAD_LENGTH) from e
 
     def get_loaded_preset_state(self, module: Optional[int] = None) -> Dict:
         """What the transmitter has loaded, as the firmware sees it (OW_PRESET_LOADED).
@@ -1191,29 +1223,42 @@ class LIFUTxDevice(LIFUComponentMixin, TxDevice):
         return {"slots": slots, "free": free, "slot_size": slot_size, "blob_max": blob_max}
 
     def write_preset(self, slot: int, blob: bytes, module: int = 0) -> bool:
-        """Store a preset blob in a PRESET_MODE slot, replacing what is there.
+        """Store a preset in a slot of a standard (non-FDA) image, replacing
+        what is there.
 
-        The blob (LIFUTXPresets.preset_blob) is uploaded in parts
+        *blob* is the slot image (LIFUPresetPackage.tx_slot_image: a PRS1
+        header, then the blob), or a bare blob (LIFUTXPresets.preset_blob),
+        which gets an unsigned header. It is uploaded in parts
         (OW_PRESET_WRITE) and then committed (OW_PRESET_COMMIT) with its
-        length and CRC-32. The firmware keeps it only if all of it arrived, it
-        is a valid blob, and it fits: one over PRESET_SLOT_SIZE also needs the
-        next slot, free or already its own. Until the commit succeeds the
-        slot is unchanged. Every module keeps its own presets, so write each.
+        length and CRC-32. The firmware keeps it only if all of it arrived,
+        the header's size is the blob's and the blob is valid; it checks the
+        signature never (a signed preset is written through the bootloader:
+        LIFUDFUManager.program_transmitter_preset). Until the commit succeeds
+        the slot is unchanged. Every module keeps its own presets, so write
+        each.
 
         A reply that goes missing leaves the outcome unknown, so the whole
         upload is repeated: storing the same blob twice is harmless.
 
         Raises:
-            ValueError: Empty blob or one over PRESET_BLOB_MAX.
-            LIFUDeviceError: Refused -- OW_BAD_CRC (damaged or not a blob),
-                OW_PRESET_SLOT_TAIL, OW_PRESET_NO_ROOM, OW_PRESET_BUSY
-                (trigger running), or not a PRESET_MODE image.
+            ValueError: Empty, or a blob over PRESET_BLOB_MAX.
+            LIFUDeviceError: Refused -- OW_BAD_CRC (damaged, or not a preset),
+                OW_PRESET_NO_ROOM (no preset slots: a transmitter bootloader
+                before 1.1.0-rc.1), OW_PRESET_BUSY (trigger running), or an
+                FDA image (OW_FDA_REFUSED).
             LIFUCommunicationError: No reply on any of PRESET_WRITE_ATTEMPTS
                 uploads.
         """
+        from openlifu_sdk.io import LIFUPresetPackage as pp
+
         blob = bytes(blob)
-        if not 0 < len(blob) <= PRESET_BLOB_MAX:
-            raise ValueError("preset blob must be 1..%d bytes, got %d" % (PRESET_BLOB_MAX, len(blob)))
+        if blob[:4] != pp.PRESET_MAGIC:
+            if not 0 < len(blob) <= PRESET_BLOB_MAX:
+                raise ValueError("preset blob must be 1..%d bytes, got %d" % (PRESET_BLOB_MAX, len(blob)))
+            blob = pp.tx_slot_image(blob)
+        elif not PRESET_HEADER_LEN < len(blob) <= PRESET_SLOT_SIZE:
+            raise ValueError("preset slot image must be %d..%d bytes, got %d"
+                             % (PRESET_HEADER_LEN + 1, PRESET_SLOT_SIZE, len(blob)))
         for attempt in range(1, PRESET_WRITE_ATTEMPTS + 1):
             try:
                 # No per-command retries: a repeated part or commit would be

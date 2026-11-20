@@ -219,8 +219,10 @@ class TestTreatmentTimeout(unittest.TestCase):
         tx.get_preset.return_value = {"id": mc["id"], "settings_crc": mc["settings_crc"],
                                       "regs_crc": regs_crc(mc), "start_c": 35.0, "shutoff_c": 75.0}
         store_preset(tx, 3, mc)
-        slot, blob, module = tx.write_preset.call_args.args
+        slot, image, module = tx.write_preset.call_args.args
         self.assertEqual((slot, module), (3, 0))
+        blob = image[0x140:]                      # after the slot's PRS1 header
+        self.assertEqual(image[:4], b"PRS1")
         self.assertEqual((blob[4], parse_preset_blob(blob)["treatment_timeout_s"]), (2, 600))
 
 
