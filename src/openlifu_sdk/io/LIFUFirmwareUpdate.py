@@ -154,8 +154,15 @@ MIGRATE_BELOW_BL = (1, 1, 0)
 # in the new bootloader's DFU (a few seconds on the bench; generous for the
 # VM re-attaching USB).
 MIGRATION_TIMEOUT_S = 90.0
-# Transmitter slot base: the SFU1 header the I2C DFU reads to tell an empty slot.
-SLAVE_SLOT_BASE = 0x08010000
+# Slave migration, after the updater is written over I2C: wait this long
+# before the first re-enumeration, then poll this slowly. The old bootloader
+# verifies and launches the updater, which rewrites the bootloader and erases
+# about 95 pages before the new bootloader's I2C DFU answers: re-enumerating
+# while the slave cannot answer makes the master's discovery time out, and on
+# master firmware up to 2.1.0-rc.4 a later enumeration after such a timeout
+# hangs the master until its watchdog resets it (openlifu-transmitter-fw#80).
+SLAVE_MIGRATION_SETTLE_S = 20.0
+SLAVE_MIGRATION_POLL_S = 10.0
 
 
 def _bl_version_tuple(bl_version: str | None) -> tuple[int, int, int] | None:
@@ -273,6 +280,15 @@ def _wait_for_migrated_bootloader(device: str, get_bl: Callable[[float], str],
         "DFU, the updater refused it (protected unit) and nothing was "
         "changed. If it does not enumerate and its LEDs blink, the bootloader "
         "rewrite failed: recover it over SWD.")
+
+
+def _reopen(device: Any) -> None:
+    """Reopen a component's serial port if it was lost. The SDK reopens a
+    port from LIFUInterface's monitor, which an update run does not start; a
+    transmitter master resets (and its USB port drops) when its watchdog
+    fires."""
+    if not device.is_connected() and device.connect():
+        logger.info("Reopened the %s port", getattr(getattr(device, "_uart", None), "desc", "device"))
 
 
 def _no_dfu_message(device: str, app_version: str | None,
@@ -1109,7 +1125,10 @@ class LIFUTransmitterFirmwareUpdate:
                 "the master (module 0).")
 
         if legacy is None:
-            legacy = self._slave_path_is_legacy(module)
+            # A slave already parked in its bootloader has no application to
+            # ask; the secure path installs straight into its DFU.
+            legacy = (False if self._slave_in_bootloader(module)
+                      else self._slave_path_is_legacy(module))
 
         if legacy:
             return self._update_slave_legacy(module, production_image,
@@ -1200,6 +1219,7 @@ class LIFUTransmitterFirmwareUpdate:
         logger.info("Waiting %.0fs for the slave app to boot...", dfu_wait_s)
         time.sleep(dfu_wait_s)
         try:
+            _reopen(tx)
             tx.enumerate_modules()
             ver = str(tx.get_version(module=module))
             logger.info("Slave module %d app version: %s", module, ver)
@@ -1216,7 +1236,12 @@ class LIFUTransmitterFirmwareUpdate:
                              replace_bootloader: bool = False) -> UpdateResult:
         tx = self._require_tx()
         app = _require_image(signed_app, "signed application image", "signed_app= / --app")
-        i2c_addr = self._slave_enter_dfu(module, dfu_wait_s)
+        if self._slave_in_bootloader(module):
+            i2c_addr = tx.get_module_i2c_addr(module)
+            logger.info("Slave %d is already in its bootloader's I2C DFU at 0x%02X",
+                        module, i2c_addr)
+        else:
+            i2c_addr = self._slave_enter_dfu(module, dfu_wait_s)
         mgr = LIFUDFUManager(uart=tx.uart)
         bl = STM32I2CDFUviaMaster(tx.uart, i2c_addr=i2c_addr).get_version()
         logger.info("Slave %d bootloader version: %s", module, bl)
@@ -1247,30 +1272,39 @@ class LIFUTransmitterFirmwareUpdate:
     def _slave_wait_migrated_bootloader(self, module: int, old_bl: str,
                                         dfu_wait_s: float) -> tuple[int, str]:
         """After the shim was installed on a slave, wait for the NEW
-        bootloader's I2C DFU: re-enumerate (the slave is in a bootloader or the
-        shim, not an application, so this is safe for it) until *module* is a
-        bootloader node reporting a migrated version. Returns ``(i2c_addr,
-        version)``."""
+        bootloader's I2C DFU. Returns ``(i2c_addr, version)``.
+
+        The I2C DFU has no read command, so this goes by the bootloader's
+        version: a 1.0.x bootloader replaced by 1.1.x shows. With
+        ``replace_bootloader`` (same version, other key) the version does not
+        tell them apart; the application written next does: a bootloader
+        refuses an image not signed with its key, so if the updater was
+        refused that write fails. Waits :data:`SLAVE_MIGRATION_SETTLE_S`
+        before the first re-enumeration and polls every
+        :data:`SLAVE_MIGRATION_POLL_S` (see there), reopening the master's
+        port if it was lost.
+        """
         from openlifu_sdk.io.LIFUConfig import NODE_MODE_BOOTLOADER
         tx = self._require_tx()
         deadline = time.monotonic() + MIGRATION_TIMEOUT_S
         seen = old_bl
-        while time.monotonic() < deadline:
-            time.sleep(dfu_wait_s)
+        logger.info("Slave %d: waiting %.0f s for the updater to replace the "
+                    "bootloader", module, SLAVE_MIGRATION_SETTLE_S)
+        time.sleep(max(SLAVE_MIGRATION_SETTLE_S, dfu_wait_s))
+        while True:
             try:
+                _reopen(tx)
                 count = tx.enumerate_modules()
-                if module >= count or tx.get_module_mode(module) != NODE_MODE_BOOTLOADER:
-                    continue
-                addr = tx.get_module_i2c_addr(module)
-                dfu = STM32I2CDFUviaMaster(tx.uart, i2c_addr=addr)
-                seen = dfu.get_version()
-                # The updater erases the slot; the old bootloader still holds it.
-                empty = dfu.read_memory(SLAVE_SLOT_BASE, 4) == b"\xff\xff\xff\xff"
+                if module < count and tx.get_module_mode(module) == NODE_MODE_BOOTLOADER:
+                    addr = tx.get_module_i2c_addr(module)
+                    seen = STM32I2CDFUviaMaster(tx.uart, i2c_addr=addr).get_version()
+                    if not bootloader_needs_migration(seen):
+                        return addr, seen
             except Exception as e:  # noqa: BLE001 - keep polling until the deadline
                 logger.info("Slave %d not back yet (%s)", module, e)
-                continue
-            if not bootloader_needs_migration(seen) and empty:
-                return addr, seen
+            if time.monotonic() + SLAVE_MIGRATION_POLL_S > deadline:
+                break
+            time.sleep(SLAVE_MIGRATION_POLL_S)
         raise RuntimeError(
             f"slave module {module}: the bootloader updater was installed on "
             f"bootloader {old_bl} but no newer bootloader came up within "
@@ -1278,6 +1312,16 @@ class LIFUTransmitterFirmwareUpdate:
             f"back in bootloader {old_bl}, the updater refused it (protected "
             "unit) and nothing was changed; if it no longer answers, recover "
             "it over SWD.")
+
+    def _slave_in_bootloader(self, module: int) -> bool:
+        """True when the master already lists *module* as a bootloader node
+        (parked in its I2C DFU: an interrupted update, or a migration whose
+        application was never installed)."""
+        from openlifu_sdk.io.LIFUConfig import NODE_MODE_BOOTLOADER
+        try:
+            return self._require_tx().get_module_mode(module) == NODE_MODE_BOOTLOADER
+        except Exception:  # noqa: BLE001 - unknown: take the normal path
+            return False
 
     def update_chain(self, *, signed_app: str | None = None,
                      bl_updater: str | None = None, replace_bootloader: bool = False,

@@ -186,18 +186,36 @@ def test_master_current_bootloader_gets_the_app_only(shim):
 
 class FakeChain:
     """The master's view of a 2-module chain. The slave runs its app until it
-    is asked for DFU; after that it is a bootloader node."""
+    is asked for DFU; after that it is a bootloader node. Records each call
+    with the fake clock, and can drop its port once (a master watchdog reset)."""
 
-    def __init__(self):
+    def __init__(self, clock, mode=NODE_MODE_APP, drop_port_once=False):
         self.uart = object()
-        self.modes = {1: NODE_MODE_APP}
+        self.modes = {1: mode}
         self.log = []
+        self.clock = clock
+        self.connected = True
+        self.drop_port_once = drop_port_once
+
+    def is_connected(self):
+        return self.connected
+
+    def connect(self):
+        self.log.append(("connect", self.clock["t"]))
+        self.connected = True
+        return True
 
     def get_module_count(self):
         return 2
 
     def enumerate_modules(self):
-        self.log.append(("enumerate", dict(self.modes)))
+        if self.drop_port_once:
+            self.drop_port_once = False
+            self.connected = False
+            raise RuntimeError("TX port lost")
+        if not self.connected:
+            raise RuntimeError("TX not connected")
+        self.log.append(("enumerate", self.clock["t"], dict(self.modes)))
         return 2
 
     def enter_dfu(self, module):
@@ -211,46 +229,111 @@ class FakeChain:
         return 0x20
 
     def get_version(self, module=0):
+        if module and self.modes[module] == NODE_MODE_BOOTLOADER:
+            raise RuntimeError("no application")
         return "2.1.0-rc.4"
 
 
 @pytest.fixture
-def slave_env(monkeypatch):
-    chain = FakeChain()
-    versions = iter(["1.0.1", "1.0.1", "1.1.0-rc.1"])
-
-    class FakeI2C:
-        def __init__(self, uart, i2c_addr):
-            assert i2c_addr == 0x20
-
-        def get_version(self):
-            return next(versions)
-
-        def read_memory(self, address, length):
-            assert address == fu.SLAVE_SLOT_BASE
-            return bytes([0xFF]) * length        # the updater erased the slot
-
-    mgr = MagicMock()
-    mgr.program_transmitter_slave_i2c.return_value = "1.1.0-rc.1"
-    monkeypatch.setattr(fu, "STM32I2CDFUviaMaster", FakeI2C)
-    monkeypatch.setattr(fu, "LIFUDFUManager", lambda uart=None: mgr)
-    return chain, mgr
+def clock(monkeypatch):
+    c = {"t": 0.0}
+    monkeypatch.setattr(fu.time, "sleep", lambda s: c.__setitem__("t", c["t"] + s))
+    monkeypatch.setattr(fu.time, "monotonic", lambda: c["t"])
+    return c
 
 
-def test_slave_old_bootloader_gets_the_shim_then_the_app(slave_env, shim):
-    chain, mgr = slave_env
-    upd = fu.LIFUTransmitterFirmwareUpdate(tx=chain)
-    r = upd.update_slave(1, signed_app=APP, legacy=False, bl_updater=shim)
-    assert [c.args[0] for c in mgr.program_transmitter_slave_i2c.call_args_list] == [shim, APP]
+def i2c_versions(monkeypatch, versions):
+    """Fake STM32I2CDFUviaMaster with the real class's interface only: a
+    method the real client does not have fails the test (autospec)."""
+    from unittest.mock import create_autospec
+    from openlifu_sdk.io.LIFUDFU import STM32I2CDFUviaMaster
+    it = iter(versions)
+
+    def make(uart, i2c_addr):
+        assert i2c_addr == 0x20
+        client = create_autospec(STM32I2CDFUviaMaster, instance=True)
+        client.get_version.side_effect = lambda: next(it)
+        return client
+
+    monkeypatch.setattr(fu, "STM32I2CDFUviaMaster", make)
+
+
+@pytest.fixture
+def mgr(monkeypatch):
+    m = MagicMock()
+    m.program_transmitter_slave_i2c.return_value = "1.1.0-rc.1"
+    monkeypatch.setattr(fu, "LIFUDFUManager", lambda uart=None: m)
+    return m
+
+
+def written(mgr):
+    return [c.args[0] for c in mgr.program_transmitter_slave_i2c.call_args_list]
+
+
+def test_slave_old_bootloader_gets_the_shim_then_the_app(clock, mgr, monkeypatch, shim):
+    i2c_versions(monkeypatch, ["1.0.1", "1.1.0-rc.1"])
+    chain = FakeChain(clock)
+    r = fu.LIFUTransmitterFirmwareUpdate(tx=chain).update_slave(
+        1, signed_app=APP, legacy=False, bl_updater=shim)
+    assert written(mgr) == [shim, APP]
     assert r.action == "bl-migrate-i2c"
-    # Every re-enumeration happened with the slave out of its application (#80).
-    enum_modes = [modes for what, modes in chain.log if what == "enumerate"]
-    assert enum_modes and all(m[1] == NODE_MODE_BOOTLOADER for m in enum_modes[:-1])
     assert chain.log[0] == ("enter_dfu", 1)
 
 
-def test_slave_module_version_does_not_re_enumerate():
-    chain = FakeChain()
+def test_slave_first_re_enumeration_waits_for_the_updater(clock, mgr, monkeypatch, shim):
+    """No enumeration while the updater rewrites the bootloader (#80): the
+    first one after the updater is written comes after the settle time."""
+    i2c_versions(monkeypatch, ["1.0.1", "1.1.0-rc.1"])
+    chain = FakeChain(clock)
+    upd = fu.LIFUTransmitterFirmwareUpdate(tx=chain)
+    t_written = {}
+    mgr.program_transmitter_slave_i2c.side_effect = (
+        lambda img, **kw: t_written.setdefault(img, clock["t"]) and "1.1.0-rc.1")
+    upd.update_slave(1, signed_app=APP, legacy=False, bl_updater=shim)
+    enums = [t for what, t, *_ in chain.log if what == "enumerate"]
+    after_shim = [t for t in enums if t > t_written[shim]]
+    assert after_shim and after_shim[0] - t_written[shim] >= fu.SLAVE_MIGRATION_SETTLE_S
+
+
+def test_slave_wait_reopens_a_lost_master_port(clock, mgr, monkeypatch, shim):
+    i2c_versions(monkeypatch, ["1.0.1", "1.1.0-rc.1"])
+    chain = FakeChain(clock, drop_port_once=True)
+    chain.modes[1] = NODE_MODE_BOOTLOADER          # parked; first enumerate drops the port
+    r = fu.LIFUTransmitterFirmwareUpdate(tx=chain).update_slave(
+        1, signed_app=APP, legacy=False, bl_updater=shim)
+    assert any(what == "connect" for what, *_ in chain.log)
+    assert written(mgr) == [shim, APP] and r.action == "bl-migrate-i2c"
+
+
+def test_slave_new_bootloader_never_comes_up(clock, mgr, monkeypatch, shim):
+    i2c_versions(monkeypatch, ["1.0.1"] + ["1.0.1"] * 50)
+    chain = FakeChain(clock)
+    with pytest.raises(RuntimeError, match="no newer bootloader came up"):
+        fu.LIFUTransmitterFirmwareUpdate(tx=chain).update_slave(
+            1, signed_app=APP, legacy=False, bl_updater=shim)
+    assert written(mgr) == [shim]
+
+
+def test_slave_parked_in_its_bootloader_is_resumed(clock, mgr, monkeypatch, shim):
+    """A slave left in its bootloader's DFU (no application): no app version
+    read, no DFU request; the app goes straight into its DFU."""
+    i2c_versions(monkeypatch, ["1.1.0-rc.1"])
+    chain = FakeChain(clock, mode=NODE_MODE_BOOTLOADER)
+    r = fu.LIFUTransmitterFirmwareUpdate(tx=chain).update_slave(1, signed_app=APP, bl_updater=shim)
+    assert written(mgr) == [APP]
+    assert not any(what == "enter_dfu" for what, *_ in chain.log)
+    assert r.action == "app-update-i2c"
+
+
+def test_slave_parked_in_an_old_bootloader_gets_the_shim(clock, mgr, monkeypatch, shim):
+    i2c_versions(monkeypatch, ["1.0.1", "1.1.0-rc.1"])
+    chain = FakeChain(clock, mode=NODE_MODE_BOOTLOADER)
+    r = fu.LIFUTransmitterFirmwareUpdate(tx=chain).update_slave(1, signed_app=APP, bl_updater=shim)
+    assert written(mgr) == [shim, APP] and r.action == "bl-migrate-i2c"
+
+
+def test_slave_module_version_does_not_re_enumerate(clock):
+    chain = FakeChain(clock)
     ver, mode = fu.LIFUTransmitterFirmwareUpdate(tx=chain).slave_module_version(1)
     assert (ver, mode) == ("2.1.0-rc.4", NODE_MODE_APP)
     assert not any(what == "enumerate" for what, _ in chain.log)

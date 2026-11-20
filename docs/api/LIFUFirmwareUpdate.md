@@ -217,9 +217,25 @@ The updaters are the `open-lifu-{console,transmitter}-bl-updater` release
 assets, passed as `bl_updater=` / `--bl-updater`. With `replace_bootloader=True`
 (`--replace-bootloader`) the updater is installed even on a 1.1.x bootloader:
 openlifu-fw-updater converts a research unit to clinical this way, with an
-updater that carries the clinical bootloader. The SDK knows the new bootloader
-is up when its DFU reports at least 1.1.0 **and** the slot is empty (the
-updater erases it; the old bootloader still holds it).
+updater that carries the clinical bootloader.
+
+How the SDK knows the new bootloader is up:
+- **USB (console, transmitter master):** its DFU reports at least 1.1.0 **and**
+  the slot is empty (the updater erases it; the old bootloader still holds it).
+- **I2C (slave):** the I2C DFU has no read, so the bootloader version decides.
+  The SDK waits `SLAVE_MIGRATION_SETTLE_S` (20 s) before the first
+  re-enumeration and then polls every `SLAVE_MIGRATION_POLL_S` (10 s): a
+  re-enumeration while the slave cannot answer times out, and on master firmware
+  up to 2.1.0-rc.4 a later one then hangs the master until its watchdog resets
+  it (openlifu-transmitter-fw#80). A master port lost that way is reopened.
+  With `replace_bootloader` the version cannot tell the two bootloaders apart;
+  the application written next does, since a bootloader refuses an image not
+  signed with its key.
+
+A slave the master already lists as a bootloader node (parked in its I2C DFU:
+an interrupted update) is resumed: no application version is read and no DFU
+request sent; the application, after the updater if its bootloader is 1.0.x,
+goes straight into its DFU.
 
 **Whole transmitter chain:** `update_chain()` / `--all` updates every slave
 over I2C first, while the master still runs the firmware that brokers it, then
