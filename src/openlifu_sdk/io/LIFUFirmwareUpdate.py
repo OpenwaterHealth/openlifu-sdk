@@ -602,35 +602,44 @@ class LIFUFirmwareUpdate:
                                 "bootloader (RAM updater).", reboot_required=True)
 
         if cohort == COHORT_SECURE:
-            if not in_dfu:
-                logger.info("Requesting console DFU mode...")
-                self._enter_dfu()
-                time.sleep(2.0)
-            mgr, kw = self._mgr, dict(vid=self.vid, pid=self.pid,
-                                      libusb_dll=self.libusb_dll)
-            bl_version, migrated = _install_with_migration(
-                "Console",
-                get_bl=lambda t: mgr.get_console_bootloader_version(timeout_s=t, **kw),
-                program=lambda img: mgr.program_console(
-                    img, keys_dir=self.keys_dir, force=force,
-                    progress_callback=progress_callback, **kw),
-                abort=lambda: mgr.abort_dfu(profile=CONSOLE_PROFILE, **kw),
-                app=app,
-                bl_updater=lambda bl: _resolve_bl_updater(
-                    bl_updater, bundled_console_bl_updater, "Console", bl),
-                entered=not in_dfu)
-            if migrated:
-                return UpdateResult(cohort, "bl-migrate",
-                                    f"Replaced the bootloader (now {bl_version}) "
-                                    "with the bootloader updater, then installed "
-                                    "the application.", reboot_required=True,
-                                    bl_version=bl_version)
-            return UpdateResult(cohort, "app-update",
-                                "Updated the application on the secure "
-                                "bootloader.", reboot_required=True,
-                                bl_version=bl_version)
+            return self._update_secure(cohort, app, in_dfu, force, bl_updater,
+                                       progress_callback)
 
         raise RuntimeError(f"unhandled cohort: {cohort}")
+
+    def _update_secure(self, cohort: str, app: str, in_dfu: bool, force: bool,
+                       bl_updater: str | None,
+                       progress_callback: Callable | None) -> UpdateResult:
+        """The secure-bootloader path of :meth:`update`: the signed app over
+        the bootloader's DFU, replacing a 1.0.x bootloader through the updater
+        shim first."""
+        if not in_dfu:
+            logger.info("Requesting console DFU mode...")
+            self._enter_dfu()
+            time.sleep(2.0)
+        mgr, kw = self._mgr, dict(vid=self.vid, pid=self.pid,
+                                  libusb_dll=self.libusb_dll)
+        bl_version, migrated = _install_with_migration(
+            "Console",
+            get_bl=lambda t: mgr.get_console_bootloader_version(timeout_s=t, **kw),
+            program=lambda img: mgr.program_console(
+                img, keys_dir=self.keys_dir, force=force,
+                progress_callback=progress_callback, **kw),
+            abort=lambda: mgr.abort_dfu(profile=CONSOLE_PROFILE, **kw),
+            app=app,
+            bl_updater=lambda bl: _resolve_bl_updater(
+                bl_updater, bundled_console_bl_updater, "Console", bl),
+            entered=not in_dfu)
+        if migrated:
+            return UpdateResult(cohort, "bl-migrate",
+                                f"Replaced the bootloader (now {bl_version}) "
+                                "with the bootloader updater, then installed "
+                                "the application.", reboot_required=True,
+                                bl_version=bl_version)
+        return UpdateResult(cohort, "app-update",
+                            "Updated the application on the secure "
+                            "bootloader.", reboot_required=True,
+                            bl_version=bl_version)
 
     # ------------------------------------------------------------------
     # DFU-entry callables (raise a clear error if no HV controller)
@@ -1010,6 +1019,15 @@ class LIFUTransmitterFirmwareUpdate:
                                 reboot_required=False)
 
         app = str(signed_app) if signed_app else str(bundled_transmitter_signed_app())
+        return self._update_secure(state, app, in_dfu, force, bl_updater,
+                                   progress_callback)
+
+    def _update_secure(self, state: str, app: str, in_dfu: bool, force: bool,
+                       bl_updater: str | None,
+                       progress_callback: Callable | None) -> UpdateResult:
+        """The secure-bootloader path of :meth:`update`: the signed app over
+        the master's USB DFU, replacing a 1.0.x bootloader through the updater
+        shim first."""
         if not in_dfu:
             logger.info("Requesting transmitter DFU mode...")
             self._enter_dfu()
