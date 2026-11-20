@@ -204,11 +204,12 @@ TRANSMITTER_PROFILE = DeviceProfile(
     program_alignment_bytes=8,
     app_default_address=None,
     reset_virt_addr=0xFFFFFF08,
-    # Pages 32-109 = the DFU-writable window. The erase stops at 0x08036FFF,
-    # short of the stored presets (0x08037000), the anti-rollback log
-    # (0x0803F000) and the user config (0x0803F800). Bootloaders from before
-    # presets were stored there let DFU reach page 125; stopping at 109 suits both.
-    slot_size=0x27000,
+    # Pages 32-105 = the slot (open-lifu-transmitter-bl >= 1.1.0-rc.1, and the
+    # application's memory_map.h). The erase stops at 0x08034FFF, short of the
+    # presets (pages 106-125, 0x08035000), the anti-rollback log (0x0803F000)
+    # and the runtime config (0x0803F800). Older bootloaders let DFU reach
+    # page 125; stopping at 105 suits both.
+    slot_size=0x25000,
 )
 
 CONSOLE_PROFILE = DeviceProfile(

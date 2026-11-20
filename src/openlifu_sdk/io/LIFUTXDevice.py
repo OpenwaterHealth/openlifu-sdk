@@ -204,13 +204,13 @@ PRESET_BLOB_MAGIC = b"OWPR"
 # 2 added treatment_timeout_s; the firmware refuses a version 1 blob.
 PRESET_BLOB_VERSION = 2
 PRESET_ID_MAX = 64
-# A PRESET_MODE image keeps blobs in flash slots of one page each
-# (presets.h in the firmware); a blob over one slot takes the next too.
+# A PRESET_MODE image keeps blobs in fixed 4 KB flash slots, pages 106-125
+# (memory_map.h / presets.h in the firmware); a blob fits one slot.
 # The device reports its own figures (get_preset_capacity); these are what
 # today's firmware has, for code that runs with no device.
-PRESET_SLOT_SIZE = 2048
-PRESET_SLOTS = 16
-PRESET_BLOB_MAX = 2 * PRESET_SLOT_SIZE
+PRESET_SLOT_SIZE = 4096
+PRESET_SLOTS = 10
+PRESET_BLOB_MAX = PRESET_SLOT_SIZE
 # Blob bytes per OW_PRESET_WRITE: well inside every hop's packet buffer.
 PRESET_WRITE_CHUNK = 512
 # Uploads tried before a missing reply is reported. On the bench about one
