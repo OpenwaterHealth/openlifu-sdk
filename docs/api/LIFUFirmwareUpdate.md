@@ -57,7 +57,14 @@ Class
     converted to clinical by openlifu-fw-updater).
 
 `UpdateResult` fields: `cohort`, `action` (`"migrate-rom"` / `"migrate-legacy"`
-/ `"app-update"`), `summary`, `reboot_required`.
+/ `"app-update"` / `"bl-migrate"` / `"force-production"`), `summary`,
+`reboot_required`, `bl_version`.
+
+`reboot_required` is True only when the operator must power-cycle the unit to
+run the new application. It is False on the secure-bootloader paths
+(`"app-update"`, `"bl-migrate"`, console and transmitter master): the DFU
+manifest resets the unit and the bootloader verifies and launches the new
+application by itself. The CLI prints "Power-cycle the ..." only when it is True.
 
 Behaviour notes
 - If a running app is present, its version names the cohort and the updater
@@ -252,6 +259,14 @@ updated is in a bootloader; `slave_module_version()` / `--detect` read without
 re-enumerating. In a chain of several old slaves, another slave still running
 its application can hang during that re-enumeration; it comes back after its
 watchdog reset and the next slave's update picks it up again.
+
+**Slave version after an I2C update:** after the one re-enumeration, the slave
+application may not answer yet and its version reads as the `v0.0.0`
+placeholder. The SDK retries only the version read (no further enumeration)
+every `SLAVE_VERSION_POLL_S` (2 s) for at most `SLAVE_VERSION_TIMEOUT_S` (24 s)
+until it is a real X.Y.Z version. The summary names the version (`(now X.Y.Z)`)
+only when one was read; a master on firmware 2.0.8 truncates forwarded version
+replies, so there the summary has no version and a warning is logged.
 
 See also: `docs/api/LIFUDFU.md` (the underlying per-scenario methods),
 `docs/api/LIFUCrypto.md` (image signing/validation),
