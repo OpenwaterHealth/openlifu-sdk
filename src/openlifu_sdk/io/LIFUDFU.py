@@ -1910,7 +1910,7 @@ class LIFUDFUManager:
                        vid: int = 0x0483, pid: int = 0xDF11,
                        libusb_dll: str | None = None,
                        dfu_wait_s: float = 2.0,
-                       dfu_enum_timeout_s: float = 30.0,
+                       dfu_enum_timeout_s: float = 45.0,
                        progress_callback: Callable | None = None) -> str:
         """High-level console firmware update.
 
@@ -2019,7 +2019,7 @@ class LIFUDFUManager:
                            vid: int = 0x0483, pid: int = 0xDF11,
                            libusb_dll: str | None = None,
                            dfu_wait_s: float = 2.0,
-                           dfu_enum_timeout_s: float = 30.0,
+                           dfu_enum_timeout_s: float = 45.0,
                            progress_callback: Callable | None = None) -> str:
         """High-level transmitter firmware update over standard USB DFU
         (module 0, secure bootloader).
@@ -2101,7 +2101,7 @@ class LIFUDFUManager:
                                        vid: int = 0x0483, pid: int = 0xDF11,
                                        libusb_dll: str | None = None,
                                        dfu_wait_s: float = 3.0,
-                                       dfu_enum_timeout_s: float = 30.0,
+                                       dfu_enum_timeout_s: float = 45.0,
                                        progress_callback: Callable | None = None) -> None:
         """Migrate a transmitter to the secure bootloader by MASS-ERASING the
         chip and writing the whole combined production image (bootloader +
@@ -2436,7 +2436,7 @@ class LIFUDFUManager:
                         vid: int = 0x0483, pid: int = 0xDF11,
                         libusb_dll: str | None = None,
                         dfu_wait_s: float = 3.0,
-                        dfu_enum_timeout_s: float = 30.0,
+                        dfu_enum_timeout_s: float = 45.0,
                         progress_callback: Callable | None = None) -> None:
         """End-to-end console bootloader migration for a beta unit.
 
@@ -2494,7 +2494,7 @@ class LIFUDFUManager:
                                vid: int = 0x0483, pid: int = 0xDF11,
                                libusb_dll: str | None = None,
                                dfu_wait_s: float = 3.0,
-                               dfu_enum_timeout_s: float = 30.0,
+                               dfu_enum_timeout_s: float = 45.0,
                                updater_wait_s: float = 6.0,
                                progress_callback: Callable | None = None) -> None:
         """Migrate a LEGACY-bootloader console (app 1.2.0–1.2.5) to the secure
@@ -2615,7 +2615,7 @@ class LIFUDFUManager:
                                    vid: int = 0x0483, pid: int = 0xDF11,
                                    libusb_dll: str | None = None,
                                    dfu_wait_s: float = 3.0,
-                                   dfu_enum_timeout_s: float = 30.0,
+                                   dfu_enum_timeout_s: float = 45.0,
                                    progress_callback: Callable | None = None) -> None:
         """Migrate a console by MASS-ERASING the chip and writing the whole
         combined production image (bootloader + signed app) at the flash base
@@ -3131,7 +3131,7 @@ class LIFUDFUManager:
                       libusb_dll: str | None = None,
                       i2c_addr: int = I2C_DFU_SLAVE_ADDR,
                       dfu_wait_s: float = 3.0,
-                      dfu_enum_timeout_s: float = 30.0,
+                      dfu_enum_timeout_s: float = 45.0,
                       device_type: str = "transmitter",
                       progress_callback: Callable | None = None) -> None:
         """High-level firmware update for a single module.
