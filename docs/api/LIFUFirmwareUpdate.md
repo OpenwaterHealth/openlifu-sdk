@@ -174,6 +174,53 @@ the slave's app version. `--production` overrides the combined image, and
 `--updater` overrides the RAM-resident legacy updater used by the USB
 recovery path (and by the console legacy migration).
 
+## Replacing a 1.0.x bootloader (bootloader updater shim)
+
+Research units shipped with console app 1.2.6 / bootloader `1.0.3-rc.1` and
+transmitter app 2.0.8 / bootloader `1.0.1`. The 1.1.x bootloaders move the
+slot end and add the preset area, so those units must get the new bootloader
+before a 1.3.x / 2.1.x application. `update()` (console, transmitter master)
+and `update_slave()` do it on the way, over the normal DFU paths, with no ROM
+loader and no SWD:
+
+1. Read the secure bootloader's version from its DFU. Older than **1.1.0**
+   (`bootloader_needs_migration()`): install the **bootloader updater**
+   first — `open-lifu-console-bl-updater` / `open-lifu-transmitter-bl-updater`,
+   a one-shot application signed with the research key the old bootloader
+   trusts (image version 1.2.31 / 2.0.31: above every fielded floor, below the
+   first application for the new bootloader).
+2. The old bootloader verifies and launches it. It rewrites pages 0-31 with
+   the bootloader it carries, erases the old slot, the preset area and the
+   anti-rollback floor (the runtime-config page is kept), and resets into the
+   **new** bootloader's DFU — USB on a console or master, I2C on a slave.
+3. The SDK waits for the new bootloader (`MIGRATION_TIMEOUT_S`) and installs
+   the application there. The result's `action` is `bl-migrate` /
+   `bl-migrate-i2c`.
+
+The updater refuses a protected unit (RDP > 0 or write protection) without
+writing anything and comes back in the old bootloader's DFU; the SDK then
+reports that no newer bootloader came up. A power loss while the bootloader
+pages are rewritten (a few seconds) needs SWD recovery.
+
+The updaters are bundled as `firmware/openlifu-{console,transmitter}-bl-updater-signed.bin`;
+`bl_updater=` / `--bl-updater` overrides them.
+
+**Whole transmitter chain:** `update_chain()` / `--all` updates every slave
+over I2C first, while the master still runs the firmware that brokers it, then
+the master over USB:
+
+```
+python -m openlifu_sdk.io.LIFUFirmwareUpdate --device transmitter --all
+```
+
+**Re-enumeration:** transmitter firmware up to 2.1.0-rc.4 hangs a slave that is
+running its application when the chain is re-enumerated
+(openlifu-transmitter-fw#80). The SDK re-enumerates only once the slave being
+updated is in a bootloader; `slave_module_version()` / `--detect` read without
+re-enumerating. In a chain of several old slaves, another slave still running
+its application can hang during that re-enumeration; it comes back after its
+watchdog reset and the next slave's update picks it up again.
+
 See also: `docs/api/LIFUDFU.md` (the underlying per-scenario methods),
 `docs/api/LIFUCrypto.md` (image signing/validation),
 `docs/api/LIFUHVController.md` (DFU entry).
