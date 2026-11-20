@@ -152,6 +152,34 @@ def build_preset_package(body: bytes, *, diathermy_sha: str, context: str,
     return header + body
 
 
+def tx_slot_image(blob: bytes, *, keys: SigningKeys | None = None,
+                  diathermy_sha: str | None = None, context: str | None = None) -> bytes:
+    """The image of one transmitter preset slot for *blob*: a PRS1 header,
+    then the blob.
+
+    With *keys* (and *diathermy_sha* and *context*) the header is signed, as
+    :func:`build_tx_preset` makes it: what a released preset is, and what the
+    bootloader takes. Without, the header carries the blob's size and hash and
+    a zero signature, context and commit: a research or bare-metal image
+    stores it (it checks integrity, not the signature), the bootloader never.
+
+    Raises:
+        ValueError: The blob does not fit a slot.
+    """
+    if keys is not None:
+        return build_tx_preset(blob, diathermy_sha=diathermy_sha, context=context, keys=keys)
+    if not blob:
+        raise ValueError("A preset slot needs a blob")
+    if PRESET_BODY_OFFSET + len(blob) > TX_PRESET_SLOT_SIZE:
+        raise ValueError(f"Preset blob is {len(blob)} bytes; a slot holds "
+                         f"{TX_PRESET_SLOT_SIZE - PRESET_BODY_OFFSET}")
+    tag = hashlib.sha256(blob).digest()
+    auth = struct.pack(_AUTH_STRUCT, PRESET_MAGIC, PRESET_PROTOCOL, 0, len(blob),
+                       0, len(blob), tag, tag, bytes(16), bytes(28))
+    header = auth + bytes(HEADER_SIGN_LEN) + b"\xFF" * HEADER_STATE_LEN + b"\x00" * HEADER_FP_LEN
+    return header + blob
+
+
 def build_tx_preset(blob: bytes, *, diathermy_sha: str, context: str,
                     keys: SigningKeys) -> bytes:
     """Sign one transmitter preset blob (``LIFUTXPresets.preset_blob``) into

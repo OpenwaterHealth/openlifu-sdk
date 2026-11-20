@@ -1026,29 +1026,37 @@ def verify_preset(txdevice, index: int, machine_config: Dict) -> Dict:
 
 
 def preset_slots(machine_config: Dict, slot_size: int = PRESET_SLOT_SIZE) -> int:
-    """How many of a PRESET_MODE module's slots this preset takes: 1, or
-    2 if a module's blob is over *slot_size* (pass the device's own, from
-    get_preset_capacity). A module stores only its own part, so this does not
-    grow with the number of modules.
+    """How many of a module's preset slots this preset takes: always 1. A
+    slot holds a PRS1 header, then one blob (*slot_size* less the header; pass
+    the device's own slot size, from get_preset_capacity). A module stores
+    only its own part, so this does not grow with the number of modules.
 
     Raises:
-        ValueError: A blob is over two slots and cannot be stored.
+        ValueError: A blob does not fit a slot.
     """
+    from openlifu_sdk.io.LIFUPresetPackage import PRESET_BODY_OFFSET
+
+    room = slot_size - PRESET_BODY_OFFSET
     size = max(len(preset_blob(machine_config, m)) for m in range(preset_modules(machine_config)))
-    if size > 2 * slot_size:
-        raise ValueError("%s: blob is %d bytes; a stored preset is at most %d"
-                         % (machine_config["id"], size, 2 * slot_size))
-    return 2 if size > slot_size else 1
+    if size > room:
+        raise ValueError("%s: blob is %d bytes; a preset slot holds %d"
+                         % (machine_config["id"], size, room))
+    return 1
 
 
-def store_preset(txdevice, slot: int, machine_config: Dict) -> Dict:
-    """Write a compiled preset to a PRESET_MODE slot and prove it took.
+def store_preset(txdevice, slot: int, machine_config: Dict, *, keys=None,
+                 diathermy_sha: str | None = None, context: str | None = None) -> Dict:
+    """Write a compiled preset to a slot of a standard (non-FDA) image and
+    prove it took.
 
-    Uploads each module its own part, then reads the slot back
-    (:func:`verify_preset`), so a success means the device holds this preset
-    under index *slot*. Returns the device's description of it. A preset
-    whose module count differs from the transmitter's is refused before
-    anything is written, as DeviceInterface.load_preset refuses it.
+    Uploads each module its own part, as a slot image (a PRS1 header, then the
+    blob: LIFUPresetPackage.tx_slot_image), signed with *keys* for
+    *diathermy_sha* and *context* if given, else with an unsigned header (a
+    research use: the image checks integrity, not the signature). Then reads
+    the slot back (:func:`verify_preset`), so a success means the device holds
+    this preset under index *slot*. Returns the device's description of it. A
+    preset whose module count differs from the transmitter's is refused
+    before anything is written, as DeviceInterface.load_preset refuses it.
 
     Raises:
         ValueError: The blob cannot be stored, or the slot does not read back
@@ -1057,9 +1065,13 @@ def store_preset(txdevice, slot: int, machine_config: Dict) -> Dict:
             (LIFU_ERR_MODULE_COUNT_MISMATCH).
         LIFUDeviceError: The device refused the write (see write_preset).
     """
+    from openlifu_sdk.io.LIFUPresetPackage import tx_slot_image
+
     preset_slots(machine_config)
     for module in _device_modules(txdevice, machine_config):
-        txdevice.write_preset(slot, preset_blob(machine_config, module), module)
+        image = tx_slot_image(preset_blob(machine_config, module), keys=keys,
+                              diathermy_sha=diathermy_sha, context=context)
+        txdevice.write_preset(slot, image, module)
     return verify_preset(txdevice, slot, machine_config)
 
 

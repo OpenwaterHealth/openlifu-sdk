@@ -10,6 +10,7 @@ from unittest.mock import MagicMock, call
 
 from openlifu_sdk.io.exceptions import LIFUError
 from openlifu_sdk.io.LIFUConfig import LIFU_ERR_MODULE_COUNT_MISMATCH
+from openlifu_sdk.io.LIFUPresetPackage import tx_slot_image
 from openlifu_sdk.io.LIFUTXPresets import (
     compile_preset,
     load_preset,
@@ -81,8 +82,10 @@ class TestModuleCountGuard(unittest.TestCase):
             "start_c": 35.0, "shutoff_c": 75.0,
         }
         store_preset(tx, 3, mc)
+        # Each module its own blob, in a slot image (unsigned PRS1 header + blob).
         self.assertEqual(tx.write_preset.call_args_list,
-                         [call(3, preset_blob(mc, 0), 0), call(3, preset_blob(mc, 1), 1)])
+                         [call(3, tx_slot_image(preset_blob(mc, 0)), 0),
+                          call(3, tx_slot_image(preset_blob(mc, 1)), 1)])
         tx.get_preset.assert_called_once_with(3)
 
     def test_load_matching_count_loads_every_module(self):

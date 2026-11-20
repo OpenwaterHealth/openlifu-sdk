@@ -29,8 +29,8 @@ OW_SUCCESS = 0x00
 OW_HV_FAULT = 0xF0         # console: HV on refused while an HV rail fault is latched (SR-025)
 OW_HV_RANGE = 0xF1         # console: select's rescaled voltage is outside the FDA window
 OW_PRESET_BUSY = 0xF2      # TX: trigger running, presets cannot be stored or deleted
-OW_PRESET_NO_ROOM = 0xF3   # TX: blob needs the next slot too, and it is taken or missing
-OW_PRESET_SLOT_TAIL = 0xF4 # TX: slot holds the second half of the preset before it
+OW_PRESET_NO_ROOM = 0xF3   # TX: no preset slots (under a bootloader before 1.1.0-rc.1)
+OW_PRESET_SLOT_TAIL = 0xF4 # TX: retired (a preset fits one slot); older images only
 OW_PRESET_EMPTY = 0xF5     # TX: nothing stored in the slot
 OW_HV_PRESET_CRC = 0xF6    # console: select's settings_crc is not that preset's
 OW_HV_NO_PRESET = 0xF7     # console: HV on before any preset was selected
@@ -104,6 +104,8 @@ OW_PRESET_DELETE = 0x54
 OW_PRESET_CAPACITY = 0x55
 # What every module has loaded (16 bytes; TxDevice.get_loaded_preset_state).
 OW_PRESET_LOADED = 0x57
+# A slot's PRS1 header (320 bytes; TxDevice.get_preset_info).
+OW_PRESET_INFO = 0x58
 
 # Thermal limits, start_C / shutoff_C, and the treatment timeout, the third
 # limit (transmitter-fw thermal_limits.h): armed by a preset load and kept
@@ -226,7 +228,7 @@ CONTROLLER_COMMANDS = {
     OW_CTRL_SET_PROFILE_CYCLE,
     OW_PRESET_GET, OW_PRESET_LOAD,
     OW_PRESET_WRITE, OW_PRESET_COMMIT, OW_PRESET_DELETE, OW_PRESET_CAPACITY,
-    OW_PRESET_LOADED,
+    OW_PRESET_LOADED, OW_PRESET_INFO,
     OW_CTRL_GET_THERMAL_LIMITS, OW_CTRL_SET_THERMAL_LIMITS, OW_CTRL_CLEAR_THERMAL_LIMITS,
 }
 
@@ -261,7 +263,7 @@ TX_FDA_PACKETS = {
         OW_CTRL_GET_SWTRIG, OW_CTRL_START_SWTRIG, OW_CTRL_STOP_SWTRIG,
         OW_CTRL_PAUSE_SWTRIG, OW_CTRL_RESUME_SWTRIG,
         OW_CTRL_GET_MODULE_COUNT,
-        OW_PRESET_GET, OW_PRESET_LOAD, OW_PRESET_LOADED,
+        OW_PRESET_GET, OW_PRESET_LOAD, OW_PRESET_LOADED, OW_PRESET_INFO,
         OW_CTRL_GET_THERMAL_LIMITS,
     }),
     OW_TX7332: frozenset({OW_TX7332_DEVICE_COUNT}),  # get_module_count fallback on older images
