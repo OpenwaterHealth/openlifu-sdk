@@ -124,6 +124,9 @@ I2C_DFU_CMD_GETSTATUS   = 0x03
 I2C_DFU_CMD_MANIFEST    = 0x04
 I2C_DFU_CMD_RESET       = 0x05
 I2C_DFU_CMD_GETVERSION  = 0x06
+# "OWC1" + capability word, as at USB_DFU_CAPS_VIRT_ADDR (transmitter
+# bootloader >= 1.1.0-rc.1; older ones answer I2C_DFU_STATUS_ERROR).
+I2C_DFU_CMD_GETCAPS     = 0x07
 I2C_DFU_STATUS_OK       = 0x00
 I2C_DFU_STATUS_BUSY     = 0x01
 I2C_DFU_STATUS_ERROR    = 0x02
@@ -195,6 +198,9 @@ class DeviceProfile:
     # bootloader the slot ends at preset_base, so the slot erase stops there.
     preset_base: int | None = None
     preset_size: int | None = None
+    # Size of one preset slot when the preset area is split into slots
+    # (transmitter); None = one page holding the whole set (console).
+    preset_slot_size: int | None = None
 
 # Built-in profiles
 TRANSMITTER_PROFILE = DeviceProfile(
@@ -210,6 +216,12 @@ TRANSMITTER_PROFILE = DeviceProfile(
     # and the runtime config (0x0803F800). Older bootloaders let DFU reach
     # page 125; stopping at 105 suits both.
     slot_size=0x25000,
+    # The capability word is read only for preset writes: the slot write
+    # checks the header in-band on its first block and needs no staging.
+    caps_virt_addr=USB_DFU_CAPS_VIRT_ADDR,
+    preset_base=0x08035000,          # LIFUPresetPackage.TX_PRESET_BASE
+    preset_size=0xA000,
+    preset_slot_size=0x1000,
 )
 
 CONSOLE_PROFILE = DeviceProfile(
@@ -1028,7 +1040,9 @@ class STM32USBDFU:
         p = self._profile
         if p is None:
             return None
-        if self.has_preset_page() and p.app_default_address is not None:
+        # app_default_address first: a profile without one (transmitter) has
+        # a fixed slot and is never probed for capabilities on a slot write.
+        if p.app_default_address is not None and self.has_preset_page():
             return p.preset_base - p.app_default_address
         return p.slot_size
 
@@ -1445,6 +1459,27 @@ class STM32I2CDFUviaMaster:
     def reset(self) -> None:
         """Send CMD_RESET; the device reboots immediately (no response)."""
         self._write(bytes([I2C_DFU_CMD_RESET]))
+
+    def read_capabilities(self) -> int:
+        """The slave bootloader's capability word, or 0 when it has none
+        (bootloaders before 1.1.0-rc.1 answer GETCAPS with an error)."""
+        raw = self._exchange(bytes([I2C_DFU_CMD_GETCAPS]), 2 + 8)
+        if raw[0] != I2C_DFU_STATUS_OK or raw[2:6] != USB_DFU_CAPS_MAGIC:
+            return 0
+        return struct.unpack_from("<I", raw, 6)[0]
+
+    def stage_preset(self, package: bytes) -> None:
+        """DNLOAD a preset's signed PRS1 header to the staging address and
+        wait for the slave bootloader to verify it (~1.5 s, off the bus).
+
+        Raises:
+            DFUWriteRefusedError: Refused (wrong key, tampered, too large);
+                the slot was not touched.
+        """
+        header = bytes(package[:USB_DFU_SFU_HEADER_LEN])
+        if len(header) < USB_DFU_SFU_HEADER_LEN or header[:4] != b"PRS1":
+            raise ValueError("stage_preset: not a preset (no PRS1 header)")
+        self.write_block(USB_DFU_PRESET_STAGE_VIRT_ADDR, header)
 
     def get_version(self) -> str:
         """Read the null-terminated bootloader version string."""
@@ -1902,6 +1937,94 @@ class LIFUDFUManager:
             logger.info("Console presets written and read back; sending manifest "
                         "(the bootloader checks the body hash, then resets)")
             dfu.manifest()
+
+    @staticmethod
+    def _check_tx_preset(slot: int, package: str | bytes, public_key=None) -> bytes:
+        """The slot image to write for *package*, checked before any device
+        is touched: it parses, its blob matches its signed hash, it fits a
+        slot, and with *public_key* its signature verifies."""
+        from openlifu_sdk.io import LIFUPresetPackage as pp
+
+        pp.tx_preset_slot_address(slot)   # range check
+        data = Path(package).read_bytes() if isinstance(package, (str, Path)) else bytes(package)
+        pkg = pp.parse_preset_package(data)
+        if not pkg.body_ok:
+            raise ValueError("Preset blob does not match its signed hash")
+        data = pkg.header + pkg.body
+        if len(data) > pp.TX_PRESET_SLOT_SIZE:
+            raise ValueError(f"Preset is {len(data)} bytes; a slot holds {pp.TX_PRESET_SLOT_SIZE}")
+        if public_key is not None and not pp.verify_preset_package(data, public_key):
+            raise ValueError("Preset is not signed by the given key")
+        logger.info("Transmitter preset for slot %d: %d bytes, context %s, diathermy %s",
+                    slot, len(pkg.body), pkg.context, pkg.diathermy_sha)
+        return data
+
+    def program_transmitter_preset(self, slot: int, package: str | bytes,
+                                   public_key=None,
+                                   vid: int = 0x0483, pid: int = 0xDF11,
+                                   libusb_dll: str | None = None,
+                                   progress_callback: Callable | None = None) -> None:
+        """Write one signed preset (``LIFUPresetPackage.build_tx_preset``)
+        into preset slot *slot* of the USB transmitter (module 0) through its
+        bootloader's DFU (open-lifu-transmitter-bl >= 1.1.0-rc.1), then reset.
+        The transmitter must already be in USB DFU mode.
+
+        The bootloader checks the signature before it erases the slot, and the
+        blob's hash when the write completes (erasing the slot on a mismatch).
+
+        Raises:
+            ValueError: Bad slot or preset, or not signed by *public_key*.
+                Nothing was written.
+            RuntimeError: The bootloader has no preset slots, or DFU failed.
+            DFUHeaderRefusedError: The bootloader refused the preset; the
+                slot is intact.
+        """
+        from openlifu_sdk.io import LIFUPresetPackage as pp
+
+        data = self._check_tx_preset(slot, package, public_key)
+        address = pp.tx_preset_slot_address(slot)
+        with STM32USBDFU(vid=vid, pid=pid, libusb_dll=libusb_dll,
+                         device_profile=TRANSMITTER_PROFILE) as dfu:
+            if not dfu.has_preset_page():
+                raise RuntimeError(
+                    "This transmitter bootloader has no preset slots (it predates "
+                    "open-lifu-transmitter-bl 1.1.0-rc.1); update the bootloader first.")
+            dfu.stage_preset(data)
+            dfu.write_memory(address, data, page_erase=True,
+                             progress_callback=progress_callback)
+            if dfu.read_memory(address, len(data)) != data:
+                raise RuntimeError("Transmitter preset: read-back does not match; "
+                                   "the unit stays in DFU, retry")
+            logger.info("Transmitter preset slot %d written and read back; resetting", slot)
+            dfu.trigger_reset(TRANSMITTER_PROFILE.reset_virt_addr)
+
+    def program_transmitter_slave_preset_i2c(self, slot: int, package: str | bytes,
+                                             i2c_addr: int, public_key=None,
+                                             progress_callback: Callable | None = None) -> None:
+        """Write one signed preset into preset slot *slot* of a slave
+        transmitter over I2C passthrough (slave bootloader >= 1.1.0-rc.1, in
+        its I2C DFU at *i2c_addr*), then reset the slave. Same checks as
+        :meth:`program_transmitter_preset`.
+
+        Requires a master UART (``LIFUDFUManager(uart=txdevice.uart)``).
+        """
+        from openlifu_sdk.io import LIFUPresetPackage as pp
+
+        if self._uart is None:
+            raise RuntimeError("I2C slave programming needs the master UART — construct "
+                               "LIFUDFUManager(uart=txdevice.uart).")
+        data = self._check_tx_preset(slot, package, public_key)
+        address = pp.tx_preset_slot_address(slot)
+        dfu = STM32I2CDFUviaMaster(uart=self._uart, i2c_addr=i2c_addr)
+        if not dfu.read_capabilities() & USB_DFU_CAP_SIGNED_PRESET_WRITE:
+            raise RuntimeError(
+                f"The slave bootloader at 0x{i2c_addr:02X} has no preset slots (it "
+                "predates open-lifu-transmitter-bl 1.1.0-rc.1); update it first.")
+        dfu.stage_preset(data)
+        dfu.erase_page(address)
+        dfu.write_memory(address, data, progress_callback=progress_callback)
+        logger.info("Slave 0x%02X preset slot %d written; resetting", i2c_addr, slot)
+        dfu.reset()
 
     def update_console(self, signed_image: str,
                        enter_dfu_fn: Callable | None = None,

@@ -268,10 +268,13 @@ def test_magic_without_the_staging_bit_needs_no_staging():
     assert not dfu.requires_header_staging()
 
 
-def test_transmitter_profile_never_probes():
+def test_transmitter_slot_write_never_probes():
+    # The transmitter bootloader checks the header in-band on the first slot
+    # block: a slot write sends nothing before it. (Its capability word is
+    # read only for preset writes.)
     dfu = FakeConsoleBootloader(profile=TRANSMITTER_PROFILE)
-    assert dfu.read_capabilities() == 0
     assert not dfu.prepare_slot_write(signed_image())
+    assert dfu.slot_erase_bytes() == TRANSMITTER_PROFILE.slot_size
     assert dfu.ops == []                          # nothing sent to the device
 
 
