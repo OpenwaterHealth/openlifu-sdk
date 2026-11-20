@@ -1,2 +1,2 @@
 include LICENSE README.md
-recursive-include src *.py *.pyi py.typed *.bin *.dll *.pem PROVENANCE.txt
+recursive-include src *.py *.pyi py.typed *.dll *.pem PROVENANCE.txt
