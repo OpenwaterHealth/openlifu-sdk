@@ -120,7 +120,8 @@ def build_preset_package(body: bytes, *, diathermy_sha: str, context: str,
         diathermy_sha: The diathermy application commit the presets come from
             (40 hex characters).
         context: ``"fda"`` or ``"test"``.
-        keys: Keys holding the private key for the board and domain.
+        keys: Keys holding the private key for the board and domain, or a
+            :class:`LIFUCrypto.KmsSigner` (the clinical key).
         page_size: The preset page size; the package must fit it.
 
     Raises:
@@ -250,3 +251,69 @@ def verify_preset_package(data: bytes, public_key) -> bool:
     key = LIFUCrypto.load_public_key(public_key)
     return pkg.body_ok and LIFUCrypto.verify_header_signature(
         pkg.header[:HEADER_AUTH_LEN + HEADER_SIGN_LEN], key)
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+def main(argv: list[str] | None = None) -> int:
+    """Build or verify a signed preset package:
+
+        python -m openlifu_sdk.io.LIFUPresetPackage build --board console|transmitter
+            --body BODY.bin --diathermy-sha SHA --context fda|test
+            (--keys DIR | --kms-key VERSION) --output PACKAGE.bin
+        python -m openlifu_sdk.io.LIFUPresetPackage verify PACKAGE.bin --public-key PEM
+
+    *BODY* is the console's preset records (:func:`console_preset_body`) or
+    one transmitter preset blob (``LIFUTXPresets.preset_blob``): a console
+    package fills the preset page, a transmitter one a preset slot.
+    """
+    import argparse
+
+    parser = argparse.ArgumentParser(prog="python -m openlifu_sdk.io.LIFUPresetPackage",
+                                     description="Build or verify a signed preset package.")
+    sub = parser.add_subparsers(dest="cmd", required=True)
+    p_build = sub.add_parser("build", help="Sign a preset body into a package")
+    p_build.add_argument("--board", required=True, choices=("console", "transmitter"))
+    p_build.add_argument("--body", required=True, help="The preset records or blob (.bin)")
+    p_build.add_argument("--diathermy-sha", required=True, help="Diathermy commit (40 hex)")
+    p_build.add_argument("--context", required=True, choices=sorted(PRESET_CONTEXTS))
+    signer_group = p_build.add_mutually_exclusive_group(required=True)
+    signer_group.add_argument("--keys", help="Keys directory (ecdsa_private.pem)")
+    signer_group.add_argument("--kms-key", help="Cloud KMS key version (the clinical key)")
+    p_build.add_argument("--output", required=True)
+    p_verify = sub.add_parser("verify", help="Check a package's body and signature")
+    p_verify.add_argument("package")
+    p_verify.add_argument("--public-key", required=True, help="Public key PEM file")
+
+    args = parser.parse_args(argv)
+    try:
+        if args.cmd == "build":
+            from pathlib import Path
+
+            signer = (LIFUCrypto.KmsSigner(args.kms_key) if args.kms_key
+                      else LIFUCrypto.SigningKeys.from_directory(args.keys))
+            body = Path(args.body).read_bytes()
+            page = TX_PRESET_SLOT_SIZE if args.board == "transmitter" else CONSOLE_PRESET_SIZE
+            data = build_preset_package(body, diathermy_sha=args.diathermy_sha,
+                                        context=args.context, keys=signer, page_size=page)
+            Path(args.output).write_bytes(data)
+            print(f"Preset package written: {args.output} ({len(data)} bytes, "
+                  f"{args.board}, context {args.context}, diathermy {args.diathermy_sha})")
+            print(f"Signer key: sha256:{LIFUCrypto.public_key_fingerprint(signer.public_key)}")
+            return 0
+        with open(args.package, "rb") as f:
+            data = f.read()
+        ok = verify_preset_package(data, args.public_key)
+        pkg = parse_preset_package(data)
+        print(f"Context {pkg.context}, diathermy {pkg.diathermy_sha}, body {len(pkg.body)} bytes: "
+              f"{'VERIFIED' if ok else 'NOT VERIFIED'}")
+        return 0 if ok else 1
+    except (LIFUCryptoError, ValueError, OSError) as e:
+        print(f"ERROR: {e}")
+        return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
