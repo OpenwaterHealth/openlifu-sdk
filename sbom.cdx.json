@@ -312,6 +312,33 @@
       "version": "2.34.2"
     },
     {
+      "bom-ref": "google-cloud-kms",
+      "type": "library",
+      "name": "google-cloud-kms",
+      "supplier": {
+        "name": "Google LLC"
+      },
+      "description": "Cloud KMS client, used by LIFUCrypto.KmsSigner to sign clinical firmware and preset packages with the HSM key. Only installed with the optional kms extra (CI clinical builds); never on a device host.",
+      "licenses": [
+        {
+          "license": {
+            "id": "Apache-2.0"
+          }
+        }
+      ],
+      "purl": "pkg:pypi/google-cloud-kms@3.18.0",
+      "properties": [
+        {
+          "name": "openwater:declared-constraint",
+          "value": "google-cloud-kms==3.18.0 (optional-dependencies: kms)"
+        },
+        {
+          "name": "openwater:version-basis",
+          "value": "pinned exactly in pyproject.toml"
+        }
+      ]
+    },
+    {
       "bom-ref": "libusb",
       "type": "library",
       "group": "org.libusb",

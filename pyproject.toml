@@ -38,6 +38,10 @@ dependencies = [
 crypto = [
   "cryptography==46.0.5",
 ]
+# Clinical signing with the Cloud KMS key (LIFUCrypto.KmsSigner); CI only.
+kms = [
+  "google-cloud-kms==3.18.0",
+]
 test = [
   "pytest>=6",
   "pytest-cov>=3",
