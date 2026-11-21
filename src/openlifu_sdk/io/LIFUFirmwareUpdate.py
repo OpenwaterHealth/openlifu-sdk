@@ -163,11 +163,26 @@ MIGRATION_TIMEOUT_S = 90.0
 # hangs the master until its watchdog resets it (openlifu-transmitter-fw#80).
 SLAVE_MIGRATION_SETTLE_S = 20.0
 SLAVE_MIGRATION_POLL_S = 10.0
+# After a slave I2C update, the version read can come back as the "v0.0.0"
+# placeholder (empty reply) for a few seconds while the slave application
+# starts. Only the version READ is retried (one enumeration, never repeated:
+# see above), every SLAVE_VERSION_POLL_S, for at most SLAVE_VERSION_TIMEOUT_S.
+# Bounded because a master on firmware 2.0.8 truncates forwarded version
+# replies and never reports a valid slave version.
+SLAVE_VERSION_TIMEOUT_S = 24.0
+SLAVE_VERSION_POLL_S = 2.0
 
 
 def _bl_version_tuple(bl_version: str | None) -> tuple[int, int, int] | None:
     m = re.match(r"\s*v?(\d+)\.(\d+)\.(\d+)", bl_version or "")
     return (int(m.group(1)), int(m.group(2)), int(m.group(3))) if m else None
+
+
+def _is_real_version(version: str | None) -> bool:
+    """True for a parseable X.Y.Z version other than the SDK's "v0.0.0"
+    placeholder for an empty / invalid version reply."""
+    v = _bl_version_tuple(version)
+    return v is not None and v != (0, 0, 0)
 
 
 def bootloader_needs_migration(bl_version: str | None) -> bool:
@@ -322,7 +337,9 @@ class UpdateResult:
     cohort: str            # detected cohort / DFU kind driving the choice
     action: str            # "migrate-rom" | "migrate-legacy" | "app-update"
     summary: str           # human-readable one-liner
-    reboot_required: bool  # True if a power-cycle is needed to run the app
+    reboot_required: bool  # True if the operator must power-cycle the unit
+                           # to run the new app (False when it resets into
+                           # the new app by itself)
     bl_version: str | None = None  # bootloader version string (DFU virtual
                                    # version address), when the path read it
 
@@ -616,15 +633,20 @@ class LIFUFirmwareUpdate:
             entered=not in_dfu,
             slot_empty=lambda: mgr.get_console_installed_version(**kw) is None,
             replace=replace_bootloader)
+        # The manifest resets the unit and the bootloader verifies and
+        # launches the new application: no power-cycle (see
+        # LIFUDFUManager._program_slot_image).
         if migrated:
             return UpdateResult(cohort, "bl-migrate",
                                 f"Replaced the bootloader (now {bl_version}) "
                                 "with the bootloader updater, then installed "
-                                "the application.", reboot_required=True,
+                                "the application; the unit is rebooting into "
+                                "the new app.", reboot_required=False,
                                 bl_version=bl_version)
         return UpdateResult(cohort, "app-update",
                             "Updated the application on the secure "
-                            "bootloader.", reboot_required=True,
+                            "bootloader; the unit is rebooting into the new "
+                            "app.", reboot_required=False,
                             bl_version=bl_version)
 
     # ------------------------------------------------------------------
@@ -1030,15 +1052,19 @@ class LIFUTransmitterFirmwareUpdate:
             entered=not in_dfu,
             slot_empty=lambda: mgr.get_transmitter_installed_version(**kw) is None,
             replace=replace_bootloader)
+        # The manifest resets the master and the bootloader verifies and
+        # launches the new application: no power-cycle.
         if migrated:
             return UpdateResult(state, "bl-migrate",
                                 f"Replaced the transmitter bootloader (now "
                                 f"{bl_version}) with the bootloader updater, "
-                                "then installed the application.",
-                                reboot_required=True, bl_version=bl_version)
+                                "then installed the application; the unit is "
+                                "rebooting into the new app.",
+                                reboot_required=False, bl_version=bl_version)
         return UpdateResult(state, "app-update",
                             "Updated the transmitter application on the "
-                            "secure bootloader.", reboot_required=True,
+                            "secure bootloader; the unit is rebooting into "
+                            "the new app.", reboot_required=False,
                             bl_version=bl_version)
 
     def slave_module_version(self, module: int) -> tuple[str, int]:
@@ -1214,20 +1240,39 @@ class LIFUTransmitterFirmwareUpdate:
 
     def _slave_post_boot_version(self, module: int, dfu_wait_s: float) -> str:
         """Wait for the slave app to boot and read its version back (best
-        effort)."""
+        effort, never raises). Returns the version, or ``""`` when no valid
+        one was read.
+
+        Enumerates ONCE, then retries only the version read (see
+        :data:`SLAVE_VERSION_TIMEOUT_S`) until it is a real X.Y.Z version.
+        """
         tx = self._require_tx()
         logger.info("Waiting %.0fs for the slave app to boot...", dfu_wait_s)
         time.sleep(dfu_wait_s)
         try:
             _reopen(tx)
             tx.enumerate_modules()
-            ver = str(tx.get_version(module=module))
-            logger.info("Slave module %d app version: %s", module, ver)
-            return ver
         except Exception as e:
-            logger.warning("Slave %d post-update version read failed (%s) — "
+            logger.warning("Slave %d post-update re-enumeration failed (%s) — "
                            "it may still be verifying/booting", module, e)
             return ""
+        deadline = time.monotonic() + SLAVE_VERSION_TIMEOUT_S
+        while True:
+            try:
+                ver = str(tx.get_version(module=module))
+            except Exception as e:
+                ver = f"<{e}>"
+            if _is_real_version(ver):
+                logger.info("Slave module %d app version: %s", module, ver)
+                return ver
+            if time.monotonic() >= deadline:
+                break
+            time.sleep(SLAVE_VERSION_POLL_S)
+        logger.warning("Slave %d did not report a valid app version within "
+                       "%.0f s (last reply: %s) — it may still be booting, or "
+                       "the master firmware (2.0.8) truncates forwarded "
+                       "version replies", module, SLAVE_VERSION_TIMEOUT_S, ver)
+        return ""
 
     def _update_slave_secure(self, module: int, signed_app: str | None,
                              dfu_wait_s: float,
