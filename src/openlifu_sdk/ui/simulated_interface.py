@@ -70,7 +70,7 @@ else:
 
 from openlifu_sdk.io import LIFUInterfaceStatus
 from openlifu_sdk.io.component import FirmwareDomain
-from openlifu_sdk.io.LIFUPresetPackage import PRESET_BODY_OFFSET, PresetHeader
+from openlifu_sdk.io.LIFUPresetPackage import PRESET_BODY_OFFSET, TX_PRESET_SLOTS, PresetHeader
 from openlifu_sdk.io.exceptions import LIFUDeviceError, LIFUError, LIFUHVFaultError, LIFUSolutionError
 from openlifu_sdk.io.LIFUConfig import (
     LIFU_ERR_MODULE_COUNT_MISMATCH,
@@ -90,6 +90,7 @@ from openlifu_sdk.io.LIFUConfig import (
     OW_HV_DATA_ERROR,
     OW_NO_PRESET,
     OW_PRESET_BUSY,
+    OW_PRESET_EMPTY,
     OW_TEMP_TOO_HIGH,
     SETTLE_TIME_HV_ON,
 )
@@ -404,9 +405,13 @@ class SimulatedTxDevice:
         return sensitivity_at_frequency(self.module_user_configs, freq_hz)
 
     def _flash_entry(self, index: int) -> tuple[dict, int]:
-        if not 0 <= index < len(self._preset_flash):
-            raise LIFUDeviceError(f"TX: no preset at index {index}")
-        return self._preset_flash[index]
+        if 0 <= index < len(self._preset_flash):
+            return self._preset_flash[index]
+        if 0 <= index < TX_PRESET_SLOTS:
+            # As the firmware answers for a slot that holds nothing.
+            raise LIFUDeviceError(f"TX: preset slot {index} is empty",
+                                  device_error_code=OW_PRESET_EMPTY)
+        raise LIFUDeviceError(f"TX: no preset at index {index}")
 
     @staticmethod
     def _module_crcs(flash_regs_crc) -> list[int]:
@@ -414,11 +419,14 @@ class SimulatedTxDevice:
         return [int(flash_regs_crc)] if isinstance(flash_regs_crc, int) else [int(c) for c in flash_regs_crc]
 
     def get_preset(self, index: int) -> dict:
-        """Same shape as :meth:`TxDevice.get_preset` (OW_PRESET_GET)."""
+        """Same shape as :meth:`TxDevice.get_preset` (OW_PRESET_GET).
+        ``count`` is the number of preset slots, as the slot firmware
+        reports it (presets.c ``presets_count``), not how many hold a
+        preset; an empty slot raises OW_PRESET_EMPTY."""
         machine_config, flash_regs_crc = self._flash_entry(index)
         crcs = self._module_crcs(flash_regs_crc)
         return {
-            "count": len(self._preset_flash),
+            "count": TX_PRESET_SLOTS,
             "index": index,
             "chip_count": 2,
             "profile_count": 1,
@@ -431,6 +439,16 @@ class SimulatedTxDevice:
             "start_c": machine_config.get("start_C"),
             "shutoff_c": machine_config.get("shutoff_C"),
         }
+
+    def get_preset_slot(self, slot: int) -> dict:
+        """Same contract as :meth:`TxDevice.get_preset_slot`."""
+        try:
+            got = self.get_preset(slot)
+        except LIFUDeviceError as e:
+            if e.device_error_code != OW_PRESET_EMPTY:
+                raise
+            return {"index": slot, "state": "empty"}
+        return {**got, "state": "preset"}
 
     def load_preset(self, index: int, regs_crc: int, duration_index: int = 0,
                     module: int = 0, *, settings_crc: int | None = None) -> bool:

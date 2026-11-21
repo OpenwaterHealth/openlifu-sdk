@@ -16,7 +16,8 @@ pytest.importorskip("openlifu_sdk.ui._qt")
 from sr003_presets import flash_entry  # noqa: E402 -- reason: after the Qt importorskip
 
 from openlifu_sdk.io.exceptions import LIFUDeviceError  # noqa: E402 -- reason: after the Qt importorskip
-from openlifu_sdk.io.LIFUConfig import OW_BAD_CRC, OW_HV_PRESET_CRC  # noqa: E402 -- reason: after the Qt importorskip
+from openlifu_sdk.io.LIFUConfig import OW_BAD_CRC, OW_HV_PRESET_CRC, OW_PRESET_EMPTY  # noqa: E402 -- reason: after the Qt importorskip
+from openlifu_sdk.io.LIFUPresetPackage import TX_PRESET_SLOTS  # noqa: E402 -- reason: after the Qt importorskip
 from openlifu_sdk.io.LIFUTXPresets import preset_sensitivity  # noqa: E402 -- reason: after the Qt importorskip
 from openlifu_sdk.ui.simulated_interface import (  # noqa: E402 -- reason: after the Qt importorskip
     SimulatedDeviceInterface,
@@ -68,7 +69,7 @@ def test_get_preset_matches_real_txdevice_shape():
     )
     a = tx.get_preset(0)
     assert (a["id"], a["settings_crc"], a["regs_crc"]) == ("preset-A", 0x11111111, 0xAAAAAAAA)
-    assert (a["count"], a["index"]) == (2, 0)
+    assert (a["count"], a["index"]) == (TX_PRESET_SLOTS, 0)   # slots, as the firmware reports
     assert a["train_counts"] == [1, 2, 3, 4, 5]
     assert (a["start_c"], a["shutoff_c"]) == (30.0, 60.0)
     # Same keys TxDevice.get_preset returns from OW_PRESET_GET.
@@ -82,7 +83,7 @@ def test_get_preset_matches_real_txdevice_shape():
 def test_default_flash_has_one_loadable_preset():
     tx = SimulatedTxDevice()
     preset = tx.get_preset(0)
-    assert preset["count"] == 1
+    assert preset["count"] == TX_PRESET_SLOTS
     assert tx.load_preset(0, preset["regs_crc"], 0)
 
 
@@ -90,6 +91,21 @@ def test_empty_flash_has_no_presets():
     tx = SimulatedTxDevice(preset_flash=[])
     with pytest.raises(LIFUDeviceError):
         tx.get_preset(0)
+
+
+def test_slots_past_the_stored_presets_answer_empty_like_the_firmware():
+    """A slot that holds nothing raises OW_PRESET_EMPTY, so callers tell
+    empty slots apart from presets as they do on a device."""
+    tx = SimulatedTxDevice(preset_flash=[(_mc("only", 0xDEADBEEF), 0xC0FFEE00)])
+    with pytest.raises(LIFUDeviceError) as e:
+        tx.get_preset(1)
+    assert e.value.device_error_code == OW_PRESET_EMPTY
+    assert tx.get_preset_slot(1) == {"index": 1, "state": "empty"}
+    assert tx.get_preset_slot(TX_PRESET_SLOTS - 1)["state"] == "empty"
+    got = tx.get_preset_slot(0)
+    assert (got["state"], got["id"]) == ("preset", "only")
+    with pytest.raises(LIFUDeviceError):
+        tx.get_preset_slot(TX_PRESET_SLOTS)          # no such slot
 
 
 @pytest.mark.parametrize("bad_index", [-1, 5])
