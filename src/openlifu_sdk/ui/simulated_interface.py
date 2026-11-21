@@ -67,6 +67,7 @@ else:
         _QT_BACKEND = "PythonQt"
 
 from openlifu_sdk.io import LIFUInterfaceStatus
+from openlifu_sdk.io.component import FirmwareDomain
 from openlifu_sdk.io.exceptions import LIFUDeviceError, LIFUError, LIFUHVFaultError, LIFUSolutionError
 from openlifu_sdk.io.LIFUConfig import (
     LIFU_ERR_MODULE_COUNT_MISMATCH,
@@ -256,6 +257,13 @@ class SimulatedTxDevice:
         # string for all modules; if per-module version drift ever
         # becomes worth simulating, extend this to a list.
         self._fw_version: str = "sim-1.0.7"
+        # Which trusted key signed each module's firmware
+        # (:meth:`firmware_domain`). A simulator is not a clinical unit:
+        # research unless a test or debug UI says otherwise. One domain for
+        # every module, plus per-module overrides, so it holds whatever the
+        # module count becomes.
+        self._fw_domain: FirmwareDomain = FirmwareDomain.RESEARCH
+        self._fw_domain_overrides: dict[int, FirmwareDomain] = {}
         self.refresh_metadata()
 
     # ---- helpers --------------------------------------------------------
@@ -534,6 +542,24 @@ class SimulatedTxDevice:
         :meth:`get_version`'s signature.
         """
         self._fw_version = str(version)
+
+    def firmware_domain(self, module: int = 0) -> FirmwareDomain:
+        """Which trusted key signed *module*'s firmware, as
+        :meth:`openlifu_sdk.io.component.OWComponent.firmware_domain`
+        reports it on hardware."""
+        return self._fw_domain_overrides.get(module, self._fw_domain)
+
+    def set_firmware_domain(self, domain: FirmwareDomain | str,
+                            module: int | None = None) -> None:
+        """Override the reported firmware domain: for every module, or
+        only *module*. Lets tests and debug UIs simulate a clinical,
+        research or bare-metal unit, or one module that differs."""
+        domain = FirmwareDomain(domain)
+        if module is None:
+            self._fw_domain = domain
+            self._fw_domain_overrides.clear()
+        else:
+            self._fw_domain_overrides[module] = domain
 
     def get_hardware_id(self, module: int = 0, raw_hex: bool = False,
                         base58: bool = False, legacy_6byte: bool = False) -> str:
@@ -900,6 +926,7 @@ class SimulatedHVController:
         # Reported firmware version. See
         # :attr:`SimulatedTxDevice._fw_version` for rationale.
         self._fw_version: str = "sim-1.0.7"
+        self._fw_domain: FirmwareDomain = FirmwareDomain.RESEARCH
 
     def is_connected(self) -> bool:
         return self._connected
@@ -1070,6 +1097,16 @@ class SimulatedHVController:
         """Override the reported firmware version. See
         :meth:`SimulatedTxDevice.set_version` for rationale."""
         self._fw_version = str(version)
+
+    def firmware_domain(self, module: int = 0) -> FirmwareDomain:
+        """Which trusted key signed the console firmware. See
+        :meth:`SimulatedTxDevice.firmware_domain`."""
+        return self._fw_domain
+
+    def set_firmware_domain(self, domain: FirmwareDomain | str) -> None:
+        """Override the reported firmware domain. See
+        :meth:`SimulatedTxDevice.set_firmware_domain`."""
+        self._fw_domain = FirmwareDomain(domain)
 
     def get_hardware_id(self, raw_hex: bool = False, base58: bool = False,
                         legacy_6byte: bool = False) -> str:
