@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Transmitter preset slots (open-lifu-transmitter-bl >= 1.1.0-rc.1).
 
-Pages 106-125 hold 10 slots of 4 KB, each one signed preset: a PRS1 header
+Pages 96-125 hold 15 slots of 4 KB, each one signed preset: a PRS1 header
 and one preset blob. The bootloader advertises them with capability bit 1
 (USB: the 0xFFFFFF18 upload; I2C: GETCAPS) and writes a slot only after the
 preset's header, DNLOADed to 0xFFFFFF20, verifies. These tests drive the SDK
@@ -45,14 +45,14 @@ def _preset(tmp_path, name="k", blob=b"OWPR" + bytes(range(256)) * 13):
 # The slot image
 # --------------------------------------------------------------------------
 
-def test_slots_are_fixed_4k_from_page_106():
-    assert (BASE, pp.TX_PRESET_SLOT_SIZE, pp.TX_PRESET_SLOTS) == (0x08035000, 0x1000, 10)
-    assert pp.tx_preset_slot_address(0) == 0x08035000
-    assert pp.tx_preset_slot_address(9) == 0x0803E000
+def test_slots_are_fixed_4k_from_page_96():
+    assert (BASE, pp.TX_PRESET_SLOT_SIZE, pp.TX_PRESET_SLOTS) == (0x08030000, 0x1000, 15)
+    assert pp.tx_preset_slot_address(0) == 0x08030000
+    assert pp.tx_preset_slot_address(14) == 0x0803E000
     assert END == 0x0803F000                      # the anti-rollback page
     assert (TRANSMITTER_PROFILE.preset_base, TRANSMITTER_PROFILE.preset_size,
             TRANSMITTER_PROFILE.preset_slot_size) == (BASE, END - BASE, 0x1000)
-    for bad in (-1, 10):
+    for bad in (-1, 15):
         with pytest.raises(ValueError, match="slot"):
             pp.tx_preset_slot_address(bad)
 
@@ -189,7 +189,7 @@ def test_pre_flight_never_opens_the_device(fake, tmp_path):
     with pytest.raises(ValueError, match="does not match its signed hash"):
         LIFUDFUManager().program_transmitter_preset(0, bytes(bad))
     with pytest.raises(ValueError, match="slot"):
-        LIFUDFUManager().program_transmitter_preset(10, data)
+        LIFUDFUManager().program_transmitter_preset(15, data)
     with pytest.raises(LIFUCrypto.LIFUCryptoError, match="Not a preset package"):
         LIFUDFUManager().program_transmitter_preset(0, signed_image())
     assert "dev" not in fake

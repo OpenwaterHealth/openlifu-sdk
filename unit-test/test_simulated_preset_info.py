@@ -26,7 +26,7 @@ def test_tx_slot_i_holds_preset_i_on_every_module():
     assert tx.get_preset_info(1, module=1).domain("transmitter") is FirmwareDomain.RESEARCH
     assert tx.get_preset_info(2) is None          # past the presets: empty
     with pytest.raises(LIFUDeviceError):
-        tx.get_preset_info(10)                    # no such slot
+        tx.get_preset_info(15)                    # no such slot
     with pytest.raises(LIFUDeviceError):
         tx.get_preset_info(0, module=2)           # no such module
 
