@@ -515,6 +515,27 @@ class TxDevice(OWComponent):
                 "id": d[17:17 + id_len].decode("ascii", "replace"), "train_counts": counts,
                 "start_c": start_c, "shutoff_c": shutoff_c, "modules": modules}
 
+    def get_preset_slot(self, slot: int) -> Dict:
+        """Describe one of a PRESET_MODE image's preset slots. A read only
+        (OW_PRESET_GET), so the FDA component has it too.
+
+        Returns get_preset()'s dict with ``state`` "preset"; or just ``index``
+        and ``state`` "empty", or "tail" for the second half of the preset in
+        the slot before.
+
+        Raises:
+            LIFUDeviceError: Bad slot, or what the slot holds no longer parses
+                (OW_BAD_CRC).
+        """
+        try:
+            got = self.get_preset(slot)
+        except LIFUDeviceError as e:
+            state = {OW_PRESET_EMPTY: "empty", OW_PRESET_SLOT_TAIL: "tail"}.get(e.device_error_code)
+            if state is None:
+                raise
+            return {"index": slot, "state": state}
+        return {**got, "state": "preset"}
+
     def load_preset(self, index: int, regs_crc: int, duration_index: int = 0, module: int = 0, *,
                     settings_crc: int) -> bool:
         """Program one module's chips from its part of preset *index* (OW_PRESET_LOAD).
@@ -1182,26 +1203,6 @@ class LIFUTxDevice(LIFUComponentMixin, TxDevice):
             raise LIFUProtocolError(f"TX: clear_thermal_limits left {armed} armed",
                                     code=LIFU_ERR_BAD_PAYLOAD_FORMAT)
         return armed
-
-    def get_preset_slot(self, slot: int) -> Dict:
-        """Describe one of a PRESET_MODE image's preset slots.
-
-        Returns get_preset()'s dict with ``state`` "preset"; or just ``index``
-        and ``state`` "empty", or "tail" for the second half of the preset in
-        the slot before.
-
-        Raises:
-            LIFUDeviceError: Bad slot, or what the slot holds no longer parses
-                (OW_BAD_CRC).
-        """
-        try:
-            got = self.get_preset(slot)
-        except LIFUDeviceError as e:
-            state = {OW_PRESET_EMPTY: "empty", OW_PRESET_SLOT_TAIL: "tail"}.get(e.device_error_code)
-            if state is None:
-                raise
-            return {"index": slot, "state": state}
-        return {**got, "state": "preset"}
 
     def get_preset_capacity(self) -> Dict | None:
         """How many presets a PRESET_MODE image can hold (OW_PRESET_CAPACITY).
