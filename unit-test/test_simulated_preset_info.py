@@ -57,6 +57,7 @@ def test_hv_reports_its_page_header():
 
 
 def test_simulated_signed_by_matches_the_trusted_key():
+    pytest.importorskip("cryptography")
     from openlifu_sdk.io import LIFUCrypto
 
     hv = SimulatedHVController()

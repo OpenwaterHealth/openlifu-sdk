@@ -4,8 +4,10 @@ simulated boards' package headers (get_preset_info / set_preset_package)."""
 
 import pytest
 
-from openlifu_sdk.io import LIFUPresetPackage as pp
-from openlifu_sdk.io.component import FirmwareDomain
+pytest.importorskip("cryptography")
+
+from openlifu_sdk.io import LIFUPresetPackage as pp  # noqa: E402  # reason: after importorskip
+from openlifu_sdk.io.component import FirmwareDomain  # noqa: E402  # reason: after importorskip
 
 SHA = "ab" * 20
 
