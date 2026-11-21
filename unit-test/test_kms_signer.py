@@ -97,11 +97,11 @@ def test_preset_packages_sign_with_kms(board):
     signer = LIFUCrypto.KmsSigner(KEY, client=kms)
     body = b"OWPR" + bytes(300)
     if board == "transmitter":
-        data = pp.build_tx_preset(body, diathermy_sha="cd" * 20, context="fda", keys=signer)
+        data = pp.build_tx_preset(body, diathermy_sha="cd" * 20, context="clinical", keys=signer)
     else:
-        data = pp.build_preset_package(body, diathermy_sha="cd" * 20, context="fda", keys=signer)
+        data = pp.build_preset_package(body, diathermy_sha="cd" * 20, context="clinical", keys=signer)
     assert pp.verify_preset_package(data, kms.priv.public_key())
-    assert pp.parse_preset_package(data).context == "fda"
+    assert pp.parse_preset_package(data).context == "clinical"
 
 
 def test_fingerprint_matches_the_shipped_provenance():
@@ -146,7 +146,7 @@ def test_preset_cli_builds_and_verifies(tmp_path, monkeypatch):
     body.write_bytes(b"OWPR" + bytes(500))
     out = tmp_path / "presets.bin"
     assert pp.main(["build", "--board", "transmitter", "--body", str(body), "--diathermy-sha", "ab" * 20,
-                    "--context", "fda", "--kms-key", KEY, "--output", str(out)]) == 0
+                    "--context", "clinical", "--kms-key", KEY, "--output", str(out)]) == 0
     pem = tmp_path / "pub.pem"
     pem.write_bytes(kms.priv.public_key().public_bytes(
         serialization.Encoding.PEM, serialization.PublicFormat.SubjectPublicKeyInfo))
@@ -154,4 +154,4 @@ def test_preset_cli_builds_and_verifies(tmp_path, monkeypatch):
     big = tmp_path / "big.bin"
     big.write_bytes(b"\x01" * 4000)
     assert pp.main(["build", "--board", "transmitter", "--body", str(big), "--diathermy-sha", "ab" * 20,
-                    "--context", "fda", "--kms-key", KEY, "--output", str(out)]) == 2
+                    "--context", "clinical", "--kms-key", KEY, "--output", str(out)]) == 2

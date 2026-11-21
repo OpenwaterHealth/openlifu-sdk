@@ -38,7 +38,7 @@ def _preset(tmp_path, name="k", blob=b"OWPR" + bytes(range(256)) * 13):
     priv = ec.generate_private_key(ec.SECP256R1())
     keys = LIFUCrypto.SigningKeys(keys_dir=tmp_path / name, private_key=priv,
                                   public_key=priv.public_key())
-    return pp.build_tx_preset(blob, diathermy_sha="ab" * 20, context="test", keys=keys), keys.public_key
+    return pp.build_tx_preset(blob, diathermy_sha="ab" * 20, context="research", keys=keys), keys.public_key
 
 
 # --------------------------------------------------------------------------
@@ -356,7 +356,7 @@ def test_preset_info_reads_a_slot_header(make, tmp_path):
     data, key = _preset(tmp_path)
     dev = _tx(make, [_reply(data=data[:320])])
     info = dev.get_preset_info(2, module=1)
-    assert (info.diathermy_sha, info.context) == ("ab" * 20, "test")
+    assert (info.diathermy_sha, info.context) == ("ab" * 20, "research")
     assert info.signed_by(key)
     sent = dev._uart.send_packet.call_args.kwargs
     assert (sent["packet_type"], sent["command"], sent["reserved"], sent["addr"]) == (

@@ -58,8 +58,9 @@ def tx_preset_slot_address(slot: int) -> int:
         raise ValueError(f"Transmitter preset slot must be 0..{TX_PRESET_SLOTS - 1}, got {slot}")
     return TX_PRESET_BASE + slot * TX_PRESET_SLOT_SIZE
 
-#: The context byte: which released preset set the body is.
-PRESET_CONTEXTS = {"fda": 1, "test": 2}
+#: The context byte: which released preset set the body is. The values are
+#: unchanged from the first packages (1 was then named "fda", 2 "test").
+PRESET_CONTEXTS = {"clinical": 1, "research": 2}
 _CONTEXT_NAMES = {v: k for k, v in PRESET_CONTEXTS.items()}
 
 _SHA_LEN = 20                                 # git commit SHA-1, as bytes
@@ -74,7 +75,7 @@ class PresetHeader:
     body_size: int
     body_sha256: bytes     # FwTag
     diathermy_sha: str     # 40 hex characters
-    context: str           # "fda" / "test", or "unknown(<n>)"
+    context: str           # "clinical" / "research", or "unknown(<n>)"
 
     def signed_by(self, public_key) -> bool:
         """True if the header's signature verifies with *public_key*
@@ -84,6 +85,22 @@ class PresetHeader:
         return LIFUCrypto.verify_header_signature(
             self.header[:HEADER_AUTH_LEN + HEADER_SIGN_LEN], key)
 
+    def domain(self, board: str):
+        """Which of *board*'s trusted keys signed this preset set, as
+        ``OWComponent.firmware_domain`` reports it for firmware:
+        ``FirmwareDomain.CLINICAL`` or ``RESEARCH``, else ``UNKNOWN`` (an
+        unsigned slot header, another key).
+
+        Raises:
+            ValueError: Unknown board.
+        """
+        from openlifu_sdk.io.component import FirmwareDomain
+
+        for domain in (FirmwareDomain.CLINICAL, FirmwareDomain.RESEARCH):
+            if self.signed_by(LIFUCrypto.trusted_public_key(board, domain.value)):
+                return domain
+        return FirmwareDomain.UNKNOWN
+
 
 @dataclass(frozen=True)
 class PresetPackage:
@@ -92,7 +109,7 @@ class PresetPackage:
     header: bytes          # the 320-byte PRS1 header
     body: bytes            # the preset records
     diathermy_sha: str     # 40 hex characters
-    context: str           # "fda" / "test", or "unknown(<n>)"
+    context: str           # "clinical" / "research", or "unknown(<n>)"
     body_sha256: bytes     # FwTag from the header
 
     @property
@@ -119,7 +136,7 @@ def build_preset_package(body: bytes, *, diathermy_sha: str, context: str,
         body: The preset records.
         diathermy_sha: The diathermy application commit the presets come from
             (40 hex characters).
-        context: ``"fda"`` or ``"test"``.
+        context: ``"clinical"`` or ``"research"``.
         keys: Keys holding the private key for the board and domain, or a
             :class:`LIFUCrypto.KmsSigner` (the clinical key).
         page_size: The preset page size; the package must fit it.
@@ -261,7 +278,7 @@ def main(argv: list[str] | None = None) -> int:
     """Build or verify a signed preset package:
 
         python -m openlifu_sdk.io.LIFUPresetPackage build --board console|transmitter
-            --body BODY.bin --diathermy-sha SHA --context fda|test
+            --body BODY.bin --diathermy-sha SHA --context clinical|research
             (--keys DIR | --kms-key VERSION) --output PACKAGE.bin
         python -m openlifu_sdk.io.LIFUPresetPackage verify PACKAGE.bin --public-key PEM
 

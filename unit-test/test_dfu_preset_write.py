@@ -84,7 +84,7 @@ def _package(tmp_path, name="k", body=None):
     body = body or pp.console_preset_body([
         {"id": "soft", "settings_crc": 0x1234, "voltage": 40, "sensitivity": 3728,
          "voltage_range": [35, 45]}])
-    data = pp.build_preset_package(body, diathermy_sha="ab" * 20, context="test", keys=keys)
+    data = pp.build_preset_package(body, diathermy_sha="ab" * 20, context="research", keys=keys)
     return data, keys.public_key
 
 

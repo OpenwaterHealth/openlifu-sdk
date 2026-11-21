@@ -44,7 +44,7 @@ def _keys(tmp_path, name="k"):
 def signed(tmp_path):
     keys = _keys(tmp_path)
     data = pp.build_preset_package(pp.console_preset_body(CONFIGS), diathermy_sha=SHA,
-                                   context="test", keys=keys)
+                                   context="research", keys=keys)
     return data, keys.public_key
 
 
@@ -80,7 +80,7 @@ def test_info_reports_the_stored_set(make, signed, tmp_path):
     data, key = signed
     dev = _device(make, [_reply(reserved=PRESET_INFO_OK, data=data[:320])])
     info = dev.get_preset_info()
-    assert (info.diathermy_sha, info.context) == (SHA, "test")
+    assert (info.diathermy_sha, info.context) == (SHA, "research")
     assert info.body_size == len(data) - 320
     assert info.signed_by(key)
     assert not info.signed_by(_keys(tmp_path, "other").public_key)
