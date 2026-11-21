@@ -46,10 +46,11 @@ CONSOLE_PRESET_BASE = 0x0801E800
 CONSOLE_PRESET_SIZE = 0x800
 
 #: Transmitter preset slots (open-lifu-transmitter-bl / openlifu-transmitter-fw
-#: memory_map.h): 10 slots of 4 KB, each one PRS1 header + one preset blob.
-TX_PRESET_BASE = 0x08035000
+#: memory_map.h): 15 slots of 4 KB, pages 96-125, each one PRS1 header + one
+#: preset blob.
+TX_PRESET_BASE = 0x08030000
 TX_PRESET_SLOT_SIZE = 0x1000
-TX_PRESET_SLOTS = 10
+TX_PRESET_SLOTS = 15
 
 
 def tx_preset_slot_address(slot: int) -> int:

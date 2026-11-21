@@ -36,7 +36,7 @@ dependencies = [
 
 [project.optional-dependencies]
 crypto = [
-  "cryptography==46.0.5",
+  "cryptography==50.0.2",
 ]
 # Clinical signing with the Cloud KMS key (LIFUCrypto.KmsSigner); CI only.
 kms = [
@@ -51,7 +51,7 @@ dev = [
   "pytest>=6",
   "pytest-cov>=3",
   "pytest-mock",
-  "cryptography==46.0.5",
+  "cryptography==50.0.2",
 ]
 ui = [
   "PyQt6==6.11.0",

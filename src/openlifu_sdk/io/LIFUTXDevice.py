@@ -205,7 +205,7 @@ PRESET_BLOB_MAGIC = b"OWPR"
 # 2 added treatment_timeout_s; the firmware refuses a version 1 blob.
 PRESET_BLOB_VERSION = 2
 PRESET_ID_MAX = 64
-# Presets live in fixed 4 KB flash slots, pages 106-125 (memory_map.h /
+# Presets live in fixed 4 KB flash slots, pages 96-125 (memory_map.h /
 # presets.h in the firmware): each a PRS1 header (LIFUPresetPackage, 320
 # bytes), then one blob. The device reports its own figures
 # (get_preset_capacity); these are what today's firmware has, for code that

@@ -210,17 +210,17 @@ TRANSMITTER_PROFILE = DeviceProfile(
     program_alignment_bytes=8,
     app_default_address=None,
     reset_virt_addr=0xFFFFFF08,
-    # Pages 32-105 = the slot (open-lifu-transmitter-bl >= 1.1.0-rc.1, and the
-    # application's memory_map.h). The erase stops at 0x08034FFF, short of the
-    # presets (pages 106-125, 0x08035000), the anti-rollback log (0x0803F000)
+    # Pages 32-95 = the slot (open-lifu-transmitter-bl >= 1.1.0-rc.2, and the
+    # application's memory_map.h). The erase stops at 0x0802FFFF, short of the
+    # presets (pages 96-125, 0x08030000), the anti-rollback log (0x0803F000)
     # and the runtime config (0x0803F800). Older bootloaders let DFU reach
-    # page 125; stopping at 105 suits both.
-    slot_size=0x25000,
+    # page 125; stopping at 95 suits both.
+    slot_size=0x20000,
     # The capability word is read only for preset writes: the slot write
     # checks the header in-band on its first block and needs no staging.
     caps_virt_addr=USB_DFU_CAPS_VIRT_ADDR,
-    preset_base=0x08035000,          # LIFUPresetPackage.TX_PRESET_BASE
-    preset_size=0xA000,
+    preset_base=0x08030000,          # LIFUPresetPackage.TX_PRESET_BASE
+    preset_size=0xF000,
     preset_slot_size=0x1000,
 )
 

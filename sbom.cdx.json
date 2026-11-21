@@ -312,6 +312,33 @@
       "version": "2.34.2"
     },
     {
+      "bom-ref": "cryptography",
+      "type": "library",
+      "name": "cryptography",
+      "scope": "optional",
+      "supplier": {
+        "name": "Python Cryptographic Authority"
+      },
+      "description": "ECDSA P-256 signing and signature checks (LIFUCrypto, LIFUPresetPackage: firmware_domain, preset package headers). Installed with the crypto extra, which the operator interface requires.",
+      "licenses": [
+        {
+          "expression": "Apache-2.0 OR BSD-3-Clause"
+        }
+      ],
+      "purl": "pkg:pypi/cryptography@50.0.2",
+      "properties": [
+        {
+          "name": "openwater:declared-constraint",
+          "value": "cryptography==50.0.2 (optional-dependencies: crypto, dev)"
+        },
+        {
+          "name": "openwater:version-basis",
+          "value": "pinned exactly in pyproject.toml"
+        }
+      ],
+      "version": "50.0.2"
+    },
+    {
       "bom-ref": "google-cloud-kms",
       "type": "library",
       "name": "google-cloud-kms",
@@ -326,6 +353,7 @@
           }
         }
       ],
+      "version": "3.18.0",
       "purl": "pkg:pypi/google-cloud-kms@3.18.0",
       "properties": [
         {
