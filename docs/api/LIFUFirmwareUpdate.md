@@ -192,7 +192,7 @@ the slave's app version. `--production` overrides the combined image, and
 `--updater` overrides the RAM-resident legacy updater used by the USB
 recovery path (and by the console legacy migration).
 
-## Replacing a 1.0.x bootloader (bootloader updater shim)
+## Replacing a 1.0.x (or older 1.1.x) bootloader (bootloader updater shim)
 
 Research units shipped with console app 1.2.6 / bootloader `1.0.3-rc.1` and
 transmitter app 2.0.8 / bootloader `1.0.1`. The 1.1.x bootloaders move the
@@ -205,8 +205,14 @@ loader and no SWD:
    (`bootloader_needs_migration()`): install the **bootloader updater**
    first — `open-lifu-console-bl-updater` / `open-lifu-transmitter-bl-updater`,
    a one-shot application signed with the research key the old bootloader
-   trusts (image version 1.2.31 / 2.0.31: above every fielded floor, below the
-   first application for the new bootloader).
+   trusts. With `bl_target=` (the bootloader the updater carries, from its
+   SBOM; `LIFUReleaseUpdate` passes it), a 1.1.x bootloader older than that one
+   is replaced too, e.g. `1.1.0-rc.2` -> `1.1.0` (`1.1.0-rc.N` < `1.1.0`). A
+   bootloader refuses an image signed below the installed application, so
+   updaters from 1.0.0-rc.4 (transmitter) / 1.0.0-rc.3 (console) on are signed
+   at the application released with them (2.1.0 / 1.3.0); earlier ones (2.0.31
+   / 1.2.31) only run on 1.0.x. `LIFUReleaseUpdate` does not pass `bl_target`
+   when the updater is signed below the installed application.
 2. The old bootloader verifies and launches it. It rewrites pages 0-31 with
    the bootloader it carries, erases the old slot, the preset area and the
    anti-rollback floor (the runtime-config page is kept), and resets into the
@@ -227,7 +233,8 @@ openlifu-fw-updater converts a research unit to clinical this way, with an
 updater that carries the clinical bootloader.
 
 How the SDK knows the new bootloader is up:
-- **USB (console, transmitter master):** its DFU reports at least 1.1.0 **and**
+- **USB (console, transmitter master):** its DFU reports at least 1.1.0 (and
+  `bl_target`, if given) **and**
   the slot is empty (the updater erases it; the old bootloader still holds it).
 - **I2C (slave):** the I2C DFU has no read, so the bootloader version decides.
   The SDK waits `SLAVE_MIGRATION_SETTLE_S` (20 s) before the first
