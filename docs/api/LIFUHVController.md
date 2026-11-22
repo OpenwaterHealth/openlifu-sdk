@@ -25,6 +25,7 @@ Connectivity and basic
 - `close()` — close UART transport.
 - `ping() -> bool` — ping console.
 - `get_version() -> str` — firmware version string.
+- `get_bootloader_version() -> str | None` — the bootloader's version as the application reports it (`OW_CMD_BL_VERSION`, e.g. `"1.1.0-rc.3"`), without entering DFU. `None` when the firmware does not support the command (console 1.3.0-rc.4 and older answer `OW_ERROR`) or reports no version (bare metal); a timeout still raises. Research component only: not in the FDA command set.
 - `get_hardware_id(raw_hex=False, base58=False, legacy_6byte=False) -> str` — the 12-byte MCU UID. Returns dash-separated hex by default, lower-case hex with `raw_hex`, or base58 with `base58` (the form calibration records carry). Adding `legacy_6byte` to `base58` returns base58 of the first 6 bytes, the form older records carry.
 
 Power and HV control

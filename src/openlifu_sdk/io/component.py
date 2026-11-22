@@ -13,6 +13,7 @@ from .LIFUConfig import (
     OW_CMD_PING, OW_CMD_VERSION, OW_CMD_ECHO, OW_CMD_HWID,
     OW_CMD_TOGGLE_LED, OW_CMD_DFU, OW_CMD_RESET, OW_CMD_USR_CFG,
     OW_CMD_SIGCHK, SIGCHK_SLOT_IMAGE, SIGCHK_BARE_METAL,
+    OW_CMD_BL_VERSION, BL_VERSION_MAX_LEN,
     LIFU_ERR_BAD_PAYLOAD_FORMAT,
     LIFU_ERR_BAD_PAYLOAD_LENGTH,
 )
@@ -437,6 +438,30 @@ class OWComponent:
         if isinstance(header, SignatureCheck) or header[:4] != LIFUCrypto.SFU_MAGIC:
             return None
         return LIFUCrypto.FirmwareHeader.from_bytes(header)
+
+    def get_bootloader_version(self, module: int = 0) -> str | None:
+        """The version of the bootloader the running application booted
+        from (OW_CMD_BL_VERSION), e.g. ``"1.1.0-rc.3"``, read without
+        entering DFU. On the transmitter *module* is the module (0 = the
+        master, n = a slave, relayed over I2C).
+
+        Returns:
+            The version string; None when the firmware does not support the
+            command (it answers ``OW_ERROR``: every release before it) or
+            reports no bootloader version (a bare-metal build, or none
+            found).
+
+        Raises:
+            LIFUNotConnectedError, LIFUCommunicationError.
+        """
+        try:
+            r = self.send_checked(OW_CMD_BL_VERSION, addr=module, op="get_bootloader_version")
+        except LIFUDeviceError as e:
+            log.info("%s: bootloader version not available: %s", self._uart.desc, e)
+            return None
+        data = bytes(r.data[:min(r.data_len, BL_VERSION_MAX_LEN)]) if r.data_len and r.data else b""
+        version = data.decode("ascii", errors="replace").rstrip("\x00").strip()
+        return version or None
 
     def _read_signed_header(self, module: int, op: str) -> bytes | SignatureCheck:
         """Send OW_CMD_SIGCHK. Returns the signed header a slot build sends,

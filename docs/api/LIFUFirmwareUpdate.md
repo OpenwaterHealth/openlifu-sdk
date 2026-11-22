@@ -318,6 +318,19 @@ whole unit to a release (`ReleaseBundle.load(firmware, presets)`):
 - research release, research unit: application updates (`"firmware"`),
   then the presets written through the applications (`"write-presets"` /
   `"clear-slot"`);
+- research release, research board already on the release's application
+  whose application reports (`get_bootloader_version()`) a bootloader older
+  than the one the release's updater carries (same ordering as
+  `bootloader_needs_migration()`): `"bootloader"` — run exactly like a
+  firmware step (`bl_target=` the release's bootloader, the same signed
+  application re-installed), in the same order. The updater erases the
+  presets: like after any bootloader replacement, `run()` re-reads them after
+  the firmware and rewrites them, and `verify()` reads them back with the
+  board's new bootloader (`[ok] <board>: bootloader 1.1.0`). Kept (`"none"`)
+  when the version is unknown (firmware without the read, or a development
+  bootloader's git-describe text), on a clinical board, when the updater is
+  signed below the installed application, or when the release has no
+  presets to rewrite;
 - clinical release, research unit (a field unit from before the signature
   check included, if it is on a secure bootloader): `"convert"` on every
   board — `replace_bootloader=True`, `bl_target=None`, and a `before_app`
