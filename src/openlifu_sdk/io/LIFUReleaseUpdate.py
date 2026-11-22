@@ -9,6 +9,12 @@ A release is what the diathermy release build publishes:
 - ``research-presets-<tag>.zip`` (or the clinical set): the signed preset
   packages (``build_presets.py``) with ``presets-manifest.json``.
 
+A clinical release (``clinical-firmware-<tag>.zip``, ``clinical-presets-<tag>.zip``)
+has the same layout: the applications are signed with the clinical keys, the
+bootloader updaters with the research key (they run on the research
+bootloader they replace) and carry the clinical bootloader
+(``1.1.0-rc.3-clinical`` in their SBOM), and the presets are signed clinical.
+
 :class:`ReleaseBundle` loads them (a zip or an unpacked folder), checks every
 sum and every signature against the SDK's trusted keys, and names the
 release's domain: research or clinical, from the key that signed both
@@ -20,21 +26,43 @@ applications.
    board's firmware version, signing domain and signed header
    (``firmware_header``), and every preset package header. A board whose
    installed build is the release's (same FwVersion and body hash) is left
-   alone; an older one is updated; a newer one, or one in another domain, is
-   refused before anything is written.
+   alone; an older one is updated; a newer one is refused before anything is
+   written. A research board given a clinical release is converted (below); a
+   clinical board is never given a research release. Each board's user
+   configuration is read too, to be compared after the update.
 2. :meth:`~ReleaseUpdate.run` updates the firmware (console, then the
    transmitter slaves, then the master, through
    :mod:`openlifu_sdk.io.LIFUFirmwareUpdate`, which replaces a 1.0.x
    bootloader with the updater on the way), waits for each application to
-   come back, then re-reads the presets and writes the ones that differ to
-   every physical module, and empties the transmitter slots past the
-   released set.
-3. Everything is read back and compared with the release.
+   come back, then, for a research release, re-reads the presets and writes
+   the ones that differ to every physical module, and empties the
+   transmitter slots past the released set.
+3. Everything is read back and compared with the release, and each board's
+   user configuration with the one read in step 1.
 
-This version handles research releases on research units. Converting a
-research unit to clinical, and clinical presets (written through the
-bootloaders), are refused with a message; a clinical unit is never given a
-research release.
+**Research -> clinical conversion.** A research board (a field unit from
+before the signature check included) given a clinical release takes the
+release's bootloader updater whatever its bootloader version
+(``replace_bootloader``): the clinical bootloader replaces the research one,
+erases the slot and the presets, and locks the board (RDP1). While the new
+bootloader sits in its DFU with an empty slot, the clinical presets are
+written through it (the console page, then each transmitter slot, each
+checked against the clinical key first; every write ends in a reset and the
+bootloader comes back in DFU), and only then the clinical application. A
+clinical application refuses preset writes, so the presets are never written
+through it. Writing clinical presets to a unit that is already clinical
+(without a conversion) is refused: not supported yet.
+
+Step actions (:attr:`Step.action`):
+
+- ``"none"``: already the release's;
+- ``"firmware"``: application update in the board's domain;
+- ``"convert"``: research -> clinical conversion (see above);
+- ``"write-presets"`` / ``"clear-slot"``: research presets, written / emptied
+  through the running application;
+- ``"write-presets-dfu"``: a clinical preset, written in the clinical
+  bootloader's DFU during the board's conversion;
+- ``"refuse"``: nothing is written to the unit.
 
 CLI::
 
@@ -69,6 +97,14 @@ UPDATER_DIRS = {"console": "open-lifu-console-bl-updater",
 BOOTLOADER_COMPONENTS = {"console": "open-lifu-console-bl",
                          "transmitter": "open-lifu-transmitter-bl"}
 DOMAINS = ("clinical", "research")
+#: Step actions, see the module docstring.
+ACTION_NONE = "none"
+ACTION_FIRMWARE = "firmware"
+ACTION_CONVERT = "convert"
+ACTION_WRITE_PRESETS = "write-presets"
+ACTION_CLEAR_SLOT = "clear-slot"
+ACTION_WRITE_PRESETS_DFU = "write-presets-dfu"
+ACTION_REFUSE = "refuse"
 #: Firmware below these versions predates the signature-check command, so
 #: firmware_domain() answers with an error. It runs a 1.0.x bootloader, which
 #: was only ever built with the research keys (the clinical domain starts at
@@ -349,6 +385,41 @@ def read_presets(hv: Any, tx: Any, modules: int) -> PresetState:
                          for s in range(TX_PRESET_SLOTS)} for m in range(modules)})
 
 
+def read_user_configs(hv: Any, tx: Any, boards: list[Board]) -> dict[str, Any]:
+    """Each board's user configuration as raw bytes (``read_config``, the
+    header and JSON as the board sends them), or the exception the read
+    raised. Keyed by board name."""
+    return {b.name: _try(lambda b=b: (hv if b.board == "console" else tx)
+                         .read_config(module=b.module).to_wire_bytes())
+            for b in boards}
+
+
+def user_config_lines(before: dict[str, Any], after: dict[str, Any]) -> tuple[bool, list[str]]:
+    """Compare two :func:`read_user_configs` readings. Returns ``(ok, lines)``.
+
+    A board that could not be read before the update (firmware from before
+    the user-config read, e.g. a field unit) has nothing to compare: it is
+    reported, not failed. Readable before and unreadable or different after
+    fails."""
+    ok, lines = True, []
+    for name in list(before) + [n for n in after if n not in before]:
+        was, now = before.get(name), after.get(name)
+        if isinstance(was, Exception) or name not in before:
+            lines.append(f"[skip] {name}: user configuration could not be read before "
+                         f"the update ({was}); nothing to compare")
+            continue
+        if isinstance(now, Exception) or name not in after:
+            line = f"user configuration could not be read back ({now})"
+        elif was == now:
+            lines.append(f"[ok] {name}: user configuration unchanged")
+            continue
+        else:
+            line = "user configuration CHANGED"
+        ok = False
+        lines.append(f"[FAIL] {name}: {line}")
+    return ok, lines
+
+
 def _try(read: Callable[[], Any]) -> Any:
     try:
         return read()
@@ -365,7 +436,7 @@ class Step:
     """One thing the update does (or found already done)."""
 
     target: str
-    action: str          # "firmware" | "write-presets" | "clear-slot" | "none" | "refuse"
+    action: str          # one of the ACTION_* constants
     detail: str
     board: Board | None = None
     slot: int | None = None
@@ -378,6 +449,8 @@ class ReleasePlan:
     boards: list[Board]
     firmware: list[Step] = field(default_factory=list)
     presets: list[Step] = field(default_factory=list)
+    #: Each board's user configuration before the update (read_user_configs).
+    user_configs: dict[str, Any] = field(default_factory=dict)
 
     @property
     def refusals(self) -> list[Step]:
@@ -415,7 +488,8 @@ def is_legacy(board: Board) -> bool:
             and version < LEGACY_BELOW[board.board])
 
 
-def _legacy_step(board: Board, image: SignedImage, domain: str) -> Step:
+def _legacy_step(board: Board, image: SignedImage, domain: str,
+                 bootloader: str | None) -> Step:
     """A field unit from before the signature check: research by
     construction. Its bootloader still checks every image it is given, so a
     wrong guess is refused in DFU and the unit is returned to its app."""
@@ -423,18 +497,53 @@ def _legacy_step(board: Board, image: SignedImage, domain: str) -> Step:
         return Step(board.name, "refuse", f"runs {board.version}, an FDA build that refuses DFU "
                     "from its application; nothing will be written", board)
     if domain != "research":
-        return Step(board.name, "refuse", f"runs {board.version} (research, from before the "
-                    "signature check): converting a research unit to clinical is not supported "
-                    "by this release update yet", board)
+        if not _on_secure_bootloader(board):
+            return Step(board.name, "refuse", f"runs {board.version}, which predates the secure "
+                        "bootloader: take it to a research release first, then convert it; "
+                        "nothing will be written", board)
+        return convert_step(board, image, bootloader)
     return Step(board.name, "firmware", f"{board.version} (research, from before the signature "
                 f"check) -> {image.version} ({image.build}); its 1.0.x bootloader is replaced "
                 "first in DFU", board)
 
 
-def firmware_step(board: Board, image: SignedImage, domain: str) -> Step:
-    """What *board* needs to run the release's *image*."""
+def _on_secure_bootloader(board: Board) -> bool:
+    """True if the version *board* runs boots from a secure bootloader (the
+    only path that can replace it with the updater)."""
+    from openlifu_sdk.io.LIFUDFU import (
+        DFU_KIND_SECURE,
+        infer_console_bootloader_from_app_version,
+        infer_transmitter_bootloader_from_app_version,
+    )
+    infer = (infer_console_bootloader_from_app_version if board.board == "console"
+             else infer_transmitter_bootloader_from_app_version)
+    try:
+        return infer(board.version) == DFU_KIND_SECURE
+    except Exception:  # noqa: BLE001 - an unparseable version is not converted
+        return False
+
+
+def convert_step(board: Board, image: SignedImage, bootloader: str | None) -> Step:
+    """A research *board* given a clinical release: the updater carrying the
+    clinical *bootloader* replaces its bootloader, then the presets and the
+    clinical *image* are written in the new bootloader's DFU."""
+    if "clinical" not in (bootloader or "").lower():
+        return Step(board.name, "refuse", f"the release's bootloader updater carries bootloader "
+                    f"{bootloader or 'unknown'}, not a clinical one: the board could not boot "
+                    "the clinical application; nothing will be written", board)
+    return Step(board.name, "convert", f"research -> clinical: the clinical bootloader "
+                f"{bootloader} replaces the research one and locks the board (RDP1); then the "
+                f"clinical app {image.version} ({image.build}) and presets", board)
+
+
+def firmware_step(board: Board, image: SignedImage, domain: str,
+                  bootloader: str | None = None) -> Step:
+    """What *board* needs to run the release's *image* (*bootloader*: the
+    one the release's updater carries, for a conversion)."""
     if is_legacy(board):
-        return _legacy_step(board, image, domain)
+        return _legacy_step(board, image, domain, bootloader)
+    if board.domain == "research" and domain == "clinical":
+        return convert_step(board, image, bootloader)
     if board.domain != domain:
         return Step(board.name, "refuse", _domain_refusal(board, domain), board)
     if board.header is None:
@@ -454,18 +563,53 @@ def _domain_refusal(board: Board, domain: str) -> str:
     if board.domain == "clinical":
         return ("runs clinical firmware: a research release is never installed on a clinical "
                 "unit (return it through an RMA)")
-    if board.domain == "research" and domain == "clinical":
-        return ("runs research firmware: converting a research unit to clinical is not "
-                "supported by this release update yet")
     return (f"cannot tell which key signed its firmware ({board.domain}); nothing will be "
             "written")
 
 
-def preset_steps(state: PresetState, presets: PresetRelease, domain: str) -> list[Step]:
-    """The preset writes and slot clears that take *state* to *presets*."""
-    if domain != "research":
-        return [Step("presets", "refuse", "clinical presets are written through the "
-                     "bootloaders; not supported by this release update yet")]
+def board_key(board: Board) -> str | int:
+    """``"console"``, or the transmitter module index: how preset steps name
+    the board they are on (a step's ``module`` is None on the console)."""
+    return "console" if board.board == "console" else board.module
+
+
+def preset_steps(state: PresetState, presets: PresetRelease, domain: str,
+                 converting: frozenset | set = frozenset()) -> list[Step]:
+    """The steps that take *state* to *presets*.
+
+    Research: preset writes and slot clears through the applications.
+    Clinical: on every board being converted (*converting*, a set of
+    :func:`board_key`), each released package is written in the bootloader's
+    DFU (``"write-presets-dfu"``; the updater erases everything, so no clear);
+    on a board that is not converted, a preset that differs is refused.
+    """
+    steps = compare_presets(state, presets)
+    if domain == "research":
+        return steps
+    return [_clinical_step(s, presets, converting) for s in steps
+            if not (s.action == ACTION_CLEAR_SLOT and s.module in converting)]
+
+
+def _clinical_step(step: Step, presets: PresetRelease, converting: frozenset | set) -> Step:
+    if step.action == ACTION_REFUSE:
+        return step
+    if ("console" if step.module is None else step.module) in converting:
+        want = pp.parse_preset_header(presets.console if step.module is None
+                                      else presets.tx_image(step.slot, step.module))
+        return Step(step.target, ACTION_WRITE_PRESETS_DFU,
+                    f"{want.context} / diathermy {want.diathermy_sha[:12]}, written in the "
+                    "clinical bootloader's DFU before the application (the bootloader updater "
+                    "erases the presets)", slot=step.slot, module=step.module)
+    if step.action in (ACTION_WRITE_PRESETS, ACTION_CLEAR_SLOT):
+        return Step(step.target, ACTION_REFUSE, f"{step.detail}: clinical preset-only update not "
+                    "supported yet (clinical presets are written through the bootloader only "
+                    "while a research board is converted)", slot=step.slot, module=step.module)
+    return step
+
+
+def compare_presets(state: PresetState, presets: PresetRelease) -> list[Step]:
+    """The preset writes and slot clears that take *state* to *presets*,
+    whatever the domain (the read-back uses it for both)."""
     released = len(presets.transmitter)
     modules = len(state.transmitter)
     if presets.modules > 1 and presets.modules != modules:
@@ -521,6 +665,11 @@ class ReleaseUpdate:
     """Plan and run the update of one unit (console + transmitter chain) to
     a :class:`ReleaseBundle`.
 
+    A research unit given a clinical release is converted (see the module
+    docstring): ``run`` installs the release's updater on every board with
+    ``replace_bootloader=True`` and a ``before_app`` that writes the clinical
+    presets in the new bootloader's DFU.
+
     Args:
         bundle: The verified release.
         hv: The connected console (``interface.hvcontroller``).
@@ -537,18 +686,28 @@ class ReleaseUpdate:
         self.tx = tx
         self.progress_callback = progress_callback
         self.report = report or logger.info
+        #: The user configurations read by plan() / run(), for verify().
+        self._user_configs: dict[str, Any] | None = None
 
     # -- plan ---------------------------------------------------------------
 
     def plan(self) -> ReleasePlan:
         """Read the unit (no DFU) and decide every step."""
+        bundle = self.bundle
         boards = read_boards(self.hv, self.tx)
-        plan = ReleasePlan(self.bundle, boards)
-        plan.firmware = [firmware_step(b, self.bundle.apps[b.board], self.bundle.domain)
-                         for b in boards]
-        if self.bundle.presets is not None:
+        plan = ReleasePlan(bundle, boards)
+        plan.firmware = [firmware_step(b, bundle.apps[b.board], bundle.domain,
+                                       bundle.bootloaders.get(b.board)) for b in boards]
+        converting = {board_key(s.board) for s in plan.firmware if s.action == ACTION_CONVERT}
+        if bundle.presets is not None:
             state = read_presets(self.hv, self.tx, len(boards) - 1)
-            plan.presets = preset_steps(state, self.bundle.presets, self.bundle.domain)
+            plan.presets = preset_steps(state, bundle.presets, bundle.domain, converting)
+        elif converting:
+            plan.presets = [Step("presets", ACTION_REFUSE, "a research -> clinical conversion "
+                                 "writes the clinical presets in the bootloader's DFU (a clinical "
+                                 "application takes none): pass the clinical presets")]
+        plan.user_configs = read_user_configs(self.hv, self.tx, boards)
+        self._user_configs = plan.user_configs
         return plan
 
     # -- run ----------------------------------------------------------------
@@ -564,8 +723,12 @@ class ReleaseUpdate:
         if plan.refusals:
             raise ReleaseError("refused before anything was written:\n  "
                                + "\n  ".join(f"{s.target}: {s.detail}" for s in plan.refusals))
-        self._run_firmware([s for s in plan.firmware if s.action == "firmware"])
-        if self.bundle.presets is not None:
+        self._user_configs = plan.user_configs or read_user_configs(self.hv, self.tx, plan.boards)
+        self._run_firmware([s for s in plan.firmware
+                            if s.action in (ACTION_FIRMWARE, ACTION_CONVERT)])
+        # Clinical presets were written in the bootloaders' DFU during the
+        # conversion; a clinical application takes none.
+        if self.bundle.presets is not None and self.bundle.domain == "research":
             modules = self.tx.get_module_count()
             state = read_presets(self.hv, self.tx, modules)
             steps = preset_steps(state, self.bundle.presets, self.bundle.domain)
@@ -582,29 +745,48 @@ class ReleaseUpdate:
         slaves = sorted((s for s in steps if s.board.board == "transmitter" and s.board.module > 0),
                         key=lambda s: s.board.module)
         master = [s for s in steps if s.board.board == "transmitter" and s.board.module == 0]
-        kw = {"progress_callback": self.progress_callback}
         if console:
-            self.report("console: updating the firmware")
+            self.report(f"console: {_doing(console[0])}")
             r = LIFUFirmwareUpdate(hv=self.hv).update(
-                signed_app=str(self.bundle.apps["console"].path),
-                bl_updater=str(self.bundle.updaters["console"].path),
-                bl_target=self._bl_target(console[0].board), **kw)
+                signed_app=str(self.bundle.apps["console"].path), **self._update_kwargs(console[0]))
             self.report(f"console: {r.summary}")
             self._wait_app(self.hv, "console")
             self._transmitter_back_after_console()
         fw = LIFUTransmitterFirmwareUpdate(tx=self.tx)
         app = str(self.bundle.apps["transmitter"].path)
-        updater = str(self.bundle.updaters["transmitter"].path)
         for step in slaves:
-            self.report(f"{step.target}: updating the firmware over I2C")
-            self._guard(step.target, lambda m=step.board.module, b=step.board: fw.update_slave(
-                m, signed_app=app, bl_updater=updater, bl_target=self._bl_target(b), **kw))
+            self.report(f"{step.target}: {_doing(step)} over I2C")
+            self._guard(step.target, lambda s=step: fw.update_slave(
+                s.board.module, signed_app=app, **self._update_kwargs(s)))
         if master:
-            self.report("transmitter master: updating the firmware over USB")
+            self.report(f"transmitter master: {_doing(master[0])} over USB")
             self._guard("transmitter master", lambda: fw.update(
-                signed_app=app, bl_updater=updater,
-                bl_target=self._bl_target(master[0].board), **kw))
+                signed_app=app, **self._update_kwargs(master[0])))
             self._wait_app(self.tx, "transmitter")
+
+    def _update_kwargs(self, step: Step) -> dict[str, Any]:
+        """The LIFUFirmwareUpdate arguments for a firmware or convert step."""
+        board = step.board
+        kw: dict[str, Any] = {"bl_updater": str(self.bundle.updaters[board.board].path),
+                              "progress_callback": self.progress_callback}
+        if step.action == ACTION_CONVERT:
+            kw.update(replace_bootloader=True, bl_target=None,
+                      before_app=self._preset_writer(board))
+        else:
+            kw["bl_target"] = self._bl_target(board)
+        return kw
+
+    def _preset_writer(self, board: Board) -> Callable[[Any], None]:
+        """The ``before_app`` of *board*'s conversion: its released clinical
+        presets, written in the new bootloader's DFU."""
+        presets, kw = self.bundle.presets, {"progress_callback": self.progress_callback,
+                                            "report": self.report}
+        if board.board == "console":
+            return lambda ctx: write_console_presets_dfu(ctx, presets.console, **kw)
+        images = [presets.tx_image(slot, board.module) for slot in range(len(presets.transmitter))]
+        if board.module == 0:
+            return lambda ctx: write_master_presets_dfu(ctx, images, **kw)
+        return lambda ctx: write_slave_presets_dfu(ctx, images, **kw)
 
     def _bl_target(self, board: Board) -> str | None:
         """The bootloader the release's updater carries, if the updater can
@@ -702,7 +884,9 @@ class ReleaseUpdate:
     # -- read-back ----------------------------------------------------------
 
     def verify(self) -> ReleaseResult:
-        """Read everything back and compare it with the release."""
+        """Read everything back and compare it with the release, and each
+        board's user configuration with the one read by :meth:`plan` /
+        :meth:`run` (none read: not compared)."""
         boards = read_boards(self.hv, self.tx)
         lines, ok = [], True
         for board in boards:
@@ -713,12 +897,74 @@ class ReleaseUpdate:
                          f"({board.domain})")
         if self.bundle.presets is not None:
             state = read_presets(self.hv, self.tx, len(boards) - 1)
-            for step in preset_steps(state, self.bundle.presets, self.bundle.domain):
-                good = step.action == "none"
+            for step in compare_presets(state, self.bundle.presets):
+                good = step.action == ACTION_NONE
                 ok &= good
                 if not good or step.module is None or step.slot < len(self.bundle.presets.transmitter):
                     lines.append(f"[{'ok' if good else 'FAIL'}] {step.target}: {step.detail}")
+        if self._user_configs is not None:
+            good, config_lines = user_config_lines(
+                self._user_configs, read_user_configs(self.hv, self.tx, boards))
+            ok &= good
+            lines += config_lines
         return ReleaseResult(ok=ok, lines=lines)
+
+
+def _doing(step: Step) -> str:
+    return ("converting to clinical (bootloader, presets, application)"
+            if step.action == ACTION_CONVERT else "updating the firmware")
+
+
+# ---------------------------------------------------------------------------
+# Clinical presets, written in a bootloader's DFU (LIFUFirmwareUpdate before_app)
+# ---------------------------------------------------------------------------
+
+def write_console_presets_dfu(ctx: Any, package: bytes, *, domain: str = "clinical",
+                              progress_callback: Callable | None = None,
+                              report: Callable[[str], None] | None = None) -> None:
+    """Write the console preset page through the bootloader's USB DFU (*ctx*:
+    a :class:`~openlifu_sdk.io.LIFUFirmwareUpdate.DfuContext`), the package
+    checked against the *domain* console key first. The bootloader checks it
+    and resets; with an empty slot it comes back in DFU, which is waited for."""
+    ctx.mgr.program_console_presets(
+        package, public_key=LIFUCrypto.trusted_public_key("console", domain),
+        vid=ctx.vid, pid=ctx.pid, libusb_dll=ctx.libusb_dll,
+        progress_callback=progress_callback)
+    ctx.wait_dfu()
+    (report or logger.info)(f"{ctx.device}: preset page written in the bootloader's DFU")
+
+
+def write_master_presets_dfu(ctx: Any, images: list[bytes], *, domain: str = "clinical",
+                             progress_callback: Callable | None = None,
+                             report: Callable[[str], None] | None = None) -> None:
+    """Write transmitter preset slots 0..len(images)-1 of the USB master
+    through its bootloader's DFU, each checked against the *domain*
+    transmitter key first; the bootloader resets after every slot, so its DFU
+    is waited for again each time."""
+    key = LIFUCrypto.trusted_public_key("transmitter", domain)
+    for slot, image in enumerate(images):
+        ctx.mgr.program_transmitter_preset(slot, image, public_key=key, vid=ctx.vid,
+                                           pid=ctx.pid, libusb_dll=ctx.libusb_dll,
+                                           progress_callback=progress_callback)
+        ctx.wait_dfu()
+        (report or logger.info)(f"{ctx.device}: preset slot {slot:02d} written in the "
+                                "bootloader's DFU")
+
+
+def write_slave_presets_dfu(ctx: Any, images: list[bytes], *, domain: str = "clinical",
+                            progress_callback: Callable | None = None,
+                            report: Callable[[str], None] | None = None) -> None:
+    """Write transmitter preset slots 0..len(images)-1 of a slave through its
+    bootloader's I2C DFU, each checked against the *domain* transmitter key
+    first; the slave resets after every slot and is re-acquired (it gets its
+    chain address again from the master's enumeration)."""
+    key = LIFUCrypto.trusted_public_key("transmitter", domain)
+    for slot, image in enumerate(images):
+        ctx.mgr.program_transmitter_slave_preset_i2c(slot, image, ctx.i2c_addr, public_key=key,
+                                                     progress_callback=progress_callback)
+        ctx.reacquire()
+        (report or logger.info)(f"{ctx.device}: preset slot {slot:02d} written in the "
+                                "bootloader's DFU")
 
 
 # ---------------------------------------------------------------------------

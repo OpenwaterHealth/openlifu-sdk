@@ -48,13 +48,16 @@ Class
 - `detect_cohort() -> (cohort, source)` — `cohort` is `"no-bootloader"` /
   `"legacy-bl"` / `"secure-bl"`; `source` is `"app"` (from the running app
   version) or `"dfu"` (the unit was already in a bootloader DFU).
-- `update(*, production_image=None, signed_app=None, updater_bin=None, force=False, bl_updater=None, replace_bootloader=False, progress_callback=None) -> UpdateResult`
+- `update(*, production_image=None, signed_app=None, updater_bin=None, force=False, force_production=False, bl_updater=None, replace_bootloader=False, progress_callback=None, bl_target=None, before_app=None) -> UpdateResult`
   - Detects the state and runs the right path with the images it is given
     (see "Images per path"). `force` (secure path only) flashes even if not
     newer (the bootloader's anti-rollback floor still applies at boot).
     `replace_bootloader` installs `bl_updater` even on a current bootloader:
     the bootloader it carries replaces the installed one (a research unit
     converted to clinical by openlifu-fw-updater).
+  - `before_app(ctx: DfuContext)` runs in the new bootloader's DFU after the
+    bootloader was replaced and before the application is written; see
+    "Work in the new bootloader's DFU (`before_app`)" below.
 
 `UpdateResult` fields: `cohort`, `action` (`"migrate-rom"` / `"migrate-legacy"`
 / `"app-update"` / `"bl-migrate"` / `"force-production"`), `summary`,
@@ -274,6 +277,64 @@ every `SLAVE_VERSION_POLL_S` (2 s) for at most `SLAVE_VERSION_TIMEOUT_S` (24 s)
 until it is a real X.Y.Z version. The summary names the version (`(now X.Y.Z)`)
 only when one was read; a master on firmware 2.0.8 truncates forwarded version
 replies, so there the summary has no version and a warning is logged.
+
+## Work in the new bootloader's DFU (`before_app`)
+
+`update()` (console, transmitter master), `update_slave()` and
+`update_chain()` take `before_app: Callable[[DfuContext], None] | None`. It is
+called only when the bootloader was replaced (a migration, or
+`replace_bootloader=True`), after the new bootloader is up in its DFU with an
+empty slot and before the application is written; when the bootloader is
+kept it is not called. Only the secure-bootloader paths support it: the ROM,
+legacy and force-production paths raise before anything is written when it is
+given. An exception from it stops the update with the board in the new
+bootloader's DFU (empty slot), ready for a retry.
+
+`DfuContext` fields:
+
+| Field | Console / master (USB) | Slave (I2C) |
+|---|---|---|
+| `device` | `"console"` / `"transmitter master"` | `"transmitter module N"` |
+| `module` | 0 | N |
+| `mgr` | the update's `LIFUDFUManager` | `LIFUDFUManager(uart=tx.uart)` |
+| `vid`, `pid`, `libusb_dll` | the DFU device | None |
+| `wait_dfu()` | after a reset, waits `PRESET_RESET_SETTLE_S` (3 s), then up to `PRESET_DFU_TIMEOUT_S` (90 s) for the bootloader DFU; returns its version | None |
+| `i2c_addr` | None | the bootloader's current I2C DFU address |
+| `reacquire()` | None | after a reset, waits `SLAVE_PRESET_SETTLE_S` (5 s), then re-enumerates every `SLAVE_MIGRATION_POLL_S` for at most `MIGRATION_TIMEOUT_S` until the slave is a bootloader node again; updates `i2c_addr` and returns it |
+
+The callback must leave the board in its bootloader's DFU: a bootloader with
+an empty slot stays in DFU after a reset, so each write that resets
+(`program_console_presets`, `program_transmitter_preset`,
+`program_transmitter_slave_preset_i2c`) is followed by `wait_dfu()` /
+`reacquire()`. `LIFUReleaseUpdate` uses it to write the clinical presets while
+it converts a research unit to clinical (`write_console_presets_dfu`,
+`write_master_presets_dfu`, `write_slave_presets_dfu`).
+
+## Release updates (`LIFUReleaseUpdate`)
+
+`ReleaseUpdate(bundle, hv, tx).plan()` / `.run(plan)` / `.verify()` takes a
+whole unit to a release (`ReleaseBundle.load(firmware, presets)`):
+
+- research release, research unit: application updates (`"firmware"`),
+  then the presets written through the applications (`"write-presets"` /
+  `"clear-slot"`);
+- clinical release, research unit (a field unit from before the signature
+  check included, if it is on a secure bootloader): `"convert"` on every
+  board — `replace_bootloader=True`, `bl_target=None`, and a `before_app`
+  that writes the board's clinical presets (`"write-presets-dfu"`: the
+  console page; slots `0..n-1` on every transmitter module, each checked
+  against the clinical key first) in the clinical bootloader's DFU, before
+  the clinical application. Order: console, slaves, master. Refused when the
+  release's updater does not carry a clinical bootloader, or no clinical
+  presets are given;
+- clinical release, clinical unit: application updates only; presets that
+  differ are refused (clinical preset-only update not supported yet);
+- research release, clinical unit: refused (RMA).
+
+`plan()` also reads each board's user configuration (`read_config`, raw
+bytes); `verify()` reads it again and reports `[ok] <board>: user
+configuration unchanged` or `[FAIL] <board>: user configuration CHANGED` (or
+that it could not be read), failing the result on any difference.
 
 See also: `docs/api/LIFUDFU.md` (the underlying per-scenario methods),
 `docs/api/LIFUCrypto.md` (image signing/validation),

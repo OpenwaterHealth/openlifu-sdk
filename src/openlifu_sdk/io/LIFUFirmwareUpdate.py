@@ -172,6 +172,69 @@ SLAVE_MIGRATION_POLL_S = 10.0
 # replies and never reports a valid slave version.
 SLAVE_VERSION_TIMEOUT_S = 24.0
 SLAVE_VERSION_POLL_S = 2.0
+# Work done in the new bootloader's DFU before the application (``before_app``,
+# e.g. clinical presets): each bootloader preset write ends in a reset, and the
+# bootloader, with its slot still empty, comes back in DFU. USB: wait this long
+# for the device to drop off the bus, then up to PRESET_DFU_TIMEOUT_S for it to
+# enumerate again (generous: the VM re-attaches USB). I2C slave: wait
+# SLAVE_PRESET_SETTLE_S before re-enumerating (the bootloader only restarts,
+# nothing is erased; re-enumerating while it cannot answer hangs a master on
+# firmware up to 2.1.0-rc.4, see SLAVE_MIGRATION_SETTLE_S), then poll every
+# SLAVE_MIGRATION_POLL_S for at most MIGRATION_TIMEOUT_S.
+PRESET_RESET_SETTLE_S = 3.0
+PRESET_DFU_TIMEOUT_S = 90.0
+SLAVE_PRESET_SETTLE_S = 5.0
+
+
+@dataclass
+class DfuContext:
+    """What a ``before_app`` callback gets: the board is in its NEW
+    bootloader's DFU (after a bootloader replacement), its application slot is
+    empty, and the application is written once the callback returns. The
+    callback must leave the board in that DFU (a bootloader with an empty slot
+    stays in DFU after a reset; re-acquire it after each reset).
+
+    Attributes:
+        device: ``"console"``, ``"transmitter master"`` or
+            ``"transmitter module N"``.
+        module: 0 for the console and the transmitter master, N for a slave.
+        mgr: The :class:`LIFUDFUManager` the update uses (for a slave, built
+            on the master's UART, as the I2C writers need).
+        vid, pid, libusb_dll: The USB DFU device (console, master); None on a
+            slave.
+        wait_dfu: USB only: after the board reset, wait for its bootloader DFU
+            again; returns the bootloader version.
+        i2c_addr: Slave only: the bootloader's current I2C DFU address.
+        reacquire: Slave only: after the slave reset, re-enumerate the chain
+            until the slave is a bootloader node again; updates
+            :attr:`i2c_addr` and returns it.
+    """
+
+    device: str
+    module: int
+    mgr: Any
+    vid: int | None = None
+    pid: int | None = None
+    libusb_dll: str | None = None
+    wait_dfu: Callable[[], str] | None = None
+    i2c_addr: int | None = None
+    reacquire: Callable[[], int] | None = None
+
+
+def _usb_wait_dfu(get_bl: Callable[[float], str]) -> Callable[[], str]:
+    """``DfuContext.wait_dfu`` for a USB board: let the reset take the device
+    off the bus, then wait for its bootloader DFU."""
+    def wait() -> str:
+        time.sleep(PRESET_RESET_SETTLE_S)
+        return get_bl(PRESET_DFU_TIMEOUT_S)
+    return wait
+
+
+def _refuse_before_app(before_app: Callable | None, path: str) -> None:
+    if before_app is not None:
+        raise RuntimeError(
+            f"before_app needs the secure-bootloader path; this unit takes the "
+            f"{path} path. Nothing was written.")
 
 
 def _bl_version_tuple(bl_version: str | None) -> tuple[int, int, int] | None:
@@ -188,15 +251,18 @@ def _is_real_version(version: str | None) -> bool:
 
 def _bl_release_key(version: str | None) -> tuple[int, ...] | None:
     """An ordering key for a bootloader version: ``1.1.0-rc.2`` <
-    ``1.1.0-rc.3`` < ``1.1.0`` < ``1.1.1``. Build metadata (``+...``) is
-    ignored. None if *version* does not parse."""
+    ``1.1.0-rc.3`` < ``1.1.0`` < ``1.1.1``. Build metadata (``+...``) and a
+    ``clinical`` variant suffix (``1.1.0-rc.3-clinical``, ``1.1.0-clinical``)
+    are ignored: the clinical build of a bootloader orders as that release.
+    None if *version* does not parse."""
     m = re.match(r"\s*v?(\d+)\.(\d+)\.(\d+)(?:-([0-9A-Za-z.-]+))?", version or "")
     if not m:
         return None
     base = (int(m.group(1)), int(m.group(2)), int(m.group(3)))
-    if m.group(4) is None:
+    pre = re.sub(r"(?:^|[.-])clinical$", "", m.group(4) or "", flags=re.IGNORECASE)
+    if not pre:
         return (*base, 1, 0)
-    rc = re.fullmatch(r"rc\.?(\d+)", m.group(4))
+    rc = re.match(r"rc\.?(\d+)", pre)
     return (*base, 0, int(rc.group(1)) if rc else 0)
 
 
@@ -248,7 +314,9 @@ def _install_with_migration(device: str, get_bl: Callable[[float], str],
                             bl_updater: Callable[[str], str], entered: bool,
                             slot_empty: Callable[[], bool] | None = None,
                             replace: bool = False,
-                            bl_target: str | None = None) -> tuple[str, bool]:
+                            bl_target: str | None = None,
+                            before_app: Callable[[], None] | None = None
+                            ) -> tuple[str, bool]:
     """Install *app* through the secure bootloader's USB DFU, replacing an old
     bootloader with the updater shim first.
 
@@ -260,7 +328,9 @@ def _install_with_migration(device: str, get_bl: Callable[[float], str],
     same version, other key). *slot_empty()* tells the new bootloader's DFU
     (the updater erased the slot) from the old one (it holds the updater).
     *bl_target* is the bootloader the updater carries: an older one is
-    replaced too (see :func:`bootloader_needs_migration`).
+    replaced too (see :func:`bootloader_needs_migration`). *before_app()*,
+    only when the bootloader was replaced, runs in the new bootloader's DFU
+    before the application is written (see :class:`DfuContext`).
     Returns ``(bootloader version, migrated)``.
     """
     bl = get_bl(45.0)
@@ -278,7 +348,9 @@ def _install_with_migration(device: str, get_bl: Callable[[float], str],
     logger.info("%s bootloader replaced: %s -> %s; installing the application",
                 device, bl, new_bl)
     # The new bootloader starts with an empty slot: nothing to fall back to,
-    # so a refusal here leaves the unit in DFU for a retry.
+    # so a refusal here (or in before_app) leaves the unit in DFU for a retry.
+    if before_app is not None:
+        before_app()
     program(app)
     return new_bl, True
 
@@ -559,7 +631,9 @@ class LIFUFirmwareUpdate:
                force: bool = False, force_production: bool = False,
                bl_updater: str | None = None, replace_bootloader: bool = False,
                progress_callback: Callable | None = None,
-               bl_target: str | None = None) -> UpdateResult:
+               bl_target: str | None = None,
+               before_app: Callable[[DfuContext], None] | None = None
+               ) -> UpdateResult:
         """Detect the unit's state and run the appropriate update.
 
         The DFU environment the unit reaches decides the image: STM32 ROM DFU
@@ -589,6 +663,12 @@ class LIFUFirmwareUpdate:
             bl_target: The bootloader *bl_updater* carries (its SBOM). A
                 secure bootloader older than it is replaced too, so a 1.1.x
                 unit moves to a newer bootloader. None keeps the 1.1.0 rule.
+            before_app: Called with a :class:`DfuContext` in the new
+                bootloader's USB DFU, after the bootloader was replaced and
+                before the application is written (e.g. to write clinical
+                presets through the bootloader). Not called when the
+                bootloader is kept. Secure-bootloader path only: any other
+                path refuses before anything is written.
 
         Returns:
             :class:`UpdateResult` (``action`` ``"bl-migrate"`` when the
@@ -601,6 +681,7 @@ class LIFUFirmwareUpdate:
                 come up, or a write/verify failure.
         """
         if force_production:
+            _refuse_before_app(before_app, "force-production")
             return self._force_production_update(production_image,
                                                  progress_callback)
         cohort, source = self.detect_cohort()
@@ -609,6 +690,8 @@ class LIFUFirmwareUpdate:
         # When already in DFU we must not trigger another DFU entry.
         in_dfu = source == "dfu"
 
+        if cohort != COHORT_SECURE:
+            _refuse_before_app(before_app, cohort)
         if cohort == COHORT_NONE:
             prod = _require_image(production_image, "production image (bootloader + signed app)", "production_image= / --production")
             # App 1.1.0 - 1.2.2 (or already sitting in the STM32 ROM DFU). A
@@ -639,7 +722,8 @@ class LIFUFirmwareUpdate:
         if cohort == COHORT_SECURE:
             app = _require_image(signed_app, "signed application image", "signed_app= / --app")
             return self._update_secure(cohort, app, in_dfu, force, bl_updater,
-                                       progress_callback, replace_bootloader, bl_target)
+                                       progress_callback, replace_bootloader, bl_target,
+                                       before_app)
 
         raise RuntimeError(f"unhandled cohort: {cohort}")
 
@@ -647,7 +731,9 @@ class LIFUFirmwareUpdate:
                        bl_updater: str | None,
                        progress_callback: Callable | None,
                        replace_bootloader: bool = False,
-                       bl_target: str | None = None) -> UpdateResult:
+                       bl_target: str | None = None,
+                       before_app: Callable[[DfuContext], None] | None = None
+                       ) -> UpdateResult:
         """The secure-bootloader path of :meth:`update`: the signed app over
         the bootloader's DFU, replacing a 1.0.x bootloader through the updater
         shim first."""
@@ -657,9 +743,14 @@ class LIFUFirmwareUpdate:
             time.sleep(2.0)
         mgr, kw = self._mgr, dict(vid=self.vid, pid=self.pid,
                                   libusb_dll=self.libusb_dll)
+
+        def get_bl(t: float) -> str:
+            return mgr.get_console_bootloader_version(timeout_s=t, **kw)
+
+        ctx = DfuContext("console", 0, mgr, wait_dfu=_usb_wait_dfu(get_bl), **kw)
         bl_version, migrated = _install_with_migration(
             "Console",
-            get_bl=lambda t: mgr.get_console_bootloader_version(timeout_s=t, **kw),
+            get_bl=get_bl,
             program=lambda img: mgr.program_console(
                 img, keys_dir=self.keys_dir, force=force,
                 progress_callback=progress_callback, **kw),
@@ -669,7 +760,8 @@ class LIFUFirmwareUpdate:
                 bl_updater, "Console", bl),
             entered=not in_dfu,
             slot_empty=lambda: mgr.get_console_installed_version(**kw) is None,
-            replace=replace_bootloader, bl_target=bl_target)
+            replace=replace_bootloader, bl_target=bl_target,
+            before_app=(lambda: before_app(ctx)) if before_app else None)
         # The manifest resets the unit and the bootloader verifies and
         # launches the new application: no power-cycle (see
         # LIFUDFUManager._program_slot_image).
@@ -988,7 +1080,9 @@ class LIFUTransmitterFirmwareUpdate:
                force_production: bool = False,
                bl_updater: str | None = None, replace_bootloader: bool = False,
                progress_callback: Callable | None = None,
-               bl_target: str | None = None) -> UpdateResult:
+               bl_target: str | None = None,
+               before_app: Callable[[DfuContext], None] | None = None
+               ) -> UpdateResult:
         """Detect the unit's state and run the appropriate update.
 
         A unit found parked in its LEGACY bootloader's USB DFU (dead app)
@@ -1018,6 +1112,12 @@ class LIFUTransmitterFirmwareUpdate:
             bl_target: The bootloader *bl_updater* carries (its SBOM). A
                 secure bootloader older than it is replaced too, so a 1.1.x
                 unit moves to a newer bootloader. None keeps the 1.1.0 rule.
+            before_app: Called with a :class:`DfuContext` in the new
+                bootloader's USB DFU, after the bootloader was replaced and
+                before the application is written (e.g. to write clinical
+                presets through the bootloader). Not called when the
+                bootloader is kept. Secure-bootloader path only: any other
+                path refuses before anything is written.
 
         Returns:
             :class:`UpdateResult` (``action`` ``"bl-migrate"`` when the
@@ -1030,10 +1130,13 @@ class LIFUTransmitterFirmwareUpdate:
                 come up, or a write/verify failure.
         """
         if force_production:
+            _refuse_before_app(before_app, "force-production")
             return self._force_production_update(production_image,
                                                  progress_callback)
         state, source = self.detect()
         in_dfu = source == "dfu"
+        if state != COHORT_SECURE:
+            _refuse_before_app(before_app, state)
         if state == COHORT_NO_DFU:
             raise RuntimeError(self._no_dfu_message())
         if state == COHORT_LEGACY and in_dfu:
@@ -1065,13 +1168,16 @@ class LIFUTransmitterFirmwareUpdate:
 
         app = _require_image(signed_app, "signed application image", "signed_app= / --app")
         return self._update_secure(state, app, in_dfu, force, bl_updater,
-                                   progress_callback, replace_bootloader, bl_target)
+                                   progress_callback, replace_bootloader, bl_target,
+                                   before_app)
 
     def _update_secure(self, state: str, app: str, in_dfu: bool, force: bool,
                        bl_updater: str | None,
                        progress_callback: Callable | None,
                        replace_bootloader: bool = False,
-                       bl_target: str | None = None) -> UpdateResult:
+                       bl_target: str | None = None,
+                       before_app: Callable[[DfuContext], None] | None = None
+                       ) -> UpdateResult:
         """The secure-bootloader path of :meth:`update`: the signed app over
         the master's USB DFU, replacing a 1.0.x bootloader through the updater
         shim first."""
@@ -1081,9 +1187,14 @@ class LIFUTransmitterFirmwareUpdate:
             time.sleep(2.0)
         mgr, kw = self._mgr, dict(vid=self.vid, pid=self.pid,
                                   libusb_dll=self.libusb_dll)
+
+        def get_bl(t: float) -> str:
+            return mgr._wait_for_dfu_kind(DFU_KIND_SECURE, timeout_s=t, **kw)
+
+        ctx = DfuContext("transmitter master", 0, mgr, wait_dfu=_usb_wait_dfu(get_bl), **kw)
         bl_version, migrated = _install_with_migration(
             "Transmitter",
-            get_bl=lambda t: mgr._wait_for_dfu_kind(DFU_KIND_SECURE, timeout_s=t, **kw),
+            get_bl=get_bl,
             program=lambda img: mgr.program_transmitter(
                 img, keys_dir=self.keys_dir, force=force,
                 progress_callback=progress_callback, **kw),
@@ -1093,7 +1204,8 @@ class LIFUTransmitterFirmwareUpdate:
                 bl_updater, "Transmitter", bl),
             entered=not in_dfu,
             slot_empty=lambda: mgr.get_transmitter_installed_version(**kw) is None,
-            replace=replace_bootloader, bl_target=bl_target)
+            replace=replace_bootloader, bl_target=bl_target,
+            before_app=(lambda: before_app(ctx)) if before_app else None)
         # The manifest resets the master and the bootloader verifies and
         # launches the new application: no power-cycle.
         if migrated:
@@ -1137,7 +1249,9 @@ class LIFUTransmitterFirmwareUpdate:
                      replace_bootloader: bool = False,
                      dfu_wait_s: float = 6.0,
                      progress_callback: Callable | None = None,
-                     bl_target: str | None = None) -> UpdateResult:
+                     bl_target: str | None = None,
+                     before_app: Callable[[DfuContext], None] | None = None
+                     ) -> UpdateResult:
         """Update a SLAVE transmitter module (index >= 1) over I2C, through
         the master. The master brokers everything on the one-wire + I2C buses.
 
@@ -1181,6 +1295,13 @@ class LIFUTransmitterFirmwareUpdate:
             force_production: reflash bootloader + app on a SECURE slave via
                 the signed DFU stub (see above). Beta/unlocked units only.
             dfu_wait_s: seconds to wait for a slave BL to come up on I2C.
+            bl_updater, replace_bootloader, bl_target: as in :meth:`update`.
+            before_app: Called with a :class:`DfuContext` (``mgr``,
+                ``i2c_addr``, ``reacquire``) in the new bootloader's I2C DFU,
+                after the bootloader was replaced and before the application
+                is written. Not called when the bootloader is kept. Secure
+                path only: the legacy and force-production paths refuse it
+                before anything is written.
 
         Raises:
             ValueError: module < 1, or a bad image.
@@ -1199,6 +1320,8 @@ class LIFUTransmitterFirmwareUpdate:
             legacy = (False if self._slave_in_bootloader(module)
                       else self._slave_path_is_legacy(module))
 
+        if legacy or force_production:
+            _refuse_before_app(before_app, "legacy" if legacy else "force-production")
         if legacy:
             return self._update_slave_legacy(module, production_image,
                                              stub_bin, dfu_wait_s,
@@ -1209,7 +1332,7 @@ class LIFUTransmitterFirmwareUpdate:
                 progress_callback)
         return self._update_slave_secure(module, signed_app, dfu_wait_s,
                                          progress_callback, bl_updater,
-                                         replace_bootloader, bl_target)
+                                         replace_bootloader, bl_target, before_app)
 
     def _slave_path_is_legacy(self, module: int) -> bool:
         """Choose the slave's update path from its running app version:
@@ -1322,7 +1445,9 @@ class LIFUTransmitterFirmwareUpdate:
                              progress_callback: Callable | None,
                              bl_updater: str | None = None,
                              replace_bootloader: bool = False,
-                             bl_target: str | None = None) -> UpdateResult:
+                             bl_target: str | None = None,
+                             before_app: Callable[[DfuContext], None] | None = None
+                             ) -> UpdateResult:
         tx = self._require_tx()
         app = _require_image(signed_app, "signed application image", "signed_app= / --app")
         if self._slave_in_bootloader(module):
@@ -1347,6 +1472,8 @@ class LIFUTransmitterFirmwareUpdate:
                 module, bl, dfu_wait_s, bl_target)
             logger.info("Slave %d bootloader replaced: %s -> %s; installing "
                         "the application", module, bl, new_bl)
+            if before_app is not None:
+                i2c_addr = self._slave_before_app(module, mgr, i2c_addr, before_app)
         bl_version = mgr.program_transmitter_slave_i2c(
             app, i2c_addr=i2c_addr, keys_dir=self.keys_dir,
             progress_callback=progress_callback)
@@ -1374,27 +1501,14 @@ class LIFUTransmitterFirmwareUpdate:
         :data:`SLAVE_MIGRATION_POLL_S` (see there), reopening the master's
         port if it was lost.
         """
-        from openlifu_sdk.io.LIFUConfig import NODE_MODE_BOOTLOADER
-        tx = self._require_tx()
-        deadline = time.monotonic() + MIGRATION_TIMEOUT_S
-        seen = old_bl
         logger.info("Slave %d: waiting %.0f s for the updater to replace the "
                     "bootloader", module, SLAVE_MIGRATION_SETTLE_S)
-        time.sleep(max(SLAVE_MIGRATION_SETTLE_S, dfu_wait_s))
-        while True:
-            try:
-                _reopen(tx)
-                count = tx.enumerate_modules()
-                if module < count and tx.get_module_mode(module) == NODE_MODE_BOOTLOADER:
-                    addr = tx.get_module_i2c_addr(module)
-                    seen = STM32I2CDFUviaMaster(tx.uart, i2c_addr=addr).get_version()
-                    if not bootloader_needs_migration(seen, bl_target):
-                        return addr, seen
-            except Exception as e:  # noqa: BLE001 - keep polling until the deadline
-                logger.info("Slave %d not back yet (%s)", module, e)
-            if time.monotonic() + SLAVE_MIGRATION_POLL_S > deadline:
-                break
-            time.sleep(SLAVE_MIGRATION_POLL_S)
+        addr, seen = self._slave_wait_bootloader(
+            module, max(SLAVE_MIGRATION_SETTLE_S, dfu_wait_s),
+            lambda v: not bootloader_needs_migration(v, bl_target))
+        if addr is not None:
+            return addr, seen
+        seen = seen or old_bl
         raise RuntimeError(
             f"slave module {module}: the bootloader updater was installed on "
             f"bootloader {old_bl} but no newer bootloader came up within "
@@ -1402,6 +1516,56 @@ class LIFUTransmitterFirmwareUpdate:
             f"back in bootloader {old_bl}, the updater refused it (protected "
             "unit) and nothing was changed; if it no longer answers, recover "
             "it over SWD.")
+
+    def _slave_wait_bootloader(self, module: int, settle_s: float,
+                               accept: Callable[[str], bool]
+                               ) -> tuple[int | None, str | None]:
+        """Wait *settle_s*, then re-enumerate every :data:`SLAVE_MIGRATION_POLL_S`
+        (reopening a lost master port) until *module* is a bootloader node whose
+        I2C DFU version *accept* takes, for at most :data:`MIGRATION_TIMEOUT_S`.
+        Returns ``(i2c_addr, version)``, or ``(None, last version seen)`` at the
+        deadline."""
+        from openlifu_sdk.io.LIFUConfig import NODE_MODE_BOOTLOADER
+        tx = self._require_tx()
+        deadline = time.monotonic() + MIGRATION_TIMEOUT_S
+        seen = None
+        time.sleep(settle_s)
+        while True:
+            try:
+                _reopen(tx)
+                count = tx.enumerate_modules()
+                if module < count and tx.get_module_mode(module) == NODE_MODE_BOOTLOADER:
+                    addr = tx.get_module_i2c_addr(module)
+                    seen = STM32I2CDFUviaMaster(tx.uart, i2c_addr=addr).get_version()
+                    if accept(seen):
+                        return addr, seen
+            except Exception as e:  # noqa: BLE001 - keep polling until the deadline
+                logger.info("Slave %d not back yet (%s)", module, e)
+            if time.monotonic() + SLAVE_MIGRATION_POLL_S > deadline:
+                return None, seen
+            time.sleep(SLAVE_MIGRATION_POLL_S)
+
+    def _slave_before_app(self, module: int, mgr: Any, i2c_addr: int,
+                          before_app: Callable[[DfuContext], None]) -> int:
+        """Run *before_app* in the slave's new bootloader DFU; returns the I2C
+        address the slave has when it returns (a reset re-assigns it)."""
+        ctx = DfuContext(f"transmitter module {module}", module, mgr, i2c_addr=i2c_addr)
+
+        def reacquire() -> int:
+            addr, seen = self._slave_wait_bootloader(module, SLAVE_PRESET_SETTLE_S,
+                                                     lambda _v: True)
+            if addr is None:
+                raise RuntimeError(
+                    f"slave module {module} did not come back in its bootloader's "
+                    f"I2C DFU within {MIGRATION_TIMEOUT_S:.0f} s after a reset "
+                    f"(last seen: {seen}); its application slot is empty, so it "
+                    "stays in DFU: re-run the update")
+            ctx.i2c_addr = addr
+            return addr
+
+        ctx.reacquire = reacquire
+        before_app(ctx)
+        return ctx.i2c_addr
 
     def _slave_in_bootloader(self, module: int) -> bool:
         """True when the master already lists *module* as a bootloader node
@@ -1417,7 +1581,8 @@ class LIFUTransmitterFirmwareUpdate:
                      bl_updater: str | None = None, replace_bootloader: bool = False,
                      dfu_wait_s: float = 6.0,
                      progress_callback: Callable | None = None,
-                     bl_target: str | None = None
+                     bl_target: str | None = None,
+                     before_app: Callable[[DfuContext], None] | None = None
                      ) -> list[UpdateResult]:
         """Update every module of the chain: each slave over I2C first, while
         the master still runs the firmware that brokers it, then the master
@@ -1430,6 +1595,9 @@ class LIFUTransmitterFirmwareUpdate:
         back after its watchdog reset and is picked up by the next
         re-enumeration, which the next slave's update does.
 
+        *before_app* is passed to every module's update (its
+        :class:`DfuContext` names the module).
+
         Returns:
             One :class:`UpdateResult` per module, slaves first, master last.
         """
@@ -1440,12 +1608,12 @@ class LIFUTransmitterFirmwareUpdate:
                                      replace_bootloader=replace_bootloader,
                                      dfu_wait_s=dfu_wait_s,
                                      progress_callback=progress_callback,
-                                     bl_target=bl_target)
+                                     bl_target=bl_target, before_app=before_app)
                    for m in range(1, count)]
         results.append(self.update(signed_app=signed_app, bl_updater=bl_updater,
                                    replace_bootloader=replace_bootloader,
                                    progress_callback=progress_callback,
-                                   bl_target=bl_target))
+                                   bl_target=bl_target, before_app=before_app))
         return results
 
     def _update_slave_legacy(self, module: int, production_image: str | None,

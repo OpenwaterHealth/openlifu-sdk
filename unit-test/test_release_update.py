@@ -91,8 +91,8 @@ def preset_package(keys, board, domain="research", commit=COMMIT, body=b"preset"
                               keys=keys[board, domain])
 
 
-def make_presets(root, keys, domain="research", commit=COMMIT, n=RELEASED):
-    d = root / "presets"
+def make_presets(root, keys, domain="research", commit=COMMIT, n=RELEASED, name="presets"):
+    d = root / name
     d.mkdir()
     (d / "console-presets.bin").write_bytes(preset_package(keys, "console", domain, commit))
     entries = []
@@ -123,6 +123,7 @@ class FakeBoard:
         self.images = list(images)
         self.domains = [domain] * len(self.images)
         self.versions = [LIFUCrypto.FirmwareHeader.from_bytes(i).fw_version_str for i in self.images]
+        self.configs = [b"OWCF" + bytes([m]) + b'{"sens":1}' for m in range(len(self.images))]
 
     def get_version(self, module=0):
         return self.versions[module]
@@ -135,6 +136,19 @@ class FakeBoard:
 
     def is_connected(self):
         return True
+
+    def read_config(self, module=0):
+        if isinstance(self.configs[module], Exception):
+            raise self.configs[module]
+        return _Config(self.configs[module])
+
+
+class _Config:
+    def __init__(self, raw):
+        self.raw = raw
+
+    def to_wire_bytes(self):
+        return self.raw
 
 
 class FakeHv(FakeBoard):
@@ -309,10 +323,18 @@ def test_a_current_firmware_that_cannot_name_its_key_is_still_refused(release, k
     assert all("cannot tell which key" in s.detail for s in plan.refusals)
 
 
-def test_a_clinical_release_is_not_put_on_a_field_unit_yet(release, keys):
+def test_a_field_unit_given_a_clinical_release_is_converted(release, keys):
     hv, tx = _from_before_the_signature_check(*unit(keys, release))
-    step = ru.firmware_step(ru.read_boards(hv, tx)[1], release.apps["transmitter"], "clinical")
-    assert step.action == "refuse" and "clinical is not supported" in step.detail
+    step = ru.firmware_step(ru.read_boards(hv, tx)[1], release.apps["transmitter"], "clinical",
+                            "1.1.0-rc.3-clinical")
+    assert step.action == "convert" and "1.1.0-rc.3-clinical replaces" in step.detail
+
+
+def test_a_field_unit_before_the_secure_bootloader_is_not_converted(release, keys):
+    hv, tx = _from_before_the_signature_check(*unit(keys, release), hv_version="1.2.5")
+    step = ru.firmware_step(ru.read_boards(hv, tx)[0], release.apps["console"], "clinical",
+                            "1.1.0-rc.3-clinical")
+    assert step.action == "refuse" and "predates the secure bootloader" in step.detail
 
 
 def test_a_newer_unit_is_refused_before_dfu(release, keys):
@@ -484,3 +506,292 @@ def test_a_refused_image_takes_the_unit_out_of_dfu():
     with pytest.raises(DFUWriteRefusedError):
         _program_or_abort(program, "app.bin", lambda: aborted.append(True), entered=True)
     assert aborted == [True]
+
+
+# ---------------------------------------------------------------------------
+# User configuration: kept across the update
+# ---------------------------------------------------------------------------
+
+def test_a_changed_user_configuration_fails_the_read_back(release, keys, fake_updaters):
+    hv, tx = unit(keys, release, tx_body=b"tx-rc7")
+    fake_updaters(release, hv, tx)
+    update = ru.ReleaseUpdate(release, hv, tx)
+    plan = update.plan()
+    tx.configs[1] = b"OWCF\x01{}"                  # module 1 lost its configuration
+    result = update.run(plan)
+    assert not result.ok
+    assert "[FAIL] transmitter module 1: user configuration CHANGED" in result.lines
+    assert "[ok] console: user configuration unchanged" in result.lines
+
+
+def test_a_configuration_unreadable_before_is_skipped_not_failed(release, keys):
+    """Old firmware (a field unit) may not answer the read: nothing to
+    compare, so it is reported and does not fail the update."""
+    hv, tx = unit(keys, release)
+    hv.configs[0] = RuntimeError("no reply")
+    update = ru.ReleaseUpdate(release, hv, tx)
+    update.plan()
+    hv.configs[0] = b"OWCF{}"
+    result = update.verify()
+    assert result.ok
+    assert any(line.startswith("[skip] console: user configuration could not be read before")
+               and "no reply" in line for line in result.lines)
+
+
+def test_a_configuration_unreadable_after_the_update_fails(release, keys):
+    hv, tx = unit(keys, release)
+    update = ru.ReleaseUpdate(release, hv, tx)
+    update.plan()
+    hv.configs[0] = RuntimeError("no reply")
+    result = update.verify()
+    assert not result.ok
+    assert any(line.startswith("[FAIL] console: user configuration could not be read back")
+               for line in result.lines)
+
+
+# ---------------------------------------------------------------------------
+# Research -> clinical conversion
+# ---------------------------------------------------------------------------
+
+CLINICAL_BL = {"console": "1.1.0-rc.3-clinical", "transmitter": "1.1.0-rc.3-clinical"}
+
+
+def make_clinical_firmware(root, keys, bootloaders=None):
+    """The diathermy clinical-firmware layout: clinical-firmware/ with the
+    lock and one folder per repo, each with its own SHA256SUMS (no top-level
+    one); the updaters are research-signed and carry the clinical bootloader."""
+    fw = root / "clinical-firmware"
+    for board, folder, version, body in (("console", "openlifu-console-fw", "1.3.0", b"hv-rc8"),
+                                         ("transmitter", "openlifu-transmitter-fw", "2.1.0",
+                                          b"tx-rc8")):
+        (fw / folder).mkdir(parents=True)
+        (fw / folder / f"{folder}-v1-signed.bin").write_bytes(
+            app_image(keys, board, "clinical", version, body))
+        (fw / folder / f"{folder}-v1-production.bin").write_bytes(b"production")
+        _sums(fw / folder)
+    for board, folder in (("console", "open-lifu-console-bl-updater"),
+                          ("transmitter", "open-lifu-transmitter-bl-updater")):
+        (fw / folder).mkdir(parents=True)
+        (fw / folder / f"{folder}-v1-clinical-signed.bin").write_bytes(
+            app_image(keys, board, "research", "31.63.30", b"shim"))
+        (fw / folder / f"{folder}-v1-clinical.cdx.json").write_text(json.dumps(
+            {"components": [{"name": ru.BOOTLOADER_COMPONENTS[board],
+                             "version": (bootloaders or CLINICAL_BL)[board]}]}))
+        _sums(fw / folder)
+    (fw / "firmware-lock.json").write_text(json.dumps({"firmware": {}}))
+    return fw
+
+
+@pytest.fixture
+def clinical(tmp_path, keys):
+    return ru.ReleaseBundle.load(make_clinical_firmware(tmp_path, keys),
+                                 make_presets(tmp_path, keys, "clinical", name="clinical-presets"),
+                                 workdir=tmp_path / "work")
+
+
+def research_unit(keys, release, modules=2):
+    """A research unit on other firmware and other presets than *release*."""
+    return unit(keys, release, tx_body=b"tx-rc7", hv_body=b"hv-rc7", commit=OLD_COMMIT,
+                modules=modules)
+
+
+def test_a_clinical_release_loads(clinical):
+    assert clinical.domain == "clinical"
+    assert {b: i.domain for b, i in clinical.updaters.items()} == {"console": "research",
+                                                                   "transmitter": "research"}
+    assert clinical.bootloaders == CLINICAL_BL
+    assert clinical.presets.context == "clinical"
+
+
+def test_clinical_presets_not_signed_clinical_are_refused_at_load(tmp_path, keys):
+    fw = make_clinical_firmware(tmp_path, keys)
+    with pytest.raises(ru.ReleaseError, match="not signed with the clinical"):
+        ru.ReleaseBundle.load(fw, make_presets(tmp_path, keys, "research"))
+
+
+def test_a_research_unit_given_a_clinical_release_is_converted(clinical, keys):
+    hv, tx = research_unit(keys, clinical)
+    plan = ru.ReleaseUpdate(clinical, hv, tx).plan()
+    assert plan.refusals == []
+    assert [s.action for s in plan.firmware] == ["convert"] * 3
+    assert all("1.1.0-rc.3-clinical replaces the research one" in s.detail
+               and "RDP1" in s.detail for s in plan.firmware)
+    assert {s.action for s in plan.presets} == {"write-presets-dfu"}
+    assert [(s.module, s.slot) for s in plan.presets] == [(None, None)] + [
+        (m, s) for m in range(2) for s in range(RELEASED)]
+
+
+def test_a_stray_research_preset_is_not_cleared_on_a_converted_board(clinical, keys):
+    """The updater erases every preset: nothing to clear."""
+    hv, tx = research_unit(keys, clinical)
+    tx.slots[1][13] = preset_package(keys, "transmitter", body=b"stray")
+    plan = ru.ReleaseUpdate(clinical, hv, tx).plan()
+    assert "clear-slot" not in {s.action for s in plan.presets} and not plan.refusals
+
+
+def test_an_updater_without_a_clinical_bootloader_is_not_used_to_convert(tmp_path, keys):
+    bundle = ru.ReleaseBundle.load(
+        make_clinical_firmware(tmp_path, keys, {"console": "1.1.0-rc.3", "transmitter": "1.1.0"}),
+        make_presets(tmp_path, keys, "clinical"), workdir=tmp_path / "work")
+    hv, tx = research_unit(keys, bundle)
+    plan = ru.ReleaseUpdate(bundle, hv, tx).plan()
+    assert len([s for s in plan.refusals if s.board]) == 3
+    assert all("not a clinical one" in s.detail for s in plan.refusals if s.board)
+
+
+def test_a_conversion_without_the_clinical_presets_is_refused(tmp_path, keys):
+    bundle = ru.ReleaseBundle.load(make_clinical_firmware(tmp_path, keys), workdir=tmp_path / "w")
+    hv, tx = research_unit(keys, bundle)
+    plan = ru.ReleaseUpdate(bundle, hv, tx).plan()
+    assert [s.target for s in plan.refusals] == ["presets"]
+
+
+def _with_clinical_presets(hv, tx, bundle):
+    hv.preset = bundle.presets.console
+    for m in tx.slots:
+        tx.slots[m] = {s: bundle.presets.tx_image(s, m) for s in range(RELEASED)}
+    return hv, tx
+
+
+def test_a_clinical_unit_on_the_clinical_release_needs_nothing(clinical, keys):
+    hv, tx = _with_clinical_presets(*unit(keys, clinical, domain="clinical"), clinical)
+    plan = ru.ReleaseUpdate(clinical, hv, tx).plan()
+    assert plan.work == [] and plan.refusals == []
+
+
+def test_an_older_clinical_unit_gets_a_firmware_update(clinical, keys):
+    hv, tx = _with_clinical_presets(*unit(keys, clinical, domain="clinical", tx_body=b"tx-rc7"),
+                                    clinical)
+    plan = ru.ReleaseUpdate(clinical, hv, tx).plan()
+    assert [s.action for s in plan.firmware] == ["none", "firmware", "firmware"]
+    assert plan.refusals == []
+
+
+def test_clinical_presets_are_not_written_to_a_clinical_unit_yet(clinical, keys):
+    hv, tx = unit(keys, clinical, domain="clinical", commit=OLD_COMMIT)
+    plan = ru.ReleaseUpdate(clinical, hv, tx).plan()
+    assert [s.action for s in plan.firmware] == ["none"] * 3
+    assert len(plan.refusals) == 1 + 2 * RELEASED
+    assert all("clinical preset-only update not supported yet" in s.detail for s in plan.refusals)
+
+
+def test_a_clinical_unit_is_never_given_a_research_release(release, keys):
+    hv, tx = unit(keys, release, domain="clinical")
+    plan = ru.ReleaseUpdate(release, hv, tx).plan()
+    assert plan.refusals and all("RMA" in s.detail for s in plan.refusals if s.board)
+
+
+class _FakeDfu:
+    """The bootloader DFU writers a before_app uses: they check the key they
+    are given and store the package on the fake board."""
+
+    def __init__(self, hv, tx, log):
+        self.hv, self.tx, self.log = hv, tx, log
+
+    def _check(self, package, public_key):
+        if not pp.verify_preset_package(package, public_key):
+            raise ValueError("Preset is not signed by the given key")
+
+    def program_console_presets(self, package, public_key=None, **_):
+        self._check(package, public_key)
+        self.hv.preset = package
+        self.log.append(("console page",))
+
+    def program_transmitter_preset(self, slot, package, public_key=None, **_):
+        self._check(package, public_key)
+        self.tx.slots[0][slot] = package
+        self.log.append(("master slot", slot))
+
+    def program_transmitter_slave_preset_i2c(self, slot, package, i2c_addr, public_key=None, **_):
+        self._check(package, public_key)
+        self.tx.slots[i2c_addr - 0x40][slot] = package
+        self.log.append(("slave slot", i2c_addr - 0x40, slot))
+
+
+@pytest.fixture
+def converting_updaters(monkeypatch):
+    """Fake updaters that convert: the updater erases the board's presets,
+    the before_app runs in a DfuContext over _FakeDfu, then the clinical app."""
+    from openlifu_sdk.io import LIFUFirmwareUpdate as fu
+
+    def install(release, hv, tx):
+        rec = {"kwargs": {}, "log": []}
+        dfu = _FakeDfu(hv, tx, rec["log"])
+        app = {b: i.path.read_bytes() for b, i in release.apps.items()}
+
+        def context(name, module):
+            if module == 0:
+                return fu.DfuContext(name, 0, dfu, wait_dfu=lambda: rec["log"].append("wait"))
+            return fu.DfuContext(name, module, dfu, i2c_addr=0x40 + module,
+                                 reacquire=lambda: rec["log"].append("reacquire") or 0x40 + module)
+
+        def convert(name, board, module, kw):
+            rec["kwargs"][name] = kw
+            rec["log"].append(("updater", name))
+            if board is hv:
+                hv.preset = None
+            else:
+                tx.slots[module] = {}
+            kw["before_app"](context(name, module))
+            rec["log"].append(("app", name))
+            board.images[module] = app["console" if board is hv else "transmitter"]
+            board.domains[module] = "clinical"
+            return type("R", (), {"summary": f"{name} converted"})()
+
+        class Console:
+            def __init__(self, hv=None, **_):
+                pass
+
+            def update(self, **kw):
+                return convert("console", hv, 0, kw)
+
+        class Transmitter:
+            def __init__(self, tx=None, **_):
+                pass
+
+            def update_slave(self, module, **kw):
+                return convert(f"transmitter module {module}", tx, module, kw)
+
+            def update(self, **kw):
+                return convert("transmitter master", tx, 0, kw)
+
+        monkeypatch.setattr(fu, "LIFUFirmwareUpdate", Console)
+        monkeypatch.setattr(fu, "LIFUTransmitterFirmwareUpdate", Transmitter)
+        return rec
+    return install
+
+
+def test_a_conversion_replaces_the_bootloader_and_writes_the_presets_before_the_app(
+        clinical, keys, converting_updaters):
+    hv, tx = research_unit(keys, clinical)
+    rec = converting_updaters(clinical, hv, tx)
+    update = ru.ReleaseUpdate(clinical, hv, tx)
+    result = update.run(update.plan())
+    assert result.ok, result.lines
+    for name, kw in rec["kwargs"].items():
+        assert kw["replace_bootloader"] is True and kw["bl_target"] is None, name
+        board = "console" if name == "console" else "transmitter"
+        assert kw["bl_updater"] == str(clinical.updaters[board].path)
+    slots = range(RELEASED)
+    assert rec["log"] == (
+        [("updater", "console"), ("console page",), "wait", ("app", "console")]
+        + [("updater", "transmitter module 1")]
+        + [e for s in slots for e in (("slave slot", 1, s), "reacquire")]
+        + [("app", "transmitter module 1"), ("updater", "transmitter master")]
+        + [e for s in slots for e in (("master slot", s), "wait")]
+        + [("app", "transmitter master")])
+    assert hv.log == [] and tx.log == []        # nothing through the clinical applications
+    assert "[ok] transmitter module 1: user configuration unchanged" in result.lines
+
+
+def test_a_conversion_checks_each_preset_against_the_clinical_key(clinical, keys,
+                                                                   converting_updaters):
+    """The writers are given the clinical key: a package the research key
+    signed is refused before anything is staged."""
+    hv, tx = research_unit(keys, clinical)
+    converting_updaters(clinical, hv, tx)
+    update = ru.ReleaseUpdate(clinical, hv, tx)
+    plan = update.plan()
+    object.__setattr__(clinical.presets, "console", preset_package(keys, "console"))
+    with pytest.raises(ValueError, match="not signed by the given key"):
+        update.run(plan)
