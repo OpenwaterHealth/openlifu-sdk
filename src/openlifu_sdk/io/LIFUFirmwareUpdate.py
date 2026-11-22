@@ -100,6 +100,7 @@ from openlifu_sdk.io.LIFUDFU import (
     STM32I2CDFUviaMaster,
     TRANSMITTER_MIN_DFU_APP_VERSION,
     TRANSMITTER_PROFILE,
+    DFUWriteRefusedError,
     infer_console_bootloader_from_app_version,
     infer_transmitter_bootloader_from_app_version,
 )
@@ -259,9 +260,11 @@ def _program_or_abort(program: Callable[[str], None], image: str,
                       abort: Callable[[], None], entered: bool) -> None:
     try:
         program(image)
-    except ValueError:
-        # Pre-flight refusal: nothing was erased. If this call put the unit
-        # into DFU, boot the installed application back up.
+    except (ValueError, DFUWriteRefusedError):
+        # Pre-flight refusal, or the bootloader refused the image at its
+        # first block (open-lifu-*-bl >= 1.1.0 checks the header before it
+        # erases): nothing was erased. If this call put the unit into DFU,
+        # boot the installed application back up.
         if entered:
             abort()
         raise
