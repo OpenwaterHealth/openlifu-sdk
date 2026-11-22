@@ -424,3 +424,139 @@ def test_update_chain_updates_slaves_before_the_master():
     upd.update = lambda **kw: order.append(("master", 0)) or "m"
     assert upd.update_chain(signed_app=APP) == ["s1", "s2", "m"]
     assert order == [("slave", 1), ("slave", 2), ("master", 0)]
+
+
+# ---------------------------------------------------------------- clinical bootloader versions
+
+@pytest.mark.parametrize("version, key", [
+    ("1.1.0-rc.3-clinical", (1, 1, 0, 0, 3)),
+    ("1.1.0-rc.3+clinical", (1, 1, 0, 0, 3)),
+    ("1.1.0-clinical", (1, 1, 0, 1, 0)),
+    ("v1.1.0-rc.10-clinical", (1, 1, 0, 0, 10)),
+    ("1.1.0-rc.3", (1, 1, 0, 0, 3)),
+    ("1.1.0", (1, 1, 0, 1, 0)),
+])
+def test_bl_release_key_ignores_the_clinical_suffix(version, key):
+    assert fu._bl_release_key(version) == key
+
+
+@pytest.mark.parametrize("version, target, needs", [
+    ("1.1.0-rc.2", "1.1.0-rc.3-clinical", True),
+    ("1.1.0-rc.3-clinical", "1.1.0-rc.3", False),
+    ("1.1.0-rc.3-clinical", "1.1.0-clinical", True),
+    ("1.1.0-clinical", "1.1.0-rc.3-clinical", False),
+])
+def test_clinical_bootloaders_order_as_their_release(version, target, needs):
+    assert fu.bootloader_needs_migration(version, target) is needs
+
+
+# ---------------------------------------------------------------- before_app (clinical presets)
+
+def test_console_before_app_runs_after_the_replacement_and_before_the_app(shim):
+    # research BL -> updater -> (old BL holds the updater) -> clinical BL, empty slot;
+    # the callback's wait_dfu reads it once more after its reset
+    upd, _, mgr = console(["1.1.0-rc.3"] * 3 + ["1.1.0-rc.3-clinical"], app_version="1.3.0",
+                          slot_empty=[2143, None])
+    seen = {}
+
+    def before_app(ctx):
+        seen["written"] = programmed(mgr, "program_console")
+        seen["ctx"] = (ctx.device, ctx.module, ctx.mgr, ctx.vid, ctx.pid)
+        seen["bl"] = ctx.wait_dfu()
+
+    r = upd.update(signed_app=APP, bl_updater=shim, replace_bootloader=True, bl_target=None,
+                   before_app=before_app)
+    assert seen["written"] == [shim]
+    assert seen["ctx"] == ("console", 0, mgr, 0x0483, 0xDF11)
+    assert seen["bl"] == "1.1.0-rc.3-clinical"
+    assert programmed(mgr, "program_console") == [shim, APP]
+    assert r.action == "bl-migrate"
+
+
+def test_console_before_app_is_not_called_when_the_bootloader_is_kept(shim):
+    upd, _, mgr = console(["1.1.0-rc.3"], app_version="1.3.0")
+    called = []
+    upd.update(signed_app=APP, bl_updater=shim, before_app=called.append)
+    assert called == [] and programmed(mgr, "program_console") == [APP]
+
+
+def test_before_app_is_refused_off_the_secure_bootloader_path(shim):
+    upd, hv, mgr = console(["1.0.3-rc.1"], app_version="1.2.4")      # legacy bootloader
+    with pytest.raises(RuntimeError, match="before_app needs the secure-bootloader path"):
+        upd.update(signed_app=APP, bl_updater=shim, before_app=lambda ctx: None)
+    hv.enter_dfu.assert_not_called()
+    mgr.migrate_console_legacy.assert_not_called()
+
+
+def test_master_before_app_runs_after_the_replacement_and_before_the_app(shim):
+    upd, _, mgr = master(["1.1.0-rc.3", "1.1.0-rc.3-clinical", "1.1.0-rc.3-clinical",
+                          "1.1.0-rc.3-clinical"], app_version="2.1.0")
+    seen = []
+
+    def before_app(ctx):
+        assert ctx.device == "transmitter master" and ctx.mgr is mgr
+        for _slot in range(2):
+            seen.append((programmed(mgr, "program_transmitter"), ctx.wait_dfu()))
+
+    r = upd.update(signed_app=APP, bl_updater=shim, replace_bootloader=True, bl_target=None,
+                   before_app=before_app)
+    assert seen == [([shim], "1.1.0-rc.3-clinical")] * 2
+    assert programmed(mgr, "program_transmitter") == [shim, APP]
+    assert r.action == "bl-migrate"
+    for c in mgr._wait_for_dfu_kind.call_args_list:
+        assert c.args[0] == fu.DFU_KIND_SECURE
+
+
+def test_slave_before_app_runs_in_the_new_bootloader_and_reacquires_it(clock, mgr, monkeypatch,
+                                                                       shim):
+    # version before, after the updater, then after each of two preset resets
+    i2c_versions(monkeypatch, ["1.1.0-rc.3"] + ["1.1.0-rc.3-clinical"] * 3)
+    chain = FakeChain(clock)
+    seen = []
+
+    def before_app(ctx):
+        assert (ctx.device, ctx.module, ctx.mgr, ctx.i2c_addr) == (
+            "transmitter module 1", 1, mgr, 0x20)
+        for _slot in range(2):
+            t = clock["t"]
+            seen.append((written(mgr), ctx.reacquire()))
+            enums = [e for e in chain.log if e[0] == "enumerate" and e[1] > t]
+            assert enums and enums[0][1] - t >= fu.SLAVE_PRESET_SETTLE_S
+
+    r = fu.LIFUTransmitterFirmwareUpdate(tx=chain).update_slave(
+        1, signed_app=APP, legacy=False, bl_updater=shim, replace_bootloader=True,
+        bl_target=None, before_app=before_app)
+    assert seen == [([shim], 0x20)] * 2
+    assert written(mgr) == [shim, APP]
+    assert mgr.program_transmitter_slave_i2c.call_args_list[-1].kwargs["i2c_addr"] == 0x20
+    assert r.action == "bl-migrate-i2c"
+
+
+def test_slave_that_does_not_come_back_after_a_preset_reset(clock, mgr, monkeypatch, shim):
+    i2c_versions(monkeypatch, ["1.1.0-rc.3", "1.1.0-rc.3-clinical"])
+    chain = FakeChain(clock)
+
+    def before_app(ctx):
+        chain.modes[1] = NODE_MODE_APP        # gone from the bootloader
+        ctx.reacquire()
+
+    with pytest.raises(RuntimeError, match="did not come back in its bootloader"):
+        fu.LIFUTransmitterFirmwareUpdate(tx=chain).update_slave(
+            1, signed_app=APP, legacy=False, bl_updater=shim, replace_bootloader=True,
+            before_app=before_app)
+    assert written(mgr) == [shim]           # the app was not attempted
+
+
+def test_update_chain_passes_before_app_to_every_module():
+    tx = MagicMock()
+    tx.get_module_count.return_value = 2
+    upd = fu.LIFUTransmitterFirmwareUpdate(tx=tx)
+    got = []
+    upd.update_slave = lambda m, **kw: got.append(kw["before_app"])
+    upd.update = lambda **kw: got.append(kw["before_app"])
+
+    def before_app(ctx):
+        return None
+
+    upd.update_chain(signed_app=APP, before_app=before_app)
+    assert got == [before_app, before_app]
