@@ -274,6 +274,47 @@ def test_a_field_unit_is_updated(release, keys):
     assert {s.action for s in plan.firmware} == {"firmware"}
 
 
+def _from_before_the_signature_check(hv, tx, tx_version="2.0.8", hv_version="1.2.6"):
+    """What a field unit answers: its version, and an error for the
+    signature check and the header (bench, 2026-11-22: console 1.2.6 and
+    transmitter 2.0.8)."""
+    hv.versions, hv.domains = [hv_version], ["error"]
+    tx.versions = [tx_version] * len(tx.images)
+    tx.domains = ["error"] * len(tx.images)
+    for board in (hv, tx):
+        board.firmware_header = lambda module=0: None
+    return hv, tx
+
+
+def test_a_field_unit_that_cannot_name_its_key_is_updated(release, keys):
+    hv, tx = _from_before_the_signature_check(*unit(keys, release))
+    plan = ru.ReleaseUpdate(release, hv, tx).plan()
+    assert not plan.refusals
+    assert [s.action for s in plan.firmware] == ["firmware"] * 3
+    assert all("1.0.x bootloader is replaced" in s.detail for s in plan.firmware)
+
+
+def test_an_fda_field_build_is_refused_before_dfu(release, keys):
+    hv, tx = _from_before_the_signature_check(*unit(keys, release), tx_version="2.0.8+fda")
+    plan = ru.ReleaseUpdate(release, hv, tx).plan()
+    assert [s.target for s in plan.refusals] == ["transmitter master", "transmitter module 1"]
+    assert all("FDA build" in s.detail for s in plan.refusals)
+
+
+def test_a_current_firmware_that_cannot_name_its_key_is_still_refused(release, keys):
+    hv, tx = _from_before_the_signature_check(*unit(keys, release), tx_version="2.1.0",
+                                              hv_version="1.3.0")
+    plan = ru.ReleaseUpdate(release, hv, tx).plan()
+    assert len([s for s in plan.refusals if s.board]) == 3
+    assert all("cannot tell which key" in s.detail for s in plan.refusals)
+
+
+def test_a_clinical_release_is_not_put_on_a_field_unit_yet(release, keys):
+    hv, tx = _from_before_the_signature_check(*unit(keys, release))
+    step = ru.firmware_step(ru.read_boards(hv, tx)[1], release.apps["transmitter"], "clinical")
+    assert step.action == "refuse" and "clinical is not supported" in step.detail
+
+
 def test_a_newer_unit_is_refused_before_dfu(release, keys):
     hv, tx = unit(keys, release, tx_version="2.1.1")
     plan = ru.ReleaseUpdate(release, hv, tx).plan()

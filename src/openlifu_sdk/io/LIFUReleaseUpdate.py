@@ -47,6 +47,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import re
 import tempfile
 import time
 import zipfile
@@ -68,6 +69,11 @@ UPDATER_DIRS = {"console": "open-lifu-console-bl-updater",
 BOOTLOADER_COMPONENTS = {"console": "open-lifu-console-bl",
                          "transmitter": "open-lifu-transmitter-bl"}
 DOMAINS = ("clinical", "research")
+#: Firmware below these versions predates the signature-check command, so
+#: firmware_domain() answers with an error. It runs a 1.0.x bootloader, which
+#: was only ever built with the research keys (the clinical domain starts at
+#: bootloader 1.1.0), and the release update replaces that bootloader first.
+LEGACY_BELOW = {"console": (1, 3, 0), "transmitter": (2, 1, 0)}
 #: How long an application may take to answer again after its update (a
 #: bootloader replacement included; the VM may re-attach USB).
 APP_RETURN_TIMEOUT_S = 120.0
@@ -387,8 +393,39 @@ class ReleasePlan:
         return lines
 
 
+def _version_tuple(text: str) -> tuple[int, int, int] | None:
+    m = re.match(r"v?(\d+)\.(\d+)\.(\d+)", text.strip())
+    return (int(m[1]), int(m[2]), int(m[3])) if m else None
+
+
+def is_legacy(board: Board) -> bool:
+    """True for firmware from before the signature check (see
+    :data:`LEGACY_BELOW`): it cannot say which key signed it."""
+    version = _version_tuple(board.version)
+    return (board.domain == "error" and version is not None
+            and version < LEGACY_BELOW[board.board])
+
+
+def _legacy_step(board: Board, image: SignedImage, domain: str) -> Step:
+    """A field unit from before the signature check: research by
+    construction. Its bootloader still checks every image it is given, so a
+    wrong guess is refused in DFU and the unit is returned to its app."""
+    if "fda" in board.version.lower():
+        return Step(board.name, "refuse", f"runs {board.version}, an FDA build that refuses DFU "
+                    "from its application; nothing will be written", board)
+    if domain != "research":
+        return Step(board.name, "refuse", f"runs {board.version} (research, from before the "
+                    "signature check): converting a research unit to clinical is not supported "
+                    "by this release update yet", board)
+    return Step(board.name, "firmware", f"{board.version} (research, from before the signature "
+                f"check) -> {image.version} ({image.build}); its 1.0.x bootloader is replaced "
+                "first in DFU", board)
+
+
 def firmware_step(board: Board, image: SignedImage, domain: str) -> Step:
     """What *board* needs to run the release's *image*."""
+    if is_legacy(board):
+        return _legacy_step(board, image, domain)
     if board.domain != domain:
         return Step(board.name, "refuse", _domain_refusal(board, domain), board)
     if board.header is None:
