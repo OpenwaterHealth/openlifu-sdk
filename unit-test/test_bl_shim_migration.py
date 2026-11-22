@@ -59,6 +59,25 @@ def test_bootloader_needs_migration(version, needs):
     assert fu.bootloader_needs_migration(version) is needs
 
 
+@pytest.mark.parametrize("version, target, needs", [
+    ("1.1.0-rc.2", "1.1.0-rc.3", True),      # an older rc of the same release
+    ("1.1.0-rc.3", "1.1.0", True),           # an rc before its release
+    ("1.1.0-rc.9", "1.1.0-rc.10", True),     # rc numbers compare as numbers
+    ("1.1.0", "1.1.1-rc.1", True),
+    ("1.1.0-rc.2", "1.1.0-rc.2", False),     # the same bootloader: nothing to do
+    ("1.1.0", "1.1.0-rc.3", False),          # newer than the updater's: kept
+    ("1.2.0", "1.1.0", False),
+    ("1.1.0-rc.2+clinical", "1.1.0-rc.2", False),   # build metadata is ignored
+    ("1.0.1", "1.1.0-rc.2", True),           # 1.0.x: replaced whatever the target
+    ("1.0.1", None, True),
+    ("1.1.0-rc.2", None, False),             # no target: the 1.1.0 rule only
+    ("1.1.0-rc.2", "garbage", False),
+    ("garbage", "1.1.0", False),
+])
+def test_bootloader_needs_migration_to_the_updaters_bootloader(version, target, needs):
+    assert fu.bootloader_needs_migration(version, target) is needs
+
+
 # ---------------------------------------------------------------- console (USB)
 
 def console(bl_versions, app_version="1.2.6", slot_empty=True):
@@ -121,6 +140,37 @@ def test_console_replace_bootloader_on_a_current_bootloader(shim):
     assert mgr.get_console_installed_version.call_count == 2
 
 
+def test_console_older_1_1_bootloader_moves_to_the_updaters(shim):
+    # research 1.1.0-rc.2 -> the updater -> (old BL still up) -> 1.1.0-rc.3 with an empty slot
+    upd, _, mgr = console(["1.1.0-rc.2", "1.1.0-rc.2", "1.1.0-rc.3"], app_version="1.3.0")
+    r = upd.update(signed_app=APP, bl_updater=shim, bl_target="1.1.0-rc.3")
+    assert programmed(mgr, "program_console") == [shim, APP]
+    assert r.action == "bl-migrate" and r.bl_version == "1.1.0-rc.3"
+
+
+def test_console_bootloader_at_the_updaters_gets_the_app_only(shim):
+    upd, _, mgr = console(["1.1.0-rc.3"], app_version="1.3.0")
+    r = upd.update(signed_app=APP, bl_updater=shim, bl_target="1.1.0-rc.3")
+    assert programmed(mgr, "program_console") == [APP]
+    assert r.action == "app-update"
+
+
+def test_console_waits_for_the_updaters_bootloader_not_any_1_1(shim, monkeypatch):
+    """Back in the OLD 1.1.x bootloader (the updater refused): not taken for
+    the new one, the wait runs out and nothing more is written."""
+    monkeypatch.setattr(fu.time, "sleep", lambda s: None)
+    t = {"now": 0.0}
+
+    def tick():
+        t["now"] += 10.0
+        return t["now"]
+    monkeypatch.setattr(fu.time, "monotonic", tick)
+    upd, _, mgr = console(["1.1.0-rc.2"] * 30, app_version="1.3.0", slot_empty=True)
+    with pytest.raises(RuntimeError, match="no newer bootloader came up"):
+        upd.update(signed_app=APP, bl_updater=shim, bl_target="1.1.0-rc.3")
+    assert programmed(mgr, "program_console") == [shim]
+
+
 def test_console_current_bootloader_is_kept_without_replace(shim):
     upd, _, mgr = console(["1.1.0-rc.3"], app_version="1.3.0")
     upd.update(signed_app=APP, bl_updater=shim)
@@ -173,6 +223,13 @@ def test_master_old_bootloader_gets_the_shim_then_the_app(shim):
     assert r.action == "bl-migrate" and r.bl_version == "1.1.0-rc.1"
     for c in mgr._wait_for_dfu_kind.call_args_list:
         assert c.args[0] == fu.DFU_KIND_SECURE
+
+
+def test_master_older_1_1_bootloader_moves_to_the_updaters(shim):
+    upd, _, mgr = master(["1.1.0-rc.1", "1.1.0-rc.2"], app_version="2.1.0")
+    r = upd.update(signed_app=APP, bl_updater=shim, bl_target="1.1.0-rc.2")
+    assert programmed(mgr, "program_transmitter") == [shim, APP]
+    assert r.action == "bl-migrate" and r.bl_version == "1.1.0-rc.2"
 
 
 def test_master_current_bootloader_gets_the_app_only(shim):
@@ -278,6 +335,25 @@ def test_slave_old_bootloader_gets_the_shim_then_the_app(clock, mgr, monkeypatch
     assert written(mgr) == [shim, APP]
     assert r.action == "bl-migrate-i2c"
     assert chain.log[0] == ("enter_dfu", 1)
+
+
+def test_slave_older_1_1_bootloader_moves_to_the_updaters(clock, mgr, monkeypatch, shim):
+    i2c_versions(monkeypatch, ["1.1.0-rc.1", "1.1.0-rc.1", "1.1.0-rc.2"])
+    mgr.program_transmitter_slave_i2c.return_value = "1.1.0-rc.2"
+    chain = FakeChain(clock)
+    r = fu.LIFUTransmitterFirmwareUpdate(tx=chain).update_slave(
+        1, signed_app=APP, legacy=False, bl_updater=shim, bl_target="1.1.0-rc.2")
+    assert written(mgr) == [shim, APP]
+    assert r.action == "bl-migrate-i2c"
+
+
+def test_slave_bootloader_at_the_updaters_gets_the_app_only(clock, mgr, monkeypatch, shim):
+    i2c_versions(monkeypatch, ["1.1.0-rc.2"])
+    chain = FakeChain(clock)
+    r = fu.LIFUTransmitterFirmwareUpdate(tx=chain).update_slave(
+        1, signed_app=APP, legacy=False, bl_updater=shim, bl_target="1.1.0-rc.2")
+    assert written(mgr) == [APP]
+    assert r.action == "app-update-i2c"
 
 
 def test_slave_first_re_enumeration_waits_for_the_updater(clock, mgr, monkeypatch, shim):

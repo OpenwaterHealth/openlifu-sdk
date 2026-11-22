@@ -398,6 +398,15 @@ def _version_tuple(text: str) -> tuple[int, int, int] | None:
     return (int(m[1]), int(m[2]), int(m[3])) if m else None
 
 
+def installed_fw_version(board: Board) -> int | None:
+    """The board's FwVersion: from its signed header, or from the version it
+    reports (a field unit from before the signature check)."""
+    if board.header is not None:
+        return board.header.fw_version
+    v = _version_tuple(board.version)
+    return (v[0] << 11) | (v[1] << 5) | v[2] if v else None
+
+
 def is_legacy(board: Board) -> bool:
     """True for firmware from before the signature check (see
     :data:`LEGACY_BELOW`): it cannot say which key signed it."""
@@ -578,7 +587,8 @@ class ReleaseUpdate:
             self.report("console: updating the firmware")
             r = LIFUFirmwareUpdate(hv=self.hv).update(
                 signed_app=str(self.bundle.apps["console"].path),
-                bl_updater=str(self.bundle.updaters["console"].path), **kw)
+                bl_updater=str(self.bundle.updaters["console"].path),
+                bl_target=self._bl_target(console[0].board), **kw)
             self.report(f"console: {r.summary}")
             self._wait_app(self.hv, "console")
             self._transmitter_back_after_console()
@@ -587,13 +597,30 @@ class ReleaseUpdate:
         updater = str(self.bundle.updaters["transmitter"].path)
         for step in slaves:
             self.report(f"{step.target}: updating the firmware over I2C")
-            self._guard(step.target, lambda m=step.board.module: fw.update_slave(
-                m, signed_app=app, bl_updater=updater, **kw))
+            self._guard(step.target, lambda m=step.board.module, b=step.board: fw.update_slave(
+                m, signed_app=app, bl_updater=updater, bl_target=self._bl_target(b), **kw))
         if master:
             self.report("transmitter master: updating the firmware over USB")
             self._guard("transmitter master", lambda: fw.update(
-                signed_app=app, bl_updater=updater, **kw))
+                signed_app=app, bl_updater=updater,
+                bl_target=self._bl_target(master[0].board), **kw))
             self._wait_app(self.tx, "transmitter")
+
+    def _bl_target(self, board: Board) -> str | None:
+        """The bootloader the release's updater carries, if the updater can
+        run on *board*: a bootloader refuses an image signed below the
+        installed application, so an updater signed below it is not tried
+        (the board keeps its bootloader; a 1.0.x one is still replaced, as
+        the updater is always above a 1.0.x unit's application)."""
+        target = self.bundle.bootloaders.get(board.board)
+        updater = self.bundle.updaters[board.board]
+        installed = installed_fw_version(board)
+        if target and installed is not None and updater.header.fw_version < installed:
+            self.report(f"{board.name}: keeps its bootloader: the release's bootloader "
+                        f"updater is signed {updater.version}, below the installed "
+                        f"{board.version} (a 1.1.x bootloader would refuse it)")
+            return None
+        return target
 
     def _transmitter_back_after_console(self) -> None:
         """The console powers the transmitter chain (12 V rail); after the

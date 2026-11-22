@@ -377,6 +377,7 @@ class _FakeUpdaters:
 
     def __init__(self, release, hv, tx, fail_slave=None):
         self.order = []
+        self.targets = {}
         rel = self
         rel_app = {b: i.path.read_bytes() for b, i in release.apps.items()}
 
@@ -384,8 +385,9 @@ class _FakeUpdaters:
             def __init__(self, hv=None, **_):
                 pass
 
-            def update(self, **_):
+            def update(self, **kw):
                 rel.order.append("console")
+                rel.targets["console"] = kw.get("bl_target")
                 hv.images[0] = rel_app["console"]
                 return type("R", (), {"summary": "console updated"})()
 
@@ -393,15 +395,17 @@ class _FakeUpdaters:
             def __init__(self, tx=None, **_):
                 pass
 
-            def update_slave(self, module, **_):
+            def update_slave(self, module, **kw):
                 rel.order.append(f"module {module}")
+                rel.targets[f"module {module}"] = kw.get("bl_target")
                 if module == fail_slave:
                     raise RuntimeError("bootloader refused the image")
                 tx.images[module] = rel_app["transmitter"]
                 return type("R", (), {"summary": f"module {module} updated"})()
 
-            def update(self, **_):
+            def update(self, **kw):
                 rel.order.append("master")
+                rel.targets["master"] = kw.get("bl_target")
                 tx.images[0] = rel_app["transmitter"]
                 return type("R", (), {"summary": "master updated"})()
 
@@ -420,6 +424,28 @@ def fake_updaters(monkeypatch):
                             lambda self, **_: fakes.order.append("abort dfu"))
         return fakes
     return install
+
+
+def test_a_field_unit_gets_the_updaters_bootloader(release, keys, fake_updaters):
+    hv, tx = unit(keys, release, tx_version="2.0.8", hv_version="1.2.6")
+    fakes = fake_updaters(release, hv, tx)
+    up = ru.ReleaseUpdate(release, hv, tx)
+    up.run(up.plan())
+    assert fakes.targets == {"console": "1.1.0-rc.3", "module 1": "1.1.0-rc.2",
+                             "master": "1.1.0-rc.2"}
+
+
+def test_an_updater_signed_below_the_installed_app_is_not_tried(release, keys,
+                                                                fake_updaters):
+    """The test release's updaters are signed 1.2.31 / 2.0.31: a unit on
+    1.3.0 / 2.1.0 would refuse them, so its bootloader is kept (no target)."""
+    hv, tx = unit(keys, release, tx_body=b"tx-rc7", hv_body=b"hv-rc7")
+    fakes = fake_updaters(release, hv, tx)
+    seen = []
+    up = ru.ReleaseUpdate(release, hv, tx, report=seen.append)
+    up.run(up.plan())
+    assert fakes.targets == {"console": None, "module 1": None, "master": None}
+    assert any("keeps its bootloader" in line and "2.0.31" in line for line in seen)
 
 
 def test_firmware_goes_console_then_slaves_then_master(release, keys, fake_updaters):
