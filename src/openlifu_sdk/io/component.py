@@ -421,6 +421,23 @@ class OWComponent:
                     return domain
         return FirmwareDomain.UNKNOWN
 
+    def firmware_header(self, module: int = 0):
+        """The signed header of the running firmware (OW_CMD_SIGCHK), parsed:
+        its FwVersion and the SHA-256 of its body (``fw_tag``) name the
+        installed build, so a host can compare it with a release image
+        without entering DFU. None for a bare-metal build, a refusal or a
+        malformed reply.
+
+        Raises:
+            LIFUNotConnectedError, LIFUCommunicationError.
+        """
+        from openlifu_sdk.io import LIFUCrypto
+
+        header = self._read_signed_header(module, "firmware_header")
+        if isinstance(header, SignatureCheck) or header[:4] != LIFUCrypto.SFU_MAGIC:
+            return None
+        return LIFUCrypto.FirmwareHeader.from_bytes(header)
+
     def _read_signed_header(self, module: int, op: str) -> bytes | SignatureCheck:
         """Send OW_CMD_SIGCHK. Returns the signed header a slot build sends,
         or ``SignatureCheck.BARE_METAL`` / ``SignatureCheck.ERROR``."""
