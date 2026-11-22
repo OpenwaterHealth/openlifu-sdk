@@ -524,15 +524,29 @@ def test_a_changed_user_configuration_fails_the_read_back(release, keys, fake_up
     assert "[ok] console: user configuration unchanged" in result.lines
 
 
-def test_an_unreadable_user_configuration_is_reported_not_raised(release, keys):
+def test_a_configuration_unreadable_before_is_skipped_not_failed(release, keys):
+    """Old firmware (a field unit) may not answer the read: nothing to
+    compare, so it is reported and does not fail the update."""
     hv, tx = unit(keys, release)
     hv.configs[0] = RuntimeError("no reply")
     update = ru.ReleaseUpdate(release, hv, tx)
     update.plan()
+    hv.configs[0] = b"OWCF{}"
+    result = update.verify()
+    assert result.ok
+    assert any(line.startswith("[skip] console: user configuration could not be read before")
+               and "no reply" in line for line in result.lines)
+
+
+def test_a_configuration_unreadable_after_the_update_fails(release, keys):
+    hv, tx = unit(keys, release)
+    update = ru.ReleaseUpdate(release, hv, tx)
+    update.plan()
+    hv.configs[0] = RuntimeError("no reply")
     result = update.verify()
     assert not result.ok
-    assert any(line.startswith("[FAIL] console: user configuration could not be read before")
-               and "no reply" in line for line in result.lines)
+    assert any(line.startswith("[FAIL] console: user configuration could not be read back")
+               for line in result.lines)
 
 
 # ---------------------------------------------------------------------------

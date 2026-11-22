@@ -395,13 +395,20 @@ def read_user_configs(hv: Any, tx: Any, boards: list[Board]) -> dict[str, Any]:
 
 
 def user_config_lines(before: dict[str, Any], after: dict[str, Any]) -> tuple[bool, list[str]]:
-    """Compare two :func:`read_user_configs` readings. Returns ``(ok, lines)``."""
+    """Compare two :func:`read_user_configs` readings. Returns ``(ok, lines)``.
+
+    A board that could not be read before the update (firmware from before
+    the user-config read, e.g. a field unit) has nothing to compare: it is
+    reported, not failed. Readable before and unreadable or different after
+    fails."""
     ok, lines = True, []
     for name in list(before) + [n for n in after if n not in before]:
         was, now = before.get(name), after.get(name)
         if isinstance(was, Exception) or name not in before:
-            line = f"user configuration could not be read before the update ({was})"
-        elif isinstance(now, Exception) or name not in after:
+            lines.append(f"[skip] {name}: user configuration could not be read before "
+                         f"the update ({was}); nothing to compare")
+            continue
+        if isinstance(now, Exception) or name not in after:
             line = f"user configuration could not be read back ({now})"
         elif was == now:
             lines.append(f"[ok] {name}: user configuration unchanged")
