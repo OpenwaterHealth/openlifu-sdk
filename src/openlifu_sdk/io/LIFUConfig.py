@@ -67,6 +67,13 @@ OW_CMD_DISCOVERY = 0x0C
 OW_CMD_DFU = 0x0D
 OW_CMD_NOP = 0x0E
 OW_CMD_RESET = 0x0F
+# The bootloader's version, as the application reads it (ASCII, e.g. "1.1.0-rc.3",
+# at most BL_VERSION_MAX_LEN bytes, no NUL; empty: none found / bare metal).
+# addr is the module (transmitter: 0 = master, n = slave over I2C). Firmware
+# from before it (console up to 1.3.0-rc.4, transmitter up to 2.1.0-rc.7, the
+# field 1.2.6 / 2.0.8) answers OW_ERROR. Not in the FDA command sets.
+OW_CMD_BL_VERSION = 0x70
+BL_VERSION_MAX_LEN = 32
 
 # Node operating mode reported by OW_CTRL_GET_MODULE_MODE / discovery (Phase 2)
 NODE_MODE_UNKNOWN = 0x00
@@ -204,7 +211,7 @@ GLOBAL_COMMANDS = {
     OW_CMD_PING, OW_CMD_PONG, OW_CMD_VERSION, OW_CMD_ECHO,
     OW_CMD_TOGGLE_LED, OW_CMD_HWID, OW_CMD_GET_TEMP, OW_CMD_GET_AMBIENT,
     OW_CMD_ASYNC, OW_CMD_USR_CFG, OW_CMD_DISCOVERY, OW_CMD_DFU,
-    OW_CMD_NOP, OW_CMD_RESET, OW_CMD_SIGCHK,
+    OW_CMD_NOP, OW_CMD_RESET, OW_CMD_SIGCHK, OW_CMD_BL_VERSION,
 }
 
 # OW_CMD_SIGCHK reply payload (both firmwares, Core/Inc/common.h): a status

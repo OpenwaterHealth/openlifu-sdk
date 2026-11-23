@@ -30,6 +30,7 @@ Connectivity/status
 - `close()` — close the UART connection.
 - `ping(module:int=0) -> bool` — simple ping command.
 - `get_version(module:int=0) -> str` — firmware version string.
+- `get_bootloader_version(module:int=0) -> str | None` — the addressed module's bootloader version as its application reports it (`OW_CMD_BL_VERSION`; a slave's is relayed over I2C). `None` for firmware without the command (transmitter 2.1.0-rc.7 and older answer `OW_ERROR`) or no version; a timeout still raises. Research component only: not in the FDA command set.
 - `get_hardware_id(module:int=0, raw_hex=False, base58=False, legacy_6byte=False) -> str` — the addressed module's 12-byte MCU UID, in the same forms as `LIFUHVController.get_hardware_id`.
 
 Triggering and profiles

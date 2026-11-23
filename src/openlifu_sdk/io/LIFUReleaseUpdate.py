@@ -40,6 +40,23 @@ applications.
 3. Everything is read back and compared with the release, and each board's
    user configuration with the one read in step 1.
 
+**Bootloader-only update.** The bootloader version is readable from the
+application (``OW_CMD_BL_VERSION``, ``get_bootloader_version``); firmware
+without the command (console 1.3.0-rc.4, transmitter 2.1.0-rc.7 and older)
+answers with an error, and its bootloader is only compared in DFU, during a
+firmware update. A development bootloader (git-describe text such as
+``1.1.0-rc.1-dirty``) counts as unknown. A research
+board that runs the release's application but reports an older bootloader
+than the updater carries (same ordering as the bootloader-first rule: rc
+before final, ``-clinical`` / ``+meta`` ignored) gets a ``"bootloader"``
+step: run like a firmware step (``bl_target`` = the release's bootloader,
+the release's application), in the same order. The updater erases the
+presets, so the step is planned only with the release's presets: they are
+re-read after the firmware and rewritten, and read back with the rest. A
+clinical board keeps its bootloader (it refuses the research-signed
+updater), as does a board whose installed application is signed above the
+updater. The read-back checks each such board's bootloader again.
+
 **Research -> clinical conversion.** A research board (a field unit from
 before the signature check included) given a clinical release takes the
 release's bootloader updater whatever its bootloader version
@@ -57,6 +74,10 @@ Step actions (:attr:`Step.action`):
 
 - ``"none"``: already the release's;
 - ``"firmware"``: application update in the board's domain;
+- ``"bootloader"``: the board already runs the release's application but
+  reports (``get_bootloader_version``) a bootloader older than the one the
+  release's updater carries: the updater replaces it and the same
+  application is installed again (see below);
 - ``"convert"``: research -> clinical conversion (see above);
 - ``"write-presets"`` / ``"clear-slot"``: research presets, written / emptied
   through the running application;
@@ -101,6 +122,7 @@ DOMAINS = ("clinical", "research")
 ACTION_NONE = "none"
 ACTION_FIRMWARE = "firmware"
 ACTION_CONVERT = "convert"
+ACTION_BOOTLOADER = "bootloader"
 ACTION_WRITE_PRESETS = "write-presets"
 ACTION_CLEAR_SLOT = "clear-slot"
 ACTION_WRITE_PRESETS_DFU = "write-presets-dfu"
@@ -351,6 +373,10 @@ class Board:
     version: str
     domain: str
     header: LIFUCrypto.FirmwareHeader | None
+    #: The bootloader version the application reports
+    #: (``get_bootloader_version``); None for firmware without the read
+    #: (every release before it) or no version found.
+    bootloader: str | None = None
 
 
 @dataclass
@@ -375,7 +401,8 @@ def _read_board(name: str, board: str, device: Any, module: int) -> Board:
     return Board(name=name, board=board, module=module,
                  version=str(device.get_version(module=module)),
                  domain=device.firmware_domain(module).value,
-                 header=device.firmware_header(module))
+                 header=device.firmware_header(module),
+                 bootloader=device.get_bootloader_version(module))
 
 
 def read_presets(hv: Any, tx: Any, modules: int) -> PresetState:
@@ -537,9 +564,14 @@ def convert_step(board: Board, image: SignedImage, bootloader: str | None) -> St
 
 
 def firmware_step(board: Board, image: SignedImage, domain: str,
-                  bootloader: str | None = None) -> Step:
-    """What *board* needs to run the release's *image* (*bootloader*: the
-    one the release's updater carries, for a conversion)."""
+                  bootloader: str | None = None, updater: SignedImage | None = None,
+                  restores_presets: bool = True) -> Step:
+    """What *board* needs to run the release's *image*.
+
+    *bootloader* is the one the release's *updater* carries (for a
+    conversion, and for a board that already runs *image*: see
+    :func:`installed_step`); *restores_presets* says whether the release
+    rewrites the presets the updater erases."""
     if is_legacy(board):
         return _legacy_step(board, image, domain, bootloader)
     if board.domain == "research" and domain == "clinical":
@@ -550,13 +582,70 @@ def firmware_step(board: Board, image: SignedImage, domain: str,
         return Step(board.name, "refuse", f"runs {board.version} with no signed header to "
                     "compare; nothing will be written", board)
     if image.is_installed(board.header):
-        return Step(board.name, "none", f"already runs the release build {image.version} "
-                    f"({image.build})", board)
+        return installed_step(board, image, bootloader, updater, restores_presets)
     if image.header.fw_version < board.header.fw_version:
         return Step(board.name, "refuse", f"runs {board.version}, newer than the release's "
                     f"{image.version}: a downgrade is refused before DFU", board)
     return Step(board.name, "firmware", f"{board.version} -> {image.version} ({image.build}); "
                 "an old bootloader is replaced first in DFU", board)
+
+
+def installed_step(board: Board, image: SignedImage, bootloader: str | None,
+                   updater: SignedImage | None, restores_presets: bool = True) -> Step:
+    """*board* already runs the release's *image*. Its bootloader is
+    replaced (``"bootloader"``, the same application re-installed after it)
+    when the board reports one older than the *bootloader* the release's
+    *updater* carries, by the bootloader-first rule
+    (:func:`~openlifu_sdk.io.LIFUFirmwareUpdate.bootloader_needs_migration`).
+    Kept (``"none"``) when the version is unknown (firmware without the
+    read, or a development bootloader: see :func:`is_release_bootloader`),
+    on a clinical board (its bootloader refuses the research-signed
+    updater), when the updater would be refused (signed below the installed
+    application, see :func:`updater_runs_on`), or when the release does not
+    restore the presets the updater erases."""
+    from openlifu_sdk.io.LIFUFirmwareUpdate import bootloader_needs_migration
+
+    done = f"already runs the release build {image.version} ({image.build})"
+    if (updater is None or not is_release_bootloader(board.bootloader)
+            or not bootloader_needs_migration(board.bootloader, bootloader)):
+        return Step(board.name, ACTION_NONE, done, board)
+    kept = f"{done}; its bootloader {board.bootloader} is kept"
+    if board.domain != "research":
+        why = (f"{kept} (a {board.domain} bootloader takes no research-signed bootloader "
+               "updater)")
+    elif not updater_runs_on(board, updater):
+        why = (f"{kept} (the release's bootloader updater is signed {updater.version}, below "
+               f"the installed {board.version})")
+    elif not restores_presets:
+        why = (f"{kept} (the bootloader updater erases the presets, and this release has no "
+               "presets to rewrite)")
+    else:
+        return Step(board.name, ACTION_BOOTLOADER, f"bootloader {board.bootloader} -> "
+                    f"{bootloader} (the same application {image.version} ({image.build}) is "
+                    "re-installed; the presets are rewritten after)", board)
+    return Step(board.name, ACTION_NONE, why, board)
+
+
+#: A release bootloader's version: ``1.1.0``, ``1.1.0-rc.3``, optionally
+#: ``-clinical`` and ``+<build metadata>``. A development build reports its
+#: git-describe text instead (``1.1.0-rc.1-dirty``, ``1.0.1-3-gb241b0f-dirty``).
+_RELEASE_BL_RE = re.compile(r"v?\d+\.\d+\.\d+(?:-rc\.?\d+)?(?:-clinical)?(?:\+[0-9A-Za-z.-]+)?",
+                            re.IGNORECASE)
+
+
+def is_release_bootloader(version: str | None) -> bool:
+    """True if *version* (``get_bootloader_version``) names a release
+    bootloader. A development build's version is treated as unknown: it is
+    not ordered against a release, so it gets no bootloader step."""
+    return version is not None and _RELEASE_BL_RE.fullmatch(version.strip()) is not None
+
+
+def updater_runs_on(board: Board, updater: SignedImage) -> bool:
+    """True if *board*'s bootloader can take the release's bootloader
+    *updater*: a bootloader refuses an image signed below the installed
+    application (an unknown installed version is tried)."""
+    installed = installed_fw_version(board)
+    return installed is None or updater.header.fw_version >= installed
 
 
 def _domain_refusal(board: Board, domain: str) -> str:
@@ -688,6 +777,9 @@ class ReleaseUpdate:
         self.report = report or logger.info
         #: The user configurations read by plan() / run(), for verify().
         self._user_configs: dict[str, Any] | None = None
+        #: Board name -> the bootloader run() installed by a bootloader step,
+        #: for verify().
+        self._bootloaders_expected: dict[str, str | None] = {}
 
     # -- plan ---------------------------------------------------------------
 
@@ -697,7 +789,9 @@ class ReleaseUpdate:
         boards = read_boards(self.hv, self.tx)
         plan = ReleasePlan(bundle, boards)
         plan.firmware = [firmware_step(b, bundle.apps[b.board], bundle.domain,
-                                       bundle.bootloaders.get(b.board)) for b in boards]
+                                       bundle.bootloaders.get(b.board), bundle.updaters[b.board],
+                                       restores_presets=bundle.presets is not None)
+                         for b in boards]
         converting = {board_key(s.board) for s in plan.firmware if s.action == ACTION_CONVERT}
         if bundle.presets is not None:
             state = read_presets(self.hv, self.tx, len(boards) - 1)
@@ -713,8 +807,9 @@ class ReleaseUpdate:
     # -- run ----------------------------------------------------------------
 
     def run(self, plan: ReleasePlan) -> ReleaseResult:
-        """Run *plan*: firmware, then presets (re-planned from a fresh read,
-        since a bootloader replacement erases them), then the read-back.
+        """Run *plan*: firmware (and bootloader-only steps), then presets
+        (re-planned from a fresh read, since a bootloader replacement erases
+        them), then the read-back.
 
         Raises:
             ReleaseError: The plan has refusals (nothing is written), or a
@@ -724,8 +819,10 @@ class ReleaseUpdate:
             raise ReleaseError("refused before anything was written:\n  "
                                + "\n  ".join(f"{s.target}: {s.detail}" for s in plan.refusals))
         self._user_configs = plan.user_configs or read_user_configs(self.hv, self.tx, plan.boards)
+        self._bootloaders_expected = {s.board.name: self.bundle.bootloaders.get(s.board.board)
+                                      for s in plan.firmware if s.action == ACTION_BOOTLOADER}
         self._run_firmware([s for s in plan.firmware
-                            if s.action in (ACTION_FIRMWARE, ACTION_CONVERT)])
+                            if s.action in (ACTION_FIRMWARE, ACTION_CONVERT, ACTION_BOOTLOADER)])
         # Clinical presets were written in the bootloaders' DFU during the
         # conversion; a clinical application takes none.
         if self.bundle.presets is not None and self.bundle.domain == "research":
@@ -765,7 +862,10 @@ class ReleaseUpdate:
             self._wait_app(self.tx, "transmitter")
 
     def _update_kwargs(self, step: Step) -> dict[str, Any]:
-        """The LIFUFirmwareUpdate arguments for a firmware or convert step."""
+        """The LIFUFirmwareUpdate arguments for a firmware, bootloader or
+        convert step (a bootloader step is a firmware step whose application
+        is already installed: the updater replaces the bootloader, then the
+        same application is written again)."""
         board = step.board
         kw: dict[str, Any] = {"bl_updater": str(self.bundle.updaters[board.board].path),
                               "progress_callback": self.progress_callback}
@@ -796,8 +896,7 @@ class ReleaseUpdate:
         the updater is always above a 1.0.x unit's application)."""
         target = self.bundle.bootloaders.get(board.board)
         updater = self.bundle.updaters[board.board]
-        installed = installed_fw_version(board)
-        if target and installed is not None and updater.header.fw_version < installed:
+        if target and not updater_runs_on(board, updater):
             self.report(f"{board.name}: keeps its bootloader: the release's bootloader "
                         f"updater is signed {updater.version}, below the installed "
                         f"{board.version} (a 1.1.x bootloader would refuse it)")
@@ -895,6 +994,10 @@ class ReleaseUpdate:
             ok &= good
             lines.append(f"[{'ok' if good else 'FAIL'}] {board.name}: {board.version} "
                          f"({board.domain})")
+            if board.name in self._bootloaders_expected:
+                good, line = _bootloader_line(board, self._bootloaders_expected[board.name])
+                ok &= good
+                lines.append(line)
         if self.bundle.presets is not None:
             state = read_presets(self.hv, self.tx, len(boards) - 1)
             for step in compare_presets(state, self.bundle.presets):
@@ -911,8 +1014,21 @@ class ReleaseUpdate:
 
 
 def _doing(step: Step) -> str:
-    return ("converting to clinical (bootloader, presets, application)"
-            if step.action == ACTION_CONVERT else "updating the firmware")
+    if step.action == ACTION_CONVERT:
+        return "converting to clinical (bootloader, presets, application)"
+    if step.action == ACTION_BOOTLOADER:
+        return "replacing the bootloader (the same application is re-installed)"
+    return "updating the firmware"
+
+
+def _bootloader_line(board: Board, target: str | None) -> tuple[bool, str]:
+    """The read-back of a board given a bootloader step: it must report a
+    bootloader no older than *target*."""
+    from openlifu_sdk.io.LIFUFirmwareUpdate import bootloader_needs_migration
+
+    good = board.bootloader is not None and not bootloader_needs_migration(board.bootloader, target)
+    return good, (f"[{'ok' if good else 'FAIL'}] {board.name}: bootloader "
+                  f"{board.bootloader or 'unknown'}" + ("" if good else f", expected {target}"))
 
 
 # ---------------------------------------------------------------------------

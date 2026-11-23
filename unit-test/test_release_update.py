@@ -61,17 +61,22 @@ def app_image(keys, board, domain, version, body=b"app"):
     return LIFUCrypto.sign_firmware_bytes(body * 64, keys[board, domain], version)
 
 
+#: Each updater's signed version and the bootloader it carries.
+UPDATERS = {"console": ("1.2.31", "1.1.0-rc.3"), "transmitter": ("2.0.31", "1.1.0-rc.2")}
+
+
 def make_firmware(root, keys, domain="research", *, tx=("2.1.0", b"tx-rc8"),
-                  console=("1.3.0", b"hv-rc8"), console_domain=None):
+                  console=("1.3.0", b"hv-rc8"), console_domain=None, updaters=None):
     fw = root / "firmware"
+    updaters = updaters or UPDATERS
     for board, folder, (version, body), dom in (
             ("console", "openlifu-console-fw", console, console_domain or domain),
             ("transmitter", "openlifu-transmitter-fw", tx, domain)):
         (fw / folder).mkdir(parents=True)
         (fw / folder / f"{folder}-signed.bin").write_bytes(app_image(keys, board, dom, version, body))
-    for board, folder, version, bl in (("console", "open-lifu-console-bl-updater", "1.2.31", "1.1.0-rc.3"),
-                                       ("transmitter", "open-lifu-transmitter-bl-updater", "2.0.31",
-                                        "1.1.0-rc.2")):
+    for board, folder in (("console", "open-lifu-console-bl-updater"),
+                          ("transmitter", "open-lifu-transmitter-bl-updater")):
+        version, bl = updaters[board]
         (fw / folder).mkdir(parents=True)
         (fw / folder / f"{folder}-signed.bin").write_bytes(
             app_image(keys, board, "research", version, b"shim"))
@@ -124,6 +129,9 @@ class FakeBoard:
         self.domains = [domain] * len(self.images)
         self.versions = [LIFUCrypto.FirmwareHeader.from_bytes(i).fw_version_str for i in self.images]
         self.configs = [b"OWCF" + bytes([m]) + b'{"sens":1}' for m in range(len(self.images))]
+        #: What get_bootloader_version answers: None like every firmware
+        #: before OW_CMD_BL_VERSION.
+        self.bootloaders = [None] * len(self.images)
 
     def get_version(self, module=0):
         return self.versions[module]
@@ -133,6 +141,9 @@ class FakeBoard:
 
     def firmware_header(self, module=0):
         return LIFUCrypto.FirmwareHeader.from_bytes(self.images[module])
+
+    def get_bootloader_version(self, module=0):
+        return self.bootloaders[module]
 
     def is_connected(self):
         return True
@@ -795,3 +806,251 @@ def test_a_conversion_checks_each_preset_against_the_clinical_key(clinical, keys
     object.__setattr__(clinical.presets, "console", preset_package(keys, "console"))
     with pytest.raises(ValueError, match="not signed by the given key"):
         update.run(plan)
+
+
+# ---------------------------------------------------------------------------
+# Bootloader-only update: the application is the release's, the bootloader
+# (read from the application) is older than the one the updater carries
+# ---------------------------------------------------------------------------
+
+#: A release whose updaters can run on a unit on its applications (signed
+#: at the application's version) and carry the final bootloader.
+BL_UPDATERS = {"console": ("1.3.0", "1.1.0"), "transmitter": ("2.1.0", "1.1.0")}
+RC_BOOTLOADERS = {"console": "1.1.0-rc.3", "transmitter": "1.1.0-rc.2"}
+
+
+@pytest.fixture
+def bl_release(tmp_path, keys):
+    return ru.ReleaseBundle.load(make_firmware(tmp_path, keys, updaters=BL_UPDATERS),
+                                 make_presets(tmp_path, keys), workdir=tmp_path / "work")
+
+
+def on_bootloaders(hv, tx, console=RC_BOOTLOADERS["console"],
+                   transmitter=RC_BOOTLOADERS["transmitter"]):
+    """What the unit's applications report for their bootloader."""
+    hv.bootloaders = [console]
+    tx.bootloaders = [transmitter] * len(tx.images)
+    return hv, tx
+
+
+def test_the_plan_records_each_boards_bootloader(bl_release, keys):
+    hv, tx = on_bootloaders(*unit(keys, bl_release))
+    tx.bootloaders[1] = None
+    plan = ru.ReleaseUpdate(bl_release, hv, tx).plan()
+    assert [b.bootloader for b in plan.boards] == ["1.1.0-rc.3", "1.1.0-rc.2", None]
+
+
+def test_an_older_bootloader_under_the_release_app_is_replaced(bl_release, keys):
+    hv, tx = on_bootloaders(*unit(keys, bl_release))
+    plan = ru.ReleaseUpdate(bl_release, hv, tx).plan()
+    assert _actions(plan.firmware) == [("console", "bootloader"),
+                                       ("transmitter master", "bootloader"),
+                                       ("transmitter module 1", "bootloader")]
+    assert "bootloader 1.1.0-rc.3 -> 1.1.0" in plan.firmware[0].detail
+    assert "same application 1.3.0" in plan.firmware[0].detail
+    assert "bootloader 1.1.0-rc.2 -> 1.1.0" in plan.firmware[1].detail
+    assert plan.refusals == [] and len(plan.work) == 3
+    # The presets are the release's at plan time: rewritten only after the run.
+    assert {s.action for s in plan.presets} == {"none"}
+
+
+@pytest.mark.parametrize("reported", ["1.1.0", "1.1.0+g1234abc", "1.1.1", "1.2.0-rc.1"])
+def test_an_equal_or_newer_bootloader_is_kept(bl_release, keys, reported):
+    hv, tx = on_bootloaders(*unit(keys, bl_release), reported, reported)
+    plan = ru.ReleaseUpdate(bl_release, hv, tx).plan()
+    assert plan.work == []
+
+
+def test_an_unknown_bootloader_is_kept(bl_release, keys):
+    """Firmware from before OW_CMD_BL_VERSION: as before, nothing to do."""
+    hv, tx = unit(keys, bl_release)
+    plan = ru.ReleaseUpdate(bl_release, hv, tx).plan()
+    assert plan.work == []
+    assert all(s.detail.startswith("already runs the release build") and "kept" not in s.detail
+               for s in plan.firmware)
+
+
+@pytest.mark.parametrize("reported", ["1.1.0-rc.1-dirty", "1.0.1-3-gb241b0f-dirty",
+                                      "1.1.0-rc.3-4-g0123abc", "garbage", ""])
+def test_a_development_bootloader_is_treated_as_unknown(bl_release, keys, reported):
+    """Untagged / dev bootloaders report git-describe text: not ordered
+    against a release, so no bootloader step (and no crash)."""
+    hv, tx = on_bootloaders(*unit(keys, bl_release), reported, reported)
+    plan = ru.ReleaseUpdate(bl_release, hv, tx).plan()
+    assert plan.work == []
+    assert all("kept" not in s.detail for s in plan.firmware)
+
+
+@pytest.mark.parametrize("version, release", [
+    ("1.1.0", True), ("1.1.0-rc.3", True), ("1.1.0-rc.3-clinical", True),
+    ("1.1.0+g1234", True), ("1.0.1", True), (None, False), ("1.1.0-rc.1-dirty", False),
+    ("1.0.1-3-gb241b0f-dirty", False), ("1.1", False)])
+def test_release_bootloader_versions(version, release):
+    assert ru.is_release_bootloader(version) is release
+
+
+def test_an_updater_signed_below_the_installed_app_keeps_the_bootloader(release, keys):
+    """The default test release's updaters (1.2.31 / 2.0.31) would be refused."""
+    hv, tx = on_bootloaders(*unit(keys, release))
+    plan = ru.ReleaseUpdate(release, hv, tx).plan()
+    assert plan.work == []
+    assert "its bootloader 1.1.0-rc.3 is kept" not in plan.firmware[0].detail  # same version
+    hv.bootloaders = ["1.0.3"]
+    plan = ru.ReleaseUpdate(release, hv, tx).plan()
+    assert plan.work == []
+    assert "its bootloader 1.0.3 is kept" in plan.firmware[0].detail
+    assert "signed 1.2.31, below the installed 1.3.0" in plan.firmware[0].detail
+
+
+def test_without_presets_to_rewrite_the_bootloader_is_kept(bl_release, keys, tmp_path):
+    """The updater erases the presets: a firmware-only release would leave
+    the unit without them."""
+    firmware_only = ru.ReleaseBundle.load(tmp_path / "firmware", workdir=tmp_path / "work2")
+    hv, tx = on_bootloaders(*unit(keys, bl_release))
+    plan = ru.ReleaseUpdate(firmware_only, hv, tx).plan()
+    assert plan.work == []
+    assert all("no presets to rewrite" in s.detail for s in plan.firmware)
+
+
+def test_a_clinical_unit_keeps_its_bootloader(clinical, keys):
+    """A clinical bootloader refuses the research-signed updater."""
+    hv, tx = _with_clinical_presets(*unit(keys, clinical, domain="clinical"), clinical)
+    on_bootloaders(hv, tx, "1.1.0-rc.2-clinical", "1.1.0-rc.2-clinical")
+    plan = ru.ReleaseUpdate(clinical, hv, tx).plan()
+    assert plan.work == [] and plan.refusals == []
+    assert all("its bootloader 1.1.0-rc.2-clinical is kept" in s.detail
+               and "clinical bootloader takes no research-signed" in s.detail
+               for s in plan.firmware)
+
+
+def test_mixed_firmware_and_bootloader_steps(bl_release, keys):
+    hv, tx = on_bootloaders(*unit(keys, bl_release, modules=3))
+    tx.images[2] = app_image(keys, "transmitter", "research", "2.1.0", b"tx-rc7")
+    tx.bootloaders[2] = None                      # rc.7 cannot report it
+    plan = ru.ReleaseUpdate(bl_release, hv, tx).plan()
+    assert _actions(plan.firmware) == [("console", "bootloader"),
+                                       ("transmitter master", "bootloader"),
+                                       ("transmitter module 1", "bootloader"),
+                                       ("transmitter module 2", "firmware")]
+
+
+class _BootloaderUpdaters:
+    """Stands in for the firmware updaters: in DFU, a bootloader older than
+    *bl_target* is replaced and the presets are erased (as the updater does),
+    then the given application is installed."""
+
+    def __init__(self, hv, tx, replaces=True):
+        from openlifu_sdk.io.LIFUFirmwareUpdate import bootloader_needs_migration
+
+        self.calls = []
+        rec = self
+
+        def install(name, board, module, kw):
+            rec.calls.append((name, kw))
+            if replaces and bootloader_needs_migration(board.bootloaders[module], kw["bl_target"]):
+                board.bootloaders[module] = kw["bl_target"]
+                if board is hv:
+                    hv.preset = None
+                else:
+                    tx.slots[module] = {}
+            with open(kw["signed_app"], "rb") as f:
+                board.images[module] = f.read()
+            return type("R", (), {"summary": f"{name} done"})()
+
+        class Console:
+            def __init__(self, hv=None, **_):
+                pass
+
+            def update(self, **kw):
+                return install("console", hv, 0, kw)
+
+        class Transmitter:
+            def __init__(self, tx=None, **_):
+                pass
+
+            def update_slave(self, module, **kw):
+                return install(f"transmitter module {module}", tx, module, kw)
+
+            def update(self, **kw):
+                return install("transmitter master", tx, 0, kw)
+
+        self.Console, self.Transmitter = Console, Transmitter
+
+
+@pytest.fixture
+def bl_updaters(monkeypatch):
+    from openlifu_sdk.io import LIFUFirmwareUpdate as fu
+
+    def install(hv, tx, **kw):
+        fakes = _BootloaderUpdaters(hv, tx, **kw)
+        monkeypatch.setattr(fu, "LIFUFirmwareUpdate", fakes.Console)
+        monkeypatch.setattr(fu, "LIFUTransmitterFirmwareUpdate", fakes.Transmitter)
+        return fakes
+    return install
+
+
+def test_a_bootloader_step_runs_like_a_firmware_step(bl_release, keys, bl_updaters):
+    """Same path, same order: the release's bootloader as the target and the
+    same signed application, console, then the slaves, then the master."""
+    hv, tx = on_bootloaders(*unit(keys, bl_release, modules=3))
+    fakes = bl_updaters(hv, tx)
+    seen = []
+    update = ru.ReleaseUpdate(bl_release, hv, tx, report=seen.append)
+    update.run(update.plan())
+    assert [name for name, _ in fakes.calls] == ["console", "transmitter module 1",
+                                                 "transmitter module 2", "transmitter master"]
+    for name, kw in fakes.calls:
+        board = "console" if name == "console" else "transmitter"
+        assert kw["bl_target"] == "1.1.0", name
+        assert kw["signed_app"] == str(bl_release.apps[board].path), name
+        assert kw["bl_updater"] == str(bl_release.updaters[board].path), name
+        assert not kw.get("replace_bootloader") and "before_app" not in kw, name
+    assert "console: replacing the bootloader (the same application is re-installed)" in seen
+
+
+def test_the_presets_erased_by_a_bootloader_step_are_rewritten_and_read_back(
+        bl_release, keys, bl_updaters):
+    hv, tx = on_bootloaders(*unit(keys, bl_release))
+    bl_updaters(hv, tx)
+    update = ru.ReleaseUpdate(bl_release, hv, tx)
+    plan = update.plan()
+    assert {s.action for s in plan.presets} == {"none"}     # correct before the run
+    result = update.run(plan)
+    assert result.ok, result.lines
+    assert hv.log == ["write console"]
+    assert sorted(e for e in tx.log if e[0] == "write") == sorted(
+        ("write", m, s) for m in range(2) for s in range(RELEASED))
+    assert hv.preset == bl_release.presets.console
+    assert all(tx.slots[m][s] == bl_release.presets.tx_image(s, m)
+               for m in range(2) for s in range(RELEASED))
+    for name in ("console", "transmitter master", "transmitter module 1"):
+        assert f"[ok] {name}: bootloader 1.1.0" in result.lines
+    assert f"[ok] console page: holds the release's package ({COMMIT[:12]})" in result.lines
+
+
+def test_a_bootloader_that_was_not_replaced_fails_the_read_back(bl_release, keys, bl_updaters):
+    hv, tx = on_bootloaders(*unit(keys, bl_release))
+    bl_updaters(hv, tx, replaces=False)
+    update = ru.ReleaseUpdate(bl_release, hv, tx)
+    result = update.run(update.plan())
+    assert not result.ok
+    assert "[FAIL] console: bootloader 1.1.0-rc.3, expected 1.1.0" in result.lines
+    assert "[FAIL] transmitter module 1: bootloader 1.1.0-rc.2, expected 1.1.0" in result.lines
+
+
+def test_a_mixed_run_updates_both_and_restores_the_presets(bl_release, keys, bl_updaters):
+    """The console only needs its bootloader; the transmitter needs its
+    application (and its bootloader is compared in DFU, as before)."""
+    hv, tx = on_bootloaders(*unit(keys, bl_release, tx_body=b"tx-rc7"), transmitter="1.1.0-rc.2")
+    tx.bootloaders = [None, None]                 # rc.7 cannot report it
+    fakes = bl_updaters(hv, tx)
+    update = ru.ReleaseUpdate(bl_release, hv, tx)
+    plan = update.plan()
+    assert [s.action for s in plan.firmware] == ["bootloader", "firmware", "firmware"]
+    result = update.run(plan)
+    assert result.ok, result.lines
+    assert [name for name, _ in fakes.calls] == ["console", "transmitter module 1",
+                                                 "transmitter master"]
+    assert hv.log == ["write console"]           # erased by the console's bootloader step
+    assert "[ok] console: bootloader 1.1.0" in result.lines
+    assert not any("transmitter master: bootloader" in line for line in result.lines)
