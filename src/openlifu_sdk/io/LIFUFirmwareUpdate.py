@@ -184,15 +184,30 @@ SLAVE_VERSION_POLL_S = 2.0
 PRESET_RESET_SETTLE_S = 3.0
 PRESET_DFU_TIMEOUT_S = 90.0
 SLAVE_PRESET_SETTLE_S = 5.0
+# Presets written in the DFU of a board that keeps its application
+# (write_presets / write_slave_presets): each write resets the board into its
+# application, which must answer again within this long before DFU is
+# requested for the next write (generous: the VM may re-attach USB).
+PRESET_APP_TIMEOUT_S = 120.0
+PRESET_APP_POLL_S = 2.0
 
 
 @dataclass
 class DfuContext:
-    """What a ``before_app`` callback gets: the board is in its NEW
-    bootloader's DFU (after a bootloader replacement), its application slot is
-    empty, and the application is written once the callback returns. The
-    callback must leave the board in that DFU (a bootloader with an empty slot
-    stays in DFU after a reset; re-acquire it after each reset).
+    """What a preset writer gets: the board is in its bootloader's DFU.
+
+    During a conversion (``before_app``), it is the NEW bootloader's DFU
+    after a bootloader replacement: the application slot is empty, and the
+    application is written once the callback returns. A bootloader with an
+    empty slot stays in DFU after a reset, so the callback re-acquires it after
+    each reset and leaves the board in that DFU (``returns_to_dfu`` True).
+
+    On a board that keeps its application (:meth:`LIFUFirmwareUpdate.
+    write_presets`, :meth:`LIFUTransmitterFirmwareUpdate.write_presets` /
+    ``write_slave_presets``), every write's reset boots that application
+    instead (``returns_to_dfu`` False): ``wait_dfu`` / ``reacquire`` then
+    wait for the application and request DFU again for the next write, and
+    the writer does not call them after its last write.
 
     Attributes:
         device: ``"console"``, ``"transmitter master"`` or
@@ -208,6 +223,10 @@ class DfuContext:
         reacquire: Slave only: after the slave reset, re-enumerate the chain
             until the slave is a bootloader node again; updates
             :attr:`i2c_addr` and returns it.
+        returns_to_dfu: True when a reset brings the board back to its DFU by
+            itself (empty slot), so a writer waits after every write; False
+            when it boots the kept application, so a writer waits only
+            between writes.
     """
 
     device: str
@@ -219,6 +238,43 @@ class DfuContext:
     wait_dfu: Callable[[], str] | None = None
     i2c_addr: int | None = None
     reacquire: Callable[[], int] | None = None
+    returns_to_dfu: bool = True
+
+
+def _wait_for_app(device: Any, what: str, timeout_s: float | None = None) -> str:
+    """Wait for *device*'s application to answer with a real version
+    (reopening its port, which a reset drops); returns the version.
+
+    Raises:
+        RuntimeError: No answer within *timeout_s* (default
+            :data:`PRESET_APP_TIMEOUT_S`).
+    """
+    timeout_s = PRESET_APP_TIMEOUT_S if timeout_s is None else timeout_s
+    deadline = time.monotonic() + timeout_s
+    last: Any = None
+    while True:
+        try:
+            _reopen(device)
+            version = str(device.get_version())
+            if _is_real_version(version):
+                return version
+            last = version
+        except Exception as e:  # noqa: BLE001 - keep polling until the deadline
+            last = e
+        if time.monotonic() >= deadline:
+            raise RuntimeError(f"{what}: the application did not answer within "
+                               f"{timeout_s:.0f} s after a preset write (last: {last})")
+        time.sleep(PRESET_APP_POLL_S)
+
+
+def _leave_dfu(abort: Callable[[], None], what: str) -> None:
+    """Best effort, after a failed preset write: reset the board out of its
+    bootloader's DFU so it boots its application (a no-op if it already
+    did). Never raises: the write's own error is what gets reported."""
+    try:
+        abort()
+    except Exception as e:  # noqa: BLE001 - best effort
+        logger.info("%s: leaving DFU after a failed preset write: %s", what, e)
 
 
 def _usb_wait_dfu(get_bl: Callable[[float], str]) -> Callable[[], str]:
@@ -778,6 +834,53 @@ class LIFUFirmwareUpdate:
                             "app.", reboot_required=False,
                             bl_version=bl_version)
 
+    def write_presets(self, write: Callable[[DfuContext], None]) -> UpdateResult:
+        """Write presets in the bootloader's DFU of a console that keeps its
+        application (a clinical unit: its application takes no preset write).
+
+        Requests DFU from the running application, then calls *write(ctx)*
+        (``ctx.returns_to_dfu`` False: see :class:`DfuContext`). Each preset
+        write ends in a reset that boots the application, so ``ctx.wait_dfu``
+        waits for it and requests DFU again; the writer does not call it after
+        its last write. Returns once the application answers. The application
+        and its anti-rollback floor are not touched; the bootloader checks
+        each package against its own key before it erases the page.
+
+        Raises:
+            RuntimeError: No HV controller, the application does not answer,
+                or a DFU step failed. The console is taken out of DFU first,
+                back to its application (a refused or interrupted write leaves
+                the preset page empty, which the application reports).
+        """
+        hv = self._require_hv()
+        mgr, kw = self._mgr, dict(vid=self.vid, pid=self.pid, libusb_dll=self.libusb_dll)
+
+        def get_bl(t: float) -> str:
+            return mgr.get_console_bootloader_version(timeout_s=t, **kw)
+
+        def enter() -> str:
+            logger.info("Requesting console DFU mode for a preset write...")
+            self._enter_dfu()
+            time.sleep(2.0)
+            return get_bl(45.0)
+
+        def reenter() -> str:
+            _wait_for_app(hv, "Console")
+            return enter()
+
+        bl_version = enter()
+        ctx = DfuContext("console", 0, mgr, wait_dfu=reenter, returns_to_dfu=False, **kw)
+        try:
+            write(ctx)
+        except Exception:
+            _leave_dfu(lambda: mgr.abort_dfu(profile=CONSOLE_PROFILE, **kw), "Console")
+            raise
+        version = _wait_for_app(hv, "Console")
+        return UpdateResult(COHORT_SECURE, "presets-dfu",
+                            f"Wrote the presets in the bootloader's DFU; the application "
+                            f"{version} is running.", reboot_required=False,
+                            bl_version=bl_version)
+
     # ------------------------------------------------------------------
     # DFU-entry callables (raise a clear error if no HV controller)
     # ------------------------------------------------------------------
@@ -1219,6 +1322,90 @@ class LIFUTransmitterFirmwareUpdate:
                             "Updated the transmitter application on the "
                             "secure bootloader; the unit is rebooting into "
                             "the new app.", reboot_required=False,
+                            bl_version=bl_version)
+
+    def write_presets(self, write: Callable[[DfuContext], None]) -> UpdateResult:
+        """Write presets in the bootloader's USB DFU of a transmitter master
+        that keeps its application (a clinical unit). Same scheme as
+        :meth:`LIFUFirmwareUpdate.write_presets`: DFU is requested from the
+        running application, each slot write resets it into that application,
+        and ``ctx.wait_dfu`` waits for it and requests DFU again. Returns once
+        the application answers.
+
+        Raises:
+            RuntimeError: No transmitter, the application does not answer, or
+                a DFU step failed (the master is taken out of DFU first).
+        """
+        tx = self._require_tx()
+        mgr, kw = self._mgr, dict(vid=self.vid, pid=self.pid, libusb_dll=self.libusb_dll)
+
+        def enter() -> str:
+            logger.info("Requesting transmitter DFU mode for a preset write...")
+            self._enter_dfu()
+            time.sleep(2.0)
+            return mgr._wait_for_dfu_kind(DFU_KIND_SECURE, timeout_s=45.0, **kw)
+
+        def reenter() -> str:
+            _wait_for_app(tx, "Transmitter")
+            return enter()
+
+        bl_version = enter()
+        ctx = DfuContext("transmitter master", 0, mgr, wait_dfu=reenter,
+                         returns_to_dfu=False, **kw)
+        try:
+            write(ctx)
+        except Exception:
+            _leave_dfu(lambda: mgr.abort_dfu(profile=TRANSMITTER_PROFILE, **kw), "Transmitter")
+            raise
+        version = _wait_for_app(tx, "Transmitter")
+        return UpdateResult(COHORT_SECURE, "presets-dfu",
+                            f"Wrote the transmitter presets in the bootloader's DFU; the "
+                            f"application {version} is running.", reboot_required=False,
+                            bl_version=bl_version)
+
+    def write_slave_presets(self, module: int, write: Callable[[DfuContext], None],
+                            dfu_wait_s: float = 6.0) -> UpdateResult:
+        """Write presets in the bootloader's I2C DFU of slave *module*, which
+        keeps its application. The master requests the slave's DFU; each slot
+        write resets the slave into its application, so ``ctx.reacquire``
+        waits for it and requests DFU again (the chain re-assigns its I2C
+        address); the writer does not call it after its last write.
+
+        The master must run firmware that re-enumerates a running chain
+        safely (openlifu-transmitter-fw 2.1.0-rc.5 or later, #80).
+
+        Raises:
+            RuntimeError: The slave is not seen, did not enter DFU, or a DFU
+                step failed (the slave is reset out of DFU first).
+        """
+        tx = self._require_tx()
+        mgr = LIFUDFUManager(uart=tx.uart)
+        i2c_addr = self._slave_enter_dfu(module, dfu_wait_s)
+        bl_version = STM32I2CDFUviaMaster(tx.uart, i2c_addr=i2c_addr).get_version()
+        ctx = DfuContext(f"transmitter module {module}", module, mgr, i2c_addr=i2c_addr,
+                         returns_to_dfu=False)
+
+        def reacquire() -> int:
+            if not self._slave_post_boot_version(module, dfu_wait_s):
+                raise RuntimeError(f"slave module {module}: its application did not answer "
+                                   "after a preset write")
+            ctx.i2c_addr = self._slave_enter_dfu(module, dfu_wait_s)
+            return ctx.i2c_addr
+
+        ctx.reacquire = reacquire
+        try:
+            write(ctx)
+        except Exception:
+            _leave_dfu(lambda: STM32I2CDFUviaMaster(tx.uart, i2c_addr=ctx.i2c_addr).reset(),
+                       f"Slave {module}")
+            raise
+        version = self._slave_post_boot_version(module, dfu_wait_s)
+        if not version:
+            raise RuntimeError(f"slave module {module}: its application did not answer after "
+                               "the preset write")
+        return UpdateResult(COHORT_SECURE, "presets-dfu-i2c",
+                            f"Wrote slave transmitter module {module}'s presets in its "
+                            f"bootloader's I2C DFU (now {version}).", reboot_required=False,
                             bl_version=bl_version)
 
     def slave_module_version(self, module: int) -> tuple[str, int]:
