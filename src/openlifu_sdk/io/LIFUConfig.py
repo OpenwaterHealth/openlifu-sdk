@@ -29,8 +29,8 @@ OW_SUCCESS = 0x00
 OW_HV_FAULT = 0xF0         # console: HV on refused while an HV rail fault is latched (SR-025)
 OW_HV_RANGE = 0xF1         # console: select's rescaled voltage is outside the FDA window
 OW_PRESET_BUSY = 0xF2      # TX: trigger running, presets cannot be stored or deleted
-OW_PRESET_NO_ROOM = 0xF3   # TX: blob needs the next slot too, and it is taken or missing
-OW_PRESET_SLOT_TAIL = 0xF4 # TX: slot holds the second half of the preset before it
+OW_PRESET_NO_ROOM = 0xF3   # TX: no preset slots (under a bootloader before 1.1.0-rc.1)
+OW_PRESET_SLOT_TAIL = 0xF4 # TX: retired (a preset fits one slot); older images only
 OW_PRESET_EMPTY = 0xF5     # TX: nothing stored in the slot
 OW_HV_PRESET_CRC = 0xF6    # console: select's settings_crc is not that preset's
 OW_HV_NO_PRESET = 0xF7     # console: HV on before any preset was selected
@@ -59,6 +59,7 @@ OW_CMD_TOGGLE_LED = 0x04
 OW_CMD_HWID = 0x05
 OW_CMD_GET_TEMP = 0x06
 OW_CMD_GET_AMBIENT = 0x07
+OW_CMD_SIGCHK = 0x08  # signature check: the signed header, or bare metal
 OW_CMD_ASYNC = 0x09
 OW_CMD_USR_CFG = 0x0A
 OW_CMD_CLEAR_CONFIG = 0x0B  # Phase 2: chain broadcast to drop stale I2C addresses
@@ -66,6 +67,13 @@ OW_CMD_DISCOVERY = 0x0C
 OW_CMD_DFU = 0x0D
 OW_CMD_NOP = 0x0E
 OW_CMD_RESET = 0x0F
+# The bootloader's version, as the application reads it (ASCII, e.g. "1.1.0-rc.3",
+# at most BL_VERSION_MAX_LEN bytes, no NUL; empty: none found / bare metal).
+# addr is the module (transmitter: 0 = master, n = slave over I2C). Firmware
+# from before it (console up to 1.3.0-rc.4, transmitter up to 2.1.0-rc.7, the
+# field 1.2.6 / 2.0.8) answers OW_ERROR. Not in the FDA command sets.
+OW_CMD_BL_VERSION = 0x70
+BL_VERSION_MAX_LEN = 32
 
 # Node operating mode reported by OW_CTRL_GET_MODULE_MODE / discovery (Phase 2)
 NODE_MODE_UNKNOWN = 0x00
@@ -103,6 +111,8 @@ OW_PRESET_DELETE = 0x54
 OW_PRESET_CAPACITY = 0x55
 # What every module has loaded (16 bytes; TxDevice.get_loaded_preset_state).
 OW_PRESET_LOADED = 0x57
+# A slot's PRS1 header (320 bytes; TxDevice.get_preset_info).
+OW_PRESET_INFO = 0x58
 
 # Thermal limits, start_C / shutoff_C, and the treatment timeout, the third
 # limit (transmitter-fw thermal_limits.h): armed by a preset load and kept
@@ -148,9 +158,19 @@ OW_POWER_VMON = 0x40
 OW_POWER_RAW_DAC = 0x41
 OW_POWER_HV_ENABLE = 0x42
 OW_POWER_SET_RGB_FX = 0x43
-# FDA mode only: the console's per-preset HV table, indexed like the TX's.
+# The console's presets, indexed like the TX's, read from its preset page
+# (page 61, a signed PRS1 package: LIFUPresetPackage). Every build reads them;
+# research and bare-metal builds can also write the page (WRITE/COMMIT); the
+# FDA (clinical) build refuses that with OW_HV_FDA_REFUSED.
 OW_POWER_PRESET_GET = 0x44     # reserved=index
 OW_POWER_PRESET_SELECT = 0x45  # reserved=index, data=settings_crc u32 + transmitter sensitivity f32 (LE)
+OW_POWER_PRESET_INFO = 0x46    # -> reserved=PRESET_INFO_*, data=the package header (320 B)
+OW_POWER_PRESET_WRITE = 0x47   # data=offset u16 + bytes; the first chunk erases the page
+OW_POWER_PRESET_COMMIT = 0x48  # data=package length u32 + CRC-32 u32 (LE)
+# OW_POWER_PRESET_INFO reply reserved byte
+PRESET_INFO_OK = 0x00          # a package whose records all parse
+PRESET_INFO_EMPTY = 0x01       # no valid package in the page
+PRESET_INFO_NO_PAGE = 0x02     # no preset page: console bootloader before 1.1.0-rc.2
 
 # HV rail monitor (SR-025, console-fw#43 "Host contract"). The latched fault
 # cause rides in OW_POWER_GET_HV's reply reserved byte and in byte 1 of the
@@ -191,8 +211,13 @@ GLOBAL_COMMANDS = {
     OW_CMD_PING, OW_CMD_PONG, OW_CMD_VERSION, OW_CMD_ECHO,
     OW_CMD_TOGGLE_LED, OW_CMD_HWID, OW_CMD_GET_TEMP, OW_CMD_GET_AMBIENT,
     OW_CMD_ASYNC, OW_CMD_USR_CFG, OW_CMD_DISCOVERY, OW_CMD_DFU,
-    OW_CMD_NOP, OW_CMD_RESET,
+    OW_CMD_NOP, OW_CMD_RESET, OW_CMD_SIGCHK, OW_CMD_BL_VERSION,
 }
+
+# OW_CMD_SIGCHK reply payload (both firmwares, Core/Inc/common.h): a status
+# byte, then for a slot build the signed SBSFU header from the slot start.
+SIGCHK_SLOT_IMAGE = 0x00   # data[1:321] is the signed header
+SIGCHK_BARE_METAL = 0x01   # no bootloader, so no signed header
 
 TX7332_COMMANDS = {
     OW_TX7332_STATUS, OW_TX7332_ENUM, OW_TX7332_WREG, OW_TX7332_RREG,
@@ -210,7 +235,7 @@ CONTROLLER_COMMANDS = {
     OW_CTRL_SET_PROFILE_CYCLE,
     OW_PRESET_GET, OW_PRESET_LOAD,
     OW_PRESET_WRITE, OW_PRESET_COMMIT, OW_PRESET_DELETE, OW_PRESET_CAPACITY,
-    OW_PRESET_LOADED,
+    OW_PRESET_LOADED, OW_PRESET_INFO,
     OW_CTRL_GET_THERMAL_LIMITS, OW_CTRL_SET_THERMAL_LIMITS, OW_CTRL_CLEAR_THERMAL_LIMITS,
 }
 
@@ -220,15 +245,17 @@ POWER_COMMANDS = {
     OW_POWER_GET_TEMP2, OW_POWER_SET_FAN, OW_POWER_GET_FAN, OW_POWER_SET_RGB,
     OW_POWER_GET_RGB, OW_POWER_GET_HVON, OW_POWER_GET_12VON, OW_POWER_SET_DACS,
     OW_POWER_VMON, OW_POWER_RAW_DAC, OW_POWER_HV_ENABLE, OW_POWER_SET_RGB_FX,
-    OW_POWER_PRESET_GET, OW_POWER_PRESET_SELECT,
+    OW_POWER_PRESET_GET, OW_POWER_PRESET_SELECT, OW_POWER_PRESET_INFO,
+    OW_POWER_PRESET_WRITE, OW_POWER_PRESET_COMMIT,
 }
 
 # FDA subsets: the only commands the FDA components (TxDevice / HVController)
 # will put on the wire. LIFUTxDevice / LIFUHVController use the full sets
 # above. OW_CMD_USR_CFG carries both read (reserved=0) and write (reserved=1);
-# the FDA classes only expose the read.
+# the FDA classes only expose the read. OW_CMD_SIGCHK is a read: the clinical
+# app checks the firmware's signing key with it.
 GLOBAL_FDA_COMMANDS = {
-    OW_CMD_PING, OW_CMD_VERSION, OW_CMD_HWID, OW_CMD_USR_CFG,
+    OW_CMD_PING, OW_CMD_VERSION, OW_CMD_HWID, OW_CMD_USR_CFG, OW_CMD_SIGCHK,
 }
 
 # What the FDA components may send, as packet type -> opcodes. The firmware
@@ -243,7 +270,7 @@ TX_FDA_PACKETS = {
         OW_CTRL_GET_SWTRIG, OW_CTRL_START_SWTRIG, OW_CTRL_STOP_SWTRIG,
         OW_CTRL_PAUSE_SWTRIG, OW_CTRL_RESUME_SWTRIG,
         OW_CTRL_GET_MODULE_COUNT,
-        OW_PRESET_GET, OW_PRESET_LOAD, OW_PRESET_LOADED,
+        OW_PRESET_GET, OW_PRESET_LOAD, OW_PRESET_LOADED, OW_PRESET_INFO,
         OW_CTRL_GET_THERMAL_LIMITS,
     }),
     OW_TX7332: frozenset({OW_TX7332_DEVICE_COUNT}),  # get_module_count fallback on older images
@@ -255,7 +282,7 @@ HV_FDA_PACKETS = {
         OW_POWER_GET_HV, OW_POWER_HV_ON, OW_POWER_HV_OFF, OW_POWER_GET_HVON,
         OW_POWER_GET_12VON, OW_POWER_GET_TEMP1, OW_POWER_GET_TEMP2,
         OW_POWER_GET_FAN, OW_POWER_VMON, OW_POWER_STATUS,
-        OW_POWER_PRESET_GET, OW_POWER_PRESET_SELECT,
+        OW_POWER_PRESET_GET, OW_POWER_PRESET_SELECT, OW_POWER_PRESET_INFO,
     }),
 }
 

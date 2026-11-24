@@ -25,20 +25,20 @@ from openlifu_sdk.io.LIFUInterface import LIFUInterface
 # WARNING: beta/unlocked units only. The bootloader self-replacement is the one
 # irreversible step - keep the unit powered throughout.
 #
-# The updater is keyless (HMAC trust tag) and ships with the SDK, so normally
-# you only pass the signed app:
+# The updater is keyless (HMAC trust tag). The SDK carries no firmware: pass
+# both images:
 #
 # set PYTHONPATH=%cd%\src;%PYTHONPATH%
-# python examples\migrate_console_legacy.py --app path\to\lifu-console-fw_signed.bin
+# python examples\migrate_console_legacy.py --app path\to\lifu-console-fw_signed.bin ^
+#     --updater path\to\openlifu-console-legacy-updater.bin
 #
-# (--updater overrides the bundled updater; --keys is optional and only
+# (--keys is optional and only
 #  validates the app's signature before flashing.)
 
 parser = argparse.ArgumentParser(description="Migrate a legacy-bootloader console")
 parser.add_argument("--app", required=True, help="Signed SBSFU app image")
-parser.add_argument("--updater",
-                    help="Override the updater binary. Defaults to the "
-                         "keyless updater bundled with the SDK.")
+parser.add_argument("--updater", required=True,
+                    help="The keyless legacy updater binary.")
 parser.add_argument("--keys",
                     help="Optional keys dir to validate the signed app's "
                          "signature before flashing. Not required - the "
@@ -73,7 +73,7 @@ print("Migrating (legacy DFU -> updater -> secure BL -> app)...")
 try:
     mgr.migrate_console_legacy(
         signed_app=args.app,
-        updater_bin=args.updater,            # None -> SDK-bundled updater
+        updater_bin=args.updater,
         enter_dfu_fn=interface.hvcontroller.enter_dfu,   # normal DFU -> legacy BL
         keys_dir=args.keys,                  # None -> app structural check only
         progress_callback=progress,

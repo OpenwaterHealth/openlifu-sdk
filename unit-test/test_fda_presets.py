@@ -28,6 +28,7 @@ from openlifu_sdk.io.exceptions import LIFUDeviceError, LIFUError, LIFUHVSettleE
 from openlifu_sdk.io.LIFUConfig import (
     LIFU_ERR_MODULE_COUNT_MISMATCH,
     OW_BAD_CRC,
+    OW_PRESET_EMPTY,
     OW_CMD,
     OW_CMD_ECHO,
     OW_CMD_USR_CFG,
@@ -219,8 +220,10 @@ class TestTreatmentTimeout(unittest.TestCase):
         tx.get_preset.return_value = {"id": mc["id"], "settings_crc": mc["settings_crc"],
                                       "regs_crc": regs_crc(mc), "start_c": 35.0, "shutoff_c": 75.0}
         store_preset(tx, 3, mc)
-        slot, blob, module = tx.write_preset.call_args.args
+        slot, image, module = tx.write_preset.call_args.args
         self.assertEqual((slot, module), (3, 0))
+        blob = image[0x140:]                      # after the slot's PRS1 header
+        self.assertEqual(image[:4], b"PRS1")
         self.assertEqual((blob[4], parse_preset_blob(blob)["treatment_timeout_s"]), (2, 600))
 
 
@@ -636,6 +639,18 @@ class TestDeviceReplies(unittest.TestCase):
         got = tx.get_preset(1)
         self.assertIsNone(got["start_c"])
         self.assertEqual(got["train_counts"], [188, 375])
+
+    def test_fda_component_reads_preset_slots(self):
+        """The FDA component (the operator interface's) tells an empty slot
+        from a stored preset: it is a read (OW_PRESET_GET) only."""
+        tx = TxDevice()
+        empty = LIFUDeviceError("TX: empty", device_error_code=OW_PRESET_EMPTY)
+        tx.get_preset = MagicMock(side_effect=[{"id": "unit", "count": 15}, empty])
+        self.assertEqual(tx.get_preset_slot(0), {"id": "unit", "count": 15, "state": "preset"})
+        self.assertEqual(tx.get_preset_slot(13), {"index": 13, "state": "empty"})
+        tx.get_preset = MagicMock(side_effect=LIFUDeviceError("TX: bad", device_error_code=OW_BAD_CRC))
+        with self.assertRaises(LIFUDeviceError):
+            tx.get_preset_slot(2)
 
 
 class TestTxMetadata(unittest.TestCase):

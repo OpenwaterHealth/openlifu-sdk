@@ -18,6 +18,7 @@ Provides:
 
 from __future__ import annotations
 
+import errno
 import logging
 import struct
 import sys
@@ -91,6 +92,30 @@ def _find_bundled_libusb_dll() -> str | None:
 USB_DFU_VERSION_VIRT_ADDR = 0xFFFFFF00
 USB_DFU_VERSION_READ_LEN  = 64
 
+# Verify before erase (open-lifu-console-bl >= 1.1.0, usbd_dfu_if.c). The
+# bootloader refuses every slot erase and write until the host has DNLOADed
+# the image's signed SFU header to USB_DFU_HDR_STAGE_VIRT_ADDR and it has
+# verified (size fits, version not below the installed one, ECDSA signature).
+# It advertises this at USB_DFU_CAPS_VIRT_ADDR: an UPLOAD there returns
+# b"OWC1" + a little-endian u32 capability word. Older bootloaders STALL that
+# read or return flash bytes (1.0.3-rc.1 does), so the bits are trusted only
+# behind the magic.
+USB_DFU_HDR_STAGE_VIRT_ADDR     = 0xFFFFFF10
+USB_DFU_CAPS_VIRT_ADDR          = 0xFFFFFF18
+USB_DFU_CAPS_MAGIC              = b"OWC1"
+USB_DFU_CAP_VERIFY_BEFORE_ERASE = 0x00000001
+# Signed preset write (open-lifu-console-bl >= 1.1.0-rc.2): the slot stops at
+# page 60 and page 61 holds a signed preset package (LIFUPresetPackage), which
+# the bootloader takes only after its PRS1 header, DNLOADed to
+# USB_DFU_PRESET_STAGE_VIRT_ADDR, verifies.
+USB_DFU_CAP_SIGNED_PRESET_WRITE = 0x00000002
+USB_DFU_PRESET_STAGE_VIRT_ADDR  = 0xFFFFFF20
+# sizeof(SE_FwRawHeaderTypeDef): the signed part of the image header.
+USB_DFU_SFU_HEADER_LEN          = 320
+# The check is a software ECDSA verify on the console's Cortex-M0; the
+# bootloader's own flasher (py-tools/stm32dfu.py) allows 15 s.
+USB_DFU_HDR_VERIFY_TIMEOUT_S    = 15.0
+
 # I2C DFU command bytes (must match i2c_dfu_if.h)
 I2C_DFU_SLAVE_ADDR      = 0x72
 I2C_DFU_CMD_DNLOAD      = 0x01
@@ -99,11 +124,19 @@ I2C_DFU_CMD_GETSTATUS   = 0x03
 I2C_DFU_CMD_MANIFEST    = 0x04
 I2C_DFU_CMD_RESET       = 0x05
 I2C_DFU_CMD_GETVERSION  = 0x06
+# "OWC1" + capability word, as at USB_DFU_CAPS_VIRT_ADDR (transmitter
+# bootloader >= 1.1.0-rc.1; older ones answer I2C_DFU_STATUS_ERROR).
+I2C_DFU_CMD_GETCAPS     = 0x07
 I2C_DFU_STATUS_OK       = 0x00
 I2C_DFU_STATUS_BUSY     = 0x01
 I2C_DFU_STATUS_ERROR    = 0x02
 I2C_DFU_STATUS_BAD_ADDR = 0x03
 I2C_DFU_STATUS_FLASH_ERR= 0x04
+# The download was refused before anything was erased: its first block was
+# not a signed header that passed the bootloader's check (signature for this
+# board, version not below the installed one / anti-rollback floor, size).
+# open-lifu-transmitter-bl >= 1.1.0 (Core/Inc/dfu_guard.h).
+I2C_DFU_STATUS_REJECTED = 0x05
 I2C_DFU_STATE_DNBUSY    = 0x01
 I2C_DFU_STATE_ERROR     = 0x04
 # Maximum data bytes per write_block call.  The enclosing OW_I2C_PASSTHRU UART
@@ -115,6 +148,37 @@ I2C_DFU_MAX_XFER_SIZE   = 512
 I2C_DFU_VERSION_STR_MAX = 32
 
 
+class DFUWriteRefusedError(RuntimeError):
+    """The bootloader reported a failed DFU write (USB ``dfuERROR`` after a
+    data block, I2C status ``REJECTED``/error), as opposed to a transport
+    fault. Not retried: the same block would be refused again.
+
+    A bootloader that checks the signed header before erasing
+    (open-lifu-transmitter-bl >= 1.1.0) refuses a wrong-board, tampered,
+    downgraded or oversized image at the first block and keeps its
+    installed firmware.
+    """
+
+
+class DFUHeaderRefusedError(DFUWriteRefusedError, ValueError):
+    """The bootloader refused the signed header staged before the erase
+    (open-lifu-console-bl >= 1.1.0, verify before erase). Nothing in the slot
+    was touched, so this is also a ``ValueError``: callers that treat
+    ``ValueError`` as a pre-flight refusal (``update_console``) boot the
+    installed application back up instead of leaving the unit in DFU.
+    """
+
+
+class DFUHeaderTimeoutError(TimeoutError, ValueError):
+    """The bootloader did not finish checking the header staged before the
+    erase. Nothing in the slot was touched, so, like
+    :class:`DFUHeaderRefusedError`, this is also a ``ValueError`` and
+    ``update_console`` boots the installed application back up. Raised by
+    :meth:`STM32USBDFU.prepare_slot_write` only: a re-stage after the erase
+    (``_resync_session``) raises ``RuntimeError`` instead.
+    """
+
+
 @dataclass
 class DeviceProfile:
     name: str
@@ -124,6 +188,19 @@ class DeviceProfile:
     app_default_address: int | None = None
     reset_virt_addr: int | None = 0xFFFFFF08
     slot_size: int | None = None
+    # Verify-before-erase virtual addresses (see USB_DFU_CAPS_VIRT_ADDR).
+    # None = never probed: the transmitter bootloader checks the header
+    # in-band on the first slot block and needs no staging step.
+    caps_virt_addr: int | None = None
+    hdr_stage_virt_addr: int | None = None
+    # Preset page above the slot, on a bootloader advertising
+    # USB_DFU_CAP_SIGNED_PRESET_WRITE (console >= 1.1.0-rc.2). On such a
+    # bootloader the slot ends at preset_base, so the slot erase stops there.
+    preset_base: int | None = None
+    preset_size: int | None = None
+    # Size of one preset slot when the preset area is split into slots
+    # (transmitter); None = one page holding the whole set (console).
+    preset_slot_size: int | None = None
 
 # Built-in profiles
 TRANSMITTER_PROFILE = DeviceProfile(
@@ -133,11 +210,18 @@ TRANSMITTER_PROFILE = DeviceProfile(
     program_alignment_bytes=8,
     app_default_address=None,
     reset_virt_addr=0xFFFFFF08,
-    # Pages 32-109 = the DFU-writable window. The erase stops at 0x08036FFF,
-    # short of the stored presets (0x08037000), the anti-rollback log
-    # (0x0803F000) and the user config (0x0803F800). Bootloaders from before
-    # presets were stored there let DFU reach page 125; stopping at 109 suits both.
-    slot_size=0x27000,
+    # Pages 32-95 = the slot (open-lifu-transmitter-bl >= 1.1.0-rc.2, and the
+    # application's memory_map.h). The erase stops at 0x0802FFFF, short of the
+    # presets (pages 96-125, 0x08030000), the anti-rollback log (0x0803F000)
+    # and the runtime config (0x0803F800). Older bootloaders let DFU reach
+    # page 125; stopping at 95 suits both.
+    slot_size=0x20000,
+    # The capability word is read only for preset writes: the slot write
+    # checks the header in-band on its first block and needs no staging.
+    caps_virt_addr=USB_DFU_CAPS_VIRT_ADDR,
+    preset_base=0x08030000,          # LIFUPresetPackage.TX_PRESET_BASE
+    preset_size=0xF000,
+    preset_slot_size=0x1000,
 )
 
 CONSOLE_PROFILE = DeviceProfile(
@@ -147,10 +231,18 @@ CONSOLE_PROFILE = DeviceProfile(
     program_alignment_bytes=4,
     app_default_address=0x08010000,  # SBSFU active slot (console memory_map.h)
     reset_virt_addr=0xFFFFFF08,
-    # Pages 32-61 = the DFU-writable window. The erase stops at 0x0801EFFF,
-    # short of the app config block (0x0801F000, exposed over OW_CMD_USR_CFG
-    # since app 1.2.7) and the anti-rollback floor (0x0801F800).
+    # Pages 32-61: the slot on bootloaders before 1.1.0-rc.2. The erase stops
+    # at 0x0801EFFF, short of the app config block (0x0801F000, exposed over
+    # OW_CMD_USR_CFG since app 1.2.7) and the anti-rollback floor (0x0801F800).
+    # A bootloader with the preset page has a 58 KB slot (pages 32-60): see
+    # STM32USBDFU.slot_erase_bytes().
     slot_size=0xF000,
+    # Probed on every slot write; staged only when the bootloader advertises
+    # verify before erase (>= 1.1.0), so older bootloaders keep the old flow.
+    caps_virt_addr=USB_DFU_CAPS_VIRT_ADDR,
+    hdr_stage_virt_addr=USB_DFU_HDR_STAGE_VIRT_ADDR,
+    preset_base=0x0801E800,         # page 61 (LIFUPresetPackage.CONSOLE_PRESET_BASE)
+    preset_size=0x800,
 )
 
 # Console SBSFU active slot: the signed image (320 B header + app @ +0x400)
@@ -189,18 +281,6 @@ TRANSMITTER_FLASH_SIZE = 0x40000          # 256 KB
 # stub's full-flash DFU from a bootloader's slot-only DFU at the same address.
 TRANSMITTER_DFU_STUB_PREFIX = "dfu-stub"
 
-
-def bundled_updater_path() -> Path:
-    """Path to the RAM-resident legacy-migration updater shipped with the SDK
-    (``firmware/openlifu-console-legacy-updater.bin`` — the interim image for
-    the console legacy-bootloader migration; see console-legacy-updater).
-
-    This is the one-time, keyless self-updater used by
-    :meth:`LIFUDFUManager.migrate_console_legacy`. It needs no signing key: the
-    legacy bootloader authenticates it with an HMAC "trust tag" that the SDK
-    computes from the updater bytes at run time (``build_legacy_metadata``)."""
-    return (Path(__file__).parent.parent / "firmware"
-            / "openlifu-console-legacy-updater.bin")
 
 
 def _split_flash_image(image: bytes, slot_off: int) -> tuple[bytes, bytes]:
@@ -566,6 +646,10 @@ class STM32USBDFU:
     STATE_DFU_MANIFEST            = 7
     STATE_DFU_MANIFEST_WAIT_RESET = 8
     STATE_DFU_ERROR               = 10
+    # Not a DFU 1.1 state: ST's USB device library (v2.11.6, console
+    # bootloader >= 1.1.0) stores the status code DFU_ERROR_STALLEDPKT (0x0F)
+    # in bState after STALLing an UPLOAD it cannot serve.
+    STATE_ST_STALLED_PKT          = 0x0F
 
     def __init__(self, vid: int = 0x0483, pid: int = 0xDF11,
                  transfer_size: int = 1024, timeout_ms: int = 4000,
@@ -583,11 +667,21 @@ class STM32USBDFU:
         self.dev = None
         self.intf = None
         self._backend = None
+        # Verify before erase: addresses from the profile (None = not probed),
+        # and the header this session staged, re-staged if the device has to
+        # be re-opened mid-write (_resync_session).
+        self.caps_virt_addr: int | None = None
+        self.hdr_stage_virt_addr: int | None = None
+        self._staged_header: bytes | None = None
+        self._profile = device_profile
+        self._caps: int | None = None       # read_capabilities() result, cached
         # device_profile may override transfer_size and provide read_len/alignment
         if device_profile is not None:
             self.transfer_size = int(device_profile.transfer_size)
             self.version_read_len = int(device_profile.version_read_len)
             self.program_alignment = int(device_profile.program_alignment_bytes)
+            self.caps_virt_addr = device_profile.caps_virt_addr
+            self.hdr_stage_virt_addr = device_profile.hdr_stage_virt_addr
         else:
             self.version_read_len = USB_DFU_VERSION_READ_LEN
             # default alignment (safe): 8 (transmitter L4 uses 8-byte doubleword)
@@ -708,7 +802,10 @@ class STM32USBDFU:
                 self.STATE_DFU_MANIFEST_WAIT_RESET,
             ):
                 self.abort()
-            elif st["state"] == self.STATE_DFU_ERROR:
+            elif st["state"] in (self.STATE_DFU_ERROR,
+                                 self.STATE_ST_STALLED_PKT):
+                # From the STALLed-packet state, CLRSTATUS moves to dfuERROR
+                # and the next one to dfuIDLE (ABORT is ignored there).
                 self.clear_status()
             else:
                 break
@@ -761,7 +858,18 @@ class STM32USBDFU:
         self._ctrl_out(
             self.DFU_DNLOAD, block_num, bytes(payload) if payload else b""
         )
-        return self._wait_while_busy()
+        st = self._wait_while_busy()
+        # A data block (wBlockNum >= 2) the device failed leaves it in
+        # dfuERROR. Report it: _prepare_dnload() would otherwise clear the
+        # error before the next block and the write would carry on with a
+        # hole (or, on a bootloader that checks the header before erasing,
+        # past a refused image). Block 0 commands (erase / set address)
+        # keep their previous, lenient handling.
+        if block_num >= 2 and st["state"] == self.STATE_DFU_ERROR:
+            raise DFUWriteRefusedError(
+                f"device refused DFU block {block_num} "
+                f"(bStatus 0x{st['status']:02X})")
+        return st
 
     def _set_address(self, address: int) -> None:
         payload = bytes([self.CMD_SET_ADDRESS_POINTER]) + struct.pack("<I", address)
@@ -782,6 +890,192 @@ class STM32USBDFU:
             pass
         self.abort()
         return raw.rstrip(b"\x00").decode("ascii", errors="replace")
+
+    # --- verify before erase (open-lifu-console-bl >= 1.1.0) ---
+
+    def read_capabilities(self) -> int:
+        """Return the bootloader's capability word, or 0 when it has none.
+
+        Only probed when the device profile names a capability address.
+        Bootloaders that predate the word return flash bytes (1.0.x) or STALL
+        the read, so the bits are trusted only behind ``USB_DFU_CAPS_MAGIC``,
+        and a STALL is cleared back to dfuIDLE and reported as 0: the caller
+        keeps the plain erase-then-write flow.
+
+        Raises:
+            RuntimeError: Any other transfer error, after retries. Taking it
+                for "no capabilities" would skip the header staging a
+                verify-before-erase bootloader needs. Nothing was erased.
+        """
+        if self.caps_virt_addr is None:
+            return 0
+        last_error: Exception | None = None
+        for _attempt in range(3):
+            try:
+                self._recover_idle()
+                self._set_address(self.caps_virt_addr)
+                self.abort()   # UPLOAD is served from dfuIDLE only
+                raw = self._ctrl_in(self.DFU_UPLOAD, 2, 8)
+                self.abort()
+            except Exception as e:
+                try:
+                    self._recover_idle()
+                except Exception:
+                    pass
+                if getattr(e, "errno", None) == errno.EPIPE:   # STALL
+                    logger.debug("DFU capability read STALLed: no capabilities")
+                    return 0
+                last_error = e
+                logger.warning("DFU capability read failed (%s), retrying", e)
+                time.sleep(0.2)
+                continue
+            if len(raw) < 8 or raw[:4] != USB_DFU_CAPS_MAGIC:
+                self._caps = 0
+            else:
+                self._caps = struct.unpack("<I", raw[4:8])[0]
+            return self._caps
+        raise RuntimeError(
+            f"DFU: could not read the bootloader's capabilities "
+            f"({last_error}). Nothing was erased; retry the update.") from last_error
+
+    def requires_header_staging(self) -> bool:
+        """True if the bootloader refuses slot erase/write until
+        :meth:`stage_header` has run."""
+        if self.hdr_stage_virt_addr is None:
+            return False
+        return bool(self.read_capabilities() & USB_DFU_CAP_VERIFY_BEFORE_ERASE)
+
+    def stage_header(self, image: bytes) -> None:
+        """DNLOAD the image's signed header to the staging address and wait
+        for the bootloader to verify it. Must precede any erase or write of
+        the slot on a verify-before-erase bootloader.
+
+        Raises:
+            ValueError: *image* does not start with a signed SFU header.
+            DFUHeaderRefusedError: The bootloader refused the header; nothing
+                in the slot was erased.
+            TimeoutError: The bootloader did not finish the check in time.
+        """
+        if self.hdr_stage_virt_addr is None:
+            raise RuntimeError("stage_header: this device profile has no "
+                               "header staging address")
+        header = bytes(image[:USB_DFU_SFU_HEADER_LEN])
+        if len(header) < USB_DFU_SFU_HEADER_LEN or header[:4] != b"SFU1":
+            raise ValueError("stage_header: not a signed image (no SFU1 "
+                             f"header in the first {USB_DFU_SFU_HEADER_LEN} bytes)")
+        self._staged_header = None
+        self._stage(header, self.hdr_stage_virt_addr,
+                    "the bootloader refused the image before erasing anything "
+                    "(bStatus 0x{status:02X}): signed with a key this board "
+                    "does not trust (wrong board, or research vs clinical build), "
+                    "modified, too large for the slot, or older than the "
+                    "installed firmware. The installed firmware is intact.")
+        self._staged_header = header
+        logger.info("DFU: bootloader verified the image header before erase")
+
+    def stage_preset(self, package: bytes) -> None:
+        """DNLOAD a preset package's signed PRS1 header to the preset staging
+        address and wait for the bootloader to verify it. Must precede any
+        erase or write of the preset page.
+
+        Raises:
+            ValueError: *package* does not start with a PRS1 header.
+            DFUHeaderRefusedError: The bootloader refused it; the preset page
+                was not touched.
+            TimeoutError: The bootloader did not finish the check in time.
+        """
+        header = bytes(package[:USB_DFU_SFU_HEADER_LEN])
+        if len(header) < USB_DFU_SFU_HEADER_LEN or header[:4] != b"PRS1":
+            raise ValueError("stage_preset: not a preset package (no PRS1 "
+                             f"header in the first {USB_DFU_SFU_HEADER_LEN} bytes)")
+        self._stage(header, USB_DFU_PRESET_STAGE_VIRT_ADDR,
+                    "the bootloader refused the preset package before touching "
+                    "the preset page (bStatus 0x{status:02X}): signed with a key "
+                    "this board does not trust (wrong board, or research vs "
+                    "clinical), modified, or too large for the page. The "
+                    "installed presets are intact.")
+        logger.info("DFU: bootloader verified the preset package header")
+
+    def _stage(self, header: bytes, virt_addr: int, refused: str) -> None:
+        """DNLOAD *header* to the staging address *virt_addr* and wait for
+        the bootloader's verdict; *refused* (formatted with ``status``) is the
+        DFUHeaderRefusedError message."""
+        self._recover_idle()
+        self._set_address(virt_addr)
+        self._prepare_dnload()
+        self._ctrl_out(self.DFU_DNLOAD, 2, header)
+        st = self._wait_header_check(USB_DFU_HDR_VERIFY_TIMEOUT_S)
+        if st["state"] == self.STATE_DFU_ERROR:
+            try:
+                self._recover_idle()
+            except Exception:
+                pass
+            raise DFUHeaderRefusedError(refused.format(status=st["status"]))
+
+    def has_preset_page(self) -> bool:
+        """True if the bootloader keeps presets in their own page above the
+        slot (capability USB_DFU_CAP_SIGNED_PRESET_WRITE)."""
+        if self._profile is None or self._profile.preset_base is None:
+            return False
+        caps = self._caps if self._caps is not None else self.read_capabilities()
+        return bool(caps & USB_DFU_CAP_SIGNED_PRESET_WRITE)
+
+    def slot_erase_bytes(self) -> int | None:
+        """How many bytes from the slot base a slot write erases: up to the
+        preset page on a bootloader that has one (it must survive an
+        application update), else the profile's whole slot (on older
+        bootloaders that page is part of the slot and must be blank)."""
+        p = self._profile
+        if p is None:
+            return None
+        # app_default_address first: a profile without one (transmitter) has
+        # a fixed slot and is never probed for capabilities on a slot write.
+        if p.app_default_address is not None and self.has_preset_page():
+            return p.preset_base - p.app_default_address
+        return p.slot_size
+
+    def _wait_header_check(self, timeout_s: float) -> dict:
+        """Poll GETSTATUS until the header check finishes. Unlike
+        :meth:`_wait_while_busy` this has a deadline and rides out failed
+        polls: the device may not answer while it runs the ECDSA verify."""
+        busy = {self.STATE_DFU_DNLOAD_SYNC, self.STATE_DFU_DNLOAD_BUSY}
+        deadline = time.monotonic() + timeout_s
+        last_error: Exception | None = None
+        while True:
+            try:
+                st = self.get_status()
+            except Exception as e:
+                last_error = e
+                st = None
+            if st is not None and st["state"] not in busy:
+                return st
+            if time.monotonic() >= deadline:
+                suffix = f" (last poll failed: {last_error})" if last_error else ""
+                raise TimeoutError(
+                    f"DFU: the bootloader did not finish checking the image "
+                    f"header within {timeout_s:.0f} s{suffix}")
+            wait = 0.2 if st is None else max(st["poll_timeout_ms"] / 1000.0, 0.010)
+            time.sleep(min(wait, max(deadline - time.monotonic(), 0.0)))
+
+    def prepare_slot_write(self, image: bytes) -> bool:
+        """Stage *image*'s header if the bootloader requires it. Returns True
+        if it was staged, False if this bootloader takes the plain flow.
+        Call it before the slot erase.
+
+        Raises:
+            DFUHeaderRefusedError: The bootloader refused the header.
+            DFUHeaderTimeoutError: The bootloader did not finish the check.
+                Like a refusal, this happens before any erase.
+        """
+        if not self.requires_header_staging():
+            return False
+        try:
+            self.stage_header(image)
+        except TimeoutError as e:
+            raise DFUHeaderTimeoutError(
+                f"{e}. Nothing was erased: the installed firmware is "
+                f"intact.") from e
+        return True
 
     def erase_pages(self, start_addr: int, end_addr: int,
                     page_size: int = 2048) -> None:
@@ -895,6 +1189,15 @@ class STM32USBDFU:
             try:
                 self._dnload(block, chunk)
                 return block + 1
+            except DFUWriteRefusedError as e:
+                # The device answered and failed the block: not a bus glitch.
+                hint = ("; the bootloader refused the image header (wrong key for "
+                        "this board, tampered, version below the installed one or "
+                        "the anti-rollback floor, or too large); a bootloader that "
+                        "checks before erasing keeps its installed firmware"
+                        if offset == 0 else "")
+                raise DFUWriteRefusedError(
+                    f"USB DFU write refused at offset 0x{offset:X}: {e}{hint}") from e
             except Exception as e:
                 if attempt == 2:
                     raise
@@ -915,6 +1218,12 @@ class STM32USBDFU:
         10 s for it to come back). Finally the DfuSe address pointer is set
         to the interrupted flash offset so the caller can resume with
         block 2 exactly where the failed block was.
+
+        Raises:
+            RuntimeError: The re-opened device would not take the staged
+                header again. The slot is already erased, so this is never
+                the pre-flight ``ValueError`` that :meth:`stage_header`
+                raises before an erase.
         """
         try:
             self._recover_idle()
@@ -931,6 +1240,27 @@ class STM32USBDFU:
                 except Exception:
                     if time.monotonic() > deadline:
                         raise
+            # A verify-before-erase bootloader that rebooted has forgotten
+            # the verified header and refuses every write until it is staged
+            # again. Re-staging is harmless if it had not rebooted.
+            if self._staged_header is not None:
+                logger.warning("DFU: re-staging the image header after "
+                               "re-opening the device")
+                try:
+                    self.stage_header(self._staged_header)
+                except Exception as e:
+                    # Not stage_header's own exception: a refusal is a
+                    # ValueError, which update_console answers by resetting
+                    # the unit as if nothing were erased, and a TimeoutError
+                    # during read-back repair would pass _program_slot_image's
+                    # legacy-reboot fallback as success.
+                    cause = ("the bootloader refused it"
+                             if isinstance(e, DFUHeaderRefusedError) else str(e))
+                    raise RuntimeError(
+                        f"DFU: the image header could not be staged again after "
+                        f"re-opening the device mid-write ({cause}). The slot is "
+                        f"already erased and may be partly written: leave the "
+                        f"unit in DFU and retry the update.") from e
         self._set_address(address + offset)
 
     def manifest(self) -> None:
@@ -1043,12 +1373,32 @@ class STM32I2CDFUviaMaster:
         return {"status": raw[0], "state": raw[1]}
 
     def _wait_while_busy(self, timeout_s: float = 10.0) -> dict:
+        """Poll GETSTATUS until the slave has finished the last command.
+
+        A failed poll is retried until the deadline. A bootloader that checks
+        the signed header before erasing (open-lifu-transmitter-bl >= 1.1.0)
+        leaves the I2C bus for its ~1.5 s Secure Engine signature check
+        (interrupts are masked meanwhile), so polls in that window are NACKed
+        and the master reports the exchange as failed.
+        """
         _ERROR_STATUSES = (I2C_DFU_STATUS_ERROR, I2C_DFU_STATUS_BAD_ADDR, I2C_DFU_STATUS_FLASH_ERR)
         deadline = time.monotonic() + timeout_s
+        last_error: Exception | None = None
         while time.monotonic() < deadline:
-            st = self.get_status()
+            try:
+                st = self.get_status()
+            except RuntimeError as e:
+                last_error = e
+                time.sleep(0.050)
+                continue
+            if st["status"] == I2C_DFU_STATUS_REJECTED:
+                raise DFUWriteRefusedError(
+                    f"I2C DFU: the slave at 0x{self._addr:02X} refused the image "
+                    "before erasing anything (wrong key for this board, tampered "
+                    "header, version below the installed one or the anti-rollback "
+                    "floor, or too large); its installed firmware is intact")
             if st["state"] == I2C_DFU_STATE_ERROR or st["status"] in _ERROR_STATUSES:
-                raise RuntimeError(
+                raise DFUWriteRefusedError(
                     f"I2C DFU error: status=0x{st['status']:02X}, "
                     f"state=0x{st['state']:02X}"
                 )
@@ -1056,7 +1406,8 @@ class STM32I2CDFUviaMaster:
                     and st["state"] != I2C_DFU_STATE_DNBUSY):
                 return st
             time.sleep(0.020)
-        raise TimeoutError(f"I2C DFU timed out after {timeout_s:.0f} s")
+        suffix = f" (last poll failed: {last_error})" if last_error else ""
+        raise TimeoutError(f"I2C DFU timed out after {timeout_s:.0f} s{suffix}")
 
     def erase_page(self, address: int) -> None:
         """Erase the flash page containing *address*."""
@@ -1096,6 +1447,27 @@ class STM32I2CDFUviaMaster:
     def reset(self) -> None:
         """Send CMD_RESET; the device reboots immediately (no response)."""
         self._write(bytes([I2C_DFU_CMD_RESET]))
+
+    def read_capabilities(self) -> int:
+        """The slave bootloader's capability word, or 0 when it has none
+        (bootloaders before 1.1.0-rc.1 answer GETCAPS with an error)."""
+        raw = self._exchange(bytes([I2C_DFU_CMD_GETCAPS]), 2 + 8)
+        if raw[0] != I2C_DFU_STATUS_OK or raw[2:6] != USB_DFU_CAPS_MAGIC:
+            return 0
+        return struct.unpack_from("<I", raw, 6)[0]
+
+    def stage_preset(self, package: bytes) -> None:
+        """DNLOAD a preset's signed PRS1 header to the staging address and
+        wait for the slave bootloader to verify it (~1.5 s, off the bus).
+
+        Raises:
+            DFUWriteRefusedError: Refused (wrong key, tampered, too large);
+                the slot was not touched.
+        """
+        header = bytes(package[:USB_DFU_SFU_HEADER_LEN])
+        if len(header) < USB_DFU_SFU_HEADER_LEN or header[:4] != b"PRS1":
+            raise ValueError("stage_preset: not a preset (no PRS1 header)")
+        self.write_block(USB_DFU_PRESET_STAGE_VIRT_ADDR, header)
 
     def get_version(self) -> str:
         """Read the null-terminated bootloader version string."""
@@ -1313,6 +1685,33 @@ class LIFUDFUManager:
             return None
         return header.fw_version
 
+    @staticmethod
+    def _check_slot_fit(image: bytes, report, profile: "DeviceProfile",
+                        label: str) -> None:
+        """Refuse, before any erase, an image the slot cannot hold as-is.
+
+        Raises:
+            ValueError: Larger than the slot, or data past the image end.
+        """
+        # validate_signed_image() has no slot limit, so bound the size here.
+        # The device would refuse the out-of-slot writes anyway, but only after
+        # the erase phase had already wiped the slot — this keeps the
+        # "nothing is erased until the image is accepted" contract above.
+        if profile.slot_size is not None and len(image) > profile.slot_size:
+            raise ValueError(
+                f"{label} image rejected before erase: {len(image)} bytes "
+                f"exceeds the {profile.slot_size}-byte slot capacity")
+        # Bytes past FwSize must be erased flash: secure boot invalidates a
+        # slot holding anything else, and a verify-before-erase bootloader
+        # refuses them mid-write, after the erase. The local check does not
+        # cover them, so refuse here, before anything is erased.
+        tail = image[len(image) - report.trailing_bytes:] if report.trailing_bytes else b""
+        if tail.strip(b"\xFF"):
+            raise ValueError(
+                f"{label} image rejected before erase: {len(tail)} bytes past "
+                f"the image end (FwSize {report.header.fw_size}) are not "
+                f"0xFF. The file has data appended to the signed image.")
+
     def _program_slot_image(self, signed_image: str,
                             profile: "DeviceProfile", slot_base: int,
                             label: str,
@@ -1329,18 +1728,23 @@ class LIFUDFUManager:
         flashers, which strand the board with an empty slot when the
         bootloader's anti-rollback refuses the new image at boot):
 
-          1. The image is validated locally (structure, sizes, SHA-256 tag;
-             plus the ECDSA signature when *keys_dir* is given).
-          2. The installed slot header is read back over DFU and a version
-             DOWNGRADE is refused unless *force* is set. Note this compares
-             against the installed image only - the bootloader's persistent
-             anti-rollback floor is not DFU-readable and remains the final
-             authority at boot.
+          1. The image is validated locally (structure, sizes, SHA-256 tag,
+             the ECDSA signature when *keys_dir* is given, slot fit).
+          2. A version DOWNGRADE against the installed slot header is
+             refused unless *force* is set.
+          3. A verify-before-erase bootloader (console >= 1.1.0) checks the
+             staged header: signature, size and anti-rollback.
+
+        *force* skips only (2). The bootloader's anti-rollback still applies:
+        (3) refuses a downgrade with the firmware intact; older bootloaders'
+        floor (not DFU-readable) may reject it at boot.
 
         The unit must already be in USB DFU mode.
 
         Raises:
-            ValueError: Image invalid, or downgrade without *force*.
+            ValueError: Image invalid, downgrade without *force*, or the
+                bootloader refused (or did not answer) the header check.
+                Nothing was erased.
             RuntimeError: DFU device/communication problems.
         """
         from openlifu_sdk.io import LIFUCrypto
@@ -1353,14 +1757,7 @@ class LIFUDFUManager:
                 f"Refusing to flash invalid image {signed_image}:\n"
                 + report.describe()
             )
-        # validate_signed_image() has no slot limit, so bound the size here.
-        # The device would refuse the out-of-slot writes anyway, but only after
-        # the erase phase had already wiped the slot — this keeps the
-        # "nothing is erased until the image is accepted" contract above.
-        if profile.slot_size is not None and len(image) > profile.slot_size:
-            raise ValueError(
-                f"{label} image rejected before erase: {len(image)} bytes "
-                f"exceeds the {profile.slot_size}-byte slot capacity")
+        self._check_slot_fit(image, report, profile, label)
 
         new_version = report.header.fw_version
         logger.info("%s image: version %d (%s), %d bytes", label,
@@ -1377,18 +1774,20 @@ class LIFUDFUManager:
                     f"({report.header.fw_version_str}) is below the installed "
                     f"version {installed} "
                     f"({LIFUCrypto.decode_fw_version(installed)}). "
-                    "Pass force=True to flash anyway (the bootloader's "
-                    "anti-rollback floor may still reject it at boot, leaving "
-                    "the slot empty)."
+                    "force=True skips this check only: the bootloader's own "
+                    "anti-rollback still applies (a console bootloader >= "
+                    "1.1.0 refuses the downgrade before erasing; elsewhere "
+                    "the floor may reject it at boot, leaving the slot empty)."
                 )
 
         with STM32USBDFU(vid=vid, pid=pid, libusb_dll=libusb_dll,
                          device_profile=profile) as dfu:
+            dfu.prepare_slot_write(image)   # verify before erase (BL >= 1.1.0)
             # Erase the whole slot, not just this image's pages: a smaller
             # image would leave the old tail behind, and the bootloader rejects
             # it at boot and 0x00-fills the slot, stranding the unit.
             dfu.write_memory(slot_base, image, page_erase=True,
-                             erase_bytes=profile.slot_size,
+                             erase_bytes=dfu.slot_erase_bytes(),
                              progress_callback=progress_callback)
             # Read-back verify + targeted page repair, then manifest. On
             # bootloaders <= 1.0.1-rc.1 the verify read's initial ABORT
@@ -1472,6 +1871,149 @@ class LIFUDFUManager:
             keys_dir=keys_dir, force=force, vid=vid, pid=pid,
             libusb_dll=libusb_dll, progress_callback=progress_callback)
 
+    def program_console_presets(self, package: str | bytes,
+                                public_key=None,
+                                vid: int = 0x0483, pid: int = 0xDF11,
+                                libusb_dll: str | None = None,
+                                progress_callback: Callable | None = None) -> None:
+        """Write a signed preset package to the console's preset page via the
+        bootloader's USB DFU (console bootloader >= 1.1.0-rc.2). The console
+        must already be in USB DFU mode.
+
+        Pre-flight, before the device is touched: the package must parse, its
+        body must match its signed hash, it must fit the page, and with
+        *public_key* its signature must verify. The bootloader then checks the
+        signature itself before it lets the page be erased, and the body's
+        hash when the download completes.
+
+        Raises:
+            ValueError: The package is invalid, too large, or not signed by
+                *public_key*. Nothing was written.
+            RuntimeError: The bootloader has no preset page (older than
+                1.1.0-rc.2), or DFU communication failed.
+            DFUHeaderRefusedError: The bootloader refused the package; the
+                installed presets are intact.
+        """
+        from openlifu_sdk.io import LIFUPresetPackage as pp
+
+        data = Path(package).read_bytes() if isinstance(package, (str, Path)) else bytes(package)
+        pkg = pp.parse_preset_package(data)
+        if not pkg.body_ok:
+            raise ValueError("Preset package body does not match its signed hash")
+        data = pkg.header + pkg.body
+        if len(data) > CONSOLE_PROFILE.preset_size:
+            raise ValueError(f"Preset package is {len(data)} bytes; the page "
+                             f"holds {CONSOLE_PROFILE.preset_size}")
+        if public_key is not None and not pp.verify_preset_package(data, public_key):
+            raise ValueError("Preset package is not signed by the given key")
+        logger.info("Console presets: %d bytes, context %s, diathermy %s",
+                    len(pkg.body), pkg.context, pkg.diathermy_sha)
+
+        with STM32USBDFU(vid=vid, pid=pid, libusb_dll=libusb_dll,
+                         device_profile=CONSOLE_PROFILE) as dfu:
+            if not dfu.has_preset_page():
+                raise RuntimeError(
+                    "This console bootloader has no preset page (it predates "
+                    "open-lifu-console-bl 1.1.0-rc.2); update the bootloader first.")
+            dfu.stage_preset(data)
+            dfu.write_memory(CONSOLE_PROFILE.preset_base, data, page_erase=True,
+                             progress_callback=progress_callback)
+            readback = dfu.read_memory(CONSOLE_PROFILE.preset_base, len(data))
+            if readback != data:
+                raise RuntimeError("Console presets: read-back does not match "
+                                   "the package; the unit stays in DFU, retry")
+            logger.info("Console presets written and read back; sending manifest "
+                        "(the bootloader checks the body hash, then resets)")
+            dfu.manifest()
+
+    @staticmethod
+    def _check_tx_preset(slot: int, package: str | bytes, public_key=None) -> bytes:
+        """The slot image to write for *package*, checked before any device
+        is touched: it parses, its blob matches its signed hash, it fits a
+        slot, and with *public_key* its signature verifies."""
+        from openlifu_sdk.io import LIFUPresetPackage as pp
+
+        pp.tx_preset_slot_address(slot)   # range check
+        data = Path(package).read_bytes() if isinstance(package, (str, Path)) else bytes(package)
+        pkg = pp.parse_preset_package(data)
+        if not pkg.body_ok:
+            raise ValueError("Preset blob does not match its signed hash")
+        data = pkg.header + pkg.body
+        if len(data) > pp.TX_PRESET_SLOT_SIZE:
+            raise ValueError(f"Preset is {len(data)} bytes; a slot holds {pp.TX_PRESET_SLOT_SIZE}")
+        if public_key is not None and not pp.verify_preset_package(data, public_key):
+            raise ValueError("Preset is not signed by the given key")
+        logger.info("Transmitter preset for slot %d: %d bytes, context %s, diathermy %s",
+                    slot, len(pkg.body), pkg.context, pkg.diathermy_sha)
+        return data
+
+    def program_transmitter_preset(self, slot: int, package: str | bytes,
+                                   public_key=None,
+                                   vid: int = 0x0483, pid: int = 0xDF11,
+                                   libusb_dll: str | None = None,
+                                   progress_callback: Callable | None = None) -> None:
+        """Write one signed preset (``LIFUPresetPackage.build_tx_preset``)
+        into preset slot *slot* of the USB transmitter (module 0) through its
+        bootloader's DFU (open-lifu-transmitter-bl >= 1.1.0-rc.1), then reset.
+        The transmitter must already be in USB DFU mode.
+
+        The bootloader checks the signature before it erases the slot, and the
+        blob's hash when the write completes (erasing the slot on a mismatch).
+
+        Raises:
+            ValueError: Bad slot or preset, or not signed by *public_key*.
+                Nothing was written.
+            RuntimeError: The bootloader has no preset slots, or DFU failed.
+            DFUHeaderRefusedError: The bootloader refused the preset; the
+                slot is intact.
+        """
+        from openlifu_sdk.io import LIFUPresetPackage as pp
+
+        data = self._check_tx_preset(slot, package, public_key)
+        address = pp.tx_preset_slot_address(slot)
+        with STM32USBDFU(vid=vid, pid=pid, libusb_dll=libusb_dll,
+                         device_profile=TRANSMITTER_PROFILE) as dfu:
+            if not dfu.has_preset_page():
+                raise RuntimeError(
+                    "This transmitter bootloader has no preset slots (it predates "
+                    "open-lifu-transmitter-bl 1.1.0-rc.1); update the bootloader first.")
+            dfu.stage_preset(data)
+            dfu.write_memory(address, data, page_erase=True,
+                             progress_callback=progress_callback)
+            if dfu.read_memory(address, len(data)) != data:
+                raise RuntimeError("Transmitter preset: read-back does not match; "
+                                   "the unit stays in DFU, retry")
+            logger.info("Transmitter preset slot %d written and read back; resetting", slot)
+            dfu.trigger_reset(TRANSMITTER_PROFILE.reset_virt_addr)
+
+    def program_transmitter_slave_preset_i2c(self, slot: int, package: str | bytes,
+                                             i2c_addr: int, public_key=None,
+                                             progress_callback: Callable | None = None) -> None:
+        """Write one signed preset into preset slot *slot* of a slave
+        transmitter over I2C passthrough (slave bootloader >= 1.1.0-rc.1, in
+        its I2C DFU at *i2c_addr*), then reset the slave. Same checks as
+        :meth:`program_transmitter_preset`.
+
+        Requires a master UART (``LIFUDFUManager(uart=txdevice.uart)``).
+        """
+        from openlifu_sdk.io import LIFUPresetPackage as pp
+
+        if self._uart is None:
+            raise RuntimeError("I2C slave programming needs the master UART — construct "
+                               "LIFUDFUManager(uart=txdevice.uart).")
+        data = self._check_tx_preset(slot, package, public_key)
+        address = pp.tx_preset_slot_address(slot)
+        dfu = STM32I2CDFUviaMaster(uart=self._uart, i2c_addr=i2c_addr)
+        if not dfu.read_capabilities() & USB_DFU_CAP_SIGNED_PRESET_WRITE:
+            raise RuntimeError(
+                f"The slave bootloader at 0x{i2c_addr:02X} has no preset slots (it "
+                "predates open-lifu-transmitter-bl 1.1.0-rc.1); update it first.")
+        dfu.stage_preset(data)
+        dfu.erase_page(address)
+        dfu.write_memory(address, data, progress_callback=progress_callback)
+        logger.info("Slave 0x%02X preset slot %d written; resetting", i2c_addr, slot)
+        dfu.reset()
+
     def update_console(self, signed_image: str,
                        enter_dfu_fn: Callable | None = None,
                        keys_dir: str | None = None,
@@ -1479,7 +2021,7 @@ class LIFUDFUManager:
                        vid: int = 0x0483, pid: int = 0xDF11,
                        libusb_dll: str | None = None,
                        dfu_wait_s: float = 2.0,
-                       dfu_enum_timeout_s: float = 30.0,
+                       dfu_enum_timeout_s: float = 45.0,
                        progress_callback: Callable | None = None) -> str:
         """High-level console firmware update.
 
@@ -1588,7 +2130,7 @@ class LIFUDFUManager:
                            vid: int = 0x0483, pid: int = 0xDF11,
                            libusb_dll: str | None = None,
                            dfu_wait_s: float = 2.0,
-                           dfu_enum_timeout_s: float = 30.0,
+                           dfu_enum_timeout_s: float = 45.0,
                            progress_callback: Callable | None = None) -> str:
         """High-level transmitter firmware update over standard USB DFU
         (module 0, secure bootloader).
@@ -1670,7 +2212,7 @@ class LIFUDFUManager:
                                        vid: int = 0x0483, pid: int = 0xDF11,
                                        libusb_dll: str | None = None,
                                        dfu_wait_s: float = 3.0,
-                                       dfu_enum_timeout_s: float = 30.0,
+                                       dfu_enum_timeout_s: float = 45.0,
                                        progress_callback: Callable | None = None) -> None:
         """Migrate a transmitter to the secure bootloader by MASS-ERASING the
         chip and writing the whole combined production image (bootloader +
@@ -2005,7 +2547,7 @@ class LIFUDFUManager:
                         vid: int = 0x0483, pid: int = 0xDF11,
                         libusb_dll: str | None = None,
                         dfu_wait_s: float = 3.0,
-                        dfu_enum_timeout_s: float = 30.0,
+                        dfu_enum_timeout_s: float = 45.0,
                         progress_callback: Callable | None = None) -> None:
         """End-to-end console bootloader migration for a beta unit.
 
@@ -2063,7 +2605,7 @@ class LIFUDFUManager:
                                vid: int = 0x0483, pid: int = 0xDF11,
                                libusb_dll: str | None = None,
                                dfu_wait_s: float = 3.0,
-                               dfu_enum_timeout_s: float = 30.0,
+                               dfu_enum_timeout_s: float = 45.0,
                                updater_wait_s: float = 6.0,
                                progress_callback: Callable | None = None) -> None:
         """Migrate a LEGACY-bootloader console (app 1.2.0–1.2.5) to the secure
@@ -2085,9 +2627,8 @@ class LIFUDFUManager:
         Args:
             signed_app: SBSFU signed application image.
             updater_bin: The console-legacy-updater binary (embeds the new
-                secure bootloader; links at 0x08008000). Defaults to the
-                updater bundled with the SDK (``bundled_updater_path()``) - the
-                one-time, keyless self-updater; pass a path only to override it.
+                secure bootloader; links at 0x08008000): the one-time, keyless
+                self-updater. Required: the SDK carries no firmware.
             enter_dfu_fn: Callable that reboots the running app into DFU, e.g.
                 ``interface.hvcontroller.enter_dfu``.
             keys_dir: Optional keys dir to validate the signed app's ECDSA
@@ -2104,7 +2645,10 @@ class LIFUDFUManager:
         """
         from openlifu_sdk.io import LIFUCrypto
 
-        updater_path = Path(updater_bin) if updater_bin else bundled_updater_path()
+        if not updater_bin:
+            raise ValueError("No legacy updater image given (updater_bin): the SDK "
+                             "carries no firmware. Nothing was written.")
+        updater_path = Path(updater_bin)
         if not updater_path.is_file():
             raise ValueError(f"Updater not found: {updater_path}")
         updater = updater_path.read_bytes()
@@ -2184,7 +2728,7 @@ class LIFUDFUManager:
                                    vid: int = 0x0483, pid: int = 0xDF11,
                                    libusb_dll: str | None = None,
                                    dfu_wait_s: float = 3.0,
-                                   dfu_enum_timeout_s: float = 30.0,
+                                   dfu_enum_timeout_s: float = 45.0,
                                    progress_callback: Callable | None = None) -> None:
         """Migrate a console by MASS-ERASING the chip and writing the whole
         combined production image (bootloader + signed app) at the flash base
@@ -2700,7 +3244,7 @@ class LIFUDFUManager:
                       libusb_dll: str | None = None,
                       i2c_addr: int = I2C_DFU_SLAVE_ADDR,
                       dfu_wait_s: float = 3.0,
-                      dfu_enum_timeout_s: float = 30.0,
+                      dfu_enum_timeout_s: float = 45.0,
                       device_type: str = "transmitter",
                       progress_callback: Callable | None = None) -> None:
         """High-level firmware update for a single module.

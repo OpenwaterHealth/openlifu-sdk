@@ -312,6 +312,61 @@
       "version": "2.34.2"
     },
     {
+      "bom-ref": "cryptography",
+      "type": "library",
+      "name": "cryptography",
+      "scope": "optional",
+      "supplier": {
+        "name": "Python Cryptographic Authority"
+      },
+      "description": "ECDSA P-256 signing and signature checks (LIFUCrypto, LIFUPresetPackage: firmware_domain, preset package headers). Installed with the crypto extra, which the operator interface requires.",
+      "licenses": [
+        {
+          "expression": "Apache-2.0 OR BSD-3-Clause"
+        }
+      ],
+      "purl": "pkg:pypi/cryptography@50.0.2",
+      "properties": [
+        {
+          "name": "openwater:declared-constraint",
+          "value": "cryptography==50.0.2 (optional-dependencies: crypto, dev)"
+        },
+        {
+          "name": "openwater:version-basis",
+          "value": "pinned exactly in pyproject.toml"
+        }
+      ],
+      "version": "50.0.2"
+    },
+    {
+      "bom-ref": "google-cloud-kms",
+      "type": "library",
+      "name": "google-cloud-kms",
+      "supplier": {
+        "name": "Google LLC"
+      },
+      "description": "Cloud KMS client, used by LIFUCrypto.KmsSigner to sign clinical firmware and preset packages with the HSM key. Only installed with the optional kms extra (CI clinical builds); never on a device host.",
+      "licenses": [
+        {
+          "license": {
+            "id": "Apache-2.0"
+          }
+        }
+      ],
+      "version": "3.18.0",
+      "purl": "pkg:pypi/google-cloud-kms@3.18.0",
+      "properties": [
+        {
+          "name": "openwater:declared-constraint",
+          "value": "google-cloud-kms==3.18.0 (optional-dependencies: kms)"
+        },
+        {
+          "name": "openwater:version-basis",
+          "value": "pinned exactly in pyproject.toml"
+        }
+      ]
+    },
+    {
       "bom-ref": "libusb",
       "type": "library",
       "group": "org.libusb",
@@ -335,54 +390,6 @@
           "value": "DLL Windows version resource: FileVersion 1.0.29.11953 (both win64 and win32); LegalCopyright: GNU LGPL v2.1 or later"
         }
       ]
-    },
-    {
-      "bom-ref": "bundled-transmitter-fw",
-      "type": "firmware",
-      "group": "cc.openwater",
-      "name": "openlifu-transmitter-fw (signed image)",
-      "supplier": {
-        "name": "Openwater"
-      },
-      "publisher": "Openwater",
-      "description": "SBSFU-signed LIFU transmitter application firmware image redistributed as package data (src/openlifu_sdk/firmware/openlifu-transmitter-fw.signed.bin) for field DFU updates. The signed payload carries no readable version string; see the openlifu-transmitter-fw repository and its sbom.cdx.json for the source composition.",
-      "licenses": [
-        {
-          "license": {
-            "id": "Apache-2.0"
-          }
-        }
-      ],
-      "properties": [
-        {
-          "name": "openwater:evidence",
-          "value": "git log src/openlifu_sdk/firmware: last updated in commit 8e0e19c ('updated current firmware...')"
-        }
-      ]
-    },
-    {
-      "bom-ref": "bundled-console-fw",
-      "type": "firmware",
-      "group": "cc.openwater",
-      "name": "openlifu-console-fw (signed image)",
-      "supplier": {
-        "name": "Openwater"
-      },
-      "publisher": "Openwater",
-      "description": "SBSFU-signed LIFU console application firmware image redistributed as package data (src/openlifu_sdk/firmware/openlifu-console-fw.signed.bin) for field DFU updates. The signed payload carries no readable version string; see the openlifu-console-fw repository and its sbom.cdx.json for the source composition.",
-      "licenses": [
-        {
-          "license": {
-            "id": "Apache-2.0"
-          }
-        }
-      ],
-      "properties": [
-        {
-          "name": "openwater:evidence",
-          "value": "git log src/openlifu_sdk/firmware: last updated in commit 8e0e19c ('updated current firmware...')"
-        }
-      ]
     }
   ],
   "dependencies": [
@@ -398,9 +405,7 @@
         "pyqt6",
         "packaging",
         "requests",
-        "libusb",
-        "bundled-transmitter-fw",
-        "bundled-console-fw"
+        "libusb"
       ]
     },
     {
@@ -448,14 +453,6 @@
     },
     {
       "ref": "libusb",
-      "dependsOn": []
-    },
-    {
-      "ref": "bundled-transmitter-fw",
-      "dependsOn": []
-    },
-    {
-      "ref": "bundled-console-fw",
       "dependsOn": []
     }
   ]

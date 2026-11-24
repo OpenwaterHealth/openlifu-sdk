@@ -21,12 +21,14 @@ sonicating and decays toward 25 deg C otherwise (Newton's law,
 from __future__ import annotations
 
 import copy
+import hashlib
 import json
 import logging
 import math
 import random
 import struct
 import time
+from dataclasses import dataclass
 from typing import List, Optional
 
 # Qt backend selection: prefer 3D Slicer's PythonQt-based ``qt`` module
@@ -67,6 +69,8 @@ else:
         _QT_BACKEND = "PythonQt"
 
 from openlifu_sdk.io import LIFUInterfaceStatus
+from openlifu_sdk.io.component import FirmwareDomain
+from openlifu_sdk.io.LIFUPresetPackage import PRESET_BODY_OFFSET, TX_PRESET_SLOTS, PresetHeader
 from openlifu_sdk.io.exceptions import LIFUDeviceError, LIFUError, LIFUHVFaultError, LIFUSolutionError
 from openlifu_sdk.io.LIFUConfig import (
     LIFU_ERR_MODULE_COUNT_MISMATCH,
@@ -86,6 +90,7 @@ from openlifu_sdk.io.LIFUConfig import (
     OW_HV_DATA_ERROR,
     OW_NO_PRESET,
     OW_PRESET_BUSY,
+    OW_PRESET_EMPTY,
     OW_TEMP_TOO_HIGH,
     SETTLE_TIME_HV_ON,
 )
@@ -107,6 +112,65 @@ from openlifu_sdk.util.hwid import encode_hwid
 
 logger = logging.getLogger(__name__)
 logger.debug("openlifu_sdk.ui.simulated_interface using Qt backend: %s", _QT_BACKEND)
+
+
+@dataclass(frozen=True)
+class SimulatedPresetHeader(PresetHeader):
+    """A preset package header as a simulated board reports it. The
+    simulator holds no signing keys, so it reports the domain it was told
+    signed the package (:meth:`domain`) instead of carrying a signature.
+    ``header`` is an all-zero placeholder and ``body_sha256`` a stand-in."""
+
+    board: str = ""
+    sim_domain: FirmwareDomain = FirmwareDomain.RESEARCH
+
+    def domain(self, board: str) -> FirmwareDomain:
+        """The domain the simulator was told signed this package (for this
+        header's own board; any other board's keys did not sign it)."""
+        return self.sim_domain if board == self.board else FirmwareDomain.UNKNOWN
+
+    def signed_by(self, public_key) -> bool:
+        """True if *public_key* is this board's trusted key for the
+        simulated domain."""
+        from openlifu_sdk.io import LIFUCrypto
+
+        if self.sim_domain not in (FirmwareDomain.CLINICAL, FirmwareDomain.RESEARCH):
+            return False
+        want = LIFUCrypto.trusted_public_key(self.board, self.sim_domain.value)
+        return LIFUCrypto.load_public_key(public_key).public_numbers() == want.public_numbers()
+
+
+class _SimulatedPresetPackages:
+    """What each simulated preset slot's package header says: who signed it,
+    its context and the diathermy commit. One setting for every slot, plus
+    per-(slot, module) overrides, so tests can make one slot differ."""
+
+    def __init__(self, board: str):
+        self.board = board
+        self._default = {"context": "research", "diathermy_sha": "0" * 40,
+                         "domain": FirmwareDomain.RESEARCH}
+        self._overrides: dict[tuple[int, int], dict] = {}
+
+    def set(self, *, context=None, diathermy_sha=None, domain=None,
+            slot: int | None = None, module: int | None = None) -> None:
+        fields = {k: v for k, v in (("context", context), ("diathermy_sha", diathermy_sha),
+                                    ("domain", None if domain is None else FirmwareDomain(domain)))
+                  if v is not None}
+        if slot is None and module is None:
+            self._default.update(fields)
+            self._overrides.clear()
+        else:
+            key = (slot or 0, module or 0)
+            self._overrides[key] = {**self._overrides.get(key, {}), **fields}
+
+    def header(self, slot: int, module: int, preset_id: str) -> SimulatedPresetHeader:
+        info = {**self._default, **self._overrides.get((slot, module), {})}
+        stand_in = hashlib.sha256(f"{self.board}:{preset_id}:{slot}:{module}".encode()).digest()
+        return SimulatedPresetHeader(
+            header=bytes(PRESET_BODY_OFFSET), body_size=1, body_sha256=stand_in,
+            diathermy_sha=info["diathermy_sha"], context=info["context"],
+            board=self.board, sim_domain=info["domain"],
+        )
 
 if _QT_BACKEND == "PythonQt":
     def _check_host_binding() -> None:
@@ -256,6 +320,15 @@ class SimulatedTxDevice:
         # string for all modules; if per-module version drift ever
         # becomes worth simulating, extend this to a list.
         self._fw_version: str = "sim-1.0.7"
+        # Which trusted key signed each module's firmware
+        # (:meth:`firmware_domain`). A simulator is not a clinical unit:
+        # research unless a test or debug UI says otherwise. One domain for
+        # every module, plus per-module overrides, so it holds whatever the
+        # module count becomes.
+        self._fw_domain: FirmwareDomain = FirmwareDomain.RESEARCH
+        self._fw_domain_overrides: dict[int, FirmwareDomain] = {}
+        # What each preset slot's package header says (get_preset_info).
+        self._preset_packages = _SimulatedPresetPackages("transmitter")
         self.refresh_metadata()
 
     # ---- helpers --------------------------------------------------------
@@ -332,9 +405,13 @@ class SimulatedTxDevice:
         return sensitivity_at_frequency(self.module_user_configs, freq_hz)
 
     def _flash_entry(self, index: int) -> tuple[dict, int]:
-        if not 0 <= index < len(self._preset_flash):
-            raise LIFUDeviceError(f"TX: no preset at index {index}")
-        return self._preset_flash[index]
+        if 0 <= index < len(self._preset_flash):
+            return self._preset_flash[index]
+        if 0 <= index < TX_PRESET_SLOTS:
+            # As the firmware answers for a slot that holds nothing.
+            raise LIFUDeviceError(f"TX: preset slot {index} is empty",
+                                  device_error_code=OW_PRESET_EMPTY)
+        raise LIFUDeviceError(f"TX: no preset at index {index}")
 
     @staticmethod
     def _module_crcs(flash_regs_crc) -> list[int]:
@@ -342,11 +419,14 @@ class SimulatedTxDevice:
         return [int(flash_regs_crc)] if isinstance(flash_regs_crc, int) else [int(c) for c in flash_regs_crc]
 
     def get_preset(self, index: int) -> dict:
-        """Same shape as :meth:`TxDevice.get_preset` (OW_PRESET_GET)."""
+        """Same shape as :meth:`TxDevice.get_preset` (OW_PRESET_GET).
+        ``count`` is the number of preset slots, as the slot firmware
+        reports it (presets.c ``presets_count``), not how many hold a
+        preset; an empty slot raises OW_PRESET_EMPTY."""
         machine_config, flash_regs_crc = self._flash_entry(index)
         crcs = self._module_crcs(flash_regs_crc)
         return {
-            "count": len(self._preset_flash),
+            "count": TX_PRESET_SLOTS,
             "index": index,
             "chip_count": 2,
             "profile_count": 1,
@@ -359,6 +439,16 @@ class SimulatedTxDevice:
             "start_c": machine_config.get("start_C"),
             "shutoff_c": machine_config.get("shutoff_C"),
         }
+
+    def get_preset_slot(self, slot: int) -> dict:
+        """Same contract as :meth:`TxDevice.get_preset_slot`."""
+        try:
+            got = self.get_preset(slot)
+        except LIFUDeviceError as e:
+            if e.device_error_code != OW_PRESET_EMPTY:
+                raise
+            return {"index": slot, "state": "empty"}
+        return {**got, "state": "preset"}
 
     def load_preset(self, index: int, regs_crc: int, duration_index: int = 0,
                     module: int = 0, *, settings_crc: int | None = None) -> bool:
@@ -534,6 +624,50 @@ class SimulatedTxDevice:
         :meth:`get_version`'s signature.
         """
         self._fw_version = str(version)
+
+    def firmware_domain(self, module: int = 0) -> FirmwareDomain:
+        """Which trusted key signed *module*'s firmware, as
+        :meth:`openlifu_sdk.io.component.OWComponent.firmware_domain`
+        reports it on hardware."""
+        return self._fw_domain_overrides.get(module, self._fw_domain)
+
+    def set_firmware_domain(self, domain: FirmwareDomain | str,
+                            module: int | None = None) -> None:
+        """Override the reported firmware domain: for every module, or
+        only *module*. Lets tests and debug UIs simulate a clinical,
+        research or bare-metal unit, or one module that differs."""
+        domain = FirmwareDomain(domain)
+        if module is None:
+            self._fw_domain = domain
+            self._fw_domain_overrides.clear()
+        else:
+            self._fw_domain_overrides[module] = domain
+
+    def get_preset_info(self, slot: int, module: int = 0):
+        """Same contract as :meth:`TxDevice.get_preset_info`
+        (OW_PRESET_INFO): the header of the package in *slot* on *module*,
+        or None if the slot is empty. Slot *i* holds preset *i*, as on the
+        device, and every module keeps its own slots."""
+        from openlifu_sdk.io.LIFUPresetPackage import TX_PRESET_SLOTS
+
+        if not 0 <= slot < TX_PRESET_SLOTS or not 0 <= module < self.num_modules:
+            raise LIFUDeviceError(f"TX: no preset slot {slot} on module {module}")
+        if slot >= len(self._preset_flash):
+            return None
+        return self._preset_packages.header(slot, module, self._preset_flash[slot][0]["id"])
+
+    def set_preset_package(self, *, context: str | None = None,
+                           diathermy_sha: str | None = None,
+                           domain: FirmwareDomain | str | None = None,
+                           slot: int | None = None, module: int | None = None) -> None:
+        """Set what the preset package headers report (:meth:`get_preset_info`):
+        its context, diathermy commit and the domain whose key signed it.
+        Without *slot* / *module* for every slot (clearing per-slot
+        settings); with either, for that slot on that module only (0 when
+        not given). Fields left None keep their value. Defaults: research,
+        an all-zero commit, research-signed."""
+        self._preset_packages.set(context=context, diathermy_sha=diathermy_sha,
+                                  domain=domain, slot=slot, module=module)
 
     def get_hardware_id(self, module: int = 0, raw_hex: bool = False,
                         base58: bool = False, legacy_6byte: bool = False) -> str:
@@ -900,6 +1034,9 @@ class SimulatedHVController:
         # Reported firmware version. See
         # :attr:`SimulatedTxDevice._fw_version` for rationale.
         self._fw_version: str = "sim-1.0.7"
+        self._fw_domain: FirmwareDomain = FirmwareDomain.RESEARCH
+        # What the preset page's package header says (get_preset_info).
+        self._preset_packages = _SimulatedPresetPackages("console")
 
     def is_connected(self) -> bool:
         return self._connected
@@ -1070,6 +1207,31 @@ class SimulatedHVController:
         """Override the reported firmware version. See
         :meth:`SimulatedTxDevice.set_version` for rationale."""
         self._fw_version = str(version)
+
+    def firmware_domain(self, module: int = 0) -> FirmwareDomain:
+        """Which trusted key signed the console firmware. See
+        :meth:`SimulatedTxDevice.firmware_domain`."""
+        return self._fw_domain
+
+    def set_firmware_domain(self, domain: FirmwareDomain | str) -> None:
+        """Override the reported firmware domain. See
+        :meth:`SimulatedTxDevice.set_firmware_domain`."""
+        self._fw_domain = FirmwareDomain(domain)
+
+    def get_preset_info(self):
+        """Same contract as :meth:`HVController.get_preset_info`
+        (OW_POWER_PRESET_INFO): the preset page's package header, or None
+        when it holds no presets."""
+        if not self._presets:
+            return None
+        return self._preset_packages.header(0, 0, str(self._presets[0].get("id", "")))
+
+    def set_preset_package(self, *, context: str | None = None,
+                           diathermy_sha: str | None = None,
+                           domain: FirmwareDomain | str | None = None) -> None:
+        """Set what the preset page's package header reports. See
+        :meth:`SimulatedTxDevice.set_preset_package`."""
+        self._preset_packages.set(context=context, diathermy_sha=diathermy_sha, domain=domain)
 
     def get_hardware_id(self, raw_hex: bool = False, base58: bool = False,
                         legacy_6byte: bool = False) -> str:

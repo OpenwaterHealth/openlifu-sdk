@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 from __future__ import annotations
 
+import enum
 import json
 import logging
 import struct
@@ -11,6 +12,8 @@ from .LIFUConfig import (
     DEFAULT_TIMEOUT, HW_ID_DATA_LENGTH,
     OW_CMD_PING, OW_CMD_VERSION, OW_CMD_ECHO, OW_CMD_HWID,
     OW_CMD_TOGGLE_LED, OW_CMD_DFU, OW_CMD_RESET, OW_CMD_USR_CFG,
+    OW_CMD_SIGCHK, SIGCHK_SLOT_IMAGE, SIGCHK_BARE_METAL,
+    OW_CMD_BL_VERSION, BL_VERSION_MAX_LEN,
     LIFU_ERR_BAD_PAYLOAD_FORMAT,
     LIFU_ERR_BAD_PAYLOAD_LENGTH,
 )
@@ -28,6 +31,26 @@ from ..util.hwid import encode_hwid
 
 
 log = logging.getLogger(__name__)
+
+
+class SignatureCheck(enum.Enum):
+    """Result of :meth:`OWComponent.check_signature`."""
+
+    SIGNED = "signed"            # the running image is signed by the key's private key
+    NOT_SIGNED = "not-signed"    # it is not (another key, or no valid header)
+    BARE_METAL = "bare-metal"    # a bare-metal build: no bootloader, no signature
+    ERROR = "error"              # the device refused or answered malformed
+
+
+class FirmwareDomain(enum.Enum):
+    """Result of :meth:`OWComponent.firmware_domain`: which of the board's
+    trusted keys signed the running firmware."""
+
+    RESEARCH = "research"        # the research key (GitHub release builds)
+    CLINICAL = "clinical"        # the clinical key (Cloud KMS)
+    BARE_METAL = "bare-metal"    # a bare-metal build: no bootloader, no signature
+    UNKNOWN = "unknown"          # signed by neither key, or no valid header
+    ERROR = "error"              # the device refused or answered malformed
 
 # Build a command -> packet-type lookup so callers only need to specify the
 # command byte; the correct packet type is inferred automatically.
@@ -57,6 +80,9 @@ class OWComponent:
     ALLOWED_PACKETS: dict[int, frozenset[int]] | None = None
     #: Opcodes this component may only send with ``reserved == 0`` (reads).
     READ_ONLY_COMMANDS: frozenset[int] = frozenset()
+    #: The board whose trusted keys firmware_domain() checks against
+    #: ("console" / "transmitter", LIFUCrypto.FIRMWARE_BOARDS).
+    FIRMWARE_BOARD: str | None = None
 
     def __init__(self, vid: int, pid: int, supported_commands: set[int],
                  baudrate: int = 921600, timeout: float = DEFAULT_TIMEOUT,
@@ -331,6 +357,130 @@ class OWComponent:
             )
         return encode_hwid(bytes(r.data[:HW_ID_DATA_LENGTH]), raw_hex, base58,
                            legacy_6byte)
+
+    def check_signature(self, public_key, module: int = 0) -> SignatureCheck:
+        """Check whether the running firmware is signed by the private key
+        matching *public_key* (OW_CMD_SIGCHK).
+
+        The device returns the signed header the bootloader verified at boot
+        (or says it is a bare-metal build); the ECDSA check runs here. Like the
+        firmware's other answers about itself, it reports what the image
+        says: the bootloader's boot-time check is what enforces it.
+
+        Args:
+            public_key: An ECDSA P-256 public key: a key object, PEM bytes, a
+                PEM file, or a keys directory holding ``ecdsa_public.pem``
+                (see :func:`openlifu_sdk.io.LIFUCrypto.load_public_key`).
+            module: Target module address (default 0).
+
+        Returns:
+            :class:`SignatureCheck`. ``ERROR`` when the device refuses the
+            command (e.g. firmware without it) or the reply is malformed.
+
+        Raises:
+            LIFUCryptoError: *public_key* cannot be loaded.
+            LIFUNotConnectedError, LIFUCommunicationError.
+        """
+        from openlifu_sdk.io import LIFUCrypto
+
+        key = LIFUCrypto.load_public_key(public_key)
+        header = self._read_signed_header(module, "check_signature")
+        if isinstance(header, SignatureCheck):
+            return header
+        if header[:4] == LIFUCrypto.SFU_MAGIC and LIFUCrypto.verify_header_signature(header, key):
+            return SignatureCheck.SIGNED
+        return SignatureCheck.NOT_SIGNED
+
+    def firmware_domain(self, module: int = 0) -> FirmwareDomain:
+        """Which trusted key signed the running firmware (OW_CMD_SIGCHK):
+        the board's research key (GitHub release builds), its clinical key
+        (Cloud KMS), or neither. The keys ship with the SDK
+        (``openlifu_sdk/keys``); this component's board picks the pair.
+
+        Returns:
+            :class:`FirmwareDomain`. ``UNKNOWN`` for a header signed by
+            neither key (a local development key, the other board's key) or
+            no valid header; ``ERROR`` when the device refuses the command
+            (e.g. firmware without it) or the reply is malformed.
+
+        Raises:
+            LIFUNotConnectedError, LIFUCommunicationError.
+        """
+        from openlifu_sdk.io import LIFUCrypto
+
+        if self.FIRMWARE_BOARD is None:
+            raise NotImplementedError(f"{type(self).__name__} names no firmware board")
+        header = self._read_signed_header(module, "firmware_domain")
+        if header is SignatureCheck.BARE_METAL:
+            return FirmwareDomain.BARE_METAL
+        if header is SignatureCheck.ERROR:
+            return FirmwareDomain.ERROR
+        if header[:4] == LIFUCrypto.SFU_MAGIC:
+            for domain in (FirmwareDomain.CLINICAL, FirmwareDomain.RESEARCH):
+                key = LIFUCrypto.trusted_public_key(self.FIRMWARE_BOARD, domain.value)
+                if LIFUCrypto.verify_header_signature(header, key):
+                    return domain
+        return FirmwareDomain.UNKNOWN
+
+    def firmware_header(self, module: int = 0):
+        """The signed header of the running firmware (OW_CMD_SIGCHK), parsed:
+        its FwVersion and the SHA-256 of its body (``fw_tag``) name the
+        installed build, so a host can compare it with a release image
+        without entering DFU. None for a bare-metal build, a refusal or a
+        malformed reply.
+
+        Raises:
+            LIFUNotConnectedError, LIFUCommunicationError.
+        """
+        from openlifu_sdk.io import LIFUCrypto
+
+        header = self._read_signed_header(module, "firmware_header")
+        if isinstance(header, SignatureCheck) or header[:4] != LIFUCrypto.SFU_MAGIC:
+            return None
+        return LIFUCrypto.FirmwareHeader.from_bytes(header)
+
+    def get_bootloader_version(self, module: int = 0) -> str | None:
+        """The version of the bootloader the running application booted
+        from (OW_CMD_BL_VERSION), e.g. ``"1.1.0-rc.3"``, read without
+        entering DFU. On the transmitter *module* is the module (0 = the
+        master, n = a slave, relayed over I2C).
+
+        Returns:
+            The version string; None when the firmware does not support the
+            command (it answers ``OW_ERROR``: every release before it) or
+            reports no bootloader version (a bare-metal build, or none
+            found).
+
+        Raises:
+            LIFUNotConnectedError, LIFUCommunicationError.
+        """
+        try:
+            r = self.send_checked(OW_CMD_BL_VERSION, addr=module, op="get_bootloader_version")
+        except LIFUDeviceError as e:
+            log.info("%s: bootloader version not available: %s", self._uart.desc, e)
+            return None
+        data = bytes(r.data[:min(r.data_len, BL_VERSION_MAX_LEN)]) if r.data_len and r.data else b""
+        version = data.decode("ascii", errors="replace").rstrip("\x00").strip()
+        return version or None
+
+    def _read_signed_header(self, module: int, op: str) -> bytes | SignatureCheck:
+        """Send OW_CMD_SIGCHK. Returns the signed header a slot build sends,
+        or ``SignatureCheck.BARE_METAL`` / ``SignatureCheck.ERROR``."""
+        from openlifu_sdk.io import LIFUCrypto
+
+        try:
+            r = self.send_checked(OW_CMD_SIGCHK, addr=module, op=op)
+        except LIFUDeviceError as e:
+            log.warning("%s: signature check refused: %s", self._uart.desc, e)
+            return SignatureCheck.ERROR
+        data = bytes(r.data[:r.data_len]) if r.data_len and r.data else b""
+        if data[:1] == bytes([SIGCHK_BARE_METAL]):
+            return SignatureCheck.BARE_METAL
+        if data[:1] != bytes([SIGCHK_SLOT_IMAGE]) or len(data) < 1 + LIFUCrypto.HEADER_TOTAL_LEN:
+            log.warning("%s: malformed signature check reply (%d bytes)",
+                        self._uart.desc, len(data))
+            return SignatureCheck.ERROR
+        return data[1:1 + LIFUCrypto.HEADER_TOTAL_LEN]
 
     # ------------------------------------------------------------------
     # User configuration helpers

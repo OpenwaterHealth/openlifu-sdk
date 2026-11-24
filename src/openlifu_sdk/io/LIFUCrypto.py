@@ -47,11 +47,13 @@ hash checks work without it.
 
 from __future__ import annotations
 
+import functools
 import hashlib
 import os
 import re
 import struct
 from dataclasses import dataclass
+from importlib import resources
 from pathlib import Path
 
 # Base class for LIFUCryptoError. Guarded so this module stays usable as a
@@ -273,6 +275,105 @@ class SigningKeys:
                     f"Signing requires {', '.join(missing)} in {keys_dir}")
         return keys
 
+    def sign_raw(self, data: bytes) -> bytes:
+        """ECDSA P-256 / SHA-256 signature of *data* with the local private
+        key, as raw R||S (64 bytes). The same interface as :class:`KmsSigner`.
+
+        Raises:
+            LIFUCryptoError: No private key.
+        """
+        _require_cryptography()
+        if self.private_key is None:
+            raise LIFUCryptoError("Signing requires the private ECDSA key")
+        return _der_to_raw_rs(self.private_key.sign(data, ec.ECDSA(hashes.SHA256())))
+
+
+def _der_to_raw_rs(der_sig: bytes) -> bytes:
+    """DER ECDSA signature -> raw R (32 B big-endian) || S (32 B big-endian)."""
+    r, s = decode_dss_signature(der_sig)
+    return r.to_bytes(32, "big") + s.to_bytes(32, "big")
+
+
+def _raw_rs_verifies(public_key, data: bytes, raw_sig: bytes) -> bool:
+    """True if raw R||S is a valid ECDSA P-256 / SHA-256 signature of *data*."""
+    der = encode_dss_signature(int.from_bytes(raw_sig[:32], "big"),
+                               int.from_bytes(raw_sig[32:], "big"))
+    try:
+        public_key.verify(der, data, ec.ECDSA(hashes.SHA256()))
+    except InvalidSignature:
+        return False
+    return True
+
+
+def public_key_fingerprint(public_key) -> str:
+    """SHA-256 over the DER SubjectPublicKeyInfo, hex: what PROVENANCE.txt and
+    the release notes print (``openssl pkey -pubin -outform DER | sha256sum``)."""
+    _require_cryptography()
+    der = load_public_key(public_key).public_bytes(
+        serialization.Encoding.DER, serialization.PublicFormat.SubjectPublicKeyInfo)
+    return hashlib.sha256(der).hexdigest()
+
+
+class KmsSigner:
+    """ECDSA P-256 / SHA-256 with a Google Cloud KMS asymmetric key version:
+    the clinical signing key, which never leaves the HSM.
+
+    *key_version* is the full resource name
+    ``projects/<p>/locations/<l>/keyRings/<r>/cryptoKeys/<k>/cryptoKeyVersions/<n>``.
+    Authentication is Application Default Credentials (``gcloud auth
+    application-default login``, or Workload Identity Federation in CI).
+    Usable wherever signing takes :class:`SigningKeys`: firmware images and
+    preset packages alike (:func:`sign_auth_header`).
+
+    Ported from open-motion-console-bl ``py-tools/sign_firmware.py``.
+
+    Raises:
+        LIFUCryptoError: ``google-cloud-kms`` missing (``pip install
+            openlifu-sdk[kms]``), not a key version, or not a P-256 signing key.
+    """
+
+    def __init__(self, key_version: str, client=None):
+        _require_cryptography()
+        if "/cryptoKeyVersions/" not in key_version:
+            raise LIFUCryptoError(
+                "A KMS signing key must name a crypto key VERSION "
+                f"(.../cryptoKeys/<key>/cryptoKeyVersions/<n>), got: {key_version}")
+        if client is None:
+            try:
+                from google.cloud import kms  # type: ignore
+            except ImportError as e:
+                raise LIFUCryptoError(
+                    "Cloud KMS signing needs google-cloud-kms: "
+                    "pip install openlifu-sdk[kms]") from e
+            client = kms.KeyManagementServiceClient()
+        self._client = client
+        self.key_version = key_version
+        # GetPublicKey and AsymmetricSign only: roles/cloudkms.signerVerifier
+        # grants viewPublicKey but not cryptoKeyVersions.get. GetPublicKey
+        # reports the algorithm, and fails for a version that is not enabled.
+        pub = client.get_public_key(request={"name": key_version})
+        algorithm = getattr(pub.algorithm, "name", str(pub.algorithm))
+        if algorithm != "EC_SIGN_P256_SHA256":
+            raise LIFUCryptoError(
+                f"KMS key version algorithm is {algorithm}, expected EC_SIGN_P256_SHA256")
+        self.protection_level = getattr(pub.protection_level, "name", str(pub.protection_level))
+        self.public_key = load_public_key(pub.pem.encode())
+
+    def sign_raw(self, data: bytes) -> bytes:
+        """Sign *data*: KMS signs its SHA-256 digest. The signature is checked
+        against the key's own public key before it is returned.
+
+        Raises:
+            LIFUCryptoError: KMS returned a signature that does not verify.
+        """
+        digest = hashlib.sha256(data).digest()
+        resp = self._client.asymmetric_sign(
+            request={"name": self.key_version, "digest": {"sha256": digest}})
+        raw = _der_to_raw_rs(resp.signature)
+        if not _raw_rs_verifies(self.public_key, data, raw):
+            raise LIFUCryptoError("The KMS signature does not verify against the key's public key")
+        return raw
+
 
 # ---------------------------------------------------------------------------
 # Header parsing / metadata
@@ -361,24 +462,37 @@ def parse_signed_image(image: str | Path | bytes) -> FirmwareHeader:
 # Signing
 # ---------------------------------------------------------------------------
 
-def sign_firmware_bytes(firmware: bytes, keys: SigningKeys,
+def sign_auth_header(auth_header: bytes, keys: "SigningKeys | KmsSigner") -> bytes:
+    """ECDSA P-256 / SHA-256 signature of a 128-byte authenticated header, as
+    the bootloader stores it: raw R||S, 64 bytes. Firmware images and preset
+    packages are signed the same way, with local keys (:class:`SigningKeys`)
+    or the Cloud KMS key (:class:`KmsSigner`).
+
+    Raises:
+        LIFUCryptoError: No private key, or not a 128-byte header.
+    """
+    _require_cryptography()
+    if len(auth_header) != HEADER_AUTH_LEN:
+        raise LIFUCryptoError(f"The signed header is {HEADER_AUTH_LEN} bytes, "
+                              f"not {len(auth_header)}")
+    return keys.sign_raw(auth_header)
+
+
+def sign_firmware_bytes(firmware: bytes, keys: "SigningKeys | KmsSigner",
                         version: int | str) -> bytes:
     """Sign a raw firmware binary; returns the complete signed image.
 
     Args:
         firmware: Raw application binary (linked for slot base + 0x400).
-        keys: Keys loaded with ``require_private=True``.
-        version: MMmmpp integer or ``"major.minor.patch"`` string.
+        keys: Local keys holding the private key, or a :class:`KmsSigner`.
+            The AES key is not used: images are not encrypted.
+        version: Integer FwVersion or ``"major.minor.patch"`` string.
 
     Raises:
-        LIFUCryptoError: Missing keys.
+        LIFUCryptoError: No private key.
         ValueError: Bad version encoding.
     """
     _require_cryptography()
-    if keys.private_key is None or keys.aes_key is None:
-        raise LIFUCryptoError(
-            "Signing requires the private ECDSA key and the AES key "
-            "(load keys with require_private=True)")
     fw_version = encode_fw_version(version)
 
     # Pad the body to the flash-word granule; FwTag covers the padded body.
@@ -400,9 +514,7 @@ def sign_firmware_bytes(firmware: bytes, keys: SigningKeys,
         b"\x00" * 28,           # Reserved
     )
 
-    der_sig = keys.private_key.sign(auth_header, ec.ECDSA(hashes.SHA256()))
-    r, s = decode_dss_signature(der_sig)
-    signature = r.to_bytes(32, "big") + s.to_bytes(32, "big")
+    signature = sign_auth_header(auth_header, keys)
 
     header = (auth_header + signature
               + b"\xFF" * HEADER_STATE_LEN      # FwImageState: VALID
@@ -410,16 +522,17 @@ def sign_firmware_bytes(firmware: bytes, keys: SigningKeys,
     return header + b"\xFF" * (IMAGE_OFFSET - HEADER_TOTAL_LEN) + body
 
 
-def sign_firmware_file(firmware: str | Path, keys_dir: str | Path,
+def sign_firmware_file(firmware: str | Path, keys_dir: "str | Path | KmsSigner",
                        output: str | Path,
                        version: int | str) -> FirmwareHeader:
     """Sign a firmware file and write the signed image.
 
     Args:
         firmware: Path to the raw application ``.bin``.
-        keys_dir: Directory holding ``ecdsa_private.pem`` and ``aes128.bin``.
+        keys_dir: Directory holding ``ecdsa_private.pem``, or a
+            :class:`KmsSigner`.
         output: Path the signed image is written to.
-        version: MMmmpp integer or ``"major.minor.patch"`` string.
+        version: Integer FwVersion or ``"major.minor.patch"`` string.
 
     Returns:
         The parsed header of the signed image.
@@ -430,7 +543,9 @@ def sign_firmware_file(firmware: str | Path, keys_dir: str | Path,
     firmware = Path(firmware)
     if not firmware.is_file():
         raise LIFUCryptoError(f"Firmware file not found: {firmware}")
-    keys   = SigningKeys.from_directory(keys_dir, require_private=True)
+    # A signer (KmsSigner, SigningKeys) as is; else a keys directory.
+    keys   = (keys_dir if hasattr(keys_dir, "sign_raw")
+              else SigningKeys.from_directory(keys_dir))
     signed = sign_firmware_bytes(firmware.read_bytes(), keys, version)
     Path(output).write_bytes(signed)
     return FirmwareHeader.from_bytes(signed)
@@ -493,8 +608,83 @@ class ValidationReport:
         return "\n".join(lines)
 
 
+def load_public_key(key: "str | Path | bytes | ec.EllipticCurvePublicKey"
+                    ) -> "ec.EllipticCurvePublicKey":
+    """Load an ECDSA P-256 public key.
+
+    Args:
+        key: A public key object, PEM bytes, a PEM file, or a keys directory
+            holding ``ecdsa_public.pem``.
+
+    Raises:
+        LIFUCryptoError: Unreadable, or not a P-256 public key.
+    """
+    _require_cryptography()
+    if isinstance(key, ec.EllipticCurvePublicKey):
+        loaded = key
+    else:
+        if isinstance(key, bytes):
+            pem = key
+        else:
+            path = Path(key)
+            pem = (path / PUBLIC_KEY_FILE if path.is_dir() else path).read_bytes()
+        try:
+            loaded = serialization.load_pem_public_key(pem)
+        except ValueError as e:
+            raise LIFUCryptoError(f"Cannot load the public key: {e}") from e
+    if not (isinstance(loaded, ec.EllipticCurvePublicKey)
+            and isinstance(loaded.curve, ec.SECP256R1)):
+        raise LIFUCryptoError("Not an ECDSA P-256 public key")
+    return loaded
+
+
+def verify_header_signature(header: bytes,
+                            public_key: "ec.EllipticCurvePublicKey") -> bool:
+    """True if *header*'s ECDSA signature (over its first 128 bytes, the
+    signed part the bootloader checks) verifies with *public_key*.
+
+    Raises:
+        LIFUCryptoError: *header* is shorter than the signed part.
+    """
+    _require_cryptography()
+    if len(header) < HEADER_AUTH_LEN + HEADER_SIGN_LEN:
+        raise LIFUCryptoError(
+            f"Header too short to verify ({len(header)} bytes)")
+    sig = header[HEADER_AUTH_LEN:HEADER_AUTH_LEN + HEADER_SIGN_LEN]
+    r = int.from_bytes(sig[:32], "big")
+    s = int.from_bytes(sig[32:], "big")
+    try:
+        public_key.verify(encode_dss_signature(r, s), header[:HEADER_AUTH_LEN],
+                          ec.ECDSA(hashes.SHA256()))
+    except InvalidSignature:
+        return False
+    return True
+
+
+# The keys each board's bootloaders trust, shipped in openlifu_sdk/keys (see
+# its PROVENANCE.txt): research = the firmware repos' FW_SIGNING_KEY (GitHub
+# releases), clinical = the Cloud KMS HSM key.
+FIRMWARE_BOARDS  = ("console", "transmitter")
+FIRMWARE_DOMAINS = ("research", "clinical")
+
+
+@functools.cache
+def trusted_public_key(board: str, domain: str) -> "ec.EllipticCurvePublicKey":
+    """The public key *board*'s *domain* bootloader trusts.
+
+    Raises:
+        ValueError: Unknown board or domain.
+        LIFUCryptoError: The shipped key cannot be loaded.
+    """
+    if board not in FIRMWARE_BOARDS or domain not in FIRMWARE_DOMAINS:
+        raise ValueError(f"No trusted key for board {board!r}, domain {domain!r}")
+    pem = resources.files("openlifu_sdk").joinpath("keys", board, f"{domain}.pem").read_bytes()
+    return load_public_key(pem)
+
+
 def validate_signed_image(image: str | Path | bytes,
-                          keys_dir: str | Path | None = None) -> ValidationReport:
+                          keys_dir: str | Path | None = None,
+                          public_key=None) -> ValidationReport:
     """Validate a signed image (or a dump of the active slot).
 
     Checks structure, sizes, the SHA-256 firmware tag, and - when *keys_dir*
@@ -505,6 +695,7 @@ def validate_signed_image(image: str | Path | bytes,
         image: Path to the signed image, or its raw bytes. A dump of the
             whole slot also works; bytes past ``FwSize`` are ignored.
         keys_dir: Optional keys directory for the signature check.
+        public_key: Or the public key itself (object, PEM bytes or file).
 
     Raises:
         LIFUCryptoError: Image shorter than a header, or keys unreadable.
@@ -519,21 +710,15 @@ def validate_signed_image(image: str | Path | bytes,
     pad = data[HEADER_TOTAL_LEN:min(IMAGE_OFFSET, len(data))]
 
     signature_ok: bool | None = None
-    if keys_dir is not None:
+    if public_key is not None:
+        signature_ok = verify_header_signature(data, load_public_key(public_key))
+    elif keys_dir is not None:
         keys = SigningKeys.from_directory(keys_dir)
         if keys.public_key is None:
             raise LIFUCryptoError(
                 f"No {PUBLIC_KEY_FILE} or {PRIVATE_KEY_FILE} in {keys_dir} "
                 "to verify the signature with")
-        r = int.from_bytes(header.signature[:32], "big")
-        s = int.from_bytes(header.signature[32:], "big")
-        try:
-            keys.public_key.verify(encode_dss_signature(r, s),
-                                   data[:HEADER_AUTH_LEN],
-                                   ec.ECDSA(hashes.SHA256()))
-            signature_ok = True
-        except InvalidSignature:
-            signature_ok = False
+        signature_ok = verify_header_signature(data, keys.public_key)
 
     return ValidationReport(
         header=header,
@@ -561,8 +746,11 @@ def main(argv: list[str] | None = None) -> int:
     sub = parser.add_subparsers(dest="cmd", required=True)
 
     p_sign = sub.add_parser("sign", help="Sign a raw firmware binary")
-    p_sign.add_argument("--keys", required=True,
-                        help="Keys directory (ecdsa_private.pem + aes128.bin)")
+    signer_group = p_sign.add_mutually_exclusive_group(required=True)
+    signer_group.add_argument("--keys", help="Keys directory (ecdsa_private.pem)")
+    signer_group.add_argument("--kms-key",
+                              help="Cloud KMS key version to sign with (the clinical key): "
+                                   "projects/.../cryptoKeys/<key>/cryptoKeyVersions/<n>")
     p_sign.add_argument("--firmware", required=True, help="Raw application .bin")
     p_sign.add_argument("--output", required=True, help="Signed image output path")
     ver_group = p_sign.add_mutually_exclusive_group(required=True)
@@ -575,8 +763,9 @@ def main(argv: list[str] | None = None) -> int:
 
     p_verify = sub.add_parser("verify", help="Validate a signed image")
     p_verify.add_argument("image", help="Signed image (or slot dump)")
-    p_verify.add_argument("--keys", required=True,
-                          help="Keys directory (ecdsa_public.pem)")
+    key_group = p_verify.add_mutually_exclusive_group(required=True)
+    key_group.add_argument("--keys", help="Keys directory (ecdsa_public.pem)")
+    key_group.add_argument("--public-key", help="Public key PEM file")
 
     p_info = sub.add_parser("info", help="Show signed-image metadata")
     p_info.add_argument("image", help="Signed image (or slot dump)")
@@ -601,13 +790,21 @@ def main(argv: list[str] | None = None) -> int:
                 version = args.version
                 if version.isdigit():
                     version = int(version)
-            header = sign_firmware_file(args.firmware, args.keys,
-                                        args.output, version)
+            if args.kms_key:
+                signer = KmsSigner(args.kms_key)
+                print(f"Signer         : Cloud KMS {args.kms_key} "
+                      f"({signer.protection_level})")
+                print(f"Signer key     : sha256:{public_key_fingerprint(signer.public_key)}")
+                header = sign_firmware_file(args.firmware, signer, args.output, version)
+            else:
+                header = sign_firmware_file(args.firmware, args.keys,
+                                            args.output, version)
             print(f"Signed image written: {args.output}")
             print(header.describe())
             return 0
         if args.cmd == "verify":
-            report = validate_signed_image(args.image, keys_dir=args.keys)
+            report = validate_signed_image(args.image, keys_dir=args.keys,
+                                           public_key=args.public_key)
             print(report.describe())
             return 0 if report.ok else 1
         # info

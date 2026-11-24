@@ -36,7 +36,11 @@ dependencies = [
 
 [project.optional-dependencies]
 crypto = [
-  "cryptography==46.0.5",
+  "cryptography==50.0.2",
+]
+# Clinical signing with the Cloud KMS key (LIFUCrypto.KmsSigner); CI only.
+kms = [
+  "google-cloud-kms==3.18.0",
 ]
 test = [
   "pytest>=6",
@@ -47,7 +51,7 @@ dev = [
   "pytest>=6",
   "pytest-cov>=3",
   "pytest-mock",
-  "cryptography==46.0.5",
+  "cryptography==50.0.2",
 ]
 ui = [
   "PyQt6==6.11.0",
@@ -71,7 +75,8 @@ where = ["src"]
 [tool.setuptools.package-data]
 openlifu_sdk = [
   "py.typed",
-  "firmware/*.bin",
+  "keys/PROVENANCE.txt",
+  "keys/*/*.pem",
   "libusb/win64/*.dll",
   "libusb/win32/*.dll",
 ]
