@@ -678,12 +678,36 @@ def test_an_older_clinical_unit_gets_a_firmware_update(clinical, keys):
     assert plan.refusals == []
 
 
-def test_clinical_presets_are_not_written_to_a_clinical_unit_yet(clinical, keys):
+def test_clinical_presets_of_another_build_are_written_in_each_boards_own_dfu(clinical, keys):
+    """A clinical unit already on the release's firmware: every package of
+    another diathermy build is written in its board's clinical bootloader
+    DFU; the firmware is left alone."""
     hv, tx = unit(keys, clinical, domain="clinical", commit=OLD_COMMIT)
     plan = ru.ReleaseUpdate(clinical, hv, tx).plan()
     assert [s.action for s in plan.firmware] == ["none"] * 3
-    assert len(plan.refusals) == 1 + 2 * RELEASED
-    assert all("clinical preset-only update not supported yet" in s.detail for s in plan.refusals)
+    assert plan.refusals == []
+    assert {s.action for s in plan.presets} == {"write-presets-dfu"}
+    assert [(s.module, s.slot) for s in plan.presets] == [(None, None)] + [
+        (m, s) for m in range(2) for s in range(RELEASED)]
+    assert all(f"holds clinical / diathermy {OLD_COMMIT[:12]} -> clinical / diathermy "
+               f"{COMMIT[:12]}" in s.detail and "which is kept" in s.detail for s in plan.presets)
+
+
+def test_only_the_clinical_presets_that_differ_are_written(clinical, keys):
+    hv, tx = _with_clinical_presets(*unit(keys, clinical, domain="clinical"), clinical)
+    tx.slots[1][2] = preset_package(keys, "transmitter", "clinical", OLD_COMMIT, body=b"\x02" * 8)
+    plan = ru.ReleaseUpdate(clinical, hv, tx).plan()
+    assert [(s.target, s.action) for s in plan.work] == [
+        ("transmitter module 1 slot 02", "write-presets-dfu")]
+
+
+def test_a_clinical_slot_past_the_release_cannot_be_emptied(clinical, keys):
+    """The bootloader only erases a slot to write a signed preset into it."""
+    hv, tx = _with_clinical_presets(*unit(keys, clinical, domain="clinical"), clinical)
+    tx.slots[0][13] = preset_package(keys, "transmitter", "clinical", body=b"stray")
+    plan = ru.ReleaseUpdate(clinical, hv, tx).plan()
+    assert [s.target for s in plan.refusals] == ["transmitter module 0 slot 13"]
+    assert "cannot be emptied" in plan.refusals[0].detail
 
 
 def test_a_clinical_unit_is_never_given_a_research_release(release, keys):
@@ -806,6 +830,167 @@ def test_a_conversion_checks_each_preset_against_the_clinical_key(clinical, keys
     object.__setattr__(clinical.presets, "console", preset_package(keys, "console"))
     with pytest.raises(ValueError, match="not signed by the given key"):
         update.run(plan)
+
+
+# ---------------------------------------------------------------------------
+# Clinical presets on a clinical unit: each board's own bootloader DFU,
+# entered from its application, which is kept
+# ---------------------------------------------------------------------------
+
+@pytest.fixture
+def kept_updaters(monkeypatch):
+    """Fake updaters for boards that keep their application. Firmware
+    updates install the release's image; write_presets / write_slave_presets
+    run the writer in a DfuContext with ``returns_to_dfu`` False, whose
+    wait_dfu / reacquire stand for "the application came back, DFU requested
+    again"."""
+    from openlifu_sdk.io import LIFUFirmwareUpdate as fu
+
+    def install(release, hv, tx, fail=None):
+        rec = {"log": []}
+        log = rec["log"]
+        dfu = _FakeDfu(hv, tx, log)
+        app = {b: i.path.read_bytes() for b, i in release.apps.items()}
+
+        def session(name, ctx, write):
+            log.append(("enter dfu", name))
+            if fail == name:
+                log.append(("leave dfu", name))
+                raise RuntimeError(f"{name}: DFU refused")
+            write(ctx)
+            log.append(("app back", name))
+            return type("R", (), {"summary": f"{name} presets written"})()
+
+        def firmware(name, board, module):
+            log.append(("firmware", name))
+            board.images[module] = app["console" if board is hv else "transmitter"]
+            return type("R", (), {"summary": f"{name} updated"})()
+
+        class Console:
+            def __init__(self, hv=None, **_):
+                pass
+
+            def update(self, **_):
+                return firmware("console", hv, 0)
+
+            def write_presets(self, write):
+                return session("console", fu.DfuContext(
+                    "console", 0, dfu, wait_dfu=lambda: log.append("re-enter"),
+                    returns_to_dfu=False), write)
+
+        class Transmitter:
+            def __init__(self, tx=None, **_):
+                pass
+
+            def update_slave(self, module, **_):
+                return firmware(f"transmitter module {module}", tx, module)
+
+            def update(self, **_):
+                return firmware("transmitter master", tx, 0)
+
+            def write_presets(self, write):
+                return session("transmitter master", fu.DfuContext(
+                    "transmitter master", 0, dfu, wait_dfu=lambda: log.append("re-enter"),
+                    returns_to_dfu=False), write)
+
+            def write_slave_presets(self, module, write):
+                return session(f"transmitter module {module}", fu.DfuContext(
+                    f"transmitter module {module}", module, dfu, i2c_addr=0x40 + module,
+                    reacquire=lambda: log.append("re-enter") or 0x40 + module,
+                    returns_to_dfu=False), write)
+
+        monkeypatch.setattr(fu, "LIFUFirmwareUpdate", Console)
+        monkeypatch.setattr(fu, "LIFUTransmitterFirmwareUpdate", Transmitter)
+        return rec
+    return install
+
+
+def test_clinical_presets_are_written_in_each_boards_dfu_and_read_back(clinical, keys,
+                                                                       kept_updaters):
+    hv, tx = unit(keys, clinical, domain="clinical", commit=OLD_COMMIT)
+    rec = kept_updaters(clinical, hv, tx)
+    update = ru.ReleaseUpdate(clinical, hv, tx)
+    result = update.run(update.plan())
+    assert result.ok, result.lines
+    # One DFU session per board (console, slave, master); between two writes
+    # the application comes back and DFU is requested again, never after the last.
+    assert rec["log"] == (
+        [("enter dfu", "console"), ("console page",), ("app back", "console")]
+        + [("enter dfu", "transmitter module 1")]
+        + _writes(lambda s: ("slave slot", 1, s))
+        + [("app back", "transmitter module 1"), ("enter dfu", "transmitter master")]
+        + _writes(lambda s: ("master slot", s))
+        + [("app back", "transmitter master")])
+    assert hv.log == [] and tx.log == []        # nothing through the clinical applications
+    preset_lines = [line for line in result.lines if "slot" in line or "page" in line]
+    assert len(preset_lines) == 1 + 2 * RELEASED
+    assert all(line.startswith("[ok]") and f"release's package ({COMMIT[:12]})" in line
+               for line in preset_lines)
+
+
+def _writes(entry, n=RELEASED):
+    """*n* slot writes, with "re-enter" (application back, DFU requested
+    again) between two writes and none after the last."""
+    out = []
+    for slot in range(n):
+        out += (["re-enter"] if slot else []) + [entry(slot)]
+    return out
+
+
+def test_firmware_comes_before_the_presets_on_a_clinical_unit(clinical, keys, kept_updaters):
+    """The transmitter is on older firmware and every preset is another
+    build's: the firmware is updated first, then the presets that still
+    differ are written in the bootloaders' DFU."""
+    hv, tx = unit(keys, clinical, domain="clinical", commit=OLD_COMMIT, tx_body=b"tx-rc7")
+    rec = kept_updaters(clinical, hv, tx)
+    update = ru.ReleaseUpdate(clinical, hv, tx)
+    plan = update.plan()
+    assert [s.action for s in plan.firmware] == ["none", "firmware", "firmware"]
+    result = update.run(plan)
+    assert result.ok, result.lines
+    entries = [e for e in rec["log"] if isinstance(e, tuple) and e[0] in ("firmware", "enter dfu")]
+    assert entries == [("firmware", "transmitter module 1"), ("firmware", "transmitter master"),
+                       ("enter dfu", "console"), ("enter dfu", "transmitter module 1"),
+                       ("enter dfu", "transmitter master")]
+
+
+def test_only_the_differing_slots_are_written_in_dfu(clinical, keys, kept_updaters):
+    hv, tx = _with_clinical_presets(*unit(keys, clinical, domain="clinical"), clinical)
+    tx.slots[0][1] = preset_package(keys, "transmitter", "clinical", OLD_COMMIT, body=b"\x01" * 8)
+    rec = kept_updaters(clinical, hv, tx)
+    update = ru.ReleaseUpdate(clinical, hv, tx)
+    result = update.run(update.plan())
+    assert result.ok, result.lines
+    assert rec["log"] == [("enter dfu", "transmitter master"), ("master slot", 1),
+                          ("app back", "transmitter master")]
+
+
+def test_a_preset_signed_for_another_domain_is_refused_before_it_is_written(clinical, keys,
+                                                                            kept_updaters):
+    """The writers check every package against the clinical key, as the
+    bootloader does: a research-signed one is refused before it is staged."""
+    hv, tx = unit(keys, clinical, domain="clinical", commit=OLD_COMMIT)
+    kept_updaters(clinical, hv, tx)
+    update = ru.ReleaseUpdate(clinical, hv, tx)
+    plan = update.plan()
+    object.__setattr__(clinical.presets, "console", preset_package(keys, "console"))
+    with pytest.raises(ValueError, match="not signed by the given key"):
+        update.run(plan)
+    assert pp.parse_preset_header(hv.preset).diathermy_sha == OLD_COMMIT   # untouched
+
+
+def test_a_failed_transmitter_preset_session_is_reported_with_where_it_was_left(
+        clinical, keys, kept_updaters, monkeypatch):
+    hv, tx = unit(keys, clinical, domain="clinical", commit=OLD_COMMIT)
+    rec = kept_updaters(clinical, hv, tx, fail="transmitter module 1")
+    update = ru.ReleaseUpdate(clinical, hv, tx)
+    monkeypatch.setattr(update, "_recover_transmitter", lambda: "transmitter application answering")
+    plan = update.plan()
+    with pytest.raises(ru.ReleaseError, match="transmitter module 1: transmitter module 1: DFU "
+                                              "refused\nAfter recovery: transmitter application"):
+        update.run(plan)
+    assert ("leave dfu", "transmitter module 1") in rec["log"]
+    assert ("enter dfu", "transmitter master") not in rec["log"]    # stops at the failure
 
 
 # ---------------------------------------------------------------------------

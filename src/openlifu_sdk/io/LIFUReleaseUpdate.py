@@ -34,9 +34,11 @@ applications.
    transmitter slaves, then the master, through
    :mod:`openlifu_sdk.io.LIFUFirmwareUpdate`, which replaces a 1.0.x
    bootloader with the updater on the way), waits for each application to
-   come back, then, for a research release, re-reads the presets and writes
-   the ones that differ to every physical module, and empties the
-   transmitter slots past the released set.
+   come back, then re-reads the presets: for a research release it writes
+   the ones that differ to every physical module through the applications,
+   and empties the transmitter slots past the released set; for a clinical
+   release it writes the ones that differ in each board's bootloader DFU
+   (below).
 3. Everything is read back and compared with the release, and each board's
    user configuration with the one read in step 1.
 
@@ -67,8 +69,24 @@ written through it (the console page, then each transmitter slot, each
 checked against the clinical key first; every write ends in a reset and the
 bootloader comes back in DFU), and only then the clinical application. A
 clinical application refuses preset writes, so the presets are never written
-through it. Writing clinical presets to a unit that is already clinical
-(without a conversion) is refused: not supported yet.
+through it.
+
+**Clinical presets on a clinical unit.** A board that is already clinical
+keeps its bootloader and gets the released presets that differ in that
+bootloader's DFU, after its firmware step (if any): DFU is requested from the
+running application, the bootloader checks each package against its own key
+(it takes only presets signed for its board and domain) before it erases the
+page or slot, and every write ends in a reset that boots the application, so
+DFU is requested again for the next write
+(:meth:`~openlifu_sdk.io.LIFUFirmwareUpdate.LIFUFirmwareUpdate.write_presets`,
+:meth:`~openlifu_sdk.io.LIFUFirmwareUpdate.LIFUTransmitterFirmwareUpdate.write_presets`
+/ ``write_slave_presets``). The application and its anti-rollback floor are not
+touched. Presets carry no anti-rollback: the operator interface checks at
+Startup that they are this build's (diathermy commit, context, signer). A
+refused or interrupted write leaves the page or slot empty, which the read-back
+and the application report; re-running the update writes it again. A clinical
+slot past the release's presets cannot be emptied (the bootloader only erases a
+slot to write a signed preset into it) and is refused.
 
 Step actions (:attr:`Step.action`):
 
@@ -82,7 +100,8 @@ Step actions (:attr:`Step.action`):
 - ``"write-presets"`` / ``"clear-slot"``: research presets, written / emptied
   through the running application;
 - ``"write-presets-dfu"``: a clinical preset, written in the clinical
-  bootloader's DFU during the board's conversion;
+  bootloader's DFU: during the board's conversion, or, on a board that is
+  already clinical, in its own bootloader's DFU entered from its application;
 - ``"refuse"``: nothing is written to the unit.
 
 CLI::
@@ -667,10 +686,14 @@ def preset_steps(state: PresetState, presets: PresetRelease, domain: str,
     """The steps that take *state* to *presets*.
 
     Research: preset writes and slot clears through the applications.
-    Clinical: on every board being converted (*converting*, a set of
-    :func:`board_key`), each released package is written in the bootloader's
-    DFU (``"write-presets-dfu"``; the updater erases everything, so no clear);
-    on a board that is not converted, a preset that differs is refused.
+    Clinical: every released package that differs is written in a
+    bootloader's DFU (``"write-presets-dfu"``): on a board being converted
+    (*converting*, a set of :func:`board_key`), in the new bootloader's DFU
+    before the application (the updater erases everything, so no clear); on a
+    board that keeps its application, in its own bootloader's DFU, entered
+    from that application. A clinical slot holding a preset outside the
+    release is refused: the bootloader only erases a slot to write a signed
+    preset into it.
     """
     steps = compare_presets(state, presets)
     if domain == "research":
@@ -680,20 +703,28 @@ def preset_steps(state: PresetState, presets: PresetRelease, domain: str,
 
 
 def _clinical_step(step: Step, presets: PresetRelease, converting: frozenset | set) -> Step:
-    if step.action == ACTION_REFUSE:
+    if step.action == ACTION_CLEAR_SLOT:
+        return Step(step.target, ACTION_REFUSE, f"{step.detail}: a clinical bootloader only "
+                    "erases a slot to write a signed preset into it, so a slot past the "
+                    "release's presets cannot be emptied", slot=step.slot, module=step.module)
+    converted = ("console" if step.module is None else step.module) in converting
+    # A converted board's updater erases every preset, so each released one is
+    # written, even one it already holds; a kept board gets the ones that differ.
+    if step.action == ACTION_REFUSE or not (step.action == ACTION_WRITE_PRESETS
+                                            or (converted and step.action == ACTION_NONE)):
         return step
-    if ("console" if step.module is None else step.module) in converting:
-        want = pp.parse_preset_header(presets.console if step.module is None
-                                      else presets.tx_image(step.slot, step.module))
+    want = pp.parse_preset_header(presets.console if step.module is None
+                                  else presets.tx_image(step.slot, step.module))
+    if converted:
         return Step(step.target, ACTION_WRITE_PRESETS_DFU,
                     f"{want.context} / diathermy {want.diathermy_sha[:12]}, written in the "
                     "clinical bootloader's DFU before the application (the bootloader updater "
                     "erases the presets)", slot=step.slot, module=step.module)
-    if step.action in (ACTION_WRITE_PRESETS, ACTION_CLEAR_SLOT):
-        return Step(step.target, ACTION_REFUSE, f"{step.detail}: clinical preset-only update not "
-                    "supported yet (clinical presets are written through the bootloader only "
-                    "while a research board is converted)", slot=step.slot, module=step.module)
-    return step
+    return Step(step.target, ACTION_WRITE_PRESETS_DFU,
+                f"{step.detail.split(' -> ')[0]} -> {want.context} / diathermy "
+                f"{want.diathermy_sha[:12]}, written in the board's clinical bootloader DFU "
+                "(entered from its application, which is kept)", slot=step.slot,
+                module=step.module)
 
 
 def compare_presets(state: PresetState, presets: PresetRelease) -> list[Step]:
@@ -823,14 +854,27 @@ class ReleaseUpdate:
                                       for s in plan.firmware if s.action == ACTION_BOOTLOADER}
         self._run_firmware([s for s in plan.firmware
                             if s.action in (ACTION_FIRMWARE, ACTION_CONVERT, ACTION_BOOTLOADER)])
-        # Clinical presets were written in the bootloaders' DFU during the
-        # conversion; a clinical application takes none.
-        if self.bundle.presets is not None and self.bundle.domain == "research":
-            modules = self.tx.get_module_count()
-            state = read_presets(self.hv, self.tx, modules)
-            steps = preset_steps(state, self.bundle.presets, self.bundle.domain)
-            self._run_presets([s for s in steps if s.action in ("write-presets", "clear-slot")])
+        if self.bundle.presets is not None:
+            self._run_release_presets()
         return self.verify()
+
+    def _run_release_presets(self) -> None:
+        """After the firmware: re-read the presets and write the ones that
+        differ. Research: through the applications (and empty the slots past
+        the release). Clinical: a converted board got its presets in the new
+        bootloader's DFU during the conversion; a board that kept its
+        application gets the ones that still differ in its own bootloader's
+        DFU (a clinical application takes none)."""
+        state = read_presets(self.hv, self.tx, self.tx.get_module_count())
+        steps = preset_steps(state, self.bundle.presets, self.bundle.domain)
+        if self.bundle.domain == "research":
+            self._run_presets([s for s in steps if s.action in ("write-presets", "clear-slot")])
+            return
+        refused = [s for s in steps if s.action == ACTION_REFUSE]
+        if refused:
+            raise ReleaseError("presets refused after the firmware update:\n  " + "\n  ".join(
+                f"{s.target}: {s.detail}" for s in refused))
+        self._run_presets_dfu([s for s in steps if s.action == ACTION_WRITE_PRESETS_DFU])
 
     def _run_firmware(self, steps: list[Step]) -> None:
         from openlifu_sdk.io.LIFUFirmwareUpdate import (
@@ -967,6 +1011,45 @@ class ReleaseUpdate:
                 return False
             time.sleep(APP_POLL_S)
 
+    def _run_presets_dfu(self, steps: list[Step]) -> None:
+        """Write clinical presets on boards that keep their application: one
+        bootloader DFU session per board, entered from its application, in
+        the firmware's order (console, slaves, master: the master brokers the
+        slaves' I2C DFU)."""
+        from openlifu_sdk.io.LIFUFirmwareUpdate import (
+            LIFUFirmwareUpdate,
+            LIFUTransmitterFirmwareUpdate,
+        )
+
+        presets = self.bundle.presets
+        kw = {"progress_callback": self.progress_callback, "report": self.report}
+        by_module: dict[int, list[int]] = {}
+        for s in steps:
+            if s.module is not None:
+                by_module.setdefault(s.module, []).append(s.slot)
+        if any(s.module is None for s in steps):
+            self.report("console: writing the presets in its bootloader's DFU")
+            r = LIFUFirmwareUpdate(hv=self.hv).write_presets(
+                lambda ctx: write_console_presets_dfu(ctx, presets.console, **kw))
+            self.report(f"console: {r.summary}")
+            self._transmitter_back_after_console()
+        fw = LIFUTransmitterFirmwareUpdate(tx=self.tx)
+
+        def write_module(module: int, slots: list[int]) -> Any:
+            images = [presets.tx_image(slot, module) for slot in slots]
+            if module == 0:
+                return fw.write_presets(
+                    lambda ctx: write_master_presets_dfu(ctx, images, slots=slots, **kw))
+            return fw.write_slave_presets(
+                module, lambda ctx: write_slave_presets_dfu(ctx, images, slots=slots, **kw))
+
+        for module in sorted(m for m in by_module if m > 0) + ([0] if 0 in by_module else []):
+            slots = sorted(by_module[module])
+            name = "transmitter master" if module == 0 else f"transmitter module {module}"
+            self.report(f"{name}: writing preset slot(s) {', '.join(f'{s:02d}' for s in slots)} "
+                        "in its bootloader's DFU")
+            self._guard(name, lambda m=module, sl=slots: write_module(m, sl))
+
     def _run_presets(self, steps: list[Step]) -> None:
         presets = self.bundle.presets
         for step in steps:
@@ -1035,50 +1118,65 @@ def _bootloader_line(board: Board, target: str | None) -> tuple[bool, str]:
 # Clinical presets, written in a bootloader's DFU (LIFUFirmwareUpdate before_app)
 # ---------------------------------------------------------------------------
 
+def _after_write(ctx: Any, last: bool, wait: Callable[[], Any]) -> None:
+    """After one preset write (the board reset): wait for its DFU again,
+    unless this was the last write and the reset boots a kept application
+    (``ctx.returns_to_dfu`` False, see
+    :class:`~openlifu_sdk.io.LIFUFirmwareUpdate.DfuContext`)."""
+    if getattr(ctx, "returns_to_dfu", True) or not last:
+        wait()
+
+
 def write_console_presets_dfu(ctx: Any, package: bytes, *, domain: str = "clinical",
                               progress_callback: Callable | None = None,
                               report: Callable[[str], None] | None = None) -> None:
     """Write the console preset page through the bootloader's USB DFU (*ctx*:
     a :class:`~openlifu_sdk.io.LIFUFirmwareUpdate.DfuContext`), the package
     checked against the *domain* console key first. The bootloader checks it
-    and resets; with an empty slot it comes back in DFU, which is waited for."""
+    and resets; with an empty slot it comes back in DFU, which is waited for
+    (a board that keeps its application boots it instead)."""
     ctx.mgr.program_console_presets(
         package, public_key=LIFUCrypto.trusted_public_key("console", domain),
         vid=ctx.vid, pid=ctx.pid, libusb_dll=ctx.libusb_dll,
         progress_callback=progress_callback)
-    ctx.wait_dfu()
+    _after_write(ctx, True, ctx.wait_dfu)
     (report or logger.info)(f"{ctx.device}: preset page written in the bootloader's DFU")
 
 
 def write_master_presets_dfu(ctx: Any, images: list[bytes], *, domain: str = "clinical",
+                             slots: list[int] | None = None,
                              progress_callback: Callable | None = None,
                              report: Callable[[str], None] | None = None) -> None:
-    """Write transmitter preset slots 0..len(images)-1 of the USB master
-    through its bootloader's DFU, each checked against the *domain*
-    transmitter key first; the bootloader resets after every slot, so its DFU
-    is waited for again each time."""
+    """Write transmitter preset *slots* (default 0..len(images)-1, one image
+    each) of the USB master through its bootloader's DFU, each checked
+    against the *domain* transmitter key first; the bootloader resets after
+    every slot, so its DFU is waited for again (see :func:`_after_write`)."""
     key = LIFUCrypto.trusted_public_key("transmitter", domain)
-    for slot, image in enumerate(images):
+    slots = list(range(len(images))) if slots is None else slots
+    for i, (slot, image) in enumerate(zip(slots, images, strict=True)):
         ctx.mgr.program_transmitter_preset(slot, image, public_key=key, vid=ctx.vid,
                                            pid=ctx.pid, libusb_dll=ctx.libusb_dll,
                                            progress_callback=progress_callback)
-        ctx.wait_dfu()
+        _after_write(ctx, i == len(slots) - 1, ctx.wait_dfu)
         (report or logger.info)(f"{ctx.device}: preset slot {slot:02d} written in the "
                                 "bootloader's DFU")
 
 
 def write_slave_presets_dfu(ctx: Any, images: list[bytes], *, domain: str = "clinical",
+                            slots: list[int] | None = None,
                             progress_callback: Callable | None = None,
                             report: Callable[[str], None] | None = None) -> None:
-    """Write transmitter preset slots 0..len(images)-1 of a slave through its
-    bootloader's I2C DFU, each checked against the *domain* transmitter key
-    first; the slave resets after every slot and is re-acquired (it gets its
-    chain address again from the master's enumeration)."""
+    """Write transmitter preset *slots* (default 0..len(images)-1) of a slave
+    through its bootloader's I2C DFU, each checked against the *domain*
+    transmitter key first; the slave resets after every slot and is
+    re-acquired (it gets its chain address again from the master's
+    enumeration; see :func:`_after_write`)."""
     key = LIFUCrypto.trusted_public_key("transmitter", domain)
-    for slot, image in enumerate(images):
+    slots = list(range(len(images))) if slots is None else slots
+    for i, (slot, image) in enumerate(zip(slots, images, strict=True)):
         ctx.mgr.program_transmitter_slave_preset_i2c(slot, image, ctx.i2c_addr, public_key=key,
                                                      progress_callback=progress_callback)
-        ctx.reacquire()
+        _after_write(ctx, i == len(slots) - 1, ctx.reacquire)
         (report or logger.info)(f"{ctx.device}: preset slot {slot:02d} written in the "
                                 "bootloader's DFU")
 
